@@ -422,7 +422,7 @@ where
       )?;
       match read_response(&mut transport, 2, "thread/resume") {
         Ok(thread) => (thread, "thread/resume", 3),
-        Err(error) if is_archived_session_error(&error) => {
+        Err(error) if is_stale_resume_thread_error(&error) => {
           send_request(
             &mut transport,
             3,
@@ -490,8 +490,8 @@ fn thread_start_params(ephemeral_threads: bool, dynamic_tools: Vec<Value>) -> Va
   params
 }
 
-fn is_archived_session_error(error: &str) -> bool {
-  error.contains(" is archived")
+fn is_stale_resume_thread_error(error: &str) -> bool {
+  error.contains(" is archived") || error.contains("no rollout found for thread id")
 }
 
 fn send_request<T: JsonlTransport>(
@@ -1421,6 +1421,48 @@ mod tests {
     );
     assert_eq!(writes[2]["params"]["threadId"], "thread-archived");
     assert_eq!(writes[3]["params"]["ephemeral"], true);
+    assert_eq!(writes[4]["params"]["threadId"], "thread-replacement");
+  }
+
+  #[test]
+  fn jsonl_client_starts_replacement_thread_when_resume_rollout_is_missing() {
+    let transport = FakeJsonlTransport::new([
+      r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+      r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"no rollout found for thread id 019f746f-68db-7cf0-ab67-837fe466dca5"}}"#,
+      r#"{"jsonrpc":"2.0","id":3,"result":{"thread":{"id":"thread-replacement"}}}"#,
+      r#"{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}"#,
+      r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-replacement","turn":{"id":"turn-1","status":"completed","items":[]}}}"#,
+    ]);
+    let client = CodexAppServerJsonlClient::new(|| Ok(transport.clone()), true);
+
+    let result = client
+      .start_turn(&CodexAppServerRequest {
+        conversation_id: "slack:W1:d2".to_owned(),
+        resume_thread_id: Some("thread-missing-rollout".to_owned()),
+        prompt: "Source references only".to_owned(),
+      })
+      .expect("completed turn");
+
+    assert_eq!(
+      result,
+      AgentTaskResult::accepted_dispatch_with_thread("thread-replacement")
+    );
+    let writes = transport.writes();
+    let methods = writes
+      .iter()
+      .map(|value| value["method"].as_str().expect("method"))
+      .collect::<Vec<_>>();
+    assert_eq!(
+      methods,
+      [
+        "initialize",
+        "initialized",
+        "thread/resume",
+        "thread/start",
+        "turn/start"
+      ]
+    );
+    assert_eq!(writes[2]["params"]["threadId"], "thread-missing-rollout");
     assert_eq!(writes[4]["params"]["threadId"], "thread-replacement");
   }
 

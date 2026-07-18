@@ -457,6 +457,8 @@ fn serve_tick_limit() -> Option<u64> {
     .and_then(|value| value.parse().ok())
 }
 
+const SLACK_INTAKE_RESTART_MAX_DELAY_SECS: u64 = 30;
+
 fn maybe_spawn_slack_intake_loop(config: &CodeoffConfig, state: StateStore) {
   if check_slack_worker(&config.slack).is_err() {
     return;
@@ -466,33 +468,55 @@ fn maybe_spawn_slack_intake_loop(config: &CodeoffConfig, state: StateStore) {
   };
   let slack = config.slack.clone();
   tokio::spawn(async move {
-    let mut transport = SlackSocketClient::new();
     let intake = SlackIntake::with_slack_config(state, "slack-default", &slack);
-    if let Err(error) = run_socket_worker(
-      &mut transport,
-      &app_token,
-      SocketWorkerOptions::default(),
-      move |raw_envelope| {
-        let intake = intake.clone();
-        async move {
-          match intake.accept(&raw_envelope).await {
-            Ok(SlackIntakeResult::Ignored) => {
-              eprintln!("ignored unsupported Slack Socket Mode envelope");
-            }
-            Ok(SlackIntakeResult::Queued | SlackIntakeResult::Duplicate) => {}
-            Err(error) => {
-              eprintln!("failed to intake Slack Socket Mode envelope: {error}");
+    let mut restart_count = 0_u32;
+    loop {
+      let mut transport = SlackSocketClient::new();
+      let result = run_socket_worker(
+        &mut transport,
+        &app_token,
+        SocketWorkerOptions::default(),
+        {
+          let intake = intake.clone();
+          move |raw_envelope| {
+            let intake = intake.clone();
+            async move {
+              match intake.accept(&raw_envelope).await {
+                Ok(SlackIntakeResult::Ignored) => {
+                  eprintln!("ignored unsupported Slack Socket Mode envelope");
+                }
+                Ok(SlackIntakeResult::Queued | SlackIntakeResult::Duplicate) => {}
+                Err(error) => {
+                  eprintln!("failed to intake Slack Socket Mode envelope: {error}");
+                }
+              }
+              SocketWorkerAction::Continue
             }
           }
-          SocketWorkerAction::Continue
+        },
+      )
+      .await;
+      match result {
+        Ok(_) => return,
+        Err(error) => {
+          let delay = slack_intake_restart_delay(restart_count);
+          restart_count = restart_count.saturating_add(1);
+          eprintln!(
+            "Slack Socket Mode intake loop stopped: {error}; restarting in {}s",
+            delay.as_secs()
+          );
+          tokio::time::sleep(delay).await;
         }
-      },
-    )
-    .await
-    {
-      eprintln!("Slack Socket Mode intake loop stopped: {error}");
+      }
     }
   });
+}
+
+fn slack_intake_restart_delay(restart_count: u32) -> Duration {
+  let delay = 1_u64
+    .checked_shl(restart_count.min(5))
+    .unwrap_or(SLACK_INTAKE_RESTART_MAX_DELAY_SECS);
+  Duration::from_secs(delay.min(SLACK_INTAKE_RESTART_MAX_DELAY_SECS))
 }
 
 fn maybe_spawn_retention_cleanup_loop(config: &CodeoffConfig, state: StateStore) {
@@ -1925,6 +1949,15 @@ mod tests {
 
     config.agent.codex_app_server.max_parallel_turns = 0;
     assert_eq!(channel_dispatch_worker_count(&config), 1);
+  }
+
+  #[test]
+  fn slack_intake_restart_delay_uses_capped_exponential_backoff() {
+    assert_eq!(slack_intake_restart_delay(0), Duration::from_secs(1));
+    assert_eq!(slack_intake_restart_delay(1), Duration::from_secs(2));
+    assert_eq!(slack_intake_restart_delay(4), Duration::from_secs(16));
+    assert_eq!(slack_intake_restart_delay(5), Duration::from_secs(30));
+    assert_eq!(slack_intake_restart_delay(99), Duration::from_secs(30));
   }
 
   #[test]

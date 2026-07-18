@@ -1,0 +1,1 @@
+{"envelope_id":"env-message-bot-1","type":"events_api","payload":{"event_id":"EvMessageBot1","team_id":"T1","event":{"type":"message","subtype":"bot_message","channel_type":"channel","channel":"C7","bot_id":"B1","ts":"1710000009.000900","text":"<@U0YALIN>"}}}

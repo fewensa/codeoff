@@ -1,0 +1,16 @@
+.codeoff
+.codeoff-live
+.env
+.env.*
+.git
+.gitignore
+target
+**/*.db
+**/*.db-*
+**/*.log
+**/*.pem
+**/*.key
+**/*.tar
+**/*.tar.gz
+**/*.tgz
+**/*.zip

@@ -1,0 +1,1 @@
+{"envelope_id":"env-message-group-mention-1","type":"events_api","payload":{"event_id":"EvMessageGroup1","team_id":"T1","event":{"type":"message","channel_type":"group","channel":"G1","user":"U6","ts":"1710000006.000600","text":"Private request for <@U0EXAMPLE>"}}}

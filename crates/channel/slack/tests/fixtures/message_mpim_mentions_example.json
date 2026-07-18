@@ -1,0 +1,1 @@
+{"envelope_id":"env-message-mpim-mention-1","type":"events_api","payload":{"event_id":"EvMessageMpim1","team_id":"T1","event":{"type":"message","channel_type":"mpim","channel":"GMP1","user":"U7","ts":"1710000007.000700","text":"Could <@U0EXAMPLE> take this?"}}}

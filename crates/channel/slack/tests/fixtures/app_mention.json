@@ -1,0 +1,1 @@
+{"envelope_id":"env-app-mention-1","type":"events_api","payload":{"event_id":"Ev1","team_id":"T1","event":{"type":"app_mention","channel":"C1","user":"U1","ts":"1710000000.000100","text":"<@B1> hello"}}}

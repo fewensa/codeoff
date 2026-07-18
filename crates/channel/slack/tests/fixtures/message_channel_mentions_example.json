@@ -1,0 +1,1 @@
+{"envelope_id":"env-message-channel-mention-1","type":"events_api","payload":{"event_id":"EvMessageChannel1","team_id":"T1","event":{"type":"message","channel_type":"channel","channel":"C5","user":"U5","ts":"1710000005.000500","text":"Please help <@U0EXAMPLE>","thread_ts":"1710000005.000100"}}}

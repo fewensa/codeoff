@@ -1,0 +1,1 @@
+{"envelope_id":"env-interaction-1","type":"interactive","payload":{"team":{"id":"T1"},"channel":{"id":"C4"},"user":{"id":"U4"},"callback_id":"action","actions":[{"action_id":"acknowledge","value":"action-9"}],"message":{"ts":"1710000004.000400"}}}

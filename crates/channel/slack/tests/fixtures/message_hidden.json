@@ -1,0 +1,1 @@
+{"envelope_id":"env-message-hidden-1","type":"events_api","payload":{"event_id":"EvMessageHidden1","team_id":"T1","event":{"type":"message","hidden":true,"channel_type":"channel","channel":"C7","user":"U11","ts":"1710000012.001200","text":"<@U0YALIN>"}}}

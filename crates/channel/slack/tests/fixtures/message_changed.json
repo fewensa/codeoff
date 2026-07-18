@@ -1,0 +1,1 @@
+{"envelope_id":"env-message-changed-1","type":"events_api","payload":{"event_id":"EvMessageChanged1","team_id":"T1","event":{"type":"message","subtype":"message_changed","hidden":true,"channel":"C8","ts":"1710000010.001000","message":{"type":"message","user":"U9","text":"<@U0YALIN>","ts":"1710000001.000100"}}}}

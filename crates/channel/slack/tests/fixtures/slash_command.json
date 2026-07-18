@@ -1,0 +1,1 @@
+{"envelope_id":"env-command-1","type":"slash_commands","payload":{"team_id":"T1","channel_id":"C3","user_id":"U3","trigger_id":"1337.42","command":"/codeoff","text":"help","trigger_ts":"1710000002.000300"}}

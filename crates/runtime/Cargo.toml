@@ -1,0 +1,24 @@
+[package]
+name = "codeoff-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+codeoff-agent-contract = { path = "../agent/contract" }
+codeoff-channel-contract = { path = "../channel/contract" }
+codeoff-config = { path = "../config" }
+codeoff-state = { path = "../state" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

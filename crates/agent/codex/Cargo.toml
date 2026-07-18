@@ -1,0 +1,17 @@
+[package]
+name = "codeoff-agent-codex"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+codeoff-agent-contract = { path = "../contract" }
+codeoff-config = { path = "../../config" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,1 @@
+{"envelope_id":"env-message-deleted-1","type":"events_api","payload":{"event_id":"EvMessageDeleted1","team_id":"T1","event":{"type":"message","subtype":"message_deleted","hidden":true,"channel":"C9","ts":"1710000011.001100","previous_message":{"type":"message","user":"U10","text":"<@U0YALIN>","ts":"1710000002.000200"}}}}

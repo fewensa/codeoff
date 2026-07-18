@@ -1388,6 +1388,41 @@ impl SlackCodexStreamController {
     }
   }
 
+  fn finish_active_direct_message_reply(&self, final_answer: &str) -> bool {
+    let Some(client) = self.client.clone() else {
+      return false;
+    };
+    let mut active = self.active.lock().expect("slack codex stream");
+    let Some(active) = active.as_mut() else {
+      return false;
+    };
+    if active.failed
+      || !matches!(
+        active.target.kind,
+        SlackCodexStreamTargetKind::DirectMessageUpdate
+      )
+    {
+      return false;
+    }
+    let Some(message_ts) = active.message_ts.clone() else {
+      return false;
+    };
+    let channel_id = active.target.channel_id.clone();
+    if let Some(cancel) = active.loading_cancel.take() {
+      cancel.store(true, Ordering::SeqCst);
+    }
+    let text = final_answer.to_owned();
+    active.final_text.clone_from(&text);
+    match self.block_on_slack(client.update_message(&channel_id, &message_ts, &text)) {
+      Ok(_) => true,
+      Err(error) => {
+        active.failed = true;
+        eprintln!("failed to finish Slack direct message tool reply: {error}");
+        false
+      }
+    }
+  }
+
   fn block_on_slack<F: Future>(&self, future: F) -> F::Output {
     if tokio::runtime::Handle::try_current().is_ok() {
       tokio::task::block_in_place(|| self.runtime.block_on(future))
@@ -1511,12 +1546,48 @@ impl CodexDynamicToolHandler for ServeCodexDynamicToolHandler {
   fn handle_tool_call(&self, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
     self.assistant_status.update_for_tool(tool);
     self.slack_streams.update_for_tool(tool);
+    if let Some((request_dedupe_key, text)) =
+      direct_message_reply_to_event_override(tool, &arguments)
+      && self.slack_streams.finish_active_direct_message_reply(text)
+    {
+      return direct_message_reply_to_event_override_success(request_dedupe_key);
+    }
     tokio::task::block_in_place(|| {
       self
         .runtime
         .block_on(self.inner.handle_tool_call_async(tool, arguments))
     })
   }
+}
+
+fn direct_message_reply_to_event_override<'a>(
+  tool: &str,
+  arguments: &'a serde_json::Value,
+) -> Option<(&'a str, &'a str)> {
+  if tool != "channel_reply_to_event" {
+    return None;
+  }
+  let request_dedupe_key = arguments["request_dedupe_key"].as_str()?;
+  let text = arguments["text"].as_str()?;
+  if request_dedupe_key.is_empty() || text.is_empty() {
+    return None;
+  }
+  Some((request_dedupe_key, text))
+}
+
+fn direct_message_reply_to_event_override_success(request_dedupe_key: &str) -> serde_json::Value {
+  serde_json::json!({
+    "success": true,
+    "contentItems": [
+      {
+        "type": "inputText",
+        "text": serde_json::json!({
+          "request_dedupe_key": request_dedupe_key,
+          "queued": false,
+        }).to_string(),
+      }
+    ],
+  })
 }
 
 fn build_slack_delivery_queue(
@@ -2086,6 +2157,45 @@ mod tests {
       AssistantState::ReviewingFindings.loading_text(0),
       "Reviewing findings."
     );
+  }
+
+  #[test]
+  fn direct_message_reply_override_only_accepts_valid_reply_to_event() {
+    let arguments = serde_json::json!({
+      "request_dedupe_key": "reply-1",
+      "text": "Final answer."
+    });
+
+    assert_eq!(
+      direct_message_reply_to_event_override("channel_reply_to_event", &arguments),
+      Some(("reply-1", "Final answer."))
+    );
+    assert_eq!(
+      direct_message_reply_to_event_override("channel_send_message", &arguments),
+      None
+    );
+    assert_eq!(
+      direct_message_reply_to_event_override(
+        "channel_reply_to_event",
+        &serde_json::json!({
+          "request_dedupe_key": "reply-1",
+          "text": ""
+        })
+      ),
+      None
+    );
+  }
+
+  #[test]
+  fn direct_message_reply_override_reports_inline_delivery_success() {
+    let response = direct_message_reply_to_event_override_success("reply-1");
+
+    assert_eq!(response["success"], true);
+    let text = response["contentItems"][0]["text"]
+      .as_str()
+      .expect("tool response text");
+    assert!(text.contains("\"request_dedupe_key\":\"reply-1\""));
+    assert!(text.contains("\"queued\":false"));
   }
 
   fn stream_target_task(

@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -716,7 +717,7 @@ impl<B: AgentBackend> AgentBackend for FeedbackAgentBackend<B> {
   }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct AssistantStatusTarget {
   channel_id: String,
   thread_ts: String,
@@ -799,14 +800,321 @@ fn assistant_state_for_agent_phase(phase: Option<&str>) -> Option<AssistantState
 #[derive(Clone)]
 struct AssistantStatusController {
   runtime: tokio::runtime::Handle,
-  client: Option<Arc<SlackWebApiClient<SlackReqwestWebApiClient>>>,
-  active: Arc<Mutex<Option<ActiveAssistantStatus>>>,
+  client: Option<Arc<dyn AssistantStatusTransport>>,
+  active_sessions: Arc<Mutex<HashMap<std::thread::ThreadId, ActiveAssistantStatus>>>,
+  dispatchers: Arc<Mutex<HashMap<AssistantStatusTarget, AssistantStatusDispatcher>>>,
+  next_session_id: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
 struct ActiveAssistantStatus {
   target: AssistantStatusTarget,
+  session_id: u64,
+  closed: Arc<AtomicBool>,
+  terminal_clear_queued: Arc<AtomicBool>,
   should_clear: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct AssistantStatusDispatcher {
+  sender: tokio::sync::mpsc::UnboundedSender<AssistantStatusCommand>,
+  state: Arc<Mutex<AssistantStatusDispatcherState>>,
+  target: Option<AssistantStatusTarget>,
+  dispatchers: std::sync::Weak<Mutex<HashMap<AssistantStatusTarget, AssistantStatusDispatcher>>>,
+}
+
+struct AssistantStatusDispatcherState {
+  current_session_id: u64,
+  visible_session_id: u64,
+  pending_set: Option<PendingAssistantStatusSet>,
+  set_flush_scheduled: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingAssistantStatusSet {
+  session_id: u64,
+  state: AssistantState,
+}
+
+enum AssistantStatusCommand {
+  FlushSet,
+  Clear {
+    session_id: u64,
+    log_completion: bool,
+  },
+}
+
+impl AssistantStatusDispatcher {
+  fn without_client() -> Self {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    drop(receiver);
+    Self {
+      sender,
+      state: Arc::new(Mutex::new(AssistantStatusDispatcherState {
+        current_session_id: 0,
+        visible_session_id: 0,
+        pending_set: None,
+        set_flush_scheduled: false,
+      })),
+      target: None,
+      dispatchers: std::sync::Weak::new(),
+    }
+  }
+
+  fn new(
+    runtime: &tokio::runtime::Handle,
+    client: Arc<dyn AssistantStatusTransport>,
+    target: AssistantStatusTarget,
+    dispatchers: std::sync::Weak<Mutex<HashMap<AssistantStatusTarget, AssistantStatusDispatcher>>>,
+  ) -> Self {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let state = Arc::new(Mutex::new(AssistantStatusDispatcherState {
+      current_session_id: 0,
+      visible_session_id: 0,
+      pending_set: None,
+      set_flush_scheduled: false,
+    }));
+    Self::spawn_worker(
+      runtime,
+      client,
+      target.clone(),
+      dispatchers.clone(),
+      state.clone(),
+      receiver,
+    );
+    Self {
+      sender,
+      state,
+      target: Some(target),
+      dispatchers,
+    }
+  }
+
+  fn spawn_worker(
+    runtime: &tokio::runtime::Handle,
+    client: Arc<dyn AssistantStatusTransport>,
+    target: AssistantStatusTarget,
+    dispatchers: std::sync::Weak<Mutex<HashMap<AssistantStatusTarget, AssistantStatusDispatcher>>>,
+    state: Arc<Mutex<AssistantStatusDispatcherState>>,
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<AssistantStatusCommand>,
+  ) {
+    runtime.spawn(async move {
+      while let Some(command) = receiver.recv().await {
+        match command {
+          AssistantStatusCommand::FlushSet => {
+            Self::flush_pending_set(&client, &target, &state).await;
+          }
+          AssistantStatusCommand::Clear {
+            session_id,
+            log_completion,
+          } => {
+            Self::clear_visible_status(
+              &client,
+              &target,
+              &dispatchers,
+              &state,
+              session_id,
+              log_completion,
+            )
+            .await;
+          }
+        }
+      }
+    });
+  }
+
+  async fn flush_pending_set(
+    client: &Arc<dyn AssistantStatusTransport>,
+    target: &AssistantStatusTarget,
+    state: &Arc<Mutex<AssistantStatusDispatcherState>>,
+  ) {
+    let pending = {
+      let mut state = state.lock().expect("assistant status dispatcher");
+      let pending = state.pending_set.take();
+      state.set_flush_scheduled = false;
+      pending
+    };
+    let Some(PendingAssistantStatusSet {
+      session_id,
+      state: assistant_state,
+    }) = pending
+    else {
+      return;
+    };
+    if state
+      .lock()
+      .expect("assistant status dispatcher")
+      .current_session_id
+      != session_id
+    {
+      return;
+    }
+    let status = assistant_state.status_text();
+    if let Err(error) = client
+      .set(&target.channel_id, &target.thread_ts, status)
+      .await
+    {
+      eprintln!("failed to set Slack assistant status: {error}");
+      return;
+    }
+    eprintln!(
+      "set Slack assistant status channel={} thread_ts={} status={status}",
+      target.channel_id, target.thread_ts
+    );
+    state
+      .lock()
+      .expect("assistant status dispatcher")
+      .visible_session_id = session_id;
+  }
+
+  async fn clear_visible_status(
+    client: &Arc<dyn AssistantStatusTransport>,
+    target: &AssistantStatusTarget,
+    dispatchers: &std::sync::Weak<Mutex<HashMap<AssistantStatusTarget, AssistantStatusDispatcher>>>,
+    state: &Arc<Mutex<AssistantStatusDispatcherState>>,
+    session_id: u64,
+    log_completion: bool,
+  ) {
+    if state
+      .lock()
+      .expect("assistant status dispatcher")
+      .visible_session_id
+      != session_id
+    {
+      return;
+    }
+    if let Err(error) = client.clear(&target.channel_id, &target.thread_ts).await {
+      eprintln!("failed to clear Slack assistant status: {error}");
+    } else if log_completion {
+      eprintln!(
+        "cleared Slack assistant status channel={} thread_ts={} session_id={session_id}",
+        target.channel_id, target.thread_ts
+      );
+    }
+    let retired = {
+      let mut state = state.lock().expect("assistant status dispatcher");
+      if state.visible_session_id == session_id {
+        state.visible_session_id = 0;
+      }
+      if state.current_session_id == session_id {
+        state.current_session_id = 0;
+      }
+      state.current_session_id == 0 && state.visible_session_id == 0
+    };
+    if retired {
+      Self::remove_dispatcher_if_current(dispatchers, target, state);
+    }
+  }
+
+  fn remove_dispatcher_if_current(
+    dispatchers: &std::sync::Weak<Mutex<HashMap<AssistantStatusTarget, AssistantStatusDispatcher>>>,
+    target: &AssistantStatusTarget,
+    state: &Arc<Mutex<AssistantStatusDispatcherState>>,
+  ) {
+    let Some(dispatchers) = dispatchers.upgrade() else {
+      return;
+    };
+    let mut dispatchers = dispatchers.lock().expect("assistant status dispatchers");
+    if dispatchers
+      .get(target)
+      .is_some_and(|dispatcher| Arc::ptr_eq(&dispatcher.state, state))
+    {
+      dispatchers.remove(target);
+    }
+  }
+
+  fn set(&self, active: &ActiveAssistantStatus, state: AssistantState) {
+    if active.closed.load(Ordering::SeqCst) {
+      return;
+    }
+    let schedule_flush = {
+      let mut dispatcher_state = self.state.lock().expect("assistant status dispatcher");
+      if dispatcher_state.current_session_id != active.session_id {
+        return;
+      }
+      dispatcher_state.pending_set = Some(PendingAssistantStatusSet {
+        session_id: active.session_id,
+        state,
+      });
+      if dispatcher_state.set_flush_scheduled {
+        false
+      } else {
+        dispatcher_state.set_flush_scheduled = true;
+        true
+      }
+    };
+    if schedule_flush {
+      let _ = self.sender.send(AssistantStatusCommand::FlushSet);
+    }
+  }
+
+  fn clear(&self, session_id: u64, log_completion: bool) {
+    let _ = self.sender.send(AssistantStatusCommand::Clear {
+      session_id,
+      log_completion,
+    });
+  }
+
+  fn close_session(active: &ActiveAssistantStatus) {
+    active.closed.store(true, Ordering::SeqCst);
+  }
+
+  fn activate_session(&self, session_id: u64) {
+    self
+      .state
+      .lock()
+      .expect("assistant status dispatcher")
+      .current_session_id = session_id;
+  }
+
+  fn retire_session(&self, session_id: u64) {
+    let retired = {
+      let mut state = self.state.lock().expect("assistant status dispatcher");
+      if state.current_session_id == session_id {
+        state.current_session_id = 0;
+        state.visible_session_id == 0
+      } else {
+        false
+      }
+    };
+    if !retired {
+      return;
+    }
+    let Some(target) = self.target.as_ref() else {
+      return;
+    };
+    Self::remove_dispatcher_if_current(&self.dispatchers, target, &self.state);
+  }
+}
+
+#[async_trait]
+trait AssistantStatusTransport: Send + Sync {
+  async fn set(
+    &self,
+    channel_id: &str,
+    thread_ts: &str,
+    status: &str,
+  ) -> Result<(), SlackWebApiError>;
+
+  async fn clear(&self, channel_id: &str, thread_ts: &str) -> Result<(), SlackWebApiError>;
+}
+
+#[async_trait]
+impl AssistantStatusTransport for SlackWebApiClient<SlackReqwestWebApiClient> {
+  async fn set(
+    &self,
+    channel_id: &str,
+    thread_ts: &str,
+    status: &str,
+  ) -> Result<(), SlackWebApiError> {
+    self
+      .set_assistant_status(channel_id, thread_ts, status, &[])
+      .await
+  }
+
+  async fn clear(&self, channel_id: &str, thread_ts: &str) -> Result<(), SlackWebApiError> {
+    self.clear_assistant_status(channel_id, thread_ts).await
+  }
 }
 
 fn build_assistant_status_controller(config: &CodeoffConfig) -> AssistantStatusController {
@@ -819,12 +1127,14 @@ fn build_assistant_status_controller(config: &CodeoffConfig) -> AssistantStatusC
         bot_token,
         config.slack.clone(),
         now_unix_seconds(),
-      ))
+      )) as Arc<dyn AssistantStatusTransport>
     });
   AssistantStatusController {
     runtime: tokio::runtime::Handle::current(),
     client,
-    active: Arc::new(Mutex::new(None)),
+    active_sessions: Arc::new(Mutex::new(HashMap::new())),
+    dispatchers: Arc::new(Mutex::new(HashMap::new())),
+    next_session_id: Arc::new(AtomicU64::new(1)),
   }
 }
 
@@ -833,15 +1143,26 @@ impl AssistantStatusController {
     let (cancel, mut receiver) = tokio::sync::oneshot::channel();
     let active = ActiveAssistantStatus {
       target: target.clone(),
+      session_id: self.next_session_id.fetch_add(1, Ordering::Relaxed),
+      closed: Arc::new(AtomicBool::new(false)),
+      terminal_clear_queued: Arc::new(AtomicBool::new(false)),
       should_clear: Arc::new(AtomicBool::new(false)),
     };
-    *self.active.lock().expect("assistant status target") = Some(active.clone());
+    self
+      .dispatcher_for(&target)
+      .activate_session(active.session_id);
+    self
+      .active_sessions
+      .lock()
+      .expect("assistant status sessions")
+      .insert(std::thread::current().id(), active.clone());
     if self.client.is_some() {
       let status = self.clone();
+      let delayed_active = active.clone();
       self.runtime.spawn(async move {
         tokio::select! {
           _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {
-            status.set_state_for_active_target(AssistantState::ReviewingFindings);
+            status.set_state_for_session(&delayed_active, AssistantState::ReviewingFindings);
           }
           _ = &mut receiver => {}
         }
@@ -867,45 +1188,61 @@ impl AssistantStatusController {
   }
 
   fn set_state_for_active_target(&self, state: AssistantState) {
-    let Some(client) = self.client.clone() else {
+    let Some(active) = self.active_for_current_thread() else {
       return;
     };
-    let Some(active) = self.active.lock().expect("assistant status target").clone() else {
-      return;
-    };
+    self.set_state_for_session(&active, state);
+  }
+
+  fn set_state_for_session(&self, active: &ActiveAssistantStatus, state: AssistantState) {
     active.should_clear.store(true, Ordering::SeqCst);
-    let channel_id = active.target.channel_id.clone();
-    let thread_ts = active.target.thread_ts.clone();
-    self.runtime.spawn(async move {
-      let status = state.status_text();
-      if let Err(error) = client
-        .set_assistant_status(&channel_id, &thread_ts, status, &[])
-        .await
-      {
-        eprintln!("failed to set Slack assistant status: {error}");
-      } else {
-        eprintln!(
-          "set Slack assistant status channel={channel_id} thread_ts={thread_ts} status={status}"
-        );
-      }
-    });
+    self.dispatcher_for(&active.target).set(active, state);
   }
 
   fn clear_active_now(&self) {
+    let Some(active) = self.active_for_current_thread() else {
+      return;
+    };
+    self.finish_session(&active, false);
+  }
+
+  fn active_for_current_thread(&self) -> Option<ActiveAssistantStatus> {
+    self
+      .active_sessions
+      .lock()
+      .expect("assistant status sessions")
+      .get(&std::thread::current().id())
+      .cloned()
+  }
+
+  fn finish_session(&self, active: &ActiveAssistantStatus, log_completion: bool) {
+    if active.terminal_clear_queued.swap(true, Ordering::SeqCst) {
+      return;
+    }
+    let dispatcher = self.dispatcher_for(&active.target);
+    AssistantStatusDispatcher::close_session(active);
+    dispatcher.clear(active.session_id, log_completion);
+  }
+
+  fn dispatcher_for(&self, target: &AssistantStatusTarget) -> AssistantStatusDispatcher {
     let Some(client) = self.client.clone() else {
-      return;
+      return AssistantStatusDispatcher::without_client();
     };
-    let Some(active) = self.active.lock().expect("assistant status target").clone() else {
-      return;
-    };
-    active.should_clear.store(false, Ordering::SeqCst);
-    let channel_id = active.target.channel_id.clone();
-    let thread_ts = active.target.thread_ts.clone();
-    self.runtime.spawn(async move {
-      if let Err(error) = client.clear_assistant_status(&channel_id, &thread_ts).await {
-        eprintln!("failed to clear Slack assistant status: {error}");
-      }
-    });
+    let mut dispatchers = self
+      .dispatchers
+      .lock()
+      .expect("assistant status dispatchers");
+    dispatchers
+      .entry(target.clone())
+      .or_insert_with(|| {
+        AssistantStatusDispatcher::new(
+          &self.runtime,
+          client,
+          target.clone(),
+          Arc::downgrade(&self.dispatchers),
+        )
+      })
+      .clone()
   }
 }
 
@@ -920,26 +1257,25 @@ impl Drop for AssistantStatusGuard {
     if let Some(cancel) = self.cancel.take() {
       let _ = cancel.send(());
     }
-    *self
+    let mut active_sessions = self
       .controller
-      .active
+      .active_sessions
       .lock()
-      .expect("assistant status target") = None;
+      .expect("assistant status sessions");
+    if active_sessions
+      .get(&std::thread::current().id())
+      .is_some_and(|active| active.session_id == self.active.session_id)
+    {
+      active_sessions.remove(&std::thread::current().id());
+    }
+    drop(active_sessions);
     if !self.active.should_clear.load(Ordering::SeqCst) {
+      let dispatcher = self.controller.dispatcher_for(&self.active.target);
+      AssistantStatusDispatcher::close_session(&self.active);
+      dispatcher.retire_session(self.active.session_id);
       return;
     }
-    let Some(client) = self.controller.client.clone() else {
-      return;
-    };
-    let channel_id = self.active.target.channel_id.clone();
-    let thread_ts = self.active.target.thread_ts.clone();
-    self.controller.runtime.spawn(async move {
-      if let Err(error) = client.clear_assistant_status(&channel_id, &thread_ts).await {
-        eprintln!("failed to clear Slack assistant status: {error}");
-      } else {
-        eprintln!("cleared Slack assistant status channel={channel_id} thread_ts={thread_ts}");
-      }
-    });
+    self.controller.finish_session(&self.active, true);
   }
 }
 
@@ -1901,9 +2237,217 @@ fn load_config(
 mod tests {
   use super::*;
   use std::sync::{
-    Arc,
+    Arc, Barrier,
     atomic::{AtomicBool, Ordering},
   };
+
+  #[derive(Clone, Debug, PartialEq, Eq)]
+  enum AssistantStatusOperation {
+    Set { target: String, status: String },
+    Clear { target: String },
+  }
+
+  struct BlockingAssistantStatusTransport {
+    operations: Mutex<Vec<AssistantStatusOperation>>,
+    set_started: tokio::sync::Notify,
+    release_set: tokio::sync::Notify,
+    first_set_blocked: AtomicBool,
+    clear_completed: tokio::sync::Notify,
+    operation_completed: tokio::sync::Notify,
+  }
+
+  impl BlockingAssistantStatusTransport {
+    fn new() -> Self {
+      Self {
+        operations: Mutex::new(Vec::new()),
+        set_started: tokio::sync::Notify::new(),
+        release_set: tokio::sync::Notify::new(),
+        first_set_blocked: AtomicBool::new(false),
+        clear_completed: tokio::sync::Notify::new(),
+        operation_completed: tokio::sync::Notify::new(),
+      }
+    }
+
+    async fn wait_for_operation_count(&self, expected: usize) {
+      loop {
+        let notified = self.operation_completed.notified();
+        if self.operations.lock().expect("operations").len() >= expected {
+          return;
+        }
+        notified.await;
+      }
+    }
+  }
+
+  #[async_trait]
+  impl AssistantStatusTransport for BlockingAssistantStatusTransport {
+    async fn set(
+      &self,
+      _channel_id: &str,
+      thread_ts: &str,
+      status: &str,
+    ) -> Result<(), SlackWebApiError> {
+      if !self.first_set_blocked.swap(true, Ordering::SeqCst) {
+        self.set_started.notify_one();
+        self.release_set.notified().await;
+      }
+      self
+        .operations
+        .lock()
+        .expect("operations")
+        .push(AssistantStatusOperation::Set {
+          target: thread_ts.to_owned(),
+          status: status.to_owned(),
+        });
+      self.operation_completed.notify_one();
+      Ok(())
+    }
+
+    async fn clear(&self, _channel_id: &str, thread_ts: &str) -> Result<(), SlackWebApiError> {
+      self
+        .operations
+        .lock()
+        .expect("operations")
+        .push(AssistantStatusOperation::Clear {
+          target: thread_ts.to_owned(),
+        });
+      self.operation_completed.notify_one();
+      self.clear_completed.notify_one();
+      Ok(())
+    }
+  }
+
+  fn assistant_status_controller_for_tests(
+    client: Arc<dyn AssistantStatusTransport>,
+  ) -> AssistantStatusController {
+    AssistantStatusController {
+      runtime: tokio::runtime::Handle::current(),
+      client: Some(client),
+      active_sessions: Arc::new(Mutex::new(HashMap::new())),
+      dispatchers: Arc::new(Mutex::new(HashMap::new())),
+      next_session_id: Arc::new(AtomicU64::new(1)),
+    }
+  }
+
+  struct RecordingAssistantStatusTransport {
+    operations: Mutex<Vec<AssistantStatusOperation>>,
+    operation_completed: tokio::sync::Notify,
+  }
+
+  impl RecordingAssistantStatusTransport {
+    fn new() -> Self {
+      Self {
+        operations: Mutex::new(Vec::new()),
+        operation_completed: tokio::sync::Notify::new(),
+      }
+    }
+
+    async fn wait_for_operation_count(&self, expected: usize) {
+      loop {
+        let notified = self.operation_completed.notified();
+        if self.operations.lock().expect("operations").len() >= expected {
+          return;
+        }
+        notified.await;
+      }
+    }
+  }
+
+  struct BlockingClearAssistantStatusTransport {
+    operations: Mutex<Vec<AssistantStatusOperation>>,
+    operation_completed: tokio::sync::Notify,
+    clear_started: tokio::sync::Notify,
+    release_clear: tokio::sync::Notify,
+  }
+
+  impl BlockingClearAssistantStatusTransport {
+    fn new() -> Self {
+      Self {
+        operations: Mutex::new(Vec::new()),
+        operation_completed: tokio::sync::Notify::new(),
+        clear_started: tokio::sync::Notify::new(),
+        release_clear: tokio::sync::Notify::new(),
+      }
+    }
+
+    async fn wait_for_operation_count(&self, expected: usize) {
+      loop {
+        let notified = self.operation_completed.notified();
+        if self.operations.lock().expect("operations").len() >= expected {
+          return;
+        }
+        notified.await;
+      }
+    }
+  }
+
+  #[async_trait]
+  impl AssistantStatusTransport for BlockingClearAssistantStatusTransport {
+    async fn set(
+      &self,
+      _channel_id: &str,
+      thread_ts: &str,
+      status: &str,
+    ) -> Result<(), SlackWebApiError> {
+      self
+        .operations
+        .lock()
+        .expect("operations")
+        .push(AssistantStatusOperation::Set {
+          target: thread_ts.to_owned(),
+          status: status.to_owned(),
+        });
+      self.operation_completed.notify_one();
+      Ok(())
+    }
+
+    async fn clear(&self, _channel_id: &str, thread_ts: &str) -> Result<(), SlackWebApiError> {
+      self.clear_started.notify_one();
+      self.release_clear.notified().await;
+      self
+        .operations
+        .lock()
+        .expect("operations")
+        .push(AssistantStatusOperation::Clear {
+          target: thread_ts.to_owned(),
+        });
+      self.operation_completed.notify_one();
+      Ok(())
+    }
+  }
+
+  #[async_trait]
+  impl AssistantStatusTransport for RecordingAssistantStatusTransport {
+    async fn set(
+      &self,
+      _channel_id: &str,
+      thread_ts: &str,
+      status: &str,
+    ) -> Result<(), SlackWebApiError> {
+      self
+        .operations
+        .lock()
+        .expect("operations")
+        .push(AssistantStatusOperation::Set {
+          target: thread_ts.to_owned(),
+          status: status.to_owned(),
+        });
+      self.operation_completed.notify_one();
+      Ok(())
+    }
+
+    async fn clear(&self, _channel_id: &str, thread_ts: &str) -> Result<(), SlackWebApiError> {
+      self
+        .operations
+        .lock()
+        .expect("operations")
+        .push(AssistantStatusOperation::Clear {
+          target: thread_ts.to_owned(),
+        });
+      self.operation_completed.notify_one();
+      Ok(())
+    }
+  }
 
   #[test]
   fn delivery_tick_errors_are_retry_activity_not_daemon_fatal() {
@@ -2025,6 +2569,503 @@ mod tests {
     config.slack.response_feedback.mode = codeoff_config::SlackResponseFeedbackMode::Off;
 
     assert!(assistant_status_target(&config, Some("C1"), Some("100.0"), Some("100.0")).is_none());
+  }
+
+  #[tokio::test]
+  async fn assistant_status_clear_is_last_after_a_late_set_response() {
+    let transport = Arc::new(BlockingAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let guard = controller.start(
+      AssistantStatusTarget {
+        channel_id: "C1".to_owned(),
+        thread_ts: "100.0".to_owned(),
+      },
+      60_000,
+    );
+
+    let set_started = transport.set_started.notified();
+    controller.set_state_for_active_target(AssistantState::Processing);
+    set_started.await;
+
+    let clear_completed = transport.clear_completed.notified();
+    drop(guard);
+    tokio::task::yield_now().await;
+    transport.release_set.notify_one();
+    clear_completed.await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+      transport.operations.lock().expect("operations").last(),
+      Some(&AssistantStatusOperation::Clear {
+        target: "100.0".to_owned(),
+      })
+    );
+  }
+
+  #[tokio::test]
+  async fn assistant_status_terminal_clear_retires_its_dispatcher() {
+    let transport = Arc::new(RecordingAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let target = AssistantStatusTarget {
+      channel_id: "C1".to_owned(),
+      thread_ts: "100.0".to_owned(),
+    };
+    let guard = controller.start(target.clone(), 60_000);
+
+    controller.update_for_tool("channel_get_delivery_status");
+    transport.wait_for_operation_count(1).await;
+    drop(guard);
+    transport.wait_for_operation_count(2).await;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+      loop {
+        if !controller
+          .dispatchers
+          .lock()
+          .expect("assistant status dispatchers")
+          .contains_key(&target)
+        {
+          return;
+        }
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("dispatcher retired after terminal clear");
+
+    let reused = controller.start(target, 60_000);
+    controller.update_for_tool("channel_get_thread_context");
+    transport.wait_for_operation_count(3).await;
+    drop(reused);
+    transport.wait_for_operation_count(4).await;
+  }
+
+  #[tokio::test]
+  async fn assistant_status_without_updates_retires_its_dispatcher_and_can_restart() {
+    let transport = Arc::new(RecordingAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let target = AssistantStatusTarget {
+      channel_id: "C1".to_owned(),
+      thread_ts: "100.0".to_owned(),
+    };
+
+    drop(controller.start(target.clone(), 60_000));
+
+    assert!(
+      !controller
+        .dispatchers
+        .lock()
+        .expect("assistant status dispatchers")
+        .contains_key(&target)
+    );
+
+    let restarted = controller.start(target, 60_000);
+    controller.update_for_tool("channel_get_delivery_status");
+    transport.wait_for_operation_count(1).await;
+    drop(restarted);
+    transport.wait_for_operation_count(2).await;
+  }
+
+  #[tokio::test]
+  async fn assistant_status_queued_clear_survives_a_newer_session_without_status() {
+    let transport = Arc::new(BlockingClearAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let target = AssistantStatusTarget {
+      channel_id: "C1".to_owned(),
+      thread_ts: "100.0".to_owned(),
+    };
+    let first = controller.start(target.clone(), 60_000);
+    controller.update_for_tool("channel_get_delivery_status");
+    transport.wait_for_operation_count(1).await;
+
+    let clear_started = transport.clear_started.notified();
+    drop(first);
+    clear_started.await;
+    drop(controller.start(target.clone(), 60_000));
+    transport.release_clear.notify_one();
+    transport.wait_for_operation_count(2).await;
+
+    assert_eq!(
+      transport.operations.lock().expect("operations").as_slice(),
+      [
+        AssistantStatusOperation::Set {
+          target: "100.0".to_owned(),
+          status: "Processing...".to_owned(),
+        },
+        AssistantStatusOperation::Clear {
+          target: "100.0".to_owned(),
+        },
+      ]
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+      loop {
+        if !controller
+          .dispatchers
+          .lock()
+          .expect("assistant status dispatchers")
+          .contains_key(&target)
+        {
+          return;
+        }
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("dispatcher retired after queued clear");
+  }
+
+  #[tokio::test]
+  async fn assistant_status_coalesces_pending_sets_before_terminal_clear() {
+    let transport = Arc::new(BlockingAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let guard = controller.start(
+      AssistantStatusTarget {
+        channel_id: "C1".to_owned(),
+        thread_ts: "100.0".to_owned(),
+      },
+      60_000,
+    );
+
+    let set_started = transport.set_started.notified();
+    controller.update_for_tool("channel_get_delivery_status");
+    set_started.await;
+    for _ in 0..32 {
+      controller.update_for_tool("channel_get_thread_context");
+    }
+    controller.update_for_tool("channel_reply_to_event");
+    let clear_completed = transport.clear_completed.notified();
+    drop(guard);
+    transport.release_set.notify_one();
+    clear_completed.await;
+
+    assert_eq!(
+      transport.operations.lock().expect("operations").as_slice(),
+      [
+        AssistantStatusOperation::Set {
+          target: "100.0".to_owned(),
+          status: "Processing...".to_owned(),
+        },
+        AssistantStatusOperation::Set {
+          target: "100.0".to_owned(),
+          status: "Summarizing findings...".to_owned(),
+        },
+        AssistantStatusOperation::Clear {
+          target: "100.0".to_owned(),
+        },
+      ]
+    );
+  }
+
+  #[tokio::test]
+  async fn assistant_status_stale_set_cannot_replace_a_newer_pending_set() {
+    let transport = Arc::new(BlockingAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let first = controller.start(
+      AssistantStatusTarget {
+        channel_id: "C1".to_owned(),
+        thread_ts: "100.0".to_owned(),
+      },
+      60_000,
+    );
+
+    let set_started = transport.set_started.notified();
+    controller.set_state_for_session(&first.active, AssistantState::Processing);
+    set_started.await;
+
+    let second = controller.start(first.active.target.clone(), 60_000);
+    controller.set_state_for_session(&second.active, AssistantState::Searching);
+    controller.set_state_for_session(&first.active, AssistantState::SummarizingFindings);
+    transport.release_set.notify_one();
+    transport.wait_for_operation_count(2).await;
+
+    assert_eq!(
+      transport.operations.lock().expect("operations").as_slice(),
+      [
+        AssistantStatusOperation::Set {
+          target: "100.0".to_owned(),
+          status: "Processing...".to_owned(),
+        },
+        AssistantStatusOperation::Set {
+          target: "100.0".to_owned(),
+          status: "Searching...".to_owned(),
+        },
+      ]
+    );
+    drop(first);
+    drop(second);
+  }
+
+  #[tokio::test]
+  async fn assistant_status_clear_rejects_a_later_set_for_the_same_session() {
+    let transport = Arc::new(RecordingAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let guard = controller.start(
+      AssistantStatusTarget {
+        channel_id: "C1".to_owned(),
+        thread_ts: "100.0".to_owned(),
+      },
+      60_000,
+    );
+
+    controller.set_state_for_active_target(AssistantState::Processing);
+    transport.wait_for_operation_count(1).await;
+    controller.clear_active_now();
+    transport.wait_for_operation_count(2).await;
+    controller.set_state_for_active_target(AssistantState::Searching);
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+      transport.operations.lock().expect("operations").as_slice(),
+      [
+        AssistantStatusOperation::Set {
+          target: "100.0".to_owned(),
+          status: "Processing...".to_owned(),
+        },
+        AssistantStatusOperation::Clear {
+          target: "100.0".to_owned(),
+        },
+      ]
+    );
+    drop(guard);
+  }
+
+  #[tokio::test]
+  async fn assistant_status_sessions_dispatch_to_their_own_targets() {
+    let transport = Arc::new(RecordingAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let first = controller.start(
+      AssistantStatusTarget {
+        channel_id: "C1".to_owned(),
+        thread_ts: "100.0".to_owned(),
+      },
+      60_000,
+    );
+    controller.set_state_for_session(&first.active, AssistantState::Processing);
+    transport.wait_for_operation_count(1).await;
+
+    let second = controller.start(
+      AssistantStatusTarget {
+        channel_id: "C2".to_owned(),
+        thread_ts: "200.0".to_owned(),
+      },
+      60_000,
+    );
+    controller.set_state_for_session(&second.active, AssistantState::Searching);
+    transport.wait_for_operation_count(2).await;
+
+    assert_eq!(
+      transport.operations.lock().expect("operations").as_slice(),
+      [
+        AssistantStatusOperation::Set {
+          target: "100.0".to_owned(),
+          status: "Processing...".to_owned(),
+        },
+        AssistantStatusOperation::Set {
+          target: "200.0".to_owned(),
+          status: "Searching...".to_owned(),
+        },
+      ]
+    );
+    drop(second);
+    drop(first);
+  }
+
+  #[tokio::test]
+  async fn assistant_status_public_updates_are_isolated_between_controllers_on_one_thread() {
+    let first_transport = Arc::new(RecordingAssistantStatusTransport::new());
+    let first_controller = assistant_status_controller_for_tests(first_transport.clone());
+    let first = first_controller.start(
+      AssistantStatusTarget {
+        channel_id: "C1".to_owned(),
+        thread_ts: "100.0".to_owned(),
+      },
+      60_000,
+    );
+
+    let second_transport = Arc::new(RecordingAssistantStatusTransport::new());
+    let second_controller = assistant_status_controller_for_tests(second_transport.clone());
+    let second = second_controller.start(
+      AssistantStatusTarget {
+        channel_id: "C2".to_owned(),
+        thread_ts: "200.0".to_owned(),
+      },
+      60_000,
+    );
+
+    first_controller.update_for_tool("channel_get_delivery_status");
+    first_transport.wait_for_operation_count(1).await;
+
+    assert_eq!(
+      first_transport
+        .operations
+        .lock()
+        .expect("operations")
+        .as_slice(),
+      [AssistantStatusOperation::Set {
+        target: "100.0".to_owned(),
+        status: "Processing...".to_owned(),
+      }]
+    );
+    assert!(
+      second_transport
+        .operations
+        .lock()
+        .expect("operations")
+        .is_empty()
+    );
+    drop(second);
+    drop(first);
+  }
+
+  #[tokio::test]
+  async fn assistant_status_old_session_clear_does_not_clear_a_newer_same_target_session() {
+    let transport = Arc::new(RecordingAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let first = controller.start(
+      AssistantStatusTarget {
+        channel_id: "C1".to_owned(),
+        thread_ts: "100.0".to_owned(),
+      },
+      60_000,
+    );
+    controller.set_state_for_session(&first.active, AssistantState::Processing);
+    transport.wait_for_operation_count(1).await;
+
+    let second = controller.start(first.active.target.clone(), 60_000);
+    controller.set_state_for_session(&second.active, AssistantState::Searching);
+    transport.wait_for_operation_count(2).await;
+    drop(first);
+    tokio::task::yield_now().await;
+
+    assert_eq!(transport.operations.lock().expect("operations").len(), 2);
+    drop(second);
+    transport.wait_for_operation_count(3).await;
+    assert_eq!(
+      transport.operations.lock().expect("operations").last(),
+      Some(&AssistantStatusOperation::Clear {
+        target: "100.0".to_owned(),
+      })
+    );
+  }
+
+  #[tokio::test]
+  async fn assistant_status_public_updates_keep_a_newer_same_target_session_active() {
+    let transport = Arc::new(RecordingAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let old_ready = Arc::new(Barrier::new(2));
+    let release_old = Arc::new(Barrier::new(2));
+    let old_controller = controller.clone();
+    let old_ready_for_thread = old_ready.clone();
+    let release_old_for_thread = release_old.clone();
+    let old_turn = std::thread::spawn(move || {
+      let _old = old_controller.start(
+        AssistantStatusTarget {
+          channel_id: "C1".to_owned(),
+          thread_ts: "100.0".to_owned(),
+        },
+        60_000,
+      );
+      old_controller.update_for_tool("channel_get_delivery_status");
+      old_ready_for_thread.wait();
+      release_old_for_thread.wait();
+    });
+
+    transport.wait_for_operation_count(1).await;
+    old_ready.wait();
+    let new_turn = controller.start(
+      AssistantStatusTarget {
+        channel_id: "C1".to_owned(),
+        thread_ts: "100.0".to_owned(),
+      },
+      60_000,
+    );
+    controller.update_for_agent_phase(Some("commentary"));
+    transport.wait_for_operation_count(2).await;
+    release_old.wait();
+    old_turn.join().expect("old turn");
+    tokio::task::yield_now().await;
+
+    assert_eq!(transport.operations.lock().expect("operations").len(), 2);
+    drop(new_turn);
+    transport.wait_for_operation_count(3).await;
+    assert_eq!(
+      transport.operations.lock().expect("operations").as_slice(),
+      [
+        AssistantStatusOperation::Set {
+          target: "100.0".to_owned(),
+          status: "Processing...".to_owned(),
+        },
+        AssistantStatusOperation::Set {
+          target: "100.0".to_owned(),
+          status: "Processing...".to_owned(),
+        },
+        AssistantStatusOperation::Clear {
+          target: "100.0".to_owned(),
+        },
+      ]
+    );
+  }
+
+  #[tokio::test]
+  async fn assistant_status_public_updates_are_isolated_across_controller_threads() {
+    let transport = Arc::new(RecordingAssistantStatusTransport::new());
+    let controller = assistant_status_controller_for_tests(transport.clone());
+    let updates_started = Arc::new(Barrier::new(3));
+    let updates_finished = Arc::new(Barrier::new(3));
+    let mut turns = Vec::new();
+
+    for (channel_id, thread_ts) in [("C1", "100.0"), ("C2", "200.0")] {
+      let controller = controller.clone();
+      let updates_started = updates_started.clone();
+      let updates_finished = updates_finished.clone();
+      turns.push(std::thread::spawn(move || {
+        let _guard = controller.start(
+          AssistantStatusTarget {
+            channel_id: channel_id.to_owned(),
+            thread_ts: thread_ts.to_owned(),
+          },
+          60_000,
+        );
+        updates_started.wait();
+        controller.update_for_agent_phase(Some("commentary"));
+        updates_finished.wait();
+      }));
+    }
+
+    updates_started.wait();
+    updates_finished.wait();
+    for turn in turns {
+      turn.join().expect("turn");
+    }
+    transport.wait_for_operation_count(4).await;
+    let operations = transport.operations.lock().expect("operations").clone();
+
+    for target in ["100.0", "200.0"] {
+      let target_operations: Vec<_> = operations
+        .iter()
+        .filter(|operation| match operation {
+          AssistantStatusOperation::Set {
+            target: operation_target,
+            ..
+          }
+          | AssistantStatusOperation::Clear {
+            target: operation_target,
+          } => operation_target == target,
+        })
+        .collect();
+      assert_eq!(
+        target_operations,
+        vec![
+          &AssistantStatusOperation::Set {
+            target: target.to_owned(),
+            status: "Processing...".to_owned(),
+          },
+          &AssistantStatusOperation::Clear {
+            target: target.to_owned(),
+          },
+        ]
+      );
+    }
   }
 
   #[test]
@@ -2374,7 +3415,9 @@ mod tests {
       let assistant_status = AssistantStatusController {
         runtime: tokio::runtime::Handle::current(),
         client: None,
-        active: Arc::new(Mutex::new(None)),
+        active_sessions: Arc::new(Mutex::new(HashMap::new())),
+        dispatchers: Arc::new(Mutex::new(HashMap::new())),
+        next_session_id: Arc::new(AtomicU64::new(1)),
       };
       Self {
         runtime: tokio::runtime::Handle::current(),

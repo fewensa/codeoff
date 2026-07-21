@@ -132,6 +132,9 @@ pub enum StateError {
   #[error("scheduled run lease was lost")]
   ScheduledRunLostLease,
 
+  #[error("scheduled run attempt or fence counter is exhausted")]
+  ScheduledRunCounterExhausted,
+
   #[error("scheduled once occurrence is expired and cannot be resumed")]
   ScheduledOnceExpired,
 

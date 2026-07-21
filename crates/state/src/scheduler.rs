@@ -644,6 +644,31 @@ pub enum ExpiredRunReclaimOutcome {
   },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledRunLateEvidenceKind {
+  CompletionAfterLeaseLoss,
+  PreflightAfterLeaseLoss,
+  HeartbeatAfterLeaseLoss,
+}
+
+impl ScheduledRunLateEvidenceKind {
+  #[must_use]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::CompletionAfterLeaseLoss => "completion_after_lease_loss",
+      Self::PreflightAfterLeaseLoss => "preflight_after_lease_loss",
+      Self::HeartbeatAfterLeaseLoss => "heartbeat_after_lease_loss",
+    }
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateEvidenceAppendOutcome {
+  Recorded,
+  Duplicate,
+  QuotaExceeded,
+}
+
 impl AttestedExecutionProfileSnapshot {
   /// Builds the bounded profile attested before a scheduled turn starts.
   ///

@@ -6,11 +6,13 @@ mod store;
 
 pub use error::StateError;
 pub use scheduler::{
-  AcceptedDeliveryBaseline, CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot,
-  IdempotencyDecision, MaterializationOutcome, OccurrenceError, OccurrenceWindow, PrincipalKey,
-  ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec,
-  ScheduledDeliveryState, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
-  ScheduledJobMutation, ScheduledJobStatus, ScheduledRun, ScheduledRunState, StateValueError,
+  AcceptedDeliveryBaseline, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
+  ClaimedScheduledRun, CreateScheduledJob, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome,
+  IdempotencyDecision, MaterializationOutcome, OccurrenceError, OccurrenceWindow,
+  PreflightFailureDisposition, PrincipalKey, RunLeaseBinding, ScheduleAuditSummary,
+  ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryState,
+  ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation,
+  ScheduledJobStatus, ScheduledRun, ScheduledRunState, StateValueError,
   TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
   UpdateScheduledJob,
 };

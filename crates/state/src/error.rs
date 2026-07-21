@@ -129,6 +129,9 @@ pub enum StateError {
   #[error("scheduler generation conflict")]
   SchedulerGenerationConflict,
 
+  #[error("scheduled run lease was lost")]
+  ScheduledRunLostLease,
+
   #[error("scheduled once occurrence is expired and cannot be resumed")]
   ScheduledOnceExpired,
 

@@ -3,11 +3,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use codeoff_state::{
-  CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, MaterializationOutcome,
-  OccurrenceError, PrincipalKey, ScheduleMutationIdempotency, ScheduleSpec, ScheduledJobDefinition,
-  ScheduledJobMutation, ScheduledJobStatus, StateError, StateStore, StateValueError,
-  TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
-  UpdateScheduledJob,
+  AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot, ClaimedScheduledRun,
+  CreateScheduledJob, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome, MaterializationOutcome,
+  OccurrenceError, PreflightFailureDisposition, PrincipalKey, ScheduleMutationIdempotency,
+  ScheduleSpec, ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, StateError,
+  StateStore, StateValueError, TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline,
+  UpdateExecutionBaseline, UpdateScheduledJob,
 };
 use sqlx::Row;
 use sqlx::SqlitePool;
@@ -212,6 +213,9 @@ async fn test_initialize_adds_scheduler_tables_and_constraints() {
     "scheduled_job_delivery_targets",
     "scheduled_jobs",
     "scheduled_run_deliveries",
+    "scheduled_run_attempts",
+    "scheduled_run_late_evidence",
+    "scheduled_run_result_artifacts",
     "scheduled_runs",
     "schedules",
   ] {
@@ -507,7 +511,10 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
   let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
   for entry in std::fs::read_dir(source).expect("read migrations") {
     let entry = entry.expect("migration entry");
-    if entry.file_name() != "20260721000000_scheduler.sql" {
+    if !matches!(
+      entry.file_name().to_str(),
+      Some("20260721000000_scheduler.sql" | "20260721020000_scheduler_execution.sql")
+    ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy historical migration");
     }
@@ -626,6 +633,416 @@ async fn materialize_after_barrier(
 ) -> Result<MaterializationOutcome, StateError> {
   barrier.wait().await;
   store.materialize_due_schedule("race", 0, 110).await
+}
+
+#[tokio::test]
+async fn test_two_independent_stores_claim_one_run_and_create_one_bound_attempt() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let first = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize first store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  first
+    .create_scheduled_job(&create_request("claim-race", ScheduleSpec::once(110), 100))
+    .await
+    .expect("create job");
+  first
+    .materialize_due_schedule("claim-race", 0, 110)
+    .await
+    .expect("materialize");
+
+  let barrier = Arc::new(Barrier::new(3));
+  let first_task = tokio::spawn(claim_after_barrier(first, "worker-a", Arc::clone(&barrier)));
+  let second_task = tokio::spawn(claim_after_barrier(
+    second,
+    "worker-b",
+    Arc::clone(&barrier),
+  ));
+  barrier.wait().await;
+  let results = [
+    first_task.await.expect("first claim task"),
+    second_task.await.expect("second claim task"),
+  ];
+  let claims = results
+    .iter()
+    .filter_map(|result| result.as_ref().ok().and_then(Option::as_ref))
+    .collect::<Vec<_>>();
+  assert_eq!(claims.len(), 1);
+  for result in &results {
+    if let Err(error) = result {
+      assert!(
+        error.is_transient_storage_contention(),
+        "unexpected claim error: {error}"
+      );
+    }
+  }
+  let claim = claims[0];
+  assert_eq!(claim.binding.attempt(), 1);
+  assert_eq!(claim.binding.fence(), 1);
+
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let persisted: (i64, i64, i64, String) = sqlx::query_as(
+    "select (select count(*) from scheduled_run_attempts where run_id = ?1), attempt, fence, lease_owner from scheduled_runs where run_id = ?1",
+  )
+  .bind(claim.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read claimed run");
+  assert_eq!(persisted, (1, 1, 1, claim.binding.lease_owner().to_owned()));
+}
+
+async fn claim_after_barrier(
+  store: StateStore,
+  owner: &'static str,
+  barrier: Arc<Barrier>,
+) -> Result<Option<ClaimedScheduledRun>, StateError> {
+  barrier.wait().await;
+  store.claim_next_scheduled_run(owner, 111, 141).await
+}
+
+#[tokio::test]
+async fn test_claim_increments_attempt_and_fence_independently_and_attests_before_executing() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize state store");
+  store
+    .create_scheduled_job(&create_request(
+      "claim-counters",
+      ScheduleSpec::once(110),
+      100,
+    ))
+    .await
+    .expect("create job");
+  let MaterializationOutcome::Created(run) = store
+    .materialize_due_schedule("claim-counters", 0, 110)
+    .await
+    .expect("materialize")
+  else {
+    panic!("expected run");
+  };
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  sqlx::query("update scheduled_runs set attempt = 4, fence = 9 where run_id = ?1")
+    .bind(&run.run_id)
+    .execute(&pool)
+    .await
+    .expect("seed independent counters");
+
+  let claim = store
+    .claim_next_scheduled_run("worker", 111, 141)
+    .await
+    .expect("claim")
+    .expect("claimed run");
+  assert_eq!(claim.binding.attempt(), 5);
+  assert_eq!(claim.binding.fence(), 10);
+  let profile = AttestedExecutionProfileSnapshot::new(
+    1,
+    r#"{"codex_version":"test","tools":["github.read"]}"#,
+    "sha256-v1",
+    "profile-digest",
+  )
+  .expect("profile");
+  store
+    .mark_scheduled_run_executing(&claim.binding, &profile, 112)
+    .await
+    .expect("mark executing");
+  store
+    .heartbeat_scheduled_run(&claim.binding, 120, 160)
+    .await
+    .expect("heartbeat");
+
+  let persisted: (String, String, i64, String, i64) = sqlx::query_as(
+    "select r.state, a.state, a.executing_at, a.attested_profile_digest, r.lease_expires_at from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.attempt = r.attempt where r.run_id = ?1",
+  )
+  .bind(run.run_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read executing state");
+  assert_eq!(
+    persisted,
+    (
+      "executing".to_owned(),
+      "executing".to_owned(),
+      112,
+      "profile-digest".to_owned(),
+      160,
+    )
+  );
+  assert!(matches!(
+    store
+      .heartbeat_scheduled_run(&claim.binding, 160, 180)
+      .await,
+    Err(StateError::ScheduledRunLostLease)
+  ));
+}
+
+#[tokio::test]
+async fn test_preflight_failure_never_executes_and_expired_lease_has_one_reclaimer() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let first = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize first store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  let request = create_request("reclaim-race", ScheduleSpec::once(110), 100);
+  first
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  first
+    .materialize_due_schedule("reclaim-race", 0, 110)
+    .await
+    .expect("materialize");
+  let first_claim = first
+    .claim_next_scheduled_run("worker-a", 111, 120)
+    .await
+    .expect("claim")
+    .expect("claimed run");
+
+  let barrier = Arc::new(Barrier::new(3));
+  let first_task = tokio::spawn(reclaim_after_barrier(first, Arc::clone(&barrier)));
+  let second_task = tokio::spawn(reclaim_after_barrier(second, Arc::clone(&barrier)));
+  barrier.wait().await;
+  let outcomes = [
+    first_task.await.expect("first reclaim task"),
+    second_task.await.expect("second reclaim task"),
+  ];
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| matches!(outcome, Ok(ExpiredRunReclaimOutcome::Retried { .. })))
+      .count(),
+    1
+  );
+  for outcome in &outcomes {
+    if let Err(error) = outcome {
+      assert!(
+        error.is_transient_storage_contention()
+          || matches!(error, StateError::ScheduledRunLostLease),
+        "unexpected reclaim error: {error}"
+      );
+    }
+  }
+  let profile = AttestedExecutionProfileSnapshot::new(
+    1,
+    r#"{"codex_version":"test"}"#,
+    "sha256-v1",
+    "profile-digest",
+  )
+  .expect("profile");
+  assert!(matches!(
+    StateStore::initialize(&state_dir, None)
+      .await
+      .expect("reopen")
+      .mark_scheduled_run_executing(&first_claim.binding, &profile, 122)
+      .await,
+    Err(StateError::ScheduledRunLostLease)
+  ));
+
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("reopen store");
+  let second_claim = store
+    .claim_next_scheduled_run("worker-b", 130, 160)
+    .await
+    .expect("claim retry")
+    .expect("retried run");
+  store
+    .record_scheduled_run_preflight_failure(
+      &second_claim.binding,
+      PreflightFailureDisposition::RetryAt(170),
+      "executor_unavailable",
+      "executor unavailable",
+      140,
+    )
+    .await
+    .expect("record preflight retry");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let states: (String, String, Option<i64>, i64) = sqlx::query_as(
+    "select r.state, a.state, r.next_attempt_at, r.overlap_slot from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.attempt = r.attempt where r.run_id = ?1",
+  )
+  .bind(second_claim.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read retry states");
+  assert_eq!(
+    states,
+    (
+      "pending".to_owned(),
+      "retry_scheduled".to_owned(),
+      Some(170),
+      1,
+    )
+  );
+}
+
+async fn reclaim_after_barrier(
+  store: StateStore,
+  barrier: Arc<Barrier>,
+) -> Result<ExpiredRunReclaimOutcome, StateError> {
+  barrier.wait().await;
+  store.reclaim_next_expired_scheduled_run(121, 3, 130).await
+}
+
+#[tokio::test]
+async fn test_expired_executing_run_becomes_outcome_unknown_and_keeps_overlap() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  store
+    .create_scheduled_job(&create_request("unknown", ScheduleSpec::once(110), 100))
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule("unknown", 0, 110)
+    .await
+    .expect("materialize");
+  let claim = store
+    .claim_next_scheduled_run("worker", 111, 120)
+    .await
+    .expect("claim")
+    .expect("claimed run");
+  let profile = AttestedExecutionProfileSnapshot::new(
+    1,
+    r#"{"codex_version":"test"}"#,
+    "sha256-v1",
+    "profile-digest",
+  )
+  .expect("profile");
+  store
+    .mark_scheduled_run_executing(&claim.binding, &profile, 112)
+    .await
+    .expect("executing");
+  assert!(matches!(
+    store
+      .reclaim_next_expired_scheduled_run(121, 3, 130)
+      .await
+      .expect("reclaim"),
+    ExpiredRunReclaimOutcome::OutcomeUnknown { .. }
+  ));
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let states: (String, String, i64) = sqlx::query_as(
+    "select r.state, a.state, r.overlap_slot from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.attempt = r.attempt where r.run_id = ?1",
+  )
+  .bind(claim.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read unknown states");
+  assert_eq!(
+    states,
+    (
+      "outcome_unknown".to_owned(),
+      "outcome_unknown".to_owned(),
+      1
+    )
+  );
+}
+
+#[tokio::test]
+async fn test_result_artifact_is_single_immutable_and_bound_to_accepted_attempt() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let profile = AttestedExecutionProfileSnapshot::new(
+    1,
+    r#"{"codex_version":"test"}"#,
+    "sha256-v1",
+    "profile-digest",
+  )
+  .expect("profile");
+  let mut claims = Vec::new();
+  for job in ["artifact-a", "artifact-b"] {
+    store
+      .create_scheduled_job(&create_request(job, ScheduleSpec::once(110), 100))
+      .await
+      .expect("create job");
+    store
+      .materialize_due_schedule(job, 0, 110)
+      .await
+      .expect("materialize");
+    let claim = store
+      .claim_next_scheduled_run(job, 111, 141)
+      .await
+      .expect("claim")
+      .expect("claimed run");
+    store
+      .mark_scheduled_run_executing(&claim.binding, &profile, 112)
+      .await
+      .expect("executing");
+    claims.push(claim);
+  }
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  for (ordinal, claim) in claims.iter().enumerate() {
+    sqlx::query(
+      "insert into scheduled_run_result_artifacts (artifact_id, run_id, job_id, accepted_attempt, accepted_fence, schema_version, result_json, hash_algorithm, result_hash, previous_success_context, completed_at) values (?1, ?2, ?3, ?4, ?5, 1, '{}', 'sha256-v1', ?6, 'summary', 120)",
+    )
+    .bind(format!("artifact-{ordinal}"))
+    .bind(claim.binding.run_id())
+    .bind(claim.binding.job_id())
+    .bind(claim.binding.attempt())
+    .bind(claim.binding.fence())
+    .bind(format!("hash-{ordinal}"))
+    .execute(&pool)
+    .await
+    .expect("insert accepted artifact");
+  }
+  assert!(
+    sqlx::query(
+      "insert into scheduled_run_result_artifacts (artifact_id, run_id, job_id, accepted_attempt, accepted_fence, schema_version, result_json, hash_algorithm, result_hash, previous_success_context, completed_at) values ('duplicate', ?1, ?2, ?3, ?4, 1, '{}', 'sha256-v1', 'different', 'summary', 121)",
+    )
+    .bind(claims[0].binding.run_id())
+    .bind(claims[0].binding.job_id())
+    .bind(claims[0].binding.attempt())
+    .bind(claims[0].binding.fence())
+    .execute(&pool)
+    .await
+    .is_err()
+  );
+  assert!(
+    sqlx::query("update scheduled_run_result_artifacts set result_json = '{\"changed\":true}' where artifact_id = 'artifact-0'")
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  sqlx::query("update scheduled_runs set result_artifact_id = 'artifact-0' where run_id = ?1")
+    .bind(claims[0].binding.run_id())
+    .execute(&pool)
+    .await
+    .expect("bind own artifact");
+  assert!(
+    sqlx::query("update scheduled_runs set result_artifact_id = 'artifact-1' where run_id = ?1")
+      .bind(claims[0].binding.run_id())
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  assert!(
+    sqlx::query("update scheduled_runs set result_artifact_id = null where run_id = ?1")
+      .bind(claims[0].binding.run_id())
+      .execute(&pool)
+      .await
+      .is_err()
+  );
 }
 
 #[tokio::test]

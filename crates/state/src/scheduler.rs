@@ -557,6 +557,131 @@ pub enum ScheduledRunState {
   OutcomeUnknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunLeaseBinding {
+  run_id: String,
+  job_id: String,
+  attempt: i64,
+  fence: i64,
+  lease_owner: String,
+}
+
+impl RunLeaseBinding {
+  #[must_use]
+  pub fn run_id(&self) -> &str {
+    &self.run_id
+  }
+
+  #[must_use]
+  pub fn job_id(&self) -> &str {
+    &self.job_id
+  }
+
+  #[must_use]
+  pub const fn attempt(&self) -> i64 {
+    self.attempt
+  }
+
+  #[must_use]
+  pub const fn fence(&self) -> i64 {
+    self.fence
+  }
+
+  #[must_use]
+  pub fn lease_owner(&self) -> &str {
+    &self.lease_owner
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedScheduledRun {
+  pub binding: RunLeaseBinding,
+  pub schedule_id: String,
+  pub job_generation: i64,
+  pub schedule_generation: i64,
+  pub scheduled_for: i64,
+  pub coalesced_through: i64,
+  pub definition_version: u32,
+  pub definition_json: String,
+  pub capability_schema_version: u32,
+  pub capability_digest: String,
+  pub capability_json: String,
+  pub targets_json: String,
+  pub execution_baseline_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestedExecutionProfileSnapshot {
+  schema_version: u32,
+  canonical_json: String,
+  hash_algorithm: String,
+  digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightFailureDisposition {
+  RetryAt(i64),
+  Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpiredRunReclaimOutcome {
+  Idle,
+  Retried {
+    run_id: String,
+    attempt: i64,
+    fence: i64,
+  },
+  Failed {
+    run_id: String,
+    attempt: i64,
+    fence: i64,
+  },
+  OutcomeUnknown {
+    run_id: String,
+    attempt: i64,
+    fence: i64,
+  },
+}
+
+impl AttestedExecutionProfileSnapshot {
+  /// Builds the bounded profile attested before a scheduled turn starts.
+  ///
+  /// # Errors
+  /// Returns an error when the profile is invalid, non-canonical, or oversized.
+  pub fn new(
+    schema_version: u32,
+    canonical_json: impl Into<String>,
+    hash_algorithm: impl Into<String>,
+    digest: impl Into<String>,
+  ) -> Result<Self, StateValueError> {
+    let canonical_json = canonical_json.into();
+    let value = Self {
+      schema_version,
+      canonical_json: canonicalize_snapshot(
+        schema_version,
+        "attested execution profile",
+        &canonical_json,
+      )?,
+      hash_algorithm: hash_algorithm.into(),
+      digest: digest.into(),
+    };
+    validate_text("attested profile hash algorithm", &value.hash_algorithm)?;
+    validate_text("attested profile digest", &value.digest)?;
+    Ok(value)
+  }
+
+  fn validate(&self) -> Result<(), StateValueError> {
+    validate_canonical_snapshot(
+      self.schema_version,
+      "attested execution profile",
+      &self.canonical_json,
+    )?;
+    validate_text("attested profile hash algorithm", &self.hash_algorithm)?;
+    validate_text("attested profile digest", &self.digest)
+  }
+}
+
 impl ScheduledRunState {
   #[must_use]
   pub const fn as_str(self) -> &'static str {

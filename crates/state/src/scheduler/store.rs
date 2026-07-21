@@ -2,11 +2,12 @@ use serde_json::json;
 use sqlx::{Row, Sqlite, Transaction};
 
 use super::{
-  AcceptedDeliveryBaseline, CapabilityProfileSnapshot, CreateScheduledJob,
-  DEFAULT_OCCURRENCE_STEPS, DeliveryTargetSnapshot, IdempotencyDecision, MAX_CONTEXT_BYTES,
-  MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES, MaterializationOutcome, PrincipalKey,
-  ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec,
-  ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation,
+  AcceptedDeliveryBaseline, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
+  ClaimedScheduledRun, CreateScheduledJob, DEFAULT_OCCURRENCE_STEPS, DeliveryTargetSnapshot,
+  ExpiredRunReclaimOutcome, IdempotencyDecision, MAX_CONTEXT_BYTES, MAX_DELIVERY_TARGETS,
+  MAX_SNAPSHOT_BYTES, MaterializationOutcome, PreflightFailureDisposition, PrincipalKey,
+  RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency,
+  ScheduleSpec, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation,
   ScheduledJobStatus, StateError, TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline,
   UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
   invalid_value, materialized_run, positive_u32, scheduler_error, validate_text,
@@ -382,6 +383,343 @@ impl StateStore {
     .map_err(scheduler_error)
   }
 
+  /// Claims the oldest eligible pending run and creates its durable attempt atomically.
+  ///
+  /// # Errors
+  /// Returns an error for an invalid lease, exhausted counters, or storage failure.
+  pub async fn claim_next_scheduled_run(
+    &self,
+    lease_owner: &str,
+    now: i64,
+    lease_expires_at: i64,
+  ) -> Result<Option<ClaimedScheduledRun>, StateError> {
+    validate_text("scheduled run lease owner", lease_owner).map_err(invalid_value)?;
+    if lease_expires_at <= now {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled run lease must expire after claim time".to_owned(),
+      });
+    }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let row = sqlx::query(
+      "update scheduled_runs set state = 'leased', attempt = attempt + 1, fence = fence + 1, next_attempt_at = null, lease_owner = ?1, lease_expires_at = ?2, updated_at = ?3 where run_id = (select run_id from scheduled_runs indexed by idx_scheduled_runs_claim where state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 order by scheduled_for, run_id limit 1) and state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 returning run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, attempt, fence",
+    )
+    .bind(lease_owner)
+    .bind(lease_expires_at)
+    .bind(now)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(row) = row else {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(None);
+    };
+    let run_id: String = row.try_get("run_id").map_err(scheduler_error)?;
+    let job_id: String = row.try_get("job_id").map_err(scheduler_error)?;
+    let attempt: i64 = row.try_get("attempt").map_err(scheduler_error)?;
+    let fence: i64 = row.try_get("fence").map_err(scheduler_error)?;
+    sqlx::query(
+      "insert into scheduled_run_attempts (run_id, job_id, attempt, fence, lease_owner, state, claimed_at, lease_expires_at) values (?1, ?2, ?3, ?4, ?5, 'leased', ?6, ?7)",
+    )
+    .bind(&run_id)
+    .bind(&job_id)
+    .bind(attempt)
+    .bind(fence)
+    .bind(lease_owner)
+    .bind(now)
+    .bind(lease_expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let execution_baseline_json = row
+      .try_get::<Option<String>, _>("execution_baseline_json")
+      .map_err(scheduler_error)?
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "materialized run is missing its execution baseline snapshot".to_owned(),
+      })?;
+    let claimed = ClaimedScheduledRun {
+      binding: RunLeaseBinding {
+        run_id,
+        job_id,
+        attempt,
+        fence,
+        lease_owner: lease_owner.to_owned(),
+      },
+      schedule_id: row.try_get("schedule_id").map_err(scheduler_error)?,
+      job_generation: row.try_get("job_generation").map_err(scheduler_error)?,
+      schedule_generation: row
+        .try_get("schedule_generation")
+        .map_err(scheduler_error)?,
+      scheduled_for: row.try_get("scheduled_for").map_err(scheduler_error)?,
+      coalesced_through: row.try_get("coalesced_through").map_err(scheduler_error)?,
+      definition_version: positive_u32(
+        row.try_get("definition_version").map_err(scheduler_error)?,
+      )?,
+      definition_json: row.try_get("definition_json").map_err(scheduler_error)?,
+      capability_schema_version: positive_u32(
+        row
+          .try_get("capability_schema_version")
+          .map_err(scheduler_error)?,
+      )?,
+      capability_digest: row.try_get("capability_digest").map_err(scheduler_error)?,
+      capability_json: row.try_get("capability_json").map_err(scheduler_error)?,
+      targets_json: row.try_get("targets_json").map_err(scheduler_error)?,
+      execution_baseline_json,
+    };
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(Some(claimed))
+  }
+
+  /// Extends a live scheduled-run lease using its complete owner and fencing binding.
+  ///
+  /// # Errors
+  /// Returns `ScheduledRunLostLease` when the binding is stale or already expired.
+  pub async fn heartbeat_scheduled_run(
+    &self,
+    binding: &RunLeaseBinding,
+    now: i64,
+    lease_expires_at: i64,
+  ) -> Result<(), StateError> {
+    validate_lease_binding(binding)?;
+    if lease_expires_at <= now {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled run heartbeat must extend beyond now".to_owned(),
+      });
+    }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let run = sqlx::query(
+      "update scheduled_runs set lease_expires_at = ?1, updated_at = ?2 where run_id = ?3 and job_id = ?4 and attempt = ?5 and fence = ?6 and lease_owner = ?7 and state in ('leased', 'executing') and lease_expires_at > ?2",
+    )
+    .bind(lease_expires_at)
+    .bind(now)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if run.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunLostLease);
+    }
+    let attempt = sqlx::query(
+      "update scheduled_run_attempts set lease_expires_at = ?1 where run_id = ?2 and job_id = ?3 and attempt = ?4 and fence = ?5 and lease_owner = ?6 and state in ('leased', 'executing') and lease_expires_at > ?7",
+    )
+    .bind(lease_expires_at)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if attempt.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunLostLease);
+    }
+    transaction.commit().await.map_err(scheduler_error)
+  }
+
+  /// Persists preflight attestation before changing a leased run to executing.
+  ///
+  /// # Errors
+  /// Returns `ScheduledRunLostLease` for a stale binding or an invalid-state error for the profile.
+  pub async fn mark_scheduled_run_executing(
+    &self,
+    binding: &RunLeaseBinding,
+    profile: &AttestedExecutionProfileSnapshot,
+    now: i64,
+  ) -> Result<(), StateError> {
+    validate_lease_binding(binding)?;
+    profile.validate().map_err(invalid_value)?;
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let run = sqlx::query(
+      "update scheduled_runs set state = 'executing', updated_at = ?1 where run_id = ?2 and job_id = ?3 and attempt = ?4 and fence = ?5 and lease_owner = ?6 and state = 'leased' and lease_expires_at > ?1",
+    )
+    .bind(now)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if run.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunLostLease);
+    }
+    let attempt = sqlx::query(
+      "update scheduled_run_attempts set state = 'executing', preflight_completed_at = ?1, executing_at = ?1, attested_profile_schema_version = ?2, attested_profile_json = ?3, attested_profile_hash_algorithm = ?4, attested_profile_digest = ?5 where run_id = ?6 and job_id = ?7 and attempt = ?8 and fence = ?9 and lease_owner = ?10 and state = 'leased' and lease_expires_at > ?1",
+    )
+    .bind(now)
+    .bind(i64::from(profile.schema_version))
+    .bind(&profile.canonical_json)
+    .bind(&profile.hash_algorithm)
+    .bind(&profile.digest)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if attempt.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunLostLease);
+    }
+    transaction.commit().await.map_err(scheduler_error)
+  }
+
+  /// Records a preflight failure without allowing the run to enter executing.
+  ///
+  /// # Errors
+  /// Returns `ScheduledRunLostLease` for a stale binding or an error for invalid retry data.
+  pub async fn record_scheduled_run_preflight_failure(
+    &self,
+    binding: &RunLeaseBinding,
+    disposition: PreflightFailureDisposition,
+    error_kind: &str,
+    error_message: &str,
+    now: i64,
+  ) -> Result<(), StateError> {
+    validate_lease_binding(binding)?;
+    validate_text("scheduled preflight error kind", error_kind).map_err(invalid_value)?;
+    if error_message.len() > MAX_CONTEXT_BYTES {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled preflight error exceeds its storage bound".to_owned(),
+      });
+    }
+    let (run_state, attempt_state, retry_at, overlap_slot) = match disposition {
+      PreflightFailureDisposition::RetryAt(retry_at) if retry_at > now => {
+        ("pending", "retry_scheduled", Some(retry_at), Some(1_i64))
+      }
+      PreflightFailureDisposition::RetryAt(_) => {
+        return Err(StateError::InvalidSchedulerState {
+          reason: "scheduled preflight retry must be later than now".to_owned(),
+        });
+      }
+      PreflightFailureDisposition::Fail => ("failed", "preflight_rejected", None, None),
+    };
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let run = sqlx::query(
+      "update scheduled_runs set state = ?1, next_attempt_at = ?2, lease_owner = null, lease_expires_at = null, overlap_slot = ?3, error_kind = case when ?1 = 'failed' then ?4 else null end, error_message = case when ?1 = 'failed' then ?5 else null end, updated_at = ?6 where run_id = ?7 and job_id = ?8 and attempt = ?9 and fence = ?10 and lease_owner = ?11 and state = 'leased' and lease_expires_at > ?6",
+    )
+    .bind(run_state)
+    .bind(retry_at)
+    .bind(overlap_slot)
+    .bind(error_kind)
+    .bind(error_message)
+    .bind(now)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if run.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunLostLease);
+    }
+    let attempt = sqlx::query(
+      "update scheduled_run_attempts set state = ?1, preflight_completed_at = ?2, completed_at = ?2, error_kind = ?3, error_message = ?4 where run_id = ?5 and job_id = ?6 and attempt = ?7 and fence = ?8 and lease_owner = ?9 and state = 'leased' and lease_expires_at > ?2",
+    )
+    .bind(attempt_state)
+    .bind(now)
+    .bind(error_kind)
+    .bind(error_message)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if attempt.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunLostLease);
+    }
+    transaction.commit().await.map_err(scheduler_error)
+  }
+
+  /// Reclaims one expired lease without retrying an execution of unknown convergence.
+  ///
+  /// # Errors
+  /// Returns an error for invalid retry policy or storage failure.
+  pub async fn reclaim_next_expired_scheduled_run(
+    &self,
+    now: i64,
+    max_attempts: i64,
+    next_attempt_at: i64,
+  ) -> Result<ExpiredRunReclaimOutcome, StateError> {
+    if max_attempts <= 0 || next_attempt_at <= now {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "invalid scheduled run reclaim policy".to_owned(),
+      });
+    }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let row = sqlx::query(
+      "select run_id, job_id, attempt, fence, lease_owner, state from scheduled_runs indexed by idx_scheduled_runs_recovery where state in ('leased', 'executing') and lease_expires_at <= ?1 order by lease_expires_at, run_id limit 1",
+    )
+    .bind(now)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(row) = row else {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ExpiredRunReclaimOutcome::Idle);
+    };
+    let run_id: String = row.try_get("run_id").map_err(scheduler_error)?;
+    let job_id: String = row.try_get("job_id").map_err(scheduler_error)?;
+    let attempt: i64 = row.try_get("attempt").map_err(scheduler_error)?;
+    let fence: i64 = row.try_get("fence").map_err(scheduler_error)?;
+    let lease_owner: String = row.try_get("lease_owner").map_err(scheduler_error)?;
+    let state: String = row.try_get("state").map_err(scheduler_error)?;
+    let transition = expired_reclaim_transition(&state, &run_id, attempt, fence, max_attempts);
+    let retry_at = (transition.run_state == "pending").then_some(next_attempt_at);
+    let updated = sqlx::query(
+      "update scheduled_runs set state = ?1, next_attempt_at = ?2, lease_owner = null, lease_expires_at = null, overlap_slot = ?3, error_kind = case when ?1 in ('failed', 'outcome_unknown') then ?4 else null end, error_message = case when ?1 in ('failed', 'outcome_unknown') then ?4 else null end, updated_at = ?5 where run_id = ?6 and job_id = ?7 and attempt = ?8 and fence = ?9 and lease_owner = ?10 and state = ?11 and lease_expires_at <= ?5",
+    )
+    .bind(transition.run_state)
+    .bind(retry_at)
+    .bind(transition.overlap_slot)
+    .bind(transition.error_kind)
+    .bind(now)
+    .bind(&run_id)
+    .bind(&job_id)
+    .bind(attempt)
+    .bind(fence)
+    .bind(&lease_owner)
+    .bind(&state)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if updated.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunLostLease);
+    }
+    let attempt_updated = sqlx::query(
+      "update scheduled_run_attempts set state = ?1, completed_at = ?2, error_kind = ?3, error_message = ?3 where run_id = ?4 and job_id = ?5 and attempt = ?6 and fence = ?7 and lease_owner = ?8 and state = ?9 and lease_expires_at <= ?2",
+    )
+    .bind(transition.attempt_state)
+    .bind(now)
+    .bind(transition.error_kind)
+    .bind(&run_id)
+    .bind(&job_id)
+    .bind(attempt)
+    .bind(fence)
+    .bind(&lease_owner)
+    .bind(&state)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if attempt_updated.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunLostLease);
+    }
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(transition.outcome)
+  }
+
   /// Pauses a matching job generation and cancels pre-execution work.
   ///
   /// # Errors
@@ -732,6 +1070,60 @@ struct MaterializationSnapshots {
   execution_baseline_json: String,
 }
 
+struct ExpiredReclaimTransition {
+  run_state: &'static str,
+  attempt_state: &'static str,
+  overlap_slot: Option<i64>,
+  error_kind: &'static str,
+  outcome: ExpiredRunReclaimOutcome,
+}
+
+fn expired_reclaim_transition(
+  state: &str,
+  run_id: &str,
+  attempt: i64,
+  fence: i64,
+  max_attempts: i64,
+) -> ExpiredReclaimTransition {
+  if state == "executing" {
+    return ExpiredReclaimTransition {
+      run_state: "outcome_unknown",
+      attempt_state: "outcome_unknown",
+      overlap_slot: Some(1),
+      error_kind: "execution_lease_expired",
+      outcome: ExpiredRunReclaimOutcome::OutcomeUnknown {
+        run_id: run_id.to_owned(),
+        attempt,
+        fence,
+      },
+    };
+  }
+  if attempt < max_attempts {
+    return ExpiredReclaimTransition {
+      run_state: "pending",
+      attempt_state: "lease_expired",
+      overlap_slot: Some(1),
+      error_kind: "preflight_lease_expired",
+      outcome: ExpiredRunReclaimOutcome::Retried {
+        run_id: run_id.to_owned(),
+        attempt,
+        fence,
+      },
+    };
+  }
+  ExpiredReclaimTransition {
+    run_state: "failed",
+    attempt_state: "lease_expired",
+    overlap_slot: None,
+    error_kind: "preflight_lease_exhausted",
+    outcome: ExpiredRunReclaimOutcome::Failed {
+      run_id: run_id.to_owned(),
+      attempt,
+      fence,
+    },
+  }
+}
+
 async fn load_materialization_snapshots(
   transaction: &mut Transaction<'_, Sqlite>,
   job_id: &str,
@@ -820,6 +1212,18 @@ fn validate_create_request(request: &CreateScheduledJob) -> Result<i64, StateErr
     .schedule
     .first_after_create(request.now)
     .map_err(invalid_occurrence)
+}
+
+fn validate_lease_binding(binding: &RunLeaseBinding) -> Result<(), StateError> {
+  validate_text("scheduled run id", binding.run_id()).map_err(invalid_value)?;
+  validate_text("scheduled run job id", binding.job_id()).map_err(invalid_value)?;
+  validate_text("scheduled run lease owner", binding.lease_owner()).map_err(invalid_value)?;
+  if binding.attempt() <= 0 || binding.fence() <= 0 {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled run attempt and fence must be positive".to_owned(),
+    });
+  }
+  Ok(())
 }
 
 async fn insert_scheduled_job(

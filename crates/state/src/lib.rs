@@ -6,12 +6,12 @@ mod store;
 
 pub use error::StateError;
 pub use scheduler::{
-  CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, IdempotencyDecision,
-  MaterializationOutcome, OccurrenceError, OccurrenceWindow, PrincipalKey,
+  AcceptedDeliveryBaseline, CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot,
+  IdempotencyDecision, MaterializationOutcome, OccurrenceError, OccurrenceWindow, PrincipalKey,
   ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryState, ScheduledJob,
-  ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, ScheduledRun,
-  ScheduledRunState, StateValueError, TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline,
-  UpdateExecutionBaseline, UpdateScheduledJob,
+  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
+  ScheduledRun, ScheduledRunState, StateValueError, TransactionalMutationOutcome,
+  UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline, UpdateScheduledJob,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::StateStoreTestLock;

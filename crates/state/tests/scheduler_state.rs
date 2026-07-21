@@ -6,8 +6,8 @@ use codeoff_state::{
   CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, IdempotencyDecision,
   MaterializationOutcome, OccurrenceError, PrincipalKey, ScheduleMutationIdempotency, ScheduleSpec,
   ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, StateError, StateStore,
-  TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
-  UpdateScheduledJob,
+  StateValueError, TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline,
+  UpdateExecutionBaseline, UpdateScheduledJob,
 };
 use sqlx::Row;
 use sqlx::SqlitePool;
@@ -21,17 +21,18 @@ fn database_url(state_dir: &Path) -> String {
 }
 
 fn target(job: &str) -> DeliveryTargetSnapshot {
-  DeliveryTargetSnapshot {
-    target_id: format!("target-{job}"),
-    provider: "none".to_owned(),
-    connector: "none".to_owned(),
-    tenant: "none".to_owned(),
-    kind: "none".to_owned(),
-    address_json: "{}".to_owned(),
-    resolver_version: 1,
-    resolver_digest: "resolver-v1".to_owned(),
-    identity_digest: "none-v1".to_owned(),
-  }
+  DeliveryTargetSnapshot::new(
+    format!("target-{job}"),
+    "none",
+    "none",
+    "none",
+    "none",
+    "{}",
+    1,
+    "resolver-v1",
+    "none-v1",
+  )
+  .expect("target")
 }
 
 fn owner() -> PrincipalKey {
@@ -102,6 +103,79 @@ fn test_occurrence_search_is_bounded() {
     .expect("fixed intervals coalesce arithmetically");
   assert_eq!(saturated.skipped_count, u32::MAX);
   assert!(saturated.skipped_count_saturated);
+}
+
+#[test]
+fn test_durable_snapshots_reject_oversize_and_forbidden_keys_but_not_instruction_text() {
+  let oversized = format!(r#"{{"instruction":"{}"}}"#, "x".repeat(256 * 1024));
+  assert!(matches!(
+    ScheduledJobDefinition::new(1, oversized),
+    Err(StateValueError::TooLarge { .. })
+  ));
+  for fixture in [
+    r#"{"token":"live"}"#,
+    r#"{"nested":{"private-key":"live"}}"#,
+    r#"{"event_id":"Ev123"}"#,
+    r#"{"origin":{"thread":"live"}}"#,
+  ] {
+    assert!(matches!(
+      ScheduledJobDefinition::new(1, fixture),
+      Err(StateValueError::ForbiddenDurableData { .. })
+    ));
+  }
+  assert!(
+    ScheduledJobDefinition::new(
+      1,
+      r#"{"instruction":"Check whether the prose mentions token, password, or Slack event_id"}"#,
+    )
+    .is_ok()
+  );
+}
+
+#[tokio::test]
+async fn test_delivery_target_count_and_aggregate_snapshot_bounds_are_enforced() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize state store");
+  let mut too_many = create_request("too-many-targets", ScheduleSpec::once(110), 100);
+  too_many.targets = (0..33)
+    .map(|index| {
+      DeliveryTargetSnapshot::new(
+        format!("target-{index}"),
+        "none",
+        "none",
+        "none",
+        "none",
+        "{}",
+        1,
+        "resolver-v1",
+        format!("identity-{index}"),
+      )
+      .expect("target")
+    })
+    .collect();
+  assert!(store.create_scheduled_job(&too_many).await.is_err());
+
+  let mut aggregate = create_request("large-targets", ScheduleSpec::once(110), 100);
+  aggregate.targets = (0..32)
+    .map(|index| {
+      DeliveryTargetSnapshot::new(
+        format!("large-target-{index}"),
+        "none",
+        "none",
+        "none",
+        "none",
+        format!(r#"{{"address":"{}"}}"#, "x".repeat(8_200)),
+        1,
+        "resolver-v1",
+        format!("large-identity-{index}"),
+      )
+      .expect("target")
+    })
+    .collect();
+  assert!(store.create_scheduled_job(&aggregate).await.is_err());
 }
 
 #[tokio::test]
@@ -279,7 +353,7 @@ async fn test_pause_resume_and_update_use_generation_cas() {
     .expect("get job")
     .expect("job");
   assert_eq!(job.generation, 3);
-  assert_eq!(job.definition.version, 2);
+  assert_eq!(job.definition.version(), 2);
   assert_eq!(job.next_run_at, Some(250));
 }
 
@@ -488,6 +562,12 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
     .run(&pool)
     .await
     .expect("run historical migrations");
+  sqlx::query(
+    "insert into idempotency_keys (scope, key, status, response_ref) values ('legacy', 'preserved', 'completed', 'legacy-ref')",
+  )
+  .execute(&pool)
+  .await
+  .expect("insert representative legacy idempotency row");
   pool.close().await;
 
   StateStore::initialize(&state_dir, None)
@@ -506,6 +586,21 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
   .await
   .expect("query scheduler migration");
   assert_eq!(scheduler_migrations, 1);
+  let legacy: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+    "select status, response_ref, request_digest, response_json from idempotency_keys where scope = 'legacy' and key = 'preserved'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read preserved legacy idempotency row");
+  assert_eq!(
+    legacy,
+    (
+      "completed".to_owned(),
+      Some("legacy-ref".to_owned()),
+      None,
+      None
+    )
+  );
 }
 
 #[tokio::test]
@@ -609,6 +704,59 @@ async fn test_two_independent_stores_share_idempotency_digest_authority() {
 }
 
 #[tokio::test]
+async fn test_two_independent_stores_reject_different_digest_race() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let first = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize first store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  let barrier = Arc::new(Barrier::new(3));
+  let first_task = tokio::spawn(claim_after_barrier(
+    first,
+    mutation_idempotency("different-digest-race", "digest-a"),
+    Arc::clone(&barrier),
+  ));
+  let second_task = tokio::spawn(claim_after_barrier(
+    second,
+    mutation_idempotency("different-digest-race", "digest-b"),
+    Arc::clone(&barrier),
+  ));
+  barrier.wait().await;
+  let decisions = [
+    first_task.await.expect("first task").expect("first claim"),
+    second_task
+      .await
+      .expect("second task")
+      .expect("second claim"),
+  ];
+  assert!(decisions.contains(&IdempotencyDecision::Claimed));
+  assert!(decisions.contains(&IdempotencyDecision::Conflict));
+}
+
+async fn claim_after_barrier(
+  store: StateStore,
+  idempotency: ScheduleMutationIdempotency,
+  barrier: Arc<Barrier>,
+) -> Result<IdempotencyDecision, StateError> {
+  barrier.wait().await;
+  for _ in 0..3 {
+    match store
+      .claim_schedule_idempotency("update", &idempotency, 100)
+      .await
+    {
+      Err(error) if error.is_transient_storage_contention() => {}
+      result => return result,
+    }
+  }
+  store
+    .claim_schedule_idempotency("update", &idempotency, 100)
+    .await
+}
+
+#[tokio::test]
 async fn test_two_independent_stores_converge_on_one_transactional_mutation_response() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -704,7 +852,7 @@ async fn test_due_query_uses_due_index_and_overlap_index_is_enforced() {
     .await
     .expect("connect database");
   let plan = sqlx::query(
-    "explain query plan select job_id from schedules where next_run_at <= 200 order by next_run_at, job_id",
+    "explain query plan select s.job_id from schedules s join scheduled_jobs j on j.job_id = s.job_id where j.status = 'active' and s.next_run_at <= 200 and not exists (select 1 from scheduled_runs r where r.job_id = s.job_id and r.overlap_slot = 1) order by s.next_run_at, s.job_id limit 10",
   )
   .fetch_all(&pool)
   .await
@@ -713,6 +861,11 @@ async fn test_due_query_uses_due_index_and_overlap_index_is_enforced() {
     row
       .try_get::<String, _>("detail")
       .is_ok_and(|detail| detail.contains("idx_schedules_due"))
+  }));
+  assert!(plan.iter().any(|row| {
+    row
+      .try_get::<String, _>("detail")
+      .is_ok_and(|detail| detail.contains("idx_scheduled_runs_active_overlap"))
   }));
 
   let duplicate = sqlx::query(
@@ -725,9 +878,118 @@ async fn test_due_query_uses_due_index_and_overlap_index_is_enforced() {
     duplicate.is_err(),
     "overlap partial unique index must reject a second blocker"
   );
+
+  for (query, expected_index) in [
+    (
+      "explain query plan select run_id from scheduled_runs where job_id = 'indexes' order by scheduled_for desc limit 20",
+      "idx_scheduled_runs_history",
+    ),
+    (
+      "explain query plan select run_id from scheduled_runs where state = 'leased' and lease_expires_at <= 200 order by lease_expires_at, run_id limit 20",
+      "idx_scheduled_runs_recovery",
+    ),
+    (
+      "explain query plan select run_id from scheduled_runs where state = 'pending' and next_attempt_at <= 200 order by next_attempt_at, run_id limit 20",
+      "idx_scheduled_runs_retry",
+    ),
+    (
+      "explain query plan select delivery_id from scheduled_run_deliveries where state = 'leased' and lease_expires_at <= 200 order by lease_expires_at, delivery_id limit 20",
+      "idx_scheduled_deliveries_recovery",
+    ),
+    (
+      "explain query plan select delivery_id from scheduled_run_deliveries where state = 'pending' and next_attempt_at <= 200 order by next_attempt_at, delivery_id limit 20",
+      "idx_scheduled_deliveries_retry",
+    ),
+  ] {
+    let plan = sqlx::query(query)
+      .fetch_all(&pool)
+      .await
+      .expect("index query plan");
+    assert!(
+      plan.iter().any(|row| {
+        row
+          .try_get::<String, _>("detail")
+          .is_ok_and(|detail| detail.contains(expected_index))
+      }),
+      "expected query plan to use {expected_index}"
+    );
+  }
 }
 
 #[tokio::test]
+async fn test_owner_list_isolated_cursor_bounded_and_uses_owner_status_index() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let owner_a = PrincipalKey::new("service", "github", "org-a", "bot").expect("owner a");
+  let owner_b = PrincipalKey::new("service", "github", "org-b", "bot").expect("owner b");
+  for (job, owner) in [
+    ("owner-a-1", owner_a.clone()),
+    ("owner-a-2", owner_a.clone()),
+    ("owner-a-paused", owner_a.clone()),
+    ("owner-b-1", owner_b),
+  ] {
+    let mut request = create_request(job, ScheduleSpec::once(200), 100);
+    request.owner = owner;
+    store
+      .create_scheduled_job(&request)
+      .await
+      .expect("create job");
+  }
+  store
+    .pause_scheduled_job("owner-a-paused", 0, 101)
+    .await
+    .expect("pause job");
+
+  let first = store
+    .list_scheduled_jobs_by_owner(&owner_a, ScheduledJobStatus::Active, None, 1)
+    .await
+    .expect("first page");
+  assert_eq!(first.job_ids, ["owner-a-1"]);
+  let second = store
+    .list_scheduled_jobs_by_owner(
+      &owner_a,
+      ScheduledJobStatus::Active,
+      first.next_cursor.as_deref(),
+      1,
+    )
+    .await
+    .expect("second page");
+  assert_eq!(second.job_ids, ["owner-a-2"]);
+  assert!(second.next_cursor.is_none());
+  assert!(
+    store
+      .list_scheduled_jobs_by_owner(&owner_a, ScheduledJobStatus::Active, None, 0)
+      .await
+      .is_err()
+  );
+  assert!(
+    store
+      .list_scheduled_jobs_by_owner(&owner_a, ScheduledJobStatus::Active, None, 101)
+      .await
+      .is_err()
+  );
+
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let plan = sqlx::query(
+    "explain query plan select job_id from scheduled_jobs indexed by idx_scheduled_jobs_owner_status where owner_kind = 'service' and owner_provider = 'github' and owner_tenant = 'org-a' and owner_subject = 'bot' and status = 'active' and job_id > '' order by job_id limit 2",
+  )
+  .fetch_all(&pool)
+  .await
+  .expect("owner list plan");
+  assert!(plan.iter().any(|row| {
+    row
+      .try_get::<String, _>("detail")
+      .is_ok_and(|detail| detail.contains("idx_scheduled_jobs_owner_status"))
+  }));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_execution_and_accepted_delivery_baselines_are_independent_cas_records() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -771,7 +1033,7 @@ async fn test_execution_and_accepted_delivery_baselines_are_independent_cas_reco
     .await
     .expect("connect database");
   sqlx::query(
-    "insert into scheduled_run_deliveries (delivery_id, run_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values ('delivery-a', ?1, 'none-v1', '{}', 'delivered', 1, 1, 'sha256-utf8-exact-v1', 'payload-a', 0, 112, 112)",
+    "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values ('delivery-a', ?1, 'baselines', 'none-v1', '{}', 'delivered', 1, 1, 'sha256-utf8-exact-v1', 'payload-a', 0, 112, 112)",
   )
   .bind(&run.run_id)
   .execute(&pool)
@@ -790,6 +1052,14 @@ async fn test_execution_and_accepted_delivery_baselines_are_independent_cas_reco
     accepted_at: 112,
     expected_version: 0,
   };
+  let mut nonzero_first_create = accepted.clone();
+  nonzero_first_create.expected_version = 1;
+  assert!(
+    !store
+      .compare_and_swap_accepted_delivery_baseline(&nonzero_first_create)
+      .await
+      .expect("nonzero first-create CAS")
+  );
   assert!(
     store
       .compare_and_swap_accepted_delivery_baseline(&accepted)
@@ -809,6 +1079,186 @@ async fn test_execution_and_accepted_delivery_baselines_are_independent_cas_reco
   .await
   .expect("read baseline versions");
   assert_eq!(versions, (1, 1));
+  let baseline = store
+    .get_accepted_delivery_baseline("baselines", "none-v1", 1, 1, "sha256-utf8-exact-v1")
+    .await
+    .expect("read accepted baseline")
+    .expect("accepted baseline");
+  assert_eq!(baseline.accepted_payload_digest, "payload-a");
+  assert!(
+    store
+      .get_accepted_delivery_baseline(
+        "baselines",
+        "different-target",
+        1,
+        1,
+        "sha256-utf8-exact-v1",
+      )
+      .await
+      .expect("read different baseline")
+      .is_none()
+  );
+}
+
+#[tokio::test]
+async fn test_two_independent_stores_allow_one_accepted_baseline_first_create() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let first = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize first store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  first
+    .create_scheduled_job(&create_request(
+      "accepted-race",
+      ScheduleSpec::once(110),
+      100,
+    ))
+    .await
+    .expect("create job");
+  let MaterializationOutcome::Created(run) = first
+    .materialize_due_schedule("accepted-race", 0, 110)
+    .await
+    .expect("materialize")
+  else {
+    panic!("expected run");
+  };
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  sqlx::query(
+    "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values ('accepted-race-delivery', ?1, 'accepted-race', 'identity', '{}', 'delivered', 1, 1, 'sha256-v1', 'payload', 0, 111, 111)",
+  )
+  .bind(&run.run_id)
+  .execute(&pool)
+  .await
+  .expect("insert delivery");
+  let update = UpdateAcceptedDeliveryBaseline {
+    job_id: "accepted-race".to_owned(),
+    target_identity_digest: "identity".to_owned(),
+    delivery_policy_version: 1,
+    render_version: 1,
+    hash_algorithm: "sha256-v1".to_owned(),
+    accepted_payload_digest: "payload".to_owned(),
+    source_delivery_id: "accepted-race-delivery".to_owned(),
+    source_run_id: run.run_id,
+    source_result_hash: "result".to_owned(),
+    accepted_at: 111,
+    expected_version: 0,
+  };
+  let barrier = Arc::new(Barrier::new(3));
+  let first_task = tokio::spawn(accepted_cas_after_barrier(
+    first,
+    update.clone(),
+    Arc::clone(&barrier),
+  ));
+  let second_task = tokio::spawn(accepted_cas_after_barrier(
+    second,
+    update,
+    Arc::clone(&barrier),
+  ));
+  barrier.wait().await;
+  let outcomes = [
+    first_task.await.expect("first task").expect("first CAS"),
+    second_task.await.expect("second task").expect("second CAS"),
+  ];
+  assert_eq!(outcomes.iter().filter(|outcome| **outcome).count(), 1);
+  let version: i64 = sqlx::query_scalar(
+    "select baseline_version from scheduled_delivery_baselines where job_id = 'accepted-race'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read baseline version");
+  assert_eq!(version, 1);
+}
+
+async fn accepted_cas_after_barrier(
+  store: StateStore,
+  update: UpdateAcceptedDeliveryBaseline,
+  barrier: Arc<Barrier>,
+) -> Result<bool, StateError> {
+  barrier.wait().await;
+  for _ in 0..3 {
+    match store
+      .compare_and_swap_accepted_delivery_baseline(&update)
+      .await
+    {
+      Err(error) if error.is_transient_storage_contention() => {}
+      result => return result,
+    }
+  }
+  store
+    .compare_and_swap_accepted_delivery_baseline(&update)
+    .await
+}
+
+#[tokio::test]
+async fn test_schema_rejects_cross_job_ownership_and_invalid_run_delivery_states() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  for job in ["ownership-a", "ownership-b"] {
+    store
+      .create_scheduled_job(&create_request(job, ScheduleSpec::once(110), 100))
+      .await
+      .expect("create job");
+  }
+  let MaterializationOutcome::Created(run) = store
+    .materialize_due_schedule("ownership-a", 0, 110)
+    .await
+    .expect("materialize")
+  else {
+    panic!("expected run");
+  };
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+
+  for statement in [
+    "update scheduled_runs set lease_owner = 'worker' where run_id = ?1",
+    "update scheduled_runs set result_hash_algorithm = 'sha256-v1', result_hash = 'result' where run_id = ?1",
+    "update scheduled_runs set next_attempt_at = 120, state = 'executing' where run_id = ?1",
+  ] {
+    assert!(
+      sqlx::query(statement)
+        .bind(&run.run_id)
+        .execute(&pool)
+        .await
+        .is_err(),
+      "state invariant must reject {statement}"
+    );
+  }
+  assert!(
+    sqlx::query(
+      "insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, overlap_slot, created_at, updated_at) select 'cross-job-run', 'ownership-b', schedule_id, job_generation, schedule_generation, scheduled_for + 1, coalesced_through + 1, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, 'pending', 1, created_at, updated_at from scheduled_runs where run_id = ?1",
+    )
+    .bind(&run.run_id)
+    .execute(&pool)
+    .await
+    .is_err()
+  );
+  assert!(
+    sqlx::query(
+      "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values ('cross-job-delivery', ?1, 'ownership-b', 'identity', '{}', 'pending', 1, 1, 'sha256-v1', 'payload', 0, 111, 111)",
+    )
+    .bind(&run.run_id)
+    .execute(&pool)
+    .await
+    .is_err()
+  );
+  assert!(
+    sqlx::query(
+      "update scheduled_execution_baselines set baseline_version = 1, hash_algorithm = 'sha256-v1', result_hash = 'result', source_run_id = ?1, completed_at = 111 where job_id = 'ownership-b'",
+    )
+    .bind(&run.run_id)
+    .execute(&pool)
+    .await
+    .is_err()
+  );
 }
 
 #[tokio::test]
@@ -872,4 +1322,76 @@ async fn pause_with_contention_retry(store: &StateStore) -> Result<i64, StateErr
     }
   }
   store.pause_scheduled_job("lifecycle-race", 0, 111).await
+}
+
+#[tokio::test]
+async fn test_update_delete_race_has_one_generation_winner() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let updater = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize updater");
+  let deleter = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize deleter");
+  updater
+    .create_scheduled_job(&create_request(
+      "update-delete-race",
+      ScheduleSpec::once(200),
+      100,
+    ))
+    .await
+    .expect("create job");
+  let update = UpdateScheduledJob {
+    job_id: "update-delete-race".to_owned(),
+    expected_generation: 0,
+    definition: ScheduledJobDefinition::new(2, r#"{"prompt":"updated"}"#).expect("definition"),
+    capability: CapabilityProfileSnapshot::new(2, "profile-v2", r#"{"tools":[]}"#)
+      .expect("capability"),
+    targets: vec![target("update-delete-race-updated")],
+    schedule: ScheduleSpec::once(300),
+    now: 110,
+  };
+  let barrier = Arc::new(Barrier::new(3));
+  let update_barrier = Arc::clone(&barrier);
+  let update_task = tokio::spawn(async move {
+    update_barrier.wait().await;
+    for _ in 0..3 {
+      match updater.update_scheduled_job(&update).await {
+        Err(error) if error.is_transient_storage_contention() => {}
+        result => return result,
+      }
+    }
+    updater.update_scheduled_job(&update).await
+  });
+  let delete_barrier = Arc::clone(&barrier);
+  let delete_task = tokio::spawn(async move {
+    delete_barrier.wait().await;
+    for _ in 0..3 {
+      match deleter
+        .delete_scheduled_job("update-delete-race", 0, 110)
+        .await
+      {
+        Err(error) if error.is_transient_storage_contention() => {}
+        result => return result,
+      }
+    }
+    deleter
+      .delete_scheduled_job("update-delete-race", 0, 110)
+      .await
+  });
+  barrier.wait().await;
+  let outcomes = [
+    update_task.await.expect("update task"),
+    delete_task.await.expect("delete task"),
+  ];
+  assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+  let job = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize reader")
+    .get_scheduled_job("update-delete-race")
+    .await
+    .expect("read job")
+    .expect("job");
+  assert_eq!(job.generation, 1);
 }

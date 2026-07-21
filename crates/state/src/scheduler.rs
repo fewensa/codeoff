@@ -1,7 +1,6 @@
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
 use croner::parser::CronParser;
 use serde_json::Value;
 use thiserror::Error;
@@ -9,6 +8,9 @@ use thiserror::Error;
 use crate::StateError;
 
 mod store;
+mod timezone;
+
+use timezone::BundledTimeZone;
 
 type ScheduleStorageParts = (
   &'static str,
@@ -21,6 +23,7 @@ type ScheduleStorageParts = (
 
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_DELIVERY_TARGETS: usize = 32;
 const DEFAULT_OCCURRENCE_STEPS: u32 = 100_000;
 const MAX_CRON_HORIZON_SECONDS: i64 = 366 * 24 * 60 * 60 * 10;
 
@@ -32,6 +35,10 @@ pub enum StateValueError {
   TooLarge { field: &'static str },
   #[error("{field} must be valid JSON")]
   InvalidJson { field: &'static str },
+  #[error("{field} must use canonical JSON encoding")]
+  NonCanonicalJson { field: &'static str },
+  #[error("{field} contains forbidden durable data")]
+  ForbiddenDurableData { field: &'static str },
   #[error("version must be positive")]
   InvalidVersion,
   #[error("once timestamp must be strictly later than now")]
@@ -67,10 +74,10 @@ pub struct OccurrenceWindow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrincipalKey {
-  pub kind: String,
-  pub provider: String,
-  pub tenant: String,
-  pub subject: String,
+  kind: String,
+  provider: String,
+  tenant: String,
+  subject: String,
 }
 
 impl PrincipalKey {
@@ -96,12 +103,36 @@ impl PrincipalKey {
     validate_text("principal.subject", &value.subject)?;
     Ok(value)
   }
+
+  #[must_use]
+  pub fn kind(&self) -> &str {
+    &self.kind
+  }
+  #[must_use]
+  pub fn provider(&self) -> &str {
+    &self.provider
+  }
+  #[must_use]
+  pub fn tenant(&self) -> &str {
+    &self.tenant
+  }
+  #[must_use]
+  pub fn subject(&self) -> &str {
+    &self.subject
+  }
+
+  fn validate(&self) -> Result<(), StateValueError> {
+    validate_text("principal.kind", &self.kind)?;
+    validate_text("principal.provider", &self.provider)?;
+    validate_text("principal.tenant", &self.tenant)?;
+    validate_text("principal.subject", &self.subject)
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledJobDefinition {
-  pub version: u32,
-  pub canonical_json: String,
+  version: u32,
+  canonical_json: String,
 }
 
 impl ScheduledJobDefinition {
@@ -110,20 +141,31 @@ impl ScheduledJobDefinition {
   /// # Errors
   /// Returns an error for version zero, invalid JSON, or an oversized snapshot.
   pub fn new(version: u32, canonical_json: impl Into<String>) -> Result<Self, StateValueError> {
-    let canonical_json = canonical_json.into();
-    validate_snapshot(version, "definition", &canonical_json)?;
+    let canonical_json = canonicalize_snapshot(version, "definition", &canonical_json.into())?;
     Ok(Self {
       version,
       canonical_json,
     })
   }
+  #[must_use]
+  pub const fn version(&self) -> u32 {
+    self.version
+  }
+  #[must_use]
+  pub fn canonical_json(&self) -> &str {
+    &self.canonical_json
+  }
+
+  fn validate(&self) -> Result<(), StateValueError> {
+    validate_canonical_snapshot(self.version, "definition", &self.canonical_json)
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityProfileSnapshot {
-  pub schema_version: u32,
-  pub digest: String,
-  pub canonical_json: String,
+  schema_version: u32,
+  digest: String,
+  canonical_json: String,
 }
 
 impl CapabilityProfileSnapshot {
@@ -137,8 +179,8 @@ impl CapabilityProfileSnapshot {
     canonical_json: impl Into<String>,
   ) -> Result<Self, StateValueError> {
     let digest = digest.into();
-    let canonical_json = canonical_json.into();
-    validate_snapshot(schema_version, "capability profile", &canonical_json)?;
+    let canonical_json =
+      canonicalize_snapshot(schema_version, "capability profile", &canonical_json.into())?;
     validate_text("capability profile digest", &digest)?;
     Ok(Self {
       schema_version,
@@ -146,22 +188,75 @@ impl CapabilityProfileSnapshot {
       canonical_json,
     })
   }
+  #[must_use]
+  pub const fn schema_version(&self) -> u32 {
+    self.schema_version
+  }
+  #[must_use]
+  pub fn digest(&self) -> &str {
+    &self.digest
+  }
+  #[must_use]
+  pub fn canonical_json(&self) -> &str {
+    &self.canonical_json
+  }
+
+  fn validate(&self) -> Result<(), StateValueError> {
+    validate_text("capability profile digest", &self.digest)?;
+    validate_canonical_snapshot(
+      self.schema_version,
+      "capability profile",
+      &self.canonical_json,
+    )
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryTargetSnapshot {
-  pub target_id: String,
-  pub provider: String,
-  pub connector: String,
-  pub tenant: String,
-  pub kind: String,
-  pub address_json: String,
-  pub resolver_version: u32,
-  pub resolver_digest: String,
-  pub identity_digest: String,
+  target_id: String,
+  provider: String,
+  connector: String,
+  tenant: String,
+  kind: String,
+  address_json: String,
+  resolver_version: u32,
+  resolver_digest: String,
+  identity_digest: String,
 }
 
 impl DeliveryTargetSnapshot {
+  /// Builds a resolved, versioned delivery target snapshot.
+  ///
+  /// # Errors
+  /// Returns an error when identity fields or the durable address envelope are invalid.
+  #[allow(clippy::too_many_arguments)]
+  pub fn new(
+    target_id: impl Into<String>,
+    provider: impl Into<String>,
+    connector: impl Into<String>,
+    tenant: impl Into<String>,
+    kind: impl Into<String>,
+    address_json: impl Into<String>,
+    resolver_version: u32,
+    resolver_digest: impl Into<String>,
+    identity_digest: impl Into<String>,
+  ) -> Result<Self, StateValueError> {
+    let mut value = Self {
+      target_id: target_id.into(),
+      provider: provider.into(),
+      connector: connector.into(),
+      tenant: tenant.into(),
+      kind: kind.into(),
+      address_json: address_json.into(),
+      resolver_version,
+      resolver_digest: resolver_digest.into(),
+      identity_digest: identity_digest.into(),
+    };
+    value.address_json =
+      canonicalize_snapshot(resolver_version, "target address", &value.address_json)?;
+    value.validate()?;
+    Ok(value)
+  }
   /// Validates a fully resolved delivery target snapshot.
   ///
   /// # Errors
@@ -178,7 +273,11 @@ impl DeliveryTargetSnapshot {
     ] {
       validate_text(field, value)?;
     }
-    validate_snapshot(self.resolver_version, "target address", &self.address_json)
+    validate_canonical_snapshot(self.resolver_version, "target address", &self.address_json)
+  }
+  #[must_use]
+  pub fn identity_digest(&self) -> &str {
+    &self.identity_digest
   }
 }
 
@@ -229,10 +328,15 @@ impl ScheduleSpec {
     CronParser::new()
       .parse(&canonical)
       .map_err(|_| StateValueError::InvalidCron)?;
-    let timezone = Tz::from_str(timezone).map_err(|_| StateValueError::InvalidTimezone)?;
+    let timezone_name = timezone;
+    let timezone =
+      BundledTimeZone::parse(timezone_name).map_err(|()| StateValueError::InvalidTimezone)?;
     Ok(Self::Cron {
       expression: canonical,
-      timezone: timezone.to_string(),
+      timezone: timezone
+        .canonical_name()
+        .unwrap_or(timezone_name)
+        .to_owned(),
     })
   }
 
@@ -497,6 +601,16 @@ impl FromStr for ScheduledDeliveryState {
 }
 
 impl ScheduledJobStatus {
+  #[must_use]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Active => "active",
+      Self::Paused => "paused",
+      Self::Completed => "completed",
+      Self::Deleted => "deleted",
+    }
+  }
+
   fn parse(value: &str) -> Result<Self, StateError> {
     match value {
       "active" => Ok(Self::Active),
@@ -558,6 +672,22 @@ pub struct UpdateAcceptedDeliveryBaseline {
   pub source_result_hash: String,
   pub accepted_at: i64,
   pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedDeliveryBaseline {
+  pub accepted_payload_digest: String,
+  pub source_delivery_id: String,
+  pub source_run_id: String,
+  pub source_result_hash: String,
+  pub accepted_at: i64,
+  pub baseline_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledJobListPage {
+  pub job_ids: Vec<String>,
+  pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -719,7 +849,8 @@ fn next_cron(expression: &str, timezone: &str, reference: i64) -> Result<i64, Oc
   let cron = CronParser::new()
     .parse(expression)
     .map_err(|_| OccurrenceError::NoFutureOccurrence)?;
-  let timezone = Tz::from_str(timezone).map_err(|_| OccurrenceError::NoFutureOccurrence)?;
+  let timezone =
+    BundledTimeZone::parse(timezone).map_err(|()| OccurrenceError::NoFutureOccurrence)?;
   let reference_utc =
     DateTime::<Utc>::from_timestamp(reference, 0).ok_or(OccurrenceError::ArithmeticOverflow)?;
   let local = reference_utc.with_timezone(&timezone);
@@ -737,16 +868,77 @@ fn next_cron(expression: &str, timezone: &str, reference: i64) -> Result<i64, Oc
   Ok(timestamp)
 }
 
-fn validate_snapshot(version: u32, field: &'static str, json: &str) -> Result<(), StateValueError> {
+fn canonicalize_snapshot(
+  version: u32,
+  field: &'static str,
+  json: &str,
+) -> Result<String, StateValueError> {
   if version == 0 {
     return Err(StateValueError::InvalidVersion);
   }
   if json.len() > MAX_SNAPSHOT_BYTES {
     return Err(StateValueError::TooLarge { field });
   }
-  serde_json::from_str::<Value>(json)
-    .map(|_| ())
-    .map_err(|_| StateValueError::InvalidJson { field })
+  let value =
+    serde_json::from_str::<Value>(json).map_err(|_| StateValueError::InvalidJson { field })?;
+  if contains_forbidden_durable_key(&value) {
+    return Err(StateValueError::ForbiddenDurableData { field });
+  }
+  let canonical =
+    serde_json::to_string(&value).map_err(|_| StateValueError::InvalidJson { field })?;
+  if canonical.len() > MAX_SNAPSHOT_BYTES {
+    return Err(StateValueError::TooLarge { field });
+  }
+  Ok(canonical)
+}
+
+fn validate_canonical_snapshot(
+  version: u32,
+  field: &'static str,
+  json: &str,
+) -> Result<(), StateValueError> {
+  let canonical = canonicalize_snapshot(version, field, json)?;
+  if canonical != json {
+    return Err(StateValueError::NonCanonicalJson { field });
+  }
+  Ok(())
+}
+
+fn contains_forbidden_durable_key(value: &Value) -> bool {
+  match value {
+    Value::Object(object) => object
+      .iter()
+      .any(|(key, value)| is_forbidden_durable_key(key) || contains_forbidden_durable_key(value)),
+    Value::Array(values) => values.iter().any(contains_forbidden_durable_key),
+    _ => false,
+  }
+}
+
+fn is_forbidden_durable_key(key: &str) -> bool {
+  let normalized = key.trim().to_ascii_lowercase().replace('-', "_");
+  matches!(
+    normalized.as_str(),
+    "secret"
+      | "token"
+      | "password"
+      | "private_key"
+      | "auth"
+      | "authorization"
+      | "credentials"
+      | "api_key"
+      | "client_secret"
+      | "access_token"
+      | "refresh_token"
+      | "event_id"
+      | "dedupe_key"
+      | "origin"
+      | "slack_event"
+      | "live_event"
+  ) || normalized.ends_with("_secret")
+    || normalized.ends_with("_token")
+    || normalized.ends_with("_password")
+    || normalized.ends_with("_private_key")
+    || normalized.ends_with("_api_key")
 }
 
 fn validate_text(field: &'static str, value: &str) -> Result<(), StateValueError> {

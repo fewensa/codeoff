@@ -2,13 +2,14 @@ use serde_json::json;
 use sqlx::{Row, Sqlite, Transaction};
 
 use super::{
-  CapabilityProfileSnapshot, CreateScheduledJob, DEFAULT_OCCURRENCE_STEPS, DeliveryTargetSnapshot,
-  IdempotencyDecision, MAX_CONTEXT_BYTES, MAX_SNAPSHOT_BYTES, MaterializationOutcome, PrincipalKey,
+  AcceptedDeliveryBaseline, CapabilityProfileSnapshot, CreateScheduledJob,
+  DEFAULT_OCCURRENCE_STEPS, DeliveryTargetSnapshot, IdempotencyDecision, MAX_CONTEXT_BYTES,
+  MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES, MaterializationOutcome, PrincipalKey,
   ScheduleMutationIdempotency, ScheduleSpec, ScheduledJob, ScheduledJobDefinition,
-  ScheduledJobMutation, ScheduledJobStatus, StateError, TransactionalMutationOutcome,
-  UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json,
-  invalid_occurrence, invalid_value, materialized_run, positive_u32, scheduler_error,
-  validate_text,
+  ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus, StateError,
+  TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
+  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
+  positive_u32, scheduler_error, validate_text,
 };
 use crate::StateStore;
 
@@ -112,6 +113,103 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     row.map(|row| scheduled_job_from_row(&row)).transpose()
+  }
+
+  /// Lists one stable cursor page of jobs owned by the complete principal key and status.
+  ///
+  /// # Errors
+  /// Returns an error for an invalid principal, cursor, limit, or storage failure.
+  pub async fn list_scheduled_jobs_by_owner(
+    &self,
+    owner: &PrincipalKey,
+    status: ScheduledJobStatus,
+    after_job_id: Option<&str>,
+    limit: u32,
+  ) -> Result<ScheduledJobListPage, StateError> {
+    owner.validate().map_err(invalid_value)?;
+    if limit == 0 || limit > 100 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "owner list limit must be between 1 and 100".to_owned(),
+      });
+    }
+    if let Some(cursor) = after_job_id {
+      validate_text("owner list cursor", cursor).map_err(invalid_value)?;
+    }
+    let fetch_limit = i64::from(limit) + 1;
+    let mut job_ids: Vec<String> = sqlx::query_scalar(
+      "select job_id from scheduled_jobs indexed by idx_scheduled_jobs_owner_status where owner_kind = ?1 and owner_provider = ?2 and owner_tenant = ?3 and owner_subject = ?4 and status = ?5 and job_id > coalesce(?6, '') order by job_id limit ?7",
+    )
+    .bind(owner.kind())
+    .bind(owner.provider())
+    .bind(owner.tenant())
+    .bind(owner.subject())
+    .bind(status.as_str())
+    .bind(after_job_id)
+    .bind(fetch_limit)
+    .fetch_all(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    let has_more = job_ids.len() > limit as usize;
+    if has_more {
+      job_ids.pop();
+    }
+    let next_cursor = has_more.then(|| job_ids.last().cloned()).flatten();
+    Ok(ScheduledJobListPage {
+      job_ids,
+      next_cursor,
+    })
+  }
+
+  /// Reads the accepted baseline matching the complete delivery identity tuple.
+  ///
+  /// # Errors
+  /// Returns an error for invalid identity fields, versions, or storage failure.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn get_accepted_delivery_baseline(
+    &self,
+    job_id: &str,
+    target_identity_digest: &str,
+    delivery_policy_version: i64,
+    render_version: i64,
+    hash_algorithm: &str,
+  ) -> Result<Option<AcceptedDeliveryBaseline>, StateError> {
+    for (field, value) in [
+      ("job id", job_id),
+      ("target identity digest", target_identity_digest),
+      ("delivery hash algorithm", hash_algorithm),
+    ] {
+      validate_text(field, value).map_err(invalid_value)?;
+    }
+    if delivery_policy_version <= 0 || render_version <= 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "delivery baseline identity versions must be positive".to_owned(),
+      });
+    }
+    let row = sqlx::query(
+      "select accepted_payload_digest, source_delivery_id, source_run_id, source_result_hash, accepted_at, baseline_version from scheduled_delivery_baselines where job_id = ?1 and target_identity_digest = ?2 and delivery_policy_version = ?3 and render_version = ?4 and hash_algorithm = ?5",
+    )
+    .bind(job_id)
+    .bind(target_identity_digest)
+    .bind(delivery_policy_version)
+    .bind(render_version)
+    .bind(hash_algorithm)
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    row
+      .map(|row| {
+        Ok(AcceptedDeliveryBaseline {
+          accepted_payload_digest: row
+            .try_get("accepted_payload_digest")
+            .map_err(scheduler_error)?,
+          source_delivery_id: row.try_get("source_delivery_id").map_err(scheduler_error)?,
+          source_run_id: row.try_get("source_run_id").map_err(scheduler_error)?,
+          source_result_hash: row.try_get("source_result_hash").map_err(scheduler_error)?,
+          accepted_at: row.try_get("accepted_at").map_err(scheduler_error)?,
+          baseline_version: row.try_get("baseline_version").map_err(scheduler_error)?,
+        })
+      })
+      .transpose()
   }
 
   /// Lists active due jobs that are not blocked by overlap-forbid state.
@@ -413,15 +511,42 @@ impl StateStore {
     &self,
     update: &UpdateExecutionBaseline,
   ) -> Result<bool, StateError> {
-    validate_text("execution hash algorithm", &update.hash_algorithm).map_err(invalid_value)?;
-    validate_text("execution result hash", &update.result_hash).map_err(invalid_value)?;
-    validate_text("source run id", &update.source_run_id).map_err(invalid_value)?;
-    if update.previous_success_context.len() > MAX_CONTEXT_BYTES || update.expected_version < 0 {
-      return Err(StateError::InvalidSchedulerState {
-        reason: "invalid execution baseline CAS".to_owned(),
-      });
-    }
-    let result = sqlx::query(
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let updated =
+      compare_and_swap_execution_baseline_in_transaction(&mut transaction, update).await?;
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(updated)
+  }
+
+  /// Applies an accepted-delivery baseline CAS in its own transaction.
+  ///
+  /// # Errors
+  /// Returns an error for invalid bounded identity fields or a storage failure.
+  pub async fn compare_and_swap_accepted_delivery_baseline(
+    &self,
+    update: &UpdateAcceptedDeliveryBaseline,
+  ) -> Result<bool, StateError> {
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let updated =
+      compare_and_swap_accepted_delivery_baseline_in_transaction(&mut transaction, update).await?;
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(updated)
+  }
+}
+
+pub(crate) async fn compare_and_swap_execution_baseline_in_transaction(
+  transaction: &mut Transaction<'_, Sqlite>,
+  update: &UpdateExecutionBaseline,
+) -> Result<bool, StateError> {
+  validate_text("execution hash algorithm", &update.hash_algorithm).map_err(invalid_value)?;
+  validate_text("execution result hash", &update.result_hash).map_err(invalid_value)?;
+  validate_text("source run id", &update.source_run_id).map_err(invalid_value)?;
+  if update.previous_success_context.len() > MAX_CONTEXT_BYTES || update.expected_version < 0 {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "invalid execution baseline CAS".to_owned(),
+    });
+  }
+  let result = sqlx::query(
       "update scheduled_execution_baselines set baseline_version = baseline_version + 1, hash_algorithm = ?1, result_hash = ?2, previous_success_context = ?3, source_run_id = ?4, completed_at = ?5 where job_id = ?6 and baseline_version = ?7",
     )
     .bind(&update.hash_algorithm)
@@ -431,27 +556,19 @@ impl StateStore {
     .bind(update.completed_at)
     .bind(&update.job_id)
     .bind(update.expected_version)
-    .execute(&self.pool)
+    .execute(&mut **transaction)
     .await
     .map_err(scheduler_error)?;
-    Ok(result.rows_affected() == 1)
-  }
+  Ok(result.rows_affected() == 1)
+}
 
-  /// Applies an accepted-delivery baseline CAS primitive for the future delivery terminal
-  /// transaction.
-  ///
-  /// This primitive does not decide whether delivery was accepted; issue 07 owns that decision and
-  /// must call it only for delivered or explicitly accepted `skipped_none` outcomes.
-  ///
-  /// # Errors
-  /// Returns an error for invalid bounded identity fields or a storage failure.
-  pub async fn compare_and_swap_accepted_delivery_baseline(
-    &self,
-    update: &UpdateAcceptedDeliveryBaseline,
-  ) -> Result<bool, StateError> {
-    validate_accepted_delivery_baseline(update)?;
-    let result = sqlx::query(
-      "insert into scheduled_delivery_baselines (job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_hash, accepted_at, baseline_version) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1) on conflict(job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm) do update set accepted_payload_digest = excluded.accepted_payload_digest, source_delivery_id = excluded.source_delivery_id, source_run_id = excluded.source_run_id, source_result_hash = excluded.source_result_hash, accepted_at = excluded.accepted_at, baseline_version = scheduled_delivery_baselines.baseline_version + 1 where scheduled_delivery_baselines.baseline_version = ?11",
+pub(crate) async fn compare_and_swap_accepted_delivery_baseline_in_transaction(
+  transaction: &mut Transaction<'_, Sqlite>,
+  update: &UpdateAcceptedDeliveryBaseline,
+) -> Result<bool, StateError> {
+  validate_accepted_delivery_baseline(update)?;
+  let result = sqlx::query(
+      "insert into scheduled_delivery_baselines (job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_hash, accepted_at, baseline_version) select ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1 where ?11 = 0 on conflict(job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm) do update set accepted_payload_digest = excluded.accepted_payload_digest, source_delivery_id = excluded.source_delivery_id, source_run_id = excluded.source_run_id, source_result_hash = excluded.source_result_hash, accepted_at = excluded.accepted_at, baseline_version = scheduled_delivery_baselines.baseline_version + 1 where scheduled_delivery_baselines.baseline_version = ?11",
     )
     .bind(&update.job_id)
     .bind(&update.target_identity_digest)
@@ -464,11 +581,10 @@ impl StateStore {
     .bind(&update.source_result_hash)
     .bind(update.accepted_at)
     .bind(update.expected_version)
-    .execute(&self.pool)
+    .execute(&mut **transaction)
     .await
     .map_err(scheduler_error)?;
-    Ok(result.rows_affected() == 1)
-  }
+  Ok(result.rows_affected() == 1)
 }
 
 fn scheduled_job_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduledJob, StateError> {
@@ -479,29 +595,59 @@ fn scheduled_job_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduledJob,
       .try_get("capability_schema_version")
       .map_err(scheduler_error)?,
   )?;
+  let definition = ScheduledJobDefinition::new(
+    definition_version,
+    row
+      .try_get::<String, _>("definition_json")
+      .map_err(scheduler_error)?,
+  )
+  .map_err(invalid_value)?;
+  let creator = PrincipalKey::new(
+    row
+      .try_get::<String, _>("creator_kind")
+      .map_err(scheduler_error)?,
+    row
+      .try_get::<String, _>("creator_provider")
+      .map_err(scheduler_error)?,
+    row
+      .try_get::<String, _>("creator_tenant")
+      .map_err(scheduler_error)?,
+    row
+      .try_get::<String, _>("creator_subject")
+      .map_err(scheduler_error)?,
+  )
+  .map_err(invalid_value)?;
+  let owner = PrincipalKey::new(
+    row
+      .try_get::<String, _>("owner_kind")
+      .map_err(scheduler_error)?,
+    row
+      .try_get::<String, _>("owner_provider")
+      .map_err(scheduler_error)?,
+    row
+      .try_get::<String, _>("owner_tenant")
+      .map_err(scheduler_error)?,
+    row
+      .try_get::<String, _>("owner_subject")
+      .map_err(scheduler_error)?,
+  )
+  .map_err(invalid_value)?;
+  let capability = CapabilityProfileSnapshot::new(
+    capability_schema_version,
+    row
+      .try_get::<String, _>("capability_digest")
+      .map_err(scheduler_error)?,
+    row
+      .try_get::<String, _>("capability_json")
+      .map_err(scheduler_error)?,
+  )
+  .map_err(invalid_value)?;
   Ok(ScheduledJob {
     job_id: row.try_get("job_id").map_err(scheduler_error)?,
-    definition: ScheduledJobDefinition {
-      version: definition_version,
-      canonical_json: row.try_get("definition_json").map_err(scheduler_error)?,
-    },
-    creator: PrincipalKey {
-      kind: row.try_get("creator_kind").map_err(scheduler_error)?,
-      provider: row.try_get("creator_provider").map_err(scheduler_error)?,
-      tenant: row.try_get("creator_tenant").map_err(scheduler_error)?,
-      subject: row.try_get("creator_subject").map_err(scheduler_error)?,
-    },
-    owner: PrincipalKey {
-      kind: row.try_get("owner_kind").map_err(scheduler_error)?,
-      provider: row.try_get("owner_provider").map_err(scheduler_error)?,
-      tenant: row.try_get("owner_tenant").map_err(scheduler_error)?,
-      subject: row.try_get("owner_subject").map_err(scheduler_error)?,
-    },
-    capability: CapabilityProfileSnapshot {
-      schema_version: capability_schema_version,
-      digest: row.try_get("capability_digest").map_err(scheduler_error)?,
-      canonical_json: row.try_get("capability_json").map_err(scheduler_error)?,
-    },
+    definition,
+    creator,
+    owner,
+    capability,
     status: ScheduledJobStatus::parse(
       &row
         .try_get::<String, _>("status")
@@ -550,6 +696,7 @@ async fn load_materialization_snapshots(
     .iter()
     .map(target_snapshot_json)
     .collect::<Result<_, StateError>>()?;
+  validate_serialized_targets(&targets)?;
   let baseline = sqlx::query(
     "select baseline_version, hash_algorithm, result_hash, previous_success_context, source_run_id, completed_at from scheduled_execution_baselines where job_id = ?1",
   )
@@ -566,7 +713,7 @@ async fn load_materialization_snapshots(
     "completed_at": baseline.try_get::<Option<i64>, _>("completed_at").map_err(scheduler_error)?,
   });
   Ok(MaterializationSnapshots {
-    targets_json: serde_json::to_string(&targets).map_err(invalid_json)?,
+    targets_json: serialize_targets(&targets)?,
     execution_baseline_json: baseline.to_string(),
   })
 }
@@ -609,18 +756,15 @@ async fn replace_delivery_targets(
 fn validate_create_request(request: &CreateScheduledJob) -> Result<i64, StateError> {
   validate_text("job id", &request.job_id).map_err(invalid_value)?;
   validate_text("schedule id", &request.schedule_id).map_err(invalid_value)?;
+  request.creator.validate().map_err(invalid_value)?;
+  request.owner.validate().map_err(invalid_value)?;
+  request.definition.validate().map_err(invalid_value)?;
+  request.capability.validate().map_err(invalid_value)?;
   request
     .schedule
     .validate_for_create(request.now)
     .map_err(invalid_value)?;
-  if request.targets.is_empty() {
-    return Err(StateError::InvalidSchedulerState {
-      reason: "at least one resolved delivery target is required".to_owned(),
-    });
-  }
-  for target in &request.targets {
-    target.validate().map_err(invalid_value)?;
-  }
+  validate_delivery_targets(&request.targets)?;
   request
     .schedule
     .first_after_create(request.now)
@@ -1017,15 +1161,58 @@ fn validate_update_request(request: &UpdateScheduledJob) -> Result<(), StateErro
     .schedule
     .validate_for_create(request.now)
     .map_err(invalid_value)?;
-  if request.expected_generation < 0 || request.targets.is_empty() {
+  request.definition.validate().map_err(invalid_value)?;
+  request.capability.validate().map_err(invalid_value)?;
+  if request.expected_generation < 0 {
     return Err(StateError::InvalidSchedulerState {
-      reason: "invalid update generation or empty resolved targets".to_owned(),
+      reason: "invalid update generation".to_owned(),
     });
   }
-  for target in &request.targets {
-    target.validate().map_err(invalid_value)?;
+  validate_delivery_targets(&request.targets)
+}
+
+fn validate_delivery_targets(targets: &[DeliveryTargetSnapshot]) -> Result<(), StateError> {
+  if targets.is_empty() || targets.len() > MAX_DELIVERY_TARGETS {
+    return Err(StateError::InvalidSchedulerState {
+      reason: format!("resolved delivery targets must contain 1..={MAX_DELIVERY_TARGETS} entries"),
+    });
   }
-  Ok(())
+  let values = targets
+    .iter()
+    .map(|target| {
+      target.validate().map_err(invalid_value)?;
+      Ok(json!({
+        "provider": target.provider,
+        "connector": target.connector,
+        "tenant": target.tenant,
+        "kind": target.kind,
+        "address": serde_json::from_str::<Value>(&target.address_json).map_err(invalid_json)?,
+        "resolver_version": target.resolver_version,
+        "resolver_digest": target.resolver_digest,
+        "identity_digest": target.identity_digest,
+      }))
+    })
+    .collect::<Result<Vec<_>, StateError>>()?;
+  validate_serialized_targets(&values)
+}
+
+fn validate_serialized_targets(targets: &[Value]) -> Result<(), StateError> {
+  if targets.is_empty() || targets.len() > MAX_DELIVERY_TARGETS {
+    return Err(StateError::InvalidSchedulerState {
+      reason: format!("resolved delivery targets must contain 1..={MAX_DELIVERY_TARGETS} entries"),
+    });
+  }
+  serialize_targets(targets).map(|_| ())
+}
+
+fn serialize_targets(targets: &[Value]) -> Result<String, StateError> {
+  let serialized = serde_json::to_string(targets).map_err(invalid_json)?;
+  if serialized.len() > MAX_SNAPSHOT_BYTES {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "serialized delivery targets exceed the durable snapshot bound".to_owned(),
+    });
+  }
+  Ok(serialized)
 }
 
 fn validate_accepted_delivery_baseline(
@@ -1112,8 +1299,11 @@ mod tests {
   use tempfile::tempdir;
 
   use super::{
-    CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, PrincipalKey,
-    ScheduleSpec, ScheduledJobDefinition, StateError, StateStore,
+    CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, MaterializationOutcome,
+    PrincipalKey, ScheduleSpec, ScheduledJobDefinition, StateError, StateStore,
+    UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
+    compare_and_swap_accepted_delivery_baseline_in_transaction,
+    compare_and_swap_execution_baseline_in_transaction,
   };
 
   #[tokio::test]
@@ -1138,17 +1328,12 @@ mod tests {
       creator: PrincipalKey::new("user", "test", "tenant", "creator").expect("creator"),
       owner: PrincipalKey::new("user", "test", "tenant", "owner").expect("owner"),
       capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("profile"),
-      targets: vec![DeliveryTargetSnapshot {
-        target_id: "none".to_owned(),
-        provider: "none".to_owned(),
-        connector: "none".to_owned(),
-        tenant: "none".to_owned(),
-        kind: "none".to_owned(),
-        address_json: "{}".to_owned(),
-        resolver_version: 1,
-        resolver_digest: "resolver".to_owned(),
-        identity_digest: "identity".to_owned(),
-      }],
+      targets: vec![
+        DeliveryTargetSnapshot::new(
+          "none", "none", "none", "none", "none", "{}", 1, "resolver", "identity",
+        )
+        .expect("target"),
+      ],
       schedule: ScheduleSpec::once(2),
       now: 1,
     };
@@ -1159,5 +1344,152 @@ mod tests {
     assert!(matches!(error, StateError::Scheduler { .. }));
     assert!(error.is_transient_storage_contention());
     lock.release().await.expect("release lock");
+  }
+
+  #[tokio::test]
+  #[allow(clippy::too_many_lines)]
+  async fn test_terminal_state_and_baseline_cas_share_commit_and_rollback_boundaries() {
+    let temp = tempdir().expect("create tempdir");
+    let state_dir = temp.path().join("state");
+    let store = StateStore::initialize(&state_dir, None)
+      .await
+      .expect("initialize store");
+    let request = CreateScheduledJob {
+      job_id: "terminal-transaction".to_owned(),
+      schedule_id: "schedule-terminal-transaction".to_owned(),
+      definition: ScheduledJobDefinition::new(1, "{}").expect("definition"),
+      creator: PrincipalKey::new("user", "test", "tenant", "creator").expect("creator"),
+      owner: PrincipalKey::new("user", "test", "tenant", "owner").expect("owner"),
+      capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("profile"),
+      targets: vec![
+        DeliveryTargetSnapshot::new(
+          "none", "none", "none", "none", "none", "{}", 1, "resolver", "identity",
+        )
+        .expect("target"),
+      ],
+      schedule: ScheduleSpec::once(2),
+      now: 1,
+    };
+    store
+      .create_scheduled_job(&request)
+      .await
+      .expect("create job");
+    let MaterializationOutcome::Created(run) = store
+      .materialize_due_schedule("terminal-transaction", 0, 2)
+      .await
+      .expect("materialize")
+    else {
+      panic!("expected materialized run");
+    };
+    let execution = UpdateExecutionBaseline {
+      job_id: "terminal-transaction".to_owned(),
+      expected_version: 0,
+      hash_algorithm: "sha256-v1".to_owned(),
+      result_hash: "result".to_owned(),
+      previous_success_context: "context".to_owned(),
+      source_run_id: run.run_id.clone(),
+      completed_at: 3,
+    };
+
+    let mut transaction = store
+      .pool
+      .begin()
+      .await
+      .expect("begin rollback transaction");
+    sqlx::query("update scheduled_runs set state = 'succeeded', overlap_slot = null, result_hash_algorithm = 'sha256-v1', result_hash = 'result' where run_id = ?1")
+      .bind(&run.run_id)
+      .execute(&mut *transaction)
+      .await
+      .expect("set terminal state");
+    assert!(
+      compare_and_swap_execution_baseline_in_transaction(&mut transaction, &execution)
+        .await
+        .expect("execution CAS")
+    );
+    transaction.rollback().await.expect("rollback");
+    let rolled_back: (String, i64) = sqlx::query_as(
+      "select state, (select baseline_version from scheduled_execution_baselines where job_id = 'terminal-transaction') from scheduled_runs where run_id = ?1",
+    )
+    .bind(&run.run_id)
+    .fetch_one(&store.pool)
+    .await
+    .expect("read rolled back state");
+    assert_eq!(rolled_back, ("pending".to_owned(), 0));
+
+    let mut transaction = store.pool.begin().await.expect("begin commit transaction");
+    sqlx::query("update scheduled_runs set state = 'succeeded', overlap_slot = null, result_hash_algorithm = 'sha256-v1', result_hash = 'result' where run_id = ?1")
+      .bind(&run.run_id)
+      .execute(&mut *transaction)
+      .await
+      .expect("set terminal state");
+    assert!(
+      compare_and_swap_execution_baseline_in_transaction(&mut transaction, &execution)
+        .await
+        .expect("execution CAS")
+    );
+    transaction.commit().await.expect("commit");
+    let committed: (String, i64) = sqlx::query_as(
+      "select state, (select baseline_version from scheduled_execution_baselines where job_id = 'terminal-transaction') from scheduled_runs where run_id = ?1",
+    )
+    .bind(&run.run_id)
+    .fetch_one(&store.pool)
+    .await
+    .expect("read committed state");
+    assert_eq!(committed, ("succeeded".to_owned(), 1));
+
+    let accepted = UpdateAcceptedDeliveryBaseline {
+      job_id: "terminal-transaction".to_owned(),
+      target_identity_digest: "identity".to_owned(),
+      delivery_policy_version: 1,
+      render_version: 1,
+      hash_algorithm: "sha256-v1".to_owned(),
+      accepted_payload_digest: "payload".to_owned(),
+      source_delivery_id: "delivery-transaction".to_owned(),
+      source_run_id: run.run_id.clone(),
+      source_result_hash: "result".to_owned(),
+      accepted_at: 4,
+      expected_version: 0,
+    };
+    let mut transaction = store.pool.begin().await.expect("begin delivery rollback");
+    sqlx::query("insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values (?1, ?2, 'terminal-transaction', 'identity', '{}', 'delivered', 1, 1, 'sha256-v1', 'payload', 0, 4, 4)")
+      .bind(&accepted.source_delivery_id)
+      .bind(&run.run_id)
+      .execute(&mut *transaction)
+      .await
+      .expect("insert delivery");
+    assert!(
+      compare_and_swap_accepted_delivery_baseline_in_transaction(&mut transaction, &accepted)
+        .await
+        .expect("accepted CAS")
+    );
+    transaction.rollback().await.expect("rollback delivery");
+    let rolled_back: (i64, i64) = sqlx::query_as(
+      "select (select count(*) from scheduled_run_deliveries where delivery_id = 'delivery-transaction'), (select count(*) from scheduled_delivery_baselines where job_id = 'terminal-transaction')",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .expect("read delivery rollback");
+    assert_eq!(rolled_back, (0, 0));
+
+    let mut transaction = store.pool.begin().await.expect("begin delivery commit");
+    sqlx::query("insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values (?1, ?2, 'terminal-transaction', 'identity', '{}', 'delivered', 1, 1, 'sha256-v1', 'payload', 0, 4, 4)")
+      .bind(&accepted.source_delivery_id)
+      .bind(&run.run_id)
+      .execute(&mut *transaction)
+      .await
+      .expect("insert delivery");
+    assert!(
+      compare_and_swap_accepted_delivery_baseline_in_transaction(&mut transaction, &accepted)
+        .await
+        .expect("accepted CAS")
+    );
+    transaction.commit().await.expect("commit delivery");
+    let committed: (i64, i64) = sqlx::query_as(
+      "select (select count(*) from scheduled_run_deliveries where delivery_id = 'delivery-transaction'), (select baseline_version from scheduled_delivery_baselines where job_id = 'terminal-transaction')",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .expect("read committed delivery");
+    assert_eq!(committed, (1, 1));
   }
 }

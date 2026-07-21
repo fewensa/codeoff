@@ -50,6 +50,7 @@ create table schedules (
   next_run_at integer,
   created_at integer not null,
   updated_at integer not null,
+  unique (schedule_id, job_id),
   check (length(schedule_id) between 1 and 255),
   check (kind in ('once', 'fixed_interval', 'cron')),
   check (misfire_policy = 'coalesce'),
@@ -89,17 +90,18 @@ create table scheduled_execution_baselines (
   hash_algorithm text,
   result_hash text,
   previous_success_context text,
-  source_run_id text references scheduled_runs(run_id) on delete restrict,
+  source_run_id text,
   completed_at integer,
   check (baseline_version >= 0),
   check ((result_hash is null and hash_algorithm is null and source_run_id is null and completed_at is null)
-    or (result_hash is not null and hash_algorithm is not null and source_run_id is not null and completed_at is not null))
+    or (result_hash is not null and hash_algorithm is not null and source_run_id is not null and completed_at is not null)),
+  foreign key (source_run_id, job_id) references scheduled_runs(run_id, job_id) on delete restrict
 );
 
 create table scheduled_runs (
   run_id text primary key,
   job_id text not null references scheduled_jobs(job_id) on delete restrict,
-  schedule_id text not null references schedules(schedule_id) on delete restrict,
+  schedule_id text not null,
   job_generation integer not null,
   schedule_generation integer not null,
   scheduled_for integer not null,
@@ -128,6 +130,8 @@ create table scheduled_runs (
   created_at integer not null,
   updated_at integer not null,
   unique (job_id, scheduled_for),
+  unique (run_id, job_id),
+  foreign key (schedule_id, job_id) references schedules(schedule_id, job_id) on delete restrict,
   check (job_generation >= 0 and schedule_generation >= 0 and scheduled_for <= coalesced_through),
   check (skipped_count >= 0 and skipped_count_saturated in (0, 1)),
   check (definition_version > 0 and json_valid(definition_json)),
@@ -136,6 +140,14 @@ create table scheduled_runs (
   check (execution_baseline_json is null or json_valid(execution_baseline_json)),
   check (state in ('pending', 'leased', 'executing', 'succeeded', 'failed', 'timed_out', 'cancelled', 'outcome_unknown')),
   check (attempt >= 0 and fence >= 0),
+  check ((lease_owner is null and lease_expires_at is null)
+    or (lease_owner is not null and lease_expires_at is not null and state in ('leased', 'executing'))),
+  check (next_attempt_at is null or state = 'pending'),
+  check ((result_hash_algorithm is null and result_hash is null)
+    or (result_hash_algorithm is not null and result_hash is not null and state = 'succeeded')),
+  check (result_context is null or state = 'succeeded'),
+  check ((error_kind is null and error_message is null)
+    or (state in ('failed', 'timed_out', 'outcome_unknown') and error_kind is not null)),
   check ((state in ('pending', 'leased', 'executing', 'outcome_unknown') and overlap_slot = 1)
     or (state in ('succeeded', 'failed', 'timed_out', 'cancelled') and overlap_slot is null))
 );
@@ -148,7 +160,8 @@ create index idx_scheduled_runs_history on scheduled_runs (job_id, scheduled_for
 
 create table scheduled_run_deliveries (
   delivery_id text primary key,
-  run_id text not null references scheduled_runs(run_id) on delete restrict,
+  run_id text not null,
+  job_id text not null,
   target_identity_digest text not null,
   target_json text not null,
   state text not null default 'pending',
@@ -167,10 +180,17 @@ create table scheduled_run_deliveries (
   created_at integer not null,
   updated_at integer not null,
   unique (run_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm),
+  unique (delivery_id, run_id, job_id),
+  foreign key (run_id, job_id) references scheduled_runs(run_id, job_id) on delete restrict,
   check (json_valid(target_json)),
   check (state in ('pending', 'leased', 'sending', 'delivered', 'failed', 'delivery_unknown', 'skipped')),
   check (attempt >= 0 and fence >= 0 and delivery_policy_version > 0 and render_version > 0 and expected_baseline_version >= 0),
-  check (length(hash_algorithm) > 0 and length(payload_digest) > 0)
+  check (length(hash_algorithm) > 0 and length(payload_digest) > 0),
+  check ((lease_owner is null and lease_expires_at is null)
+    or (lease_owner is not null and lease_expires_at is not null and state in ('leased', 'sending'))),
+  check (next_attempt_at is null or state = 'pending'),
+  check (provider_receipt is null or state = 'delivered'),
+  check (error_message is null or state in ('failed', 'delivery_unknown'))
 );
 
 create index idx_scheduled_deliveries_recovery
@@ -185,12 +205,14 @@ create table scheduled_delivery_baselines (
   render_version integer not null,
   hash_algorithm text not null,
   accepted_payload_digest text not null,
-  source_delivery_id text not null references scheduled_run_deliveries(delivery_id) on delete restrict,
-  source_run_id text not null references scheduled_runs(run_id) on delete restrict,
+  source_delivery_id text not null,
+  source_run_id text not null,
   source_result_hash text not null,
   accepted_at integer not null,
   baseline_version integer not null,
   primary key (job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm),
+  foreign key (source_run_id, job_id) references scheduled_runs(run_id, job_id) on delete restrict,
+  foreign key (source_delivery_id, source_run_id, job_id) references scheduled_run_deliveries(delivery_id, run_id, job_id) on delete restrict,
   check (delivery_policy_version > 0 and render_version > 0 and baseline_version > 0),
   check (length(target_identity_digest) > 0 and length(hash_algorithm) > 0 and length(accepted_payload_digest) > 0)
 );

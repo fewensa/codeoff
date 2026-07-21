@@ -805,8 +805,11 @@ pub struct ScheduleMutationAudit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleAuditSummary {
+  pub audit_id: String,
+  pub operation: String,
   pub outcome: String,
   pub decision: String,
+  pub reason: Option<String>,
   pub error_code: Option<String>,
   pub idempotency_outcome: Option<String>,
 }

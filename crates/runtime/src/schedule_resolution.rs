@@ -11,6 +11,9 @@ use crate::schedule_service::{
   SNAPSHOT_VERSION, ScheduleServiceError, bounded, canonical_json, digest_json,
 };
 
+const SLACK_CONNECTOR: &str = "slack-default";
+const SLACK_RESOLVER_DIGEST: &str = "slack-web-api-v1";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryTargetRequest {
   None,
@@ -29,10 +32,6 @@ pub enum DeliveryTargetRequest {
 
 #[async_trait]
 pub trait TargetResolver: Send + Sync {
-  fn provider(&self) -> &'static str;
-
-  fn describe_supported_targets(&self, invocation: &ScheduleInvocation) -> Vec<&'static str>;
-
   async fn resolve(
     &self,
     invocation: &ScheduleInvocation,
@@ -41,19 +40,77 @@ pub trait TargetResolver: Send + Sync {
   ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetResolverAuthority {
+  provider: String,
+  connector: String,
+  resolver_version: u32,
+  resolver_digest: String,
+}
+
+pub struct TargetResolverRegistration {
+  authority: TargetResolverAuthority,
+  supported_kinds: Vec<&'static str>,
+  resolver: Arc<dyn TargetResolver>,
+}
+
+impl TargetResolverRegistration {
+  /// Binds a resolver implementation to trusted connector and snapshot metadata.
+  ///
+  /// # Errors
+  /// Returns an error when registration metadata or supported target kinds are invalid.
+  pub fn new(
+    provider: &str,
+    connector: &str,
+    resolver_version: u32,
+    resolver_digest: &str,
+    supported_kinds: Vec<&'static str>,
+    resolver: Arc<dyn TargetResolver>,
+  ) -> Result<Self, ScheduleServiceError> {
+    bounded("resolver provider", provider)?;
+    bounded("resolver connector", connector)?;
+    bounded("resolver digest", resolver_digest)?;
+    if resolver_version == 0 || supported_kinds.is_empty() {
+      return Err(ScheduleServiceError::InvalidRequest(
+        "resolver registration must have a positive version and supported target kind".to_owned(),
+      ));
+    }
+    for kind in &supported_kinds {
+      if !matches!(
+        *kind,
+        "none" | "origin" | "channel" | "direct_message" | "thread"
+      ) {
+        return Err(ScheduleServiceError::InvalidRequest(
+          "resolver registration contains an unsupported target kind".to_owned(),
+        ));
+      }
+    }
+    let mut supported_kinds = supported_kinds;
+    supported_kinds.sort_unstable();
+    supported_kinds.dedup();
+    Ok(Self {
+      authority: TargetResolverAuthority {
+        provider: provider.to_owned(),
+        connector: connector.to_owned(),
+        resolver_version,
+        resolver_digest: resolver_digest.to_owned(),
+      },
+      supported_kinds,
+      resolver,
+    })
+  }
+}
+
+pub(crate) struct ResolvedTargetSet {
+  authority: TargetResolverAuthority,
+  snapshots: Vec<DeliveryTargetSnapshot>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DefaultTargetResolver;
 
 #[async_trait]
 impl TargetResolver for DefaultTargetResolver {
-  fn provider(&self) -> &'static str {
-    "none"
-  }
-
-  fn describe_supported_targets(&self, _invocation: &ScheduleInvocation) -> Vec<&'static str> {
-    vec!["none"]
-  }
-
   async fn resolve(
     &self,
     _invocation: &ScheduleInvocation,
@@ -84,7 +141,7 @@ impl TargetResolver for DefaultTargetResolver {
       "address": address,
     }))?;
     let target_id = format!("target_{}", &identity_digest[..32]);
-    let resolver_digest = digest_json(&json!({"resolver": "default", "version": 1}))?;
+    let resolver_digest = "default-none-v1";
     let snapshot = DeliveryTargetSnapshot::new(
       target_id,
       provider,
@@ -103,61 +160,70 @@ impl TargetResolver for DefaultTargetResolver {
 
 #[derive(Default)]
 pub struct TargetResolverRegistry {
-  resolvers: Vec<Arc<dyn TargetResolver>>,
+  registrations: Vec<TargetResolverRegistration>,
 }
 
 impl TargetResolverRegistry {
   #[must_use]
   pub fn with_defaults() -> Self {
     Self {
-      resolvers: vec![Arc::new(DefaultTargetResolver)],
+      registrations: vec![TargetResolverRegistration {
+        authority: TargetResolverAuthority {
+          provider: "none".to_owned(),
+          connector: "none".to_owned(),
+          resolver_version: SNAPSHOT_VERSION,
+          resolver_digest: "default-none-v1".to_owned(),
+        },
+        supported_kinds: vec!["none"],
+        resolver: Arc::new(DefaultTargetResolver),
+      }],
     }
   }
 
-  pub fn register(&mut self, resolver: Arc<dyn TargetResolver>) {
-    self.resolvers.push(resolver);
-  }
-}
-
-#[async_trait]
-impl TargetResolver for TargetResolverRegistry {
-  fn provider(&self) -> &'static str {
-    "registry"
+  pub fn register(&mut self, registration: TargetResolverRegistration) {
+    self.registrations.push(registration);
   }
 
-  fn describe_supported_targets(&self, invocation: &ScheduleInvocation) -> Vec<&'static str> {
+  #[must_use]
+  pub fn describe_supported_targets(&self, invocation: &ScheduleInvocation) -> Vec<&'static str> {
     let provider = match invocation.principal.as_ref() {
       InvocationPrincipalRef::ChannelActor { provider, .. } => provider,
       InvocationPrincipalRef::Service { .. } => return Vec::new(),
     };
     let mut kinds = self
-      .resolvers
+      .registrations
       .iter()
-      .filter(|resolver| resolver.provider() == "none" || resolver.provider() == provider)
-      .flat_map(|resolver| resolver.describe_supported_targets(invocation))
+      .filter(|registration| {
+        registration.authority.provider == "none" || registration.authority.provider == provider
+      })
+      .flat_map(|registration| registration.supported_kinds.iter().copied())
       .collect::<Vec<_>>();
     kinds.sort_unstable();
     kinds.dedup();
     kinds
   }
 
-  async fn resolve(
+  pub(crate) async fn resolve(
     &self,
     invocation: &ScheduleInvocation,
     owner: &PrincipalKey,
     target: &DeliveryTargetRequest,
-  ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
+  ) -> Result<ResolvedTargetSet, ScheduleServiceError> {
     let kind = target_kind(target);
-    let resolver = self.resolvers.iter().find(|resolver| {
-      (resolver.provider() == "none" || resolver.provider() == owner.provider())
-        && resolver
-          .describe_supported_targets(invocation)
-          .contains(&kind)
+    let registration = self.registrations.iter().find(|registration| {
+      (registration.authority.provider == "none"
+        || registration.authority.provider == owner.provider())
+        && registration.supported_kinds.contains(&kind)
     });
-    resolver
-      .ok_or(ScheduleServiceError::ResolverNotAllowed)?
+    let registration = registration.ok_or(ScheduleServiceError::ResolverNotAllowed)?;
+    let snapshots = registration
+      .resolver
       .resolve(invocation, owner, target)
-      .await
+      .await?;
+    Ok(ResolvedTargetSet {
+      authority: registration.authority.clone(),
+      snapshots,
+    })
   }
 }
 
@@ -186,6 +252,13 @@ pub trait ChannelTargetVerifier: Send + Sync {
     actor_id: &str,
     user_id: &str,
   ) -> Result<(), TargetVerificationError>;
+  async fn verify_thread(
+    &self,
+    workspace_id: &str,
+    actor_id: &str,
+    channel_id: &str,
+    thread_id: &str,
+  ) -> Result<(), TargetVerificationError>;
 }
 
 pub struct VerifiedSlackTargetResolver {
@@ -198,29 +271,27 @@ impl VerifiedSlackTargetResolver {
   pub const fn new(verifier: Arc<dyn ChannelTargetVerifier>, timeout: Duration) -> Self {
     Self { verifier, timeout }
   }
+
+  #[must_use]
+  pub fn registration(
+    verifier: Arc<dyn ChannelTargetVerifier>,
+    timeout: Duration,
+  ) -> TargetResolverRegistration {
+    TargetResolverRegistration {
+      authority: TargetResolverAuthority {
+        provider: "slack".to_owned(),
+        connector: SLACK_CONNECTOR.to_owned(),
+        resolver_version: SNAPSHOT_VERSION,
+        resolver_digest: SLACK_RESOLVER_DIGEST.to_owned(),
+      },
+      supported_kinds: vec!["origin", "channel", "direct_message", "thread"],
+      resolver: Arc::new(Self::new(verifier, timeout)),
+    }
+  }
 }
 
 #[async_trait]
 impl TargetResolver for VerifiedSlackTargetResolver {
-  fn provider(&self) -> &'static str {
-    "slack"
-  }
-
-  fn describe_supported_targets(&self, invocation: &ScheduleInvocation) -> Vec<&'static str> {
-    if matches!(
-      invocation.principal.as_ref(),
-      InvocationPrincipalRef::ChannelActor {
-        provider: "slack",
-        ..
-      }
-    ) && invocation.channel.is_some()
-    {
-      vec!["origin", "channel", "direct_message", "thread"]
-    } else {
-      Vec::new()
-    }
-  }
-
   async fn resolve(
     &self,
     invocation: &ScheduleInvocation,
@@ -258,7 +329,7 @@ impl TargetResolver for VerifiedSlackTargetResolver {
         .verify_connector(owner.tenant(), actor)
         .await?;
       match kind.as_str() {
-        "channel" | "thread" => {
+        "channel" => {
           self
             .verifier
             .verify_channel(
@@ -269,12 +340,26 @@ impl TargetResolver for VerifiedSlackTargetResolver {
             .await
         }
         "direct_message" => {
+          if address["user_id"].as_str() != Some(actor) {
+            return Err(TargetVerificationError::NotAllowed);
+          }
           self
             .verifier
             .verify_user(
               owner.tenant(),
               actor,
               address["user_id"].as_str().unwrap_or_default(),
+            )
+            .await
+        }
+        "thread" => {
+          self
+            .verifier
+            .verify_thread(
+              owner.tenant(),
+              actor,
+              address["channel_id"].as_str().unwrap_or_default(),
+              address["thread_id"].as_str().unwrap_or_default(),
             )
             .await
         }
@@ -293,10 +378,12 @@ impl TargetResolver for VerifiedSlackTargetResolver {
     }
     Ok(vec![build_target_snapshot(
       "slack",
-      "channel",
+      SLACK_CONNECTOR,
       owner.tenant(),
       &kind,
       address,
+      SNAPSHOT_VERSION,
+      SLACK_RESOLVER_DIGEST,
     )?])
   }
 }
@@ -346,13 +433,13 @@ pub(crate) fn validate_capability_snapshot(
   snapshot: CapabilityProfileSnapshot,
 ) -> Result<CapabilityProfileSnapshot, ScheduleServiceError> {
   if snapshot.schema_version() != SNAPSHOT_VERSION {
-    return Err(ScheduleServiceError::CapabilityUnavailable);
+    return Err(ScheduleServiceError::CapabilityInvalid);
   }
   let value = serde_json::from_str::<Value>(snapshot.canonical_json())
-    .map_err(|_| ScheduleServiceError::CapabilityUnavailable)?;
+    .map_err(|_| ScheduleServiceError::CapabilityInvalid)?;
   let object = value
     .as_object()
-    .ok_or(ScheduleServiceError::CapabilityUnavailable)?;
+    .ok_or(ScheduleServiceError::CapabilityInvalid)?;
   if object.len() != 2
     || object.get("name").and_then(Value::as_str) != Some(requested_name)
     || object
@@ -360,14 +447,14 @@ pub(crate) fn validate_capability_snapshot(
       .and_then(Value::as_array)
       .is_none_or(|tools| !tools.is_empty())
   {
-    return Err(ScheduleServiceError::CapabilityUnavailable);
+    return Err(ScheduleServiceError::CapabilityInvalid);
   }
   let digest = digest_json(&value)?;
   if snapshot.digest() != digest {
-    return Err(ScheduleServiceError::CapabilityUnavailable);
+    return Err(ScheduleServiceError::CapabilityInvalid);
   }
   CapabilityProfileSnapshot::new(SNAPSHOT_VERSION, digest, canonical_json(&value)?)
-    .map_err(|_| ScheduleServiceError::CapabilityUnavailable)
+    .map_err(|_| ScheduleServiceError::CapabilityInvalid)
 }
 
 pub(crate) fn scope_targets(
@@ -394,10 +481,15 @@ pub(crate) fn scope_targets(
 }
 
 pub(crate) fn validate_resolved_targets(
+  invocation: &ScheduleInvocation,
   owner: &PrincipalKey,
   requested: &DeliveryTargetRequest,
-  targets: Vec<DeliveryTargetSnapshot>,
+  resolved: ResolvedTargetSet,
 ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
+  let ResolvedTargetSet {
+    authority,
+    snapshots: targets,
+  } = resolved;
   if targets.is_empty() || targets.len() > 32 {
     return Err(ScheduleServiceError::InvalidRequest(
       "invalid resolved target count".to_owned(),
@@ -409,6 +501,7 @@ pub(crate) fn validate_resolved_targets(
       .validate()
       .map_err(|_| ScheduleServiceError::ResolverUnavailable)?;
     aggregate = aggregate.saturating_add(target.address_json().len());
+    let expected_address = expected_target_address(invocation, requested)?;
     let expected_provider = if matches!(requested, DeliveryTargetRequest::None) {
       "none"
     } else {
@@ -427,11 +520,14 @@ pub(crate) fn validate_resolved_targets(
       "provider": target.provider(), "connector": target.connector(), "tenant": target.tenant(),
       "kind": target.kind(), "address": address,
     }))?;
-    if target.provider() != expected_provider
+    if authority.provider != expected_provider
+      || target.provider() != authority.provider
+      || target.connector() != authority.connector
       || target.tenant() != owner.tenant()
       || !kind_matches
-      || target.resolver_version() == 0
-      || target.resolver_digest().is_empty()
+      || address != expected_address
+      || target.resolver_version() != authority.resolver_version
+      || target.resolver_digest() != authority.resolver_digest
       || target.identity_digest() != expected_identity
     {
       return Err(ScheduleServiceError::ResolverUnavailable);
@@ -443,6 +539,34 @@ pub(crate) fn validate_resolved_targets(
     ));
   }
   Ok(targets)
+}
+
+fn expected_target_address(
+  invocation: &ScheduleInvocation,
+  requested: &DeliveryTargetRequest,
+) -> Result<Value, ScheduleServiceError> {
+  match requested {
+    DeliveryTargetRequest::None => Ok(json!({})),
+    DeliveryTargetRequest::Origin => invocation
+      .channel
+      .as_ref()
+      .ok_or(ScheduleServiceError::ResolverNotAllowed)
+      .and_then(origin_address)
+      .map(|(_, address)| address),
+    DeliveryTargetRequest::Channel { channel_id } => {
+      Ok(json!({"channel_id": bounded("channel_id", channel_id)?}))
+    }
+    DeliveryTargetRequest::DirectMessage { user_id } => {
+      Ok(json!({"user_id": bounded("user_id", user_id)?}))
+    }
+    DeliveryTargetRequest::Thread {
+      channel_id,
+      thread_id,
+    } => Ok(json!({
+      "channel_id": bounded("channel_id", channel_id)?,
+      "thread_id": bounded("thread_id", thread_id)?,
+    })),
+  }
 }
 
 fn ensure_context_matches_owner(
@@ -495,6 +619,8 @@ fn build_target_snapshot(
   tenant: &str,
   kind: &str,
   address: Value,
+  resolver_version: u32,
+  resolver_digest: &str,
 ) -> Result<DeliveryTargetSnapshot, ScheduleServiceError> {
   let address_json = canonical_json(&address)?;
   let identity_digest = digest_json(&json!({
@@ -511,8 +637,8 @@ fn build_target_snapshot(
     tenant,
     kind,
     address_json,
-    SNAPSHOT_VERSION,
-    digest_json(&json!({"resolver": provider, "version": SNAPSHOT_VERSION}))?,
+    resolver_version,
+    resolver_digest,
     identity_digest,
   )
   .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))

@@ -4,13 +4,17 @@ use codeoff_agent_contract::{
 };
 use codeoff_runtime::schedule_service::ScheduleInvocation;
 use codeoff_runtime::schedule_service::{
-  CapabilityRegistry, CapabilityRequest, ChannelTargetVerifier, DefaultCapabilityRegistry,
-  DeliveryTargetRequest, OwnerOnlyAuthorizationPolicy, ScheduleService, ScheduleServiceError,
-  TargetResolver, TargetResolverRegistry, TargetVerificationError, VerifiedSlackTargetResolver,
+  CapabilityRegistry, CapabilityRequest, ChannelTargetVerifier, CreateScheduleRequest,
+  DefaultCapabilityRegistry, DeliveryTargetRequest, OwnerOnlyAuthorizationPolicy, ScheduleService,
+  ScheduleServiceError, TargetResolver, TargetResolverRegistration, TargetResolverRegistry,
+  TargetVerificationError, VerifiedSlackTargetResolver,
 };
-use codeoff_runtime::schedule_tools::ScheduleDynamicToolHandler;
-use codeoff_state::{CapabilityProfileSnapshot, DeliveryTargetSnapshot, PrincipalKey, StateStore};
+use codeoff_runtime::schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler};
+use codeoff_state::{
+  CapabilityProfileSnapshot, DeliveryTargetSnapshot, PrincipalKey, ScheduleSpec, StateStore,
+};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -29,33 +33,48 @@ struct InvocationCapabilityRegistry {
   malicious_digest: bool,
 }
 
-struct MaliciousTargetResolver;
+struct MaliciousTargetResolver {
+  address: Value,
+  connector: &'static str,
+  resolver_version: u32,
+  resolver_digest: &'static str,
+}
 
 #[async_trait]
 impl TargetResolver for MaliciousTargetResolver {
-  fn provider(&self) -> &'static str {
-    "slack"
-  }
-  fn describe_supported_targets(&self, _invocation: &ScheduleInvocation) -> Vec<&'static str> {
-    vec!["channel"]
-  }
   async fn resolve(
     &self,
     _invocation: &ScheduleInvocation,
     owner: &PrincipalKey,
     _target: &DeliveryTargetRequest,
   ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
+    let address_json = serde_json::to_string(&self.address)
+      .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?;
+    let identity = json!({
+      "provider": "slack",
+      "connector": self.connector,
+      "tenant": owner.tenant(),
+      "kind": "channel",
+      "address": self.address,
+    });
+    let mut digest = Sha256::new();
+    digest.update(
+      serde_json::to_string(&identity)
+        .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?
+        .as_bytes(),
+    );
+    let identity_digest = format!("{:x}", digest.finalize());
     Ok(vec![
       DeliveryTargetSnapshot::new(
         "evil",
         "slack",
-        "channel",
+        self.connector,
         owner.tenant(),
         "channel",
-        r#"{"channel_id":"C2"}"#,
-        1,
-        "resolver",
-        "forged-identity",
+        address_json,
+        self.resolver_version,
+        self.resolver_digest,
+        identity_digest,
       )
       .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?,
     ])
@@ -126,6 +145,15 @@ impl ChannelTargetVerifier for FakeVerifier {
   ) -> Result<(), TargetVerificationError> {
     Ok(())
   }
+  async fn verify_thread(
+    &self,
+    _workspace_id: &str,
+    _actor_id: &str,
+    _channel_id: &str,
+    _thread_id: &str,
+  ) -> Result<(), TargetVerificationError> {
+    Ok(())
+  }
 }
 
 fn verified_handler(
@@ -134,10 +162,10 @@ fn verified_handler(
   timeout: Duration,
 ) -> ScheduleDynamicToolHandler {
   let mut targets = TargetResolverRegistry::with_defaults();
-  targets.register(Arc::new(VerifiedSlackTargetResolver::new(
+  targets.register(VerifiedSlackTargetResolver::registration(
     Arc::new(FakeVerifier(mode)),
     timeout,
-  )));
+  ));
   ScheduleDynamicToolHandler::from_service(
     ScheduleService::with_components(
       store,
@@ -193,15 +221,28 @@ fn create_arguments(request_id: &str) -> Value {
 
 fn output_content(output: &Value) -> Value {
   assert_eq!(output["success"], true, "unexpected tool failure: {output}");
+  let envelope: Value = serde_json::from_str(
+    output["contentItems"][0]["text"]
+      .as_str()
+      .expect("content text"),
+  )
+  .expect("JSON content");
+  assert_eq!(envelope["schema_version"], 1);
+  assert_eq!(envelope["ok"], true);
+  envelope["data"].clone()
+}
+
+fn tool_envelope(output: &Value) -> Value {
   serde_json::from_str(
     output["contentItems"][0]["text"]
       .as_str()
       .expect("content text"),
   )
-  .expect("JSON content")
+  .expect("versioned JSON envelope")
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_schedule_tools_owner_lifecycle_idempotency_and_restart() {
   let temp = tempdir().expect("tempdir");
   let state_dir = temp.path().join("state");
@@ -212,20 +253,18 @@ async fn test_schedule_tools_owner_lifecycle_idempotency_and_restart() {
   let handler = ScheduleDynamicToolHandler::new_with_now(store, 100);
   let owner = invocation("U1");
 
-  let created = output_content(
-    &handler
-      .handle_tool_call_async(&owner, "schedule_create", create_arguments("create-1"))
-      .await,
-  );
+  let created_output = handler
+    .handle_tool_call_async(&owner, "schedule_create", create_arguments("create-1"))
+    .await;
+  let created_envelope = tool_envelope(&created_output);
+  let created = output_content(&created_output);
   let job_id = created["job_id"].as_str().expect("job id").to_owned();
   assert_eq!(created["generation"], 0);
 
-  let replay = output_content(
-    &handler
-      .handle_tool_call_async(&owner, "schedule_create", create_arguments("create-1"))
-      .await,
-  );
-  assert_eq!(replay, created);
+  let replay_output = handler
+    .handle_tool_call_async(&owner, "schedule_create", create_arguments("create-1"))
+    .await;
+  assert_eq!(tool_envelope(&replay_output), created_envelope);
 
   let mut conflict = create_arguments("create-1");
   conflict["instruction"] = json!("Different intent");
@@ -241,6 +280,15 @@ async fn test_schedule_tools_owner_lifecycle_idempotency_and_restart() {
   assert!(audit.iter().any(|entry| entry.outcome == "applied"));
   assert!(audit.iter().any(|entry| entry.outcome == "replay"));
   assert!(audit.iter().any(|entry| entry.outcome == "conflict"));
+  assert_eq!(audit.len(), 3, "one audit event is required per attempt");
+  assert_eq!(
+    audit
+      .iter()
+      .map(|entry| entry.audit_id.as_str())
+      .collect::<std::collections::HashSet<_>>()
+      .len(),
+    3
+  );
 
   let other_read = handler
     .handle_tool_call_async(&invocation("U2"), "schedule_get", json!({"job_id": job_id}))
@@ -269,6 +317,16 @@ async fn test_schedule_tools_owner_lifecycle_idempotency_and_restart() {
     .await;
   assert_eq!(stale["success"], false);
   assert!(stale.to_string().contains("generation"));
+  let stale_audit = audit_store
+    .list_schedule_audit_summaries("pause-stale")
+    .await
+    .expect("stale audit");
+  assert_eq!(stale_audit.len(), 1);
+  assert_eq!(stale_audit[0].outcome, "stale_generation");
+  assert_eq!(
+    stale_audit[0].error_code.as_deref(),
+    Some("stale_generation")
+  );
 
   let updated = output_content(
     &handler
@@ -362,6 +420,10 @@ async fn test_schedule_tools_deny_untrusted_sources_and_unknown_fields() {
     .handle_tool_call_async(&scheduled, "schedule_create", create_arguments("create-1"))
     .await;
   assert_eq!(denied["success"], false);
+  let denied_again = handler
+    .handle_tool_call_async(&scheduled, "schedule_create", create_arguments("create-1"))
+    .await;
+  assert_eq!(denied_again["success"], false);
   let audit = audit_store
     .list_schedule_audit_summaries("create-1")
     .await
@@ -371,6 +433,8 @@ async fn test_schedule_tools_deny_untrusted_sources_and_unknown_fields() {
       && entry.decision == "deny"
       && entry.error_code.as_deref() == Some("unauthorized")
   }));
+  assert_eq!(audit.len(), 2, "each denied attempt needs one unique event");
+  assert_ne!(audit[0].audit_id, audit[1].audit_id);
 
   let mut mixed_actor = invocation("U1");
   mixed_actor.channel.as_mut().expect("context").user_id = Some("U2".to_owned());
@@ -429,7 +493,50 @@ async fn test_schedule_tools_deny_untrusted_sources_and_unknown_fields() {
     .list_schedule_audit_summaries("create-4")
     .await
     .expect("audit");
-  assert!(audit.iter().any(|entry| entry.outcome == "capability"));
+  assert!(
+    audit
+      .iter()
+      .any(|entry| entry.outcome == "capability_unavailable")
+  );
+}
+
+#[tokio::test]
+async fn test_direct_schedule_service_call_records_exactly_one_attempt_audit() {
+  let temp = tempdir().expect("tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("state");
+  let audit_store = store.clone();
+  let service = ScheduleService::new(store);
+  let mut scheduled = invocation("U1");
+  scheduled.source = InvocationSource::ScheduledRun {
+    job_id: "job-1".to_owned(),
+    run_id: "run-1".to_owned(),
+    scheduled_for: "200".to_owned(),
+  };
+
+  let error = service
+    .create(
+      &scheduled,
+      CreateScheduleRequest {
+        request_id: "direct-service".to_owned(),
+        instruction: "Direct service audit.".to_owned(),
+        schedule: ScheduleSpec::once(200),
+        target: DeliveryTargetRequest::None,
+        capability: "none".to_owned(),
+        now: 100,
+      },
+    )
+    .await
+    .expect_err("scheduled principal must be rejected");
+  assert_eq!(error.code(), "unauthorized");
+  let audit = audit_store
+    .list_schedule_audit_summaries("direct-service")
+    .await
+    .expect("direct audit");
+  assert_eq!(audit.len(), 1);
+  assert_eq!(audit[0].outcome, "denied");
+  assert_eq!(audit[0].decision, "deny");
 }
 
 #[tokio::test]
@@ -459,8 +566,26 @@ async fn test_verified_resolver_fails_closed_for_unavailable_not_allowed_and_tim
       .list_schedule_audit_summaries(&format!("resolver-{index}"))
       .await
       .expect("audit");
-    assert!(audit.iter().any(|entry| entry.outcome == "resolver"));
+    assert!(audit.iter().any(|entry| entry.outcome == code));
   }
+}
+
+#[tokio::test]
+async fn test_verified_slack_resolver_rejects_direct_message_to_another_user() {
+  let temp = tempdir().expect("tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("state");
+  let handler = verified_handler(store, VerifyMode::Allow, Duration::from_millis(50));
+  let mut arguments = create_arguments("dm-other-user");
+  arguments["target"] = json!({"kind": "direct_message", "user_id": "U2"});
+
+  let output = handler
+    .handle_tool_call_async(&invocation("U1"), "schedule_create", arguments)
+    .await;
+
+  assert_eq!(output["success"], false);
+  assert!(output.to_string().contains("resolver_not_allowed"));
 }
 
 #[tokio::test]
@@ -469,6 +594,7 @@ async fn test_capability_registry_is_invocation_scoped_and_revalidates_snapshots
   let store = StateStore::initialize(&temp.path().join("state"), None)
     .await
     .expect("state");
+  let audit_store = store.clone();
   let service = ScheduleService::with_components(
     store,
     Arc::new(TargetResolverRegistry::with_defaults()),
@@ -497,32 +623,81 @@ async fn test_capability_registry_is_invocation_scoped_and_revalidates_snapshots
       create_arguments("malicious-capability"),
     )
     .await;
-  assert!(output.to_string().contains("capability_unavailable"));
+  assert!(output.to_string().contains("capability_invalid"));
+  let audit = audit_store
+    .list_schedule_audit_summaries("malicious-capability")
+    .await
+    .expect("capability audit");
+  assert_eq!(audit.len(), 1);
+  assert_eq!(audit[0].outcome, "capability_invalid");
+  assert_eq!(audit[0].error_code.as_deref(), Some("capability_invalid"));
 }
 
 #[tokio::test]
-async fn test_service_rejects_malicious_resolver_snapshot_before_state_transaction() {
-  let temp = tempdir().expect("tempdir");
-  let store = StateStore::initialize(&temp.path().join("state"), None)
-    .await
-    .expect("state");
-  let service = ScheduleService::with_components(
-    store,
-    Arc::new(MaliciousTargetResolver),
-    Arc::new(DefaultCapabilityRegistry),
-    Arc::new(OwnerOnlyAuthorizationPolicy),
-    Duration::from_millis(50),
-  );
-  let handler = ScheduleDynamicToolHandler::from_service(service, Some(100));
-  let mut arguments = create_arguments("malicious-target");
-  arguments["target"] = json!({"kind": "channel", "channel_id": "C2"});
-  let output = handler
-    .handle_tool_call_async(&invocation("U1"), "schedule_create", arguments)
-    .await;
-  assert!(
-    output.to_string().contains("resolver_unavailable"),
-    "{output}"
-  );
+async fn test_service_rejects_resolver_snapshots_not_bound_to_registration_and_request() {
+  for (index, resolver) in [
+    MaliciousTargetResolver {
+      address: json!({"channel_id": "C3"}),
+      connector: "trusted-connector",
+      resolver_version: 7,
+      resolver_digest: "trusted-digest",
+    },
+    MaliciousTargetResolver {
+      address: json!({"channel_id": "C2"}),
+      connector: "wrong-connector",
+      resolver_version: 7,
+      resolver_digest: "trusted-digest",
+    },
+    MaliciousTargetResolver {
+      address: json!({"channel_id": "C2"}),
+      connector: "trusted-connector",
+      resolver_version: 8,
+      resolver_digest: "trusted-digest",
+    },
+    MaliciousTargetResolver {
+      address: json!({"channel_id": "C2"}),
+      connector: "trusted-connector",
+      resolver_version: 7,
+      resolver_digest: "wrong-digest",
+    },
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let temp = tempdir().expect("tempdir");
+    let store = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    let mut targets = TargetResolverRegistry::with_defaults();
+    targets.register(
+      TargetResolverRegistration::new(
+        "slack",
+        "trusted-connector",
+        7,
+        "trusted-digest",
+        vec!["channel"],
+        Arc::new(resolver),
+      )
+      .expect("trusted registration"),
+    );
+    let service = ScheduleService::with_components(
+      store,
+      Arc::new(targets),
+      Arc::new(DefaultCapabilityRegistry),
+      Arc::new(OwnerOnlyAuthorizationPolicy),
+      Duration::from_millis(50),
+    );
+    let handler = ScheduleDynamicToolHandler::from_service(service, Some(100));
+    let mut arguments = create_arguments(&format!("malicious-target-{index}"));
+    arguments["target"] = json!({"kind": "channel", "channel_id": "C2"});
+    let output = handler
+      .handle_tool_call_async(&invocation("U1"), "schedule_create", arguments)
+      .await;
+    assert!(
+      output.to_string().contains("resolver_unavailable"),
+      "case {index}: {output}"
+    );
+  }
 }
 
 #[tokio::test]
@@ -570,7 +745,7 @@ async fn test_schedule_tools_resolve_supported_target_variants_to_durable_snapsh
   let targets = [
     json!({"kind": "none"}),
     json!({"kind": "channel", "channel_id": "C2"}),
-    json!({"kind": "direct_message", "user_id": "U2"}),
+    json!({"kind": "direct_message", "user_id": "U1"}),
     json!({"kind": "thread", "channel_id": "C2", "thread_id": "T2"}),
     json!({"kind": "channel", "channel_id": "C2"}),
   ];
@@ -643,4 +818,82 @@ fn test_schedule_tool_schema_without_trusted_context_fails_closed() {
     create_arguments("no-context"),
   ));
   assert!(output.to_string().contains("unauthorized"));
+}
+
+#[tokio::test]
+async fn test_all_schedule_tools_use_the_versioned_success_and_error_contract() {
+  let temp = tempdir().expect("tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("state");
+  let handler = ScheduleDynamicToolHandler::new_with_now(store, 100);
+  let owner = invocation("U1");
+  let created_output = handler
+    .handle_tool_call_async(
+      &owner,
+      "schedule_create",
+      create_arguments("contract-create"),
+    )
+    .await;
+  let created = output_content(&created_output);
+  let job_id = created["job_id"].as_str().expect("job id");
+  assert_eq!(created["next_run_at"], 200);
+  assert_eq!(created["targets"]["count"], 1);
+
+  let success_calls = [
+    ("schedule_get", json!({"job_id": job_id})),
+    ("schedule_list", json!({"status": "active"})),
+    (
+      "schedule_update",
+      json!({
+        "request_id": "contract-update", "job_id": job_id, "expected_generation": 0,
+        "instruction": "Updated contract.", "schedule": {"kind": "once", "at": 300},
+        "target": {"kind": "none"}, "capability": "none"
+      }),
+    ),
+    (
+      "schedule_pause",
+      json!({"request_id": "contract-pause", "job_id": job_id, "expected_generation": 1}),
+    ),
+    (
+      "schedule_resume",
+      json!({"request_id": "contract-resume", "job_id": job_id, "expected_generation": 2}),
+    ),
+    (
+      "schedule_delete",
+      json!({"request_id": "contract-delete", "job_id": job_id, "expected_generation": 3}),
+    ),
+  ];
+  for (tool, arguments) in success_calls {
+    let output = handler
+      .handle_tool_call_async(&owner, tool, arguments)
+      .await;
+    assert_eq!(output["success"], true, "{tool}: {output}");
+    let envelope = tool_envelope(&output);
+    assert_eq!(envelope["schema_version"], 1, "{tool}");
+    assert_eq!(envelope["ok"], true, "{tool}");
+    assert!(envelope.get("data").is_some(), "{tool}");
+    if matches!(
+      tool,
+      "schedule_update" | "schedule_pause" | "schedule_resume" | "schedule_delete"
+    ) {
+      assert!(envelope["data"].get("next_run_at").is_some(), "{tool}");
+      assert_eq!(envelope["data"]["targets"]["count"], 1, "{tool}");
+    }
+  }
+
+  for tool in SCHEDULE_DYNAMIC_TOOL_NAMES {
+    let output = handler
+      .handle_tool_call_async(&owner, tool, json!({"unexpected": true}))
+      .await;
+    assert_eq!(output["success"], false, "{tool}: {output}");
+    let envelope = tool_envelope(&output);
+    assert_eq!(envelope["schema_version"], 1, "{tool}");
+    assert_eq!(envelope["ok"], false, "{tool}");
+    assert_eq!(envelope["error"]["schema_version"], 1, "{tool}");
+    assert_eq!(envelope["error"]["code"], "validation_failed", "{tool}");
+    assert!(envelope["error"]["retryable"].is_boolean(), "{tool}");
+    assert!(envelope["error"]["message"].is_string(), "{tool}");
+    assert!(envelope["error"]["details"].is_object(), "{tool}");
+  }
 }

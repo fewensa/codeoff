@@ -28,7 +28,24 @@ create table schedule_mutation_audit (
     or (length(principal_kind) > 0 and length(principal_provider) > 0 and length(principal_tenant) > 0 and length(principal_subject) > 0)),
   check (operation in ('create', 'get', 'list', 'update', 'pause', 'resume', 'delete')),
   check (length(request_id) between 1 and 255),
-  check (outcome in ('applied', 'replay', 'conflict', 'in_progress', 'denied', 'validation', 'resolver', 'capability', 'storage')),
+  check (outcome in (
+    'applied',
+    'replay',
+    'conflict',
+    'in_progress',
+    'denied',
+    'not_visible',
+    'validation',
+    'resolver_unavailable',
+    'resolver_not_allowed',
+    'resolver_timeout',
+    'capability_unavailable',
+    'capability_invalid',
+    'stale_generation',
+    'expired_not_resumable',
+    'storage_busy',
+    'storage_internal'
+  )),
   check (decision in ('allow', 'deny', 'error')),
   check (latency_ms >= 0 and length(correlation_id) between 1 and 255)
 );

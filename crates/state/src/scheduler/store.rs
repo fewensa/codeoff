@@ -147,7 +147,7 @@ impl StateStore {
   ) -> Result<Vec<ScheduleAuditSummary>, StateError> {
     validate_text("audit correlation id", correlation_id).map_err(invalid_value)?;
     let rows = sqlx::query(
-      "select outcome, decision, error_code, idempotency_outcome from schedule_mutation_audit where correlation_id = ?1 order by audit_id",
+      "select audit_id, operation, outcome, decision, reason, error_code, idempotency_outcome from schedule_mutation_audit where correlation_id = ?1 order by audit_id",
     )
     .bind(correlation_id)
     .fetch_all(&self.pool)
@@ -157,8 +157,11 @@ impl StateStore {
       .into_iter()
       .map(|row| {
         Ok(ScheduleAuditSummary {
+          audit_id: row.try_get("audit_id").map_err(scheduler_error)?,
+          operation: row.try_get("operation").map_err(scheduler_error)?,
           outcome: row.try_get("outcome").map_err(scheduler_error)?,
           decision: row.try_get("decision").map_err(scheduler_error)?,
+          reason: row.try_get("reason").map_err(scheduler_error)?,
           error_code: row.try_get("error_code").map_err(scheduler_error)?,
           idempotency_outcome: row
             .try_get("idempotency_outcome")
@@ -181,6 +184,60 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     row.map(|row| scheduled_job_from_row(&row)).transpose()
+  }
+
+  /// Reads the ordered durable delivery target snapshots for one scheduled job.
+  ///
+  /// # Errors
+  /// Returns an error when persisted target state is invalid or `SQLite` cannot execute the query.
+  pub async fn get_scheduled_job_delivery_targets(
+    &self,
+    job_id: &str,
+  ) -> Result<Vec<DeliveryTargetSnapshot>, StateError> {
+    validate_text("job id", job_id).map_err(invalid_value)?;
+    let rows = sqlx::query(
+      "select target_id, provider, connector, tenant, kind, address_json, resolver_version, resolver_digest, identity_digest from scheduled_job_delivery_targets where job_id = ?1 order by ordinal",
+    )
+    .bind(job_id)
+    .fetch_all(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    rows
+      .into_iter()
+      .map(|row| {
+        let resolver_version = positive_u32(
+          row
+            .try_get::<i64, _>("resolver_version")
+            .map_err(scheduler_error)?,
+        )?;
+        DeliveryTargetSnapshot::new(
+          row
+            .try_get::<String, _>("target_id")
+            .map_err(scheduler_error)?,
+          row
+            .try_get::<String, _>("provider")
+            .map_err(scheduler_error)?,
+          row
+            .try_get::<String, _>("connector")
+            .map_err(scheduler_error)?,
+          row
+            .try_get::<String, _>("tenant")
+            .map_err(scheduler_error)?,
+          row.try_get::<String, _>("kind").map_err(scheduler_error)?,
+          row
+            .try_get::<String, _>("address_json")
+            .map_err(scheduler_error)?,
+          resolver_version,
+          row
+            .try_get::<String, _>("resolver_digest")
+            .map_err(scheduler_error)?,
+          row
+            .try_get::<String, _>("identity_digest")
+            .map_err(scheduler_error)?,
+        )
+        .map_err(invalid_value)
+      })
+      .collect()
   }
 
   /// Lists one stable cursor page of jobs owned by the complete principal key and status.
@@ -1060,10 +1117,17 @@ fn validate_schedule_audit(audit: &ScheduleMutationAudit) -> Result<(), StateErr
         | "conflict"
         | "in_progress"
         | "denied"
+        | "not_visible"
         | "validation"
-        | "resolver"
-        | "capability"
-        | "storage"
+        | "resolver_unavailable"
+        | "resolver_not_allowed"
+        | "resolver_timeout"
+        | "capability_unavailable"
+        | "capability_invalid"
+        | "stale_generation"
+        | "expired_not_resumable"
+        | "storage_busy"
+        | "storage_internal"
     )
   {
     return Err(StateError::InvalidSchedulerState {
@@ -1078,7 +1142,7 @@ async fn insert_mutation_audit(
   audit: &ScheduleMutationAudit,
 ) -> Result<(), StateError> {
   sqlx::query(
-    "insert into schedule_mutation_audit (audit_id, principal_kind, principal_provider, principal_tenant, principal_subject, operation, job_id, request_id, outcome, decision, reason, error_code, old_generation, new_generation, resolver_provider, target_kind, resolver_version, resolver_digest, capability_version, capability_digest, idempotency_outcome, latency_ms, correlation_id, occurred_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) on conflict(audit_id) do nothing",
+    "insert into schedule_mutation_audit (audit_id, principal_kind, principal_provider, principal_tenant, principal_subject, operation, job_id, request_id, outcome, decision, reason, error_code, old_generation, new_generation, resolver_provider, target_kind, resolver_version, resolver_digest, capability_version, capability_digest, idempotency_outcome, latency_ms, correlation_id, occurred_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
   )
   .bind(&audit.audit_id)
   .bind(audit.principal.as_ref().map(PrincipalKey::kind))

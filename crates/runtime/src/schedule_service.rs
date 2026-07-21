@@ -5,11 +5,14 @@ use std::time::Duration;
 use codeoff_state::{
   CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, PrincipalKey,
   ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledJob,
-  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
-  StateError, StateStore, TransactionalMutationOutcome, UpdateScheduledJob,
+  ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, StateError, StateStore,
+  TransactionalMutationOutcome, UpdateScheduledJob,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+
+use crate::schedule_audit::ScheduleAuditAttempt;
+use crate::schedule_contract::{error_envelope, success_envelope};
 
 const DIGEST_ALGORITHM: &str = "sha256-canonical-json-v1";
 pub(crate) const SNAPSHOT_VERSION: u32 = 1;
@@ -19,11 +22,11 @@ pub use crate::schedule_authorization::{
 };
 pub use crate::schedule_resolution::{
   CapabilityRegistry, CapabilityRequest, ChannelTargetVerifier, DefaultCapabilityRegistry,
-  DefaultTargetResolver, DeliveryTargetRequest, TargetResolver, TargetResolverRegistry,
-  TargetVerificationError, VerifiedSlackTargetResolver,
+  DefaultTargetResolver, DeliveryTargetRequest, TargetResolver, TargetResolverRegistration,
+  TargetResolverRegistry, TargetVerificationError, VerifiedSlackTargetResolver,
 };
 use crate::schedule_resolution::{
-  scope_targets, validate_capability_snapshot, validate_resolved_targets,
+  ResolvedTargetSet, scope_targets, validate_capability_snapshot, validate_resolved_targets,
 };
 
 #[derive(Debug)]
@@ -35,6 +38,7 @@ pub enum ScheduleServiceError {
   ResolverNotAllowed,
   ResolverTimeout,
   CapabilityUnavailable,
+  CapabilityInvalid,
   IdempotencyInProgress,
   IdempotencyConflict,
   State(StateError),
@@ -53,6 +57,7 @@ impl fmt::Display for ScheduleServiceError {
       Self::ResolverNotAllowed => write!(formatter, "target is not allowed"),
       Self::ResolverTimeout => write!(formatter, "target resolver timed out"),
       Self::CapabilityUnavailable => write!(formatter, "capability is unavailable"),
+      Self::CapabilityInvalid => write!(formatter, "capability snapshot is invalid"),
       Self::IdempotencyInProgress => write!(formatter, "schedule request is already in progress"),
       Self::IdempotencyConflict => {
         write!(formatter, "request id was reused with different semantics")
@@ -93,6 +98,7 @@ impl ScheduleServiceError {
       Self::ResolverNotAllowed => "resolver_not_allowed",
       Self::ResolverTimeout => "resolver_timeout",
       Self::CapabilityUnavailable => "capability_unavailable",
+      Self::CapabilityInvalid => "capability_invalid",
       Self::IdempotencyInProgress => "idempotency_in_progress",
       Self::IdempotencyConflict => "idempotency_conflict",
       Self::State(StateError::SchedulerGenerationConflict) => "stale_generation",
@@ -113,12 +119,7 @@ impl ScheduleServiceError {
 
   #[must_use]
   pub fn structured_json(&self) -> Value {
-    json!({
-      "code": self.code(),
-      "retryable": self.retryable(),
-      "message": self.to_string(),
-      "details": {},
-    })
+    error_envelope(self.code(), self.retryable(), &self.to_string(), json!({}))
   }
 }
 
@@ -152,10 +153,18 @@ pub struct LifecycleScheduleRequest {
   pub now: i64,
 }
 
+struct PreparedMutation {
+  mutation: ScheduledJobMutation,
+  owner: PrincipalKey,
+  request_id: String,
+  request_digest: String,
+  response: Value,
+}
+
 #[derive(Clone)]
 pub struct ScheduleService {
   state: StateStore,
-  target_resolver: Arc<dyn TargetResolver>,
+  target_resolver: Arc<TargetResolverRegistry>,
   capability_registry: Arc<dyn CapabilityRegistry>,
   authorization: Arc<dyn AuthorizationPolicy>,
   resolver_timeout: Duration,
@@ -178,7 +187,7 @@ impl ScheduleService {
   #[must_use]
   pub fn with_components(
     state: StateStore,
-    target_resolver: Arc<dyn TargetResolver>,
+    target_resolver: Arc<TargetResolverRegistry>,
     capability_registry: Arc<dyn CapabilityRegistry>,
     authorization: Arc<dyn AuthorizationPolicy>,
     resolver_timeout: Duration,
@@ -208,57 +217,24 @@ impl ScheduleService {
     Ok(self.capability_registry.describe_authorized(invocation))
   }
 
-  pub async fn record_error_audit(
+  pub async fn reject_invalid_attempt(
     &self,
     invocation: &ScheduleInvocation,
-    operation: &str,
+    operation: &'static str,
     request_id: Option<&str>,
     job_id: Option<&str>,
-    error: &ScheduleServiceError,
+    error: ScheduleServiceError,
     now: i64,
-  ) {
-    let outcome = match error.code() {
-      "unauthorized" | "not_found_or_not_visible" => "denied",
-      "validation_failed" => "validation",
-      "resolver_unavailable" | "resolver_not_allowed" | "resolver_timeout" => "resolver",
-      "capability_unavailable" => "capability",
-      _ => "storage",
-    };
-    let correlation_id = request_id
-      .filter(|value| !value.is_empty() && value.len() <= 255)
-      .unwrap_or("uncorrelated");
-    let principal = invocation.canonical_actor().ok();
-    let audit = ScheduleMutationAudit {
-      audit_id: format!(
-        "audit_error_{}",
-        &digest_json(&json!({
-          "principal": principal.as_ref().map(principal_json), "operation": operation,
-          "correlation_id": correlation_id, "job_id": job_id, "code": error.code(),
-        }))
-        .unwrap_or_else(|_| "invalid".to_owned())[..32]
-      ),
-      principal,
-      operation: operation.to_owned(),
-      job_id: job_id.map(ToOwned::to_owned),
-      request_id: correlation_id.to_owned(),
-      outcome: outcome.to_owned(),
-      decision: if outcome == "denied" { "deny" } else { "error" }.to_owned(),
-      reason: Some(error.code().to_owned()),
-      error_code: Some(error.code().to_owned()),
-      old_generation: None,
-      new_generation: None,
-      resolver_provider: None,
-      target_kind: None,
-      resolver_version: None,
-      resolver_digest: None,
-      capability_version: None,
-      capability_digest: None,
-      idempotency_outcome: None,
-      latency_ms: 0,
-      correlation_id: correlation_id.to_owned(),
-      occurred_at: now,
-    };
-    let _ = self.state.append_schedule_audit(&audit).await;
+  ) -> ScheduleServiceError {
+    let attempt = ScheduleAuditAttempt::new(invocation, operation, request_id, job_id, now);
+    match self
+      .state
+      .append_schedule_audit(&attempt.error_record(&error))
+      .await
+    {
+      Ok(()) => error,
+      Err(state_error) => ScheduleServiceError::State(state_error),
+    }
   }
 
   pub async fn create(
@@ -266,6 +242,24 @@ impl ScheduleService {
     invocation: &ScheduleInvocation,
     request: CreateScheduleRequest,
   ) -> Result<Value, ScheduleServiceError> {
+    let attempt = ScheduleAuditAttempt::new(
+      invocation,
+      "create",
+      Some(&request.request_id),
+      None,
+      request.now,
+    );
+    match self.prepare_create(invocation, request).await {
+      Ok(prepared) => self.apply_mutation(prepared, &attempt).await,
+      Err(error) => self.finish_error_attempt(&attempt, error).await,
+    }
+  }
+
+  async fn prepare_create(
+    &self,
+    invocation: &ScheduleInvocation,
+    request: CreateScheduleRequest,
+  ) -> Result<PreparedMutation, ScheduleServiceError> {
     validate_request_id(&request.request_id)?;
     validate_instruction(&request.instruction)?;
     let owner = self.authorization.authorize_create(invocation)?;
@@ -280,6 +274,7 @@ impl ScheduleService {
     let targets = scope_targets(
       &job_id,
       validate_resolved_targets(
+        invocation,
         &owner,
         &request.target,
         self
@@ -297,8 +292,17 @@ impl ScheduleService {
       None,
       None,
     )?;
-    let request_digest = digest_json(&semantic)?;
-    let response = json!({"job_id": job_id, "status": "active", "generation": 0});
+    let next_run_at = request
+      .schedule
+      .first_after_create(request.now)
+      .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?;
+    let response = success_envelope(json!({
+      "job_id": job_id,
+      "status": "active",
+      "generation": 0,
+      "next_run_at": next_run_at,
+      "targets": target_summary(&targets),
+    }));
     let mutation = ScheduledJobMutation::Create(Box::new(CreateScheduledJob {
       job_id: job_id.clone(),
       schedule_id: format!("schedule_{job_id}"),
@@ -310,23 +314,37 @@ impl ScheduleService {
       schedule: request.schedule,
       now: request.now,
     }));
-    self
-      .apply_mutation(
-        mutation,
-        owner,
-        request.request_id,
-        request_digest,
-        response,
-        request.now,
-      )
-      .await
+    Ok(PreparedMutation {
+      mutation,
+      owner,
+      request_id: request.request_id,
+      request_digest: digest_json(&semantic)?,
+      response,
+    })
   }
-
   pub async fn update(
     &self,
     invocation: &ScheduleInvocation,
     request: UpdateScheduleRequest,
   ) -> Result<Value, ScheduleServiceError> {
+    let attempt = ScheduleAuditAttempt::new(
+      invocation,
+      "update",
+      Some(&request.request_id),
+      Some(&request.job_id),
+      request.now,
+    );
+    match self.prepare_update(invocation, request).await {
+      Ok(prepared) => self.apply_mutation(prepared, &attempt).await,
+      Err(error) => self.finish_error_attempt(&attempt, error).await,
+    }
+  }
+
+  async fn prepare_update(
+    &self,
+    invocation: &ScheduleInvocation,
+    request: UpdateScheduleRequest,
+  ) -> Result<PreparedMutation, ScheduleServiceError> {
     validate_request_id(&request.request_id)?;
     validate_instruction(&request.instruction)?;
     let (owner, current) = self.authorize_job(invocation, &request.job_id).await?;
@@ -334,6 +352,7 @@ impl ScheduleService {
     let targets = scope_targets(
       &request.job_id,
       validate_resolved_targets(
+        invocation,
         &owner,
         &request.target,
         self
@@ -351,11 +370,23 @@ impl ScheduleService {
       Some(&request.job_id),
       Some(request.expected_generation),
     )?;
-    let response = json!({
+    let next_run_at = if current.status == ScheduledJobStatus::Active {
+      Some(
+        request
+          .schedule
+          .first_after_create(request.now)
+          .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?,
+      )
+    } else {
+      None
+    };
+    let response = success_envelope(json!({
       "job_id": request.job_id,
       "status": current.status.as_str(),
       "generation": next_generation(request.expected_generation)?,
-    });
+      "next_run_at": next_run_at,
+      "targets": target_summary(&targets),
+    }));
     let mutation = ScheduledJobMutation::Update(Box::new(UpdateScheduledJob {
       job_id: request.job_id,
       expected_generation: request.expected_generation,
@@ -365,18 +396,14 @@ impl ScheduleService {
       schedule: request.schedule,
       now: request.now,
     }));
-    self
-      .apply_mutation(
-        mutation,
-        owner,
-        request.request_id,
-        digest_json(&semantic)?,
-        response,
-        request.now,
-      )
-      .await
+    Ok(PreparedMutation {
+      mutation,
+      owner,
+      request_id: request.request_id,
+      request_digest: digest_json(&semantic)?,
+      response,
+    })
   }
-
   pub async fn pause(
     &self,
     invocation: &ScheduleInvocation,
@@ -405,9 +432,19 @@ impl ScheduleService {
     &self,
     invocation: &ScheduleInvocation,
     job_id: &str,
+    now: i64,
   ) -> Result<Value, ScheduleServiceError> {
-    let (_, job) = self.authorize_job(invocation, job_id).await?;
-    job_json(&job)
+    let attempt = ScheduleAuditAttempt::new(invocation, "get", Some(job_id), Some(job_id), now);
+    let result = async {
+      let (_, job) = self.authorize_job(invocation, job_id).await?;
+      let targets = self
+        .state
+        .get_scheduled_job_delivery_targets(job_id)
+        .await?;
+      Ok(success_envelope(job_json(&job, &targets)?))
+    }
+    .await;
+    self.finish_read_attempt(&attempt, result).await
   }
 
   pub async fn list(
@@ -416,13 +453,22 @@ impl ScheduleService {
     status: ScheduledJobStatus,
     cursor: Option<&str>,
     limit: u32,
-  ) -> Result<ScheduledJobListPage, ScheduleServiceError> {
-    let owner = self.authorization.authorize_create(invocation)?;
-    self
-      .state
-      .list_scheduled_jobs_by_owner(&owner, status, cursor, limit)
-      .await
-      .map_err(Into::into)
+    now: i64,
+  ) -> Result<Value, ScheduleServiceError> {
+    let attempt = ScheduleAuditAttempt::new(invocation, "list", Some("list"), None, now);
+    let result = async {
+      let owner = self.authorization.authorize_create(invocation)?;
+      let page = self
+        .state
+        .list_scheduled_jobs_by_owner(&owner, status, cursor, limit)
+        .await?;
+      Ok(success_envelope(json!({
+        "job_ids": page.job_ids,
+        "next_cursor": page.next_cursor,
+      })))
+    }
+    .await;
+    self.finish_read_attempt(&attempt, result).await
   }
 
   async fn lifecycle(
@@ -431,25 +477,59 @@ impl ScheduleService {
     request: LifecycleScheduleRequest,
     operation: &'static str,
   ) -> Result<Value, ScheduleServiceError> {
+    let attempt = ScheduleAuditAttempt::new(
+      invocation,
+      operation,
+      Some(&request.request_id),
+      Some(&request.job_id),
+      request.now,
+    );
+    match self.prepare_lifecycle(invocation, request, operation).await {
+      Ok(prepared) => self.apply_mutation(prepared, &attempt).await,
+      Err(error) => self.finish_error_attempt(&attempt, error).await,
+    }
+  }
+
+  async fn prepare_lifecycle(
+    &self,
+    invocation: &ScheduleInvocation,
+    request: LifecycleScheduleRequest,
+    operation: &'static str,
+  ) -> Result<PreparedMutation, ScheduleServiceError> {
     validate_request_id(&request.request_id)?;
-    let (owner, _) = self.authorize_job(invocation, &request.job_id).await?;
+    let (owner, current) = self.authorize_job(invocation, &request.job_id).await?;
+    let targets = self
+      .state
+      .get_scheduled_job_delivery_targets(&request.job_id)
+      .await?;
     let semantic = json!({
       "operation": operation,
       "owner": principal_json(&owner),
       "job_id": request.job_id,
       "expected_generation": request.expected_generation,
     });
-    let status = match operation {
-      "pause" => "paused",
-      "resume" => "active",
-      "delete" => "deleted",
+    let (status, next_run_at) = match operation {
+      "pause" => ("paused", None),
+      "resume" => (
+        "active",
+        Some(current.schedule.next_after(request.now).map_err(|error| {
+          if matches!(current.schedule, ScheduleSpec::Once { .. }) {
+            ScheduleServiceError::State(StateError::ScheduledOnceExpired)
+          } else {
+            ScheduleServiceError::InvalidRequest(error.to_string())
+          }
+        })?),
+      ),
+      "delete" => ("deleted", None),
       _ => unreachable!("bounded lifecycle operation"),
     };
-    let response = json!({
+    let response = success_envelope(json!({
       "job_id": request.job_id,
       "status": status,
       "generation": next_generation(request.expected_generation)?,
-    });
+      "next_run_at": next_run_at,
+      "targets": target_summary(&targets),
+    }));
     let mutation = match operation {
       "pause" => ScheduledJobMutation::Pause {
         job_id: request.job_id,
@@ -468,16 +548,13 @@ impl ScheduleService {
       },
       _ => unreachable!("bounded lifecycle operation"),
     };
-    self
-      .apply_mutation(
-        mutation,
-        owner,
-        request.request_id,
-        digest_json(&semantic)?,
-        response,
-        request.now,
-      )
-      .await
+    Ok(PreparedMutation {
+      mutation,
+      owner,
+      request_id: request.request_id,
+      request_digest: digest_json(&semantic)?,
+      response,
+    })
   }
 
   async fn authorize_job(
@@ -502,13 +579,19 @@ impl ScheduleService {
     {
       return Err(ScheduleServiceError::CapabilityUnavailable);
     }
-    let snapshot = self.capability_registry.resolve(
-      invocation,
-      owner,
-      &CapabilityRequest {
-        name: name.to_owned(),
-      },
-    )?;
+    let snapshot = self
+      .capability_registry
+      .resolve(
+        invocation,
+        owner,
+        &CapabilityRequest {
+          name: name.to_owned(),
+        },
+      )
+      .map_err(|error| match error {
+        ScheduleServiceError::CapabilityUnavailable => error,
+        _ => ScheduleServiceError::CapabilityInvalid,
+      })?;
     validate_capability_snapshot(name, snapshot)
   }
 
@@ -517,7 +600,7 @@ impl ScheduleService {
     invocation: &ScheduleInvocation,
     owner: &PrincipalKey,
     target: &DeliveryTargetRequest,
-  ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
+  ) -> Result<ResolvedTargetSet, ScheduleServiceError> {
     tokio::time::timeout(
       self.resolver_timeout,
       self.target_resolver.resolve(invocation, owner, target),
@@ -528,14 +611,20 @@ impl ScheduleService {
 
   async fn apply_mutation(
     &self,
-    mutation: ScheduledJobMutation,
-    owner: PrincipalKey,
-    request_id: String,
-    request_digest: String,
-    response: Value,
-    now: i64,
+    prepared: PreparedMutation,
+    attempt: &ScheduleAuditAttempt,
   ) -> Result<Value, ScheduleServiceError> {
-    let response_json = canonical_json(&response)?;
+    let PreparedMutation {
+      mutation,
+      owner,
+      request_id,
+      request_digest,
+      response,
+    } = prepared;
+    let response_json = match canonical_json(&response) {
+      Ok(response) => response,
+      Err(error) => return self.finish_error_attempt(attempt, error).await,
+    };
     let operation = mutation_operation(&mutation);
     let job_id = mutation_job_id(&mutation).to_owned();
     let (old_generation, new_generation) = mutation_generations(&mutation);
@@ -547,36 +636,21 @@ impl ScheduleService {
       capability_version,
       capability_digest,
     ) = mutation_audit_snapshots(&mutation);
-    let audit = ScheduleMutationAudit {
-      audit_id: format!(
-        "audit_{}",
-        &digest_json(&json!({
-          "principal": principal_json(&owner),
-          "operation": operation,
-          "request_id": request_id,
-        }))?[..32]
-      ),
-      principal: Some(owner.clone()),
-      operation: operation.to_owned(),
-      job_id: Some(job_id),
-      request_id: request_id.clone(),
-      outcome: "applied".to_owned(),
-      decision: "allow".to_owned(),
-      reason: None,
-      error_code: None,
-      old_generation,
-      new_generation,
-      resolver_provider,
-      target_kind,
-      resolver_version,
-      resolver_digest,
-      capability_version,
-      capability_digest,
-      idempotency_outcome: Some("applied".to_owned()),
-      latency_ms: 0,
-      correlation_id: request_id.clone(),
-      occurred_at: now,
-    };
+    let mut audit = attempt.record("applied", "allow", None);
+    audit.principal = Some(owner.clone());
+    audit.operation = operation.to_owned();
+    audit.job_id = Some(job_id);
+    audit.request_id.clone_from(&request_id);
+    audit.correlation_id.clone_from(&request_id);
+    audit.old_generation = old_generation;
+    audit.new_generation = new_generation;
+    audit.resolver_provider = resolver_provider;
+    audit.target_kind = target_kind;
+    audit.resolver_version = resolver_version;
+    audit.resolver_digest = resolver_digest;
+    audit.capability_version = capability_version;
+    audit.capability_digest = capability_digest;
+    audit.idempotency_outcome = Some("applied".to_owned());
     let idempotency = ScheduleMutationIdempotency {
       principal: owner,
       request_id,
@@ -590,11 +664,9 @@ impl ScheduleService {
       .await;
     match outcome {
       Err(error) => {
-        let service_error = ScheduleServiceError::State(error);
-        let mut failed = audit_for_outcome(&audit, "storage", "error", Some(service_error.code()));
-        failed.idempotency_outcome = None;
-        let _ = self.state.append_schedule_audit(&failed).await;
-        Err(service_error)
+        self
+          .finish_error_attempt(attempt, ScheduleServiceError::State(error))
+          .await
       }
       Ok(TransactionalMutationOutcome::Applied(response)) => serde_json::from_str(&response)
         .map_err(|error| {
@@ -603,28 +675,68 @@ impl ScheduleService {
           })
         }),
       Ok(TransactionalMutationOutcome::Replay(response)) => {
-        let replay = audit_for_outcome(&audit, "replay", "allow", None);
-        let _ = self.state.append_schedule_audit(&replay).await;
-        serde_json::from_str(&response).map_err(|_| {
-          ScheduleServiceError::InvalidRequest("invalid persisted response".to_owned())
-        })
+        let response = match serde_json::from_str(&response) {
+          Ok(response) => response,
+          Err(error) => {
+            return self
+              .finish_error_attempt(
+                attempt,
+                ScheduleServiceError::State(StateError::InvalidSchedulerState {
+                  reason: format!("invalid persisted schedule response: {error}"),
+                }),
+              )
+              .await;
+          }
+        };
+        let mut replay = attempt.record("replay", "allow", None);
+        replay.idempotency_outcome = Some("replay".to_owned());
+        self.append_attempt(replay).await?;
+        Ok(response)
       }
       Ok(TransactionalMutationOutcome::InProgress) => {
-        let pending = audit_for_outcome(
-          &audit,
-          "in_progress",
-          "error",
-          Some("idempotency_in_progress"),
-        );
-        let _ = self.state.append_schedule_audit(&pending).await;
-        Err(ScheduleServiceError::IdempotencyInProgress)
+        self
+          .finish_error_attempt(attempt, ScheduleServiceError::IdempotencyInProgress)
+          .await
       }
       Ok(TransactionalMutationOutcome::Conflict) => {
-        let conflict = audit_for_outcome(&audit, "conflict", "deny", Some("idempotency_conflict"));
-        let _ = self.state.append_schedule_audit(&conflict).await;
-        Err(ScheduleServiceError::IdempotencyConflict)
+        self
+          .finish_error_attempt(attempt, ScheduleServiceError::IdempotencyConflict)
+          .await
       }
     }
+  }
+
+  async fn finish_read_attempt(
+    &self,
+    attempt: &ScheduleAuditAttempt,
+    result: Result<Value, ScheduleServiceError>,
+  ) -> Result<Value, ScheduleServiceError> {
+    match result {
+      Ok(value) => {
+        self
+          .append_attempt(attempt.record("applied", "allow", None))
+          .await?;
+        Ok(value)
+      }
+      Err(error) => self.finish_error_attempt(attempt, error).await,
+    }
+  }
+
+  async fn finish_error_attempt(
+    &self,
+    attempt: &ScheduleAuditAttempt,
+    error: ScheduleServiceError,
+  ) -> Result<Value, ScheduleServiceError> {
+    self.append_attempt(attempt.error_record(&error)).await?;
+    Err(error)
+  }
+
+  async fn append_attempt(&self, audit: ScheduleMutationAudit) -> Result<(), ScheduleServiceError> {
+    self
+      .state
+      .append_schedule_audit(&audit)
+      .await
+      .map_err(Into::into)
   }
 }
 
@@ -802,22 +914,23 @@ fn mutation_audit_snapshots(mutation: &ScheduledJobMutation) -> MutationAuditSna
   )
 }
 
-fn audit_for_outcome(
-  audit: &ScheduleMutationAudit,
-  outcome: &str,
-  decision: &str,
-  error_code: Option<&str>,
-) -> ScheduleMutationAudit {
-  let mut derived = audit.clone();
-  derived.audit_id = format!("{}-{outcome}", audit.audit_id);
-  outcome.clone_into(&mut derived.outcome);
-  decision.clone_into(&mut derived.decision);
-  derived.error_code = error_code.map(ToOwned::to_owned);
-  derived.idempotency_outcome = Some(outcome.to_owned());
-  derived
+fn target_summary(targets: &[DeliveryTargetSnapshot]) -> Value {
+  json!({
+    "count": targets.len(),
+    "items": targets.iter().map(|target| json!({
+      "provider": target.provider(),
+      "kind": target.kind(),
+      "resolver_version": target.resolver_version(),
+      "resolver_digest": target.resolver_digest(),
+      "identity_digest": target.identity_digest(),
+    })).collect::<Vec<_>>(),
+  })
 }
 
-fn job_json(job: &ScheduledJob) -> Result<Value, ScheduleServiceError> {
+fn job_json(
+  job: &ScheduledJob,
+  targets: &[DeliveryTargetSnapshot],
+) -> Result<Value, ScheduleServiceError> {
   Ok(json!({
     "job_id": job.job_id,
     "status": job.status.as_str(),
@@ -825,6 +938,7 @@ fn job_json(job: &ScheduledJob) -> Result<Value, ScheduleServiceError> {
     "definition": serde_json::from_str::<Value>(job.definition.canonical_json()).map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?,
     "schedule": schedule_json(&job.schedule),
     "next_run_at": job.next_run_at,
+    "targets": target_summary(targets),
     "capability": serde_json::from_str::<Value>(job.capability.canonical_json()).map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?,
   }))
 }
@@ -857,49 +971,5 @@ fn canonicalize(value: &Value) -> Value {
     }
     Value::Array(values) => Value::Array(values.iter().map(canonicalize).collect()),
     _ => value.clone(),
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::{ScheduleMutationAudit, audit_for_outcome};
-
-  #[test]
-  fn test_in_progress_audit_uses_stable_sanitized_outcome() {
-    let base = ScheduleMutationAudit {
-      audit_id: "audit".to_owned(),
-      principal: None,
-      operation: "create".to_owned(),
-      job_id: Some("job".to_owned()),
-      request_id: "request".to_owned(),
-      outcome: "applied".to_owned(),
-      decision: "allow".to_owned(),
-      reason: None,
-      error_code: None,
-      old_generation: None,
-      new_generation: Some(0),
-      resolver_provider: None,
-      target_kind: None,
-      resolver_version: None,
-      resolver_digest: None,
-      capability_version: None,
-      capability_digest: None,
-      idempotency_outcome: Some("applied".to_owned()),
-      latency_ms: 0,
-      correlation_id: "request".to_owned(),
-      occurred_at: 1,
-    };
-
-    let audit = audit_for_outcome(
-      &base,
-      "in_progress",
-      "error",
-      Some("idempotency_in_progress"),
-    );
-
-    assert_eq!(audit.outcome, "in_progress");
-    assert_eq!(audit.decision, "error");
-    assert_eq!(audit.error_code.as_deref(), Some("idempotency_in_progress"));
-    assert_eq!(audit.idempotency_outcome.as_deref(), Some("in_progress"));
   }
 }

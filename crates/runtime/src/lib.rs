@@ -10,7 +10,9 @@
 )]
 
 pub mod channel_tools;
+mod schedule_audit;
 mod schedule_authorization;
+mod schedule_contract;
 mod schedule_resolution;
 pub mod schedule_service;
 pub mod schedule_tools;

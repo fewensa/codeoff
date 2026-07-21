@@ -179,6 +179,98 @@ async fn channel_resolve_accepts_hash_prefixed_names() {
   assert_eq!(channel.channel_id, "C1");
 }
 
+#[tokio::test]
+async fn actor_channel_membership_follows_pagination_and_matches_exact_actor() {
+  let connector = client(FakeHttpClient::with_responses(vec![
+    response(
+      200,
+      r#"{"ok":true,"members":["U2"],"response_metadata":{"next_cursor":"page-2"}}"#,
+    ),
+    response(
+      200,
+      r#"{"ok":true,"members":["U1"],"response_metadata":{"next_cursor":""}}"#,
+    ),
+  ]));
+
+  assert!(
+    connector
+      .actor_is_channel_member("U1", "C1")
+      .await
+      .expect("membership")
+  );
+  let requests = connector.http_client().requests.lock().expect("requests");
+  assert_eq!(requests.len(), 2);
+  assert_eq!(requests[0].path(), "conversations.members");
+  assert_eq!(requests[0].query_value("channel"), Some("C1"));
+  assert_eq!(requests[1].query_value("cursor"), Some("page-2"));
+}
+
+#[tokio::test]
+async fn bot_visible_private_channel_does_not_authorize_non_member_actor() {
+  let connector = client(FakeHttpClient::with_responses(vec![
+    response(
+      200,
+      r#"{"ok":true,"channel":{"id":"G1","name":"private","is_private":true}}"#,
+    ),
+    response(
+      200,
+      r#"{"ok":true,"members":["UBOT"],"response_metadata":{"next_cursor":""}}"#,
+    ),
+  ]));
+
+  assert!(
+    connector
+      .get_channel("G1")
+      .await
+      .expect("bot-visible")
+      .is_private
+  );
+  assert!(
+    !connector
+      .actor_is_channel_member("U1", "G1")
+      .await
+      .expect("membership")
+  );
+}
+
+#[tokio::test]
+async fn actor_membership_repeated_cursor_fails_closed() {
+  let connector = client(FakeHttpClient::with_responses(vec![
+    response(
+      200,
+      r#"{"ok":true,"members":["U2"],"response_metadata":{"next_cursor":"same"}}"#,
+    ),
+    response(
+      200,
+      r#"{"ok":true,"members":["U2"],"response_metadata":{"next_cursor":"same"}}"#,
+    ),
+  ]));
+
+  assert!(connector.actor_is_channel_member("U1", "G1").await.is_err());
+}
+
+#[tokio::test]
+async fn thread_parent_check_requires_exact_parent_timestamp() {
+  for (body, expected) in [
+    (r#"{"ok":true,"messages":[{"ts":"100.1"}]}"#, true),
+    (r#"{"ok":true,"messages":[{"ts":"100.2"}]}"#, false),
+    (r#"{"ok":true,"messages":[]}"#, false),
+  ] {
+    let connector = client(FakeHttpClient::with_responses(vec![response(200, body)]));
+    assert_eq!(
+      connector
+        .thread_parent_exists("C1", "100.1")
+        .await
+        .expect("thread check"),
+      expected
+    );
+    let requests = connector.http_client().requests.lock().expect("requests");
+    assert_eq!(requests[0].path(), "conversations.replies");
+    assert_eq!(requests[0].query_value("ts"), Some("100.1"));
+    assert_eq!(requests[0].query_value("limit"), Some("1"));
+  }
+}
+
 #[test]
 fn configured_senders_include_bot_and_user_tokens_without_secret_values() {
   let mut user_tokens = BTreeMap::new();

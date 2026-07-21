@@ -34,6 +34,7 @@ const RESOURCE_THREAD_REPLY_LIMIT: usize = 50;
 const RESOURCE_TEXT_MAX_BYTES: u64 = 1_048_576;
 const RESOURCE_TEXT_MAX_CHARS: usize = 1_048_576;
 const RESOURCE_DOWNLOAD_MAX_BYTES: u64 = 25 * 1_024 * 1_024;
+const MEMBERSHIP_PAGE_LIMIT: usize = 1_000;
 
 /// An async HTTP boundary for Slack Web API calls.
 #[async_trait]
@@ -785,6 +786,77 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
     Ok(self.to_channel_address(&channel))
   }
 
+  /// Proves that a Slack actor belongs to a target conversation.
+  ///
+  /// The membership cursor is followed to exhaustion with a hard page bound. Missing, repeated,
+  /// partial, or rejected pagination fails closed.
+  ///
+  /// # Errors
+  /// Returns an error when Slack rejects the request, returns invalid pagination, or is unavailable.
+  pub async fn actor_is_channel_member(
+    &self,
+    actor_id: &str,
+    channel_id: &str,
+  ) -> Result<bool, SlackWebApiError> {
+    let mut cursor: Option<String> = None;
+    for _ in 0..MEMBERSHIP_PAGE_LIMIT {
+      let mut query = vec![("channel".to_owned(), channel_id.to_owned())];
+      if let Some(value) = cursor.as_ref() {
+        query.push(("cursor".to_owned(), value.clone()));
+      }
+      let response = self.request("conversations.members", query).await?;
+      let page = self.parse_conversation_members_response(&response)?;
+      if page.members.iter().any(|member| member == actor_id) {
+        return Ok(true);
+      }
+      let next = page
+        .response_metadata
+        .next_cursor
+        .filter(|value| !value.is_empty());
+      if next.is_none() {
+        return Ok(false);
+      }
+      if next == cursor {
+        return Err(SlackWebApiError::InvalidResponse {
+          message: "conversations.members returned a repeated cursor".to_owned(),
+        });
+      }
+      cursor = next;
+    }
+    Err(SlackWebApiError::InvalidResponse {
+      message: "conversations.members exceeded the pagination bound".to_owned(),
+    })
+  }
+
+  /// Proves that the requested Slack thread parent exists in the target conversation.
+  ///
+  /// # Errors
+  /// Returns an error when Slack rejects the request or returns an invalid response.
+  pub async fn thread_parent_exists(
+    &self,
+    channel_id: &str,
+    thread_id: &str,
+  ) -> Result<bool, SlackWebApiError> {
+    let response = self
+      .request(
+        "conversations.replies",
+        vec![
+          ("channel".to_owned(), channel_id.to_owned()),
+          ("ts".to_owned(), thread_id.to_owned()),
+          ("limit".to_owned(), "1".to_owned()),
+        ],
+      )
+      .await?;
+    let parsed = self.parse_api_response(&response)?;
+    Ok(
+      parsed
+        .messages
+        .first()
+        .and_then(|message| message.ts.as_deref())
+        == Some(thread_id),
+    )
+  }
+
   /// Resolves a Slack channel id or name into one unambiguous conversation.
   ///
   /// # Errors
@@ -958,6 +1030,25 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
     response: &SlackHttpResponse,
   ) -> Result<SlackApiResponse, SlackWebApiError> {
     let parsed: SlackApiResponse =
+      serde_json::from_str(&response.body).map_err(|source| SlackWebApiError::InvalidResponse {
+        message: self.redact(&source.to_string()),
+      })?;
+    if parsed.ok {
+      Ok(parsed)
+    } else if parsed.error.as_deref().is_some_and(is_unavailable_error) {
+      Err(SlackWebApiError::Unavailable)
+    } else {
+      Err(SlackWebApiError::Provider {
+        message: self.redact(parsed.error.as_deref().unwrap_or("unknown error")),
+      })
+    }
+  }
+
+  fn parse_conversation_members_response(
+    &self,
+    response: &SlackHttpResponse,
+  ) -> Result<SlackConversationMembersResponse, SlackWebApiError> {
+    let parsed: SlackConversationMembersResponse =
       serde_json::from_str(&response.body).map_err(|source| SlackWebApiError::InvalidResponse {
         message: self.redact(&source.to_string()),
       })?;
@@ -1770,6 +1861,17 @@ struct SlackApiResponse {
   message: Option<SlackPostedResponseMessage>,
   #[serde(default)]
   file: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackConversationMembersResponse {
+  ok: bool,
+  #[serde(default)]
+  error: Option<String>,
+  #[serde(default)]
+  members: Vec<String>,
+  #[serde(default)]
+  response_metadata: ResponseMetadata,
 }
 
 #[derive(Debug, Deserialize)]

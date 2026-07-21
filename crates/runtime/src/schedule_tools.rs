@@ -19,6 +19,23 @@ pub const SCHEDULE_DYNAMIC_TOOL_NAMES: &[&str] = &[
   "schedule_delete",
 ];
 
+enum ScheduleToolCallError {
+  Input(ScheduleServiceError),
+  Service(ScheduleServiceError),
+}
+
+impl From<String> for ScheduleToolCallError {
+  fn from(reason: String) -> Self {
+    Self::Input(ScheduleServiceError::InvalidRequest(reason))
+  }
+}
+
+impl From<&str> for ScheduleToolCallError {
+  fn from(reason: &str) -> Self {
+    Self::Input(ScheduleServiceError::InvalidRequest(reason.to_owned()))
+  }
+}
+
 #[derive(Clone)]
 pub struct ScheduleDynamicToolHandler {
   service: ScheduleService,
@@ -118,26 +135,27 @@ impl ScheduleDynamicToolHandler {
       "schedule_pause" => self.lifecycle(invocation, arguments, "pause").await,
       "schedule_resume" => self.lifecycle(invocation, arguments, "resume").await,
       "schedule_delete" => self.lifecycle(invocation, arguments, "delete").await,
-      _ => Err(ScheduleServiceError::InvalidRequest(format!(
-        "unsupported dynamic tool: {tool}"
-      ))),
+      _ => Err(ScheduleToolCallError::Input(
+        ScheduleServiceError::InvalidRequest(format!("unsupported dynamic tool: {tool}")),
+      )),
     };
     match result {
       Ok(content) => success(content),
-      Err(error) => {
-        self
+      Err(ScheduleToolCallError::Input(error)) => {
+        let error = self
           .service
-          .record_error_audit(
+          .reject_invalid_attempt(
             invocation,
-            tool.strip_prefix("schedule_").unwrap_or("list"),
+            schedule_operation(tool),
             request_id.as_deref(),
             job_id.as_deref(),
-            &error,
+            error,
             self.now(),
           )
           .await;
         failure(error.structured_json())
       }
+      Err(ScheduleToolCallError::Service(error)) => failure(error.structured_json()),
     }
   }
 
@@ -145,7 +163,7 @@ impl ScheduleDynamicToolHandler {
     &self,
     invocation: &ScheduleInvocation,
     arguments: Value,
-  ) -> Result<Value, ScheduleServiceError> {
+  ) -> Result<Value, ScheduleToolCallError> {
     let object = object(arguments)?;
     reject_unknown(
       &object,
@@ -171,13 +189,14 @@ impl ScheduleDynamicToolHandler {
         },
       )
       .await
+      .map_err(ScheduleToolCallError::Service)
   }
 
   async fn update(
     &self,
     invocation: &ScheduleInvocation,
     arguments: Value,
-  ) -> Result<Value, ScheduleServiceError> {
+  ) -> Result<Value, ScheduleToolCallError> {
     let object = object(arguments)?;
     reject_unknown(
       &object,
@@ -207,26 +226,28 @@ impl ScheduleDynamicToolHandler {
         },
       )
       .await
+      .map_err(ScheduleToolCallError::Service)
   }
 
   async fn get(
     &self,
     invocation: &ScheduleInvocation,
     arguments: Value,
-  ) -> Result<Value, ScheduleServiceError> {
+  ) -> Result<Value, ScheduleToolCallError> {
     let object = object(arguments)?;
     reject_unknown(&object, &["job_id"])?;
     self
       .service
-      .get(invocation, &string(&object, "job_id")?)
+      .get(invocation, &string(&object, "job_id")?, self.now())
       .await
+      .map_err(ScheduleToolCallError::Service)
   }
 
   async fn list(
     &self,
     invocation: &ScheduleInvocation,
     arguments: Value,
-  ) -> Result<Value, ScheduleServiceError> {
+  ) -> Result<Value, ScheduleToolCallError> {
     let object = object(arguments)?;
     reject_unknown(&object, &["status", "cursor", "limit"])?;
     let status = match optional_string(&object, "status")?
@@ -238,9 +259,7 @@ impl ScheduleDynamicToolHandler {
       "completed" => ScheduledJobStatus::Completed,
       "deleted" => ScheduledJobStatus::Deleted,
       value => {
-        return Err(ScheduleServiceError::InvalidRequest(format!(
-          "invalid status: {value}"
-        )));
+        return Err(format!("invalid status: {value}").into());
       }
     };
     let cursor = optional_string(&object, "cursor")?;
@@ -250,11 +269,11 @@ impl ScheduleDynamicToolHandler {
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| "limit must be an unsigned integer".to_owned())
     })?;
-    let page = self
+    self
       .service
-      .list(invocation, status, cursor.as_deref(), limit)
-      .await?;
-    Ok(json!({"job_ids": page.job_ids, "next_cursor": page.next_cursor}))
+      .list(invocation, status, cursor.as_deref(), limit, self.now())
+      .await
+      .map_err(ScheduleToolCallError::Service)
   }
 
   async fn lifecycle(
@@ -262,7 +281,7 @@ impl ScheduleDynamicToolHandler {
     invocation: &ScheduleInvocation,
     arguments: Value,
     operation: &str,
-  ) -> Result<Value, ScheduleServiceError> {
+  ) -> Result<Value, ScheduleToolCallError> {
     let object = object(arguments)?;
     reject_unknown(&object, &["request_id", "job_id", "expected_generation"])?;
     let request = LifecycleScheduleRequest {
@@ -277,6 +296,7 @@ impl ScheduleDynamicToolHandler {
       "delete" => self.service.delete(invocation, request).await,
       _ => unreachable!("bounded lifecycle operation"),
     }
+    .map_err(ScheduleToolCallError::Service)
   }
 
   fn now(&self) -> i64 {
@@ -294,6 +314,18 @@ impl ScheduleDynamicToolHandler {
 
 fn tool_spec(name: &str, description: &str, input_schema: Value) -> Value {
   json!({"name": name, "description": description, "inputSchema": input_schema})
+}
+
+fn schedule_operation(tool: &str) -> &'static str {
+  match tool {
+    "schedule_create" => "create",
+    "schedule_get" => "get",
+    "schedule_update" => "update",
+    "schedule_pause" => "pause",
+    "schedule_resume" => "resume",
+    "schedule_delete" => "delete",
+    _ => "list",
+  }
 }
 
 fn create_schema(targets: &[&str], capabilities: &[&str]) -> Value {

@@ -1,6 +1,6 @@
 //! Fail-closed Codex execution boundary for scheduled tasks.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
@@ -10,6 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Mutex;
 #[cfg(unix)]
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 #[cfg(unix)]
@@ -41,11 +42,38 @@ pub const GITHUB_MCP_ARTIFACT_SHA256_ARM64: &str =
 const GITHUB_MCP_NAME: &str = "github";
 const GITHUB_MCP_SERVER_INFO_NAME: &str = "github-mcp-server";
 const OUTPUT_SCHEMA_REVISION: &str = "scheduled-result-v1";
+const OUTPUT_SCHEMA_VERSION: u64 = 1;
 const CREDENTIAL_DENY_POLICY_REVISION: &str = "scheduled-credential-isolation-v1";
 const NEGATIVE_TEST_REVISION: &str = "scheduled-secret-falsifier-v1";
 const MAX_FAILURE_BYTES: usize = 2 * 1024;
 const MAX_FINAL_RESPONSE_BYTES: usize = 64 * 1024;
-const MAX_ISOLATION_EVIDENCE_AGE: Duration = Duration::from_mins(5);
+const MAX_FINAL_SUMMARY_BYTES: usize = 32 * 1024;
+const MAX_FINAL_ITEM_COUNT: usize = 16;
+const MAX_ITEM_ID_BYTES: usize = 256;
+const MAX_INSTRUCTION_BYTES: usize = 64 * 1024;
+#[cfg_attr(
+  not(test),
+  allow(dead_code, reason = "reserved for the issue 09 deployment verifier")
+)]
+const MAX_JSONL_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_OUTPUT_SCHEMA_BYTES: usize = 4 * 1024;
+const MAX_OUTPUT_SCHEMA_DEPTH: usize = 6;
+const MAX_RUN_TIMEOUT: Duration = Duration::from_hours(6);
+const MAX_INTERRUPT_GRACE: Duration = Duration::from_secs(30);
+const MAX_TERMINATE_GRACE: Duration = Duration::from_secs(30);
+const MAX_KILL_GRACE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const TEST_PERMIT_TTL: Duration = Duration::from_secs(30);
+#[cfg_attr(
+  not(test),
+  allow(dead_code, reason = "reserved for the issue 09 deployment verifier")
+)]
+const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+#[cfg_attr(
+  not(test),
+  allow(dead_code, reason = "reserved for the issue 09 deployment verifier")
+)]
+const CHILD_LOCALE: &str = "C.UTF-8";
 const EXPECTED_GITHUB_TOOLS: [&str; 4] =
   ["issue_read", "list_issues", "search_issues", "search_orgs"];
 
@@ -62,7 +90,6 @@ pub struct RequestedCapabilityProfile {
   pub permission_policy_revision: String,
   pub config_revision: String,
   pub config_sha256: String,
-  pub non_secret_env: BTreeMap<String, String>,
 }
 
 impl RequestedCapabilityProfile {
@@ -125,32 +152,8 @@ impl RequestedCapabilityProfile {
     if self.config_sha256 != actual_config_hash {
       return Err(preflight("scheduled_config_digest_mismatch"));
     }
-    for (key, value) in &self.non_secret_env {
-      validate_non_secret_env(key, value)?;
-    }
     Ok(())
   }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CredentialIsolationEvidence {
-  pub endpoint_identity: String,
-  pub github_mcp_artifact_sha256: String,
-  pub credential_reference: String,
-  pub permission_policy_revision: String,
-  pub isolation_revision: String,
-  pub negative_test_revision: String,
-  pub verified_at_unix_seconds: u64,
-  pub app_server_has_no_credentials: IsolationCheck,
-  pub parent_and_sibling_environ_denied: IsolationCheck,
-  pub secret_mounts_denied: IsolationCheck,
-  pub endpoint_holds_credential_out_of_process: IsolationCheck,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IsolationCheck {
-  Verified,
-  Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,18 +162,22 @@ pub struct ScheduledRuntimeEvidence {
   pub app_server_schema_sha256: String,
   pub codex_program_sha256: String,
   pub config_sha256: String,
-  pub credential_isolation: CredentialIsolationEvidence,
 }
 
 #[derive(Debug, Clone)]
 pub struct ScheduledCodexRequest {
   pub task: AgentTask,
   pub profile: RequestedCapabilityProfile,
-  pub output_schema: Value,
   pub timeout: Duration,
   pub interrupt_grace: Duration,
   pub terminate_grace: Duration,
   pub kill_grace: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledFinalOutput {
+  pub schema_version: u64,
+  pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,7 +211,7 @@ pub struct ScheduledUsage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduledExecutionResult {
   Completed {
-    final_response: Option<String>,
+    output: ScheduledFinalOutput,
     thread_id: String,
     turn_id: String,
     usage: ScheduledUsage,
@@ -290,7 +297,8 @@ pub trait ScheduledJsonlTransport: JsonlTransport {
   /// Returns an error when the process group cannot be signaled.
   fn kill_process_group(&mut self) -> Result<(), String>;
 
-  /// Reaps the process leader without waiting past `deadline`.
+  /// Reaps the process leader and waits for the entire owned process group to disappear without
+  /// waiting past `deadline`.
   ///
   /// # Errors
   ///
@@ -299,6 +307,10 @@ pub trait ScheduledJsonlTransport: JsonlTransport {
 }
 
 #[cfg(unix)]
+#[cfg_attr(
+  not(test),
+  allow(dead_code, reason = "reserved for the issue 09 deployment verifier")
+)]
 enum ReaderEvent {
   Message(Value),
   Error(String),
@@ -307,11 +319,14 @@ enum ReaderEvent {
 
 /// Direct, process-group-owned stdio transport for scheduled Codex App Server runs.
 ///
-/// The runtime evidence is produced by the caller's startup verifier. This constructor independently
-/// re-hashes the executable and dedicated config before spawning, but deliberately does not invent
-/// version, schema, or credential-isolation evidence that the child protocol cannot observe.
+/// This crate-private transport independently re-hashes the executable and dedicated config before
+/// spawning. It cannot be used as a public bypass around the disabled production executor.
 #[cfg(unix)]
-pub struct StdioScheduledJsonlTransport {
+#[cfg_attr(
+  not(test),
+  allow(dead_code, reason = "reserved for the issue 09 deployment verifier")
+)]
+pub(crate) struct StdioScheduledJsonlTransport {
   child: Child,
   stdin: Option<ChildStdin>,
   reader: Option<JoinHandle<()>>,
@@ -321,6 +336,10 @@ pub struct StdioScheduledJsonlTransport {
 }
 
 #[cfg(unix)]
+#[cfg_attr(
+  not(test),
+  allow(dead_code, reason = "reserved for the issue 09 deployment verifier")
+)]
 impl StdioScheduledJsonlTransport {
   /// Starts the pinned Codex App Server directly, with a clean allowlisted environment and its own
   /// process group.
@@ -329,7 +348,7 @@ impl StdioScheduledJsonlTransport {
   ///
   /// Returns an error before spawn when executable/config digests drift, an environment key looks
   /// secret-bearing, or the process and stdio cannot be established.
-  pub fn spawn(
+  pub(crate) fn spawn(
     profile: &RequestedCapabilityProfile,
     runtime_evidence: ScheduledRuntimeEvidence,
   ) -> Result<Self, String> {
@@ -349,8 +368,8 @@ impl StdioScheduledJsonlTransport {
     command
       .args(["app-server", "--listen", "stdio://"])
       .env_clear()
+      .envs(fixed_child_environment())
       .env("CODEX_HOME", &profile.codex_home)
-      .envs(&profile.non_secret_env)
       .current_dir(&profile.cwd)
       .stdin(Stdio::piped())
       .stdout(Stdio::piped())
@@ -374,16 +393,25 @@ impl StdioScheduledJsonlTransport {
     let reader = thread::Builder::new()
       .name("scheduled-codex-jsonl".to_owned())
       .spawn(move || {
-        use std::io::{BufRead, BufReader};
+        use std::io::{BufRead, BufReader, Read as _};
         let mut stdout = BufReader::new(stdout);
         loop {
-          let mut line = String::new();
-          match stdout.read_line(&mut line) {
+          let mut line = Vec::new();
+          match (&mut stdout)
+            .take(u64::try_from(MAX_JSONL_MESSAGE_BYTES + 1).unwrap_or(u64::MAX))
+            .read_until(b'\n', &mut line)
+          {
             Ok(0) => {
               let _ = sender.send(ReaderEvent::Eof);
               return;
             }
-            Ok(_) => match serde_json::from_str(&line) {
+            Ok(_) if line.len() > MAX_JSONL_MESSAGE_BYTES => {
+              let _ = sender.send(ReaderEvent::Error(
+                "scheduled_codex_jsonl_message_too_large".to_owned(),
+              ));
+              return;
+            }
+            Ok(_) => match serde_json::from_slice(&line) {
               Ok(message) => {
                 if sender.send(ReaderEvent::Message(message)).is_err() {
                   return;
@@ -432,6 +460,33 @@ impl StdioScheduledJsonlTransport {
       let _ = reader.join();
     }
   }
+
+  fn process_group_is_gone(&self) -> Result<bool, String> {
+    match killpg(self.process_group, None) {
+      Err(Errno::ESRCH) => Ok(true),
+      Ok(()) => Ok(false),
+      Err(error) => Err(format!(
+        "inspect scheduled codex process group liveness: {error}"
+      )),
+    }
+  }
+
+  fn wait_process_group_until(&mut self, deadline: Instant) -> Result<ProcessExit, String> {
+    loop {
+      self
+        .child
+        .try_wait()
+        .map_err(|error| format!("reap scheduled codex app server: {error}"))?;
+      self.join_finished_reader();
+      if self.process_group_is_gone()? {
+        return Ok(ProcessExit::Exited);
+      }
+      if Instant::now() >= deadline {
+        return Ok(ProcessExit::TimedOut);
+      }
+      thread::sleep(Duration::from_millis(5));
+    }
+  }
 }
 
 #[cfg(unix)]
@@ -443,6 +498,9 @@ impl JsonlTransport for StdioScheduledJsonlTransport {
       .ok_or_else(|| "scheduled codex app server stdin closed".to_owned())?;
     let mut line = serde_json::to_vec(&value)
       .map_err(|error| format!("encode scheduled codex app server request: {error}"))?;
+    if line.len() > MAX_JSONL_MESSAGE_BYTES {
+      return Err("scheduled_codex_jsonl_request_too_large".to_owned());
+    }
     line.push(b'\n');
     stdin
       .write_all(&line)
@@ -493,20 +551,7 @@ impl ScheduledJsonlTransport for StdioScheduledJsonlTransport {
   }
 
   fn reap_until(&mut self, deadline: Instant) -> Result<ProcessExit, String> {
-    loop {
-      match self
-        .child
-        .try_wait()
-        .map_err(|error| format!("reap scheduled codex app server: {error}"))?
-      {
-        Some(_) => {
-          self.join_finished_reader();
-          return Ok(ProcessExit::Exited);
-        }
-        None if Instant::now() >= deadline => return Ok(ProcessExit::TimedOut),
-        None => thread::sleep(Duration::from_millis(5)),
-      }
-    }
+    self.wait_process_group_until(deadline)
   }
 }
 
@@ -515,22 +560,14 @@ impl Drop for StdioScheduledJsonlTransport {
   fn drop(&mut self) {
     self.stdin.take();
     let _ = self.signal_process_group(Signal::SIGTERM);
-    let terminate_deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < terminate_deadline {
-      if self.child.try_wait().ok().flatten().is_some() {
-        self.join_finished_reader();
-        return;
-      }
-      thread::sleep(Duration::from_millis(5));
+    if let Some(deadline) = Instant::now().checked_add(Duration::from_millis(100))
+      && self.wait_process_group_until(deadline).ok() == Some(ProcessExit::Exited)
+    {
+      return;
     }
     let _ = self.signal_process_group(Signal::SIGKILL);
-    let kill_deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < kill_deadline {
-      if self.child.try_wait().ok().flatten().is_some() {
-        self.join_finished_reader();
-        return;
-      }
-      thread::sleep(Duration::from_millis(5));
+    if let Some(deadline) = Instant::now().checked_add(Duration::from_millis(100)) {
+      let _ = self.wait_process_group_until(deadline);
     }
   }
 }
@@ -539,13 +576,45 @@ pub trait ScheduledCodexExecution {
   fn execute(&self, request: ScheduledCodexRequest) -> ScheduledExecutionResult;
 }
 
+#[derive(Debug)]
+struct CredentialIsolationPermit {
+  run_id: String,
+  nonce: u64,
+  github_mcp_url: String,
+  endpoint_identity: String,
+  github_mcp_artifact_sha256: String,
+  credential_reference: String,
+  codex_program_sha256: String,
+  config_sha256: String,
+  permission_policy_revision: String,
+  isolation_revision: String,
+  expires_at: Instant,
+}
+
 pub struct ScheduledCodexExecutor<F> {
   transport_factory: F,
+  isolation_permit: Mutex<Option<CredentialIsolationPermit>>,
 }
 
 impl<F> ScheduledCodexExecutor<F> {
+  /// Creates a production executor with credential-bearing scheduled execution disabled.
+  ///
+  /// A deployment verifier in this crate must issue the opaque, single-use isolation permit before
+  /// production execution can be enabled. Until that verifier exists, execution fails closed before
+  /// the transport factory is called.
   pub const fn new(transport_factory: F) -> Self {
-    Self { transport_factory }
+    Self {
+      transport_factory,
+      isolation_permit: Mutex::new(None),
+    }
+  }
+
+  #[cfg(test)]
+  fn new_with_test_permit(transport_factory: F, request: &ScheduledCodexRequest) -> Self {
+    Self {
+      transport_factory,
+      isolation_permit: Mutex::new(Some(issue_test_isolation_permit(request))),
+    }
   }
 }
 
@@ -558,6 +627,10 @@ where
     if let Err(failure) = validate_request(&request) {
       return ScheduledExecutionResult::PreflightRejected(failure);
     }
+    let isolation_permit = match self.take_isolation_permit(&request) {
+      Ok(permit) => permit,
+      Err(failure) => return ScheduledExecutionResult::PreflightRejected(failure),
+    };
     let mut transport = match (self.transport_factory)(request.profile.clone()) {
       Ok(transport) => transport,
       Err(error) => {
@@ -567,19 +640,72 @@ where
         ));
       }
     };
-    let attested_profile = match attest_runtime(&request.profile, transport.runtime_evidence()) {
+    let attested_profile = match attest_runtime(
+      &request.profile,
+      transport.runtime_evidence(),
+      isolation_permit,
+    ) {
       Ok(profile) => profile,
       Err(failure) => {
         let _ = bounded_shutdown(&mut transport, &request);
         return ScheduledExecutionResult::PreflightRejected(failure);
       }
     };
-    let deadline = Instant::now() + request.timeout;
+    let Some(deadline) = Instant::now().checked_add(request.timeout) else {
+      let _ = bounded_shutdown(&mut transport, &request);
+      return ScheduledExecutionResult::PreflightRejected(preflight(
+        "scheduled_run_deadline_overflow",
+      ));
+    };
     let result = execute_protocol(&mut transport, &request, attested_profile, deadline);
     match bounded_shutdown(&mut transport, &request) {
       Ok(()) => result,
       Err(failure) => ScheduledExecutionResult::TransportLost(failure),
     }
+  }
+}
+
+impl<F> ScheduledCodexExecutor<F> {
+  fn take_isolation_permit(
+    &self,
+    request: &ScheduledCodexRequest,
+  ) -> Result<CredentialIsolationPermit, ScheduledFailure> {
+    let mut slot = self.isolation_permit.lock().map_err(|_| {
+      ScheduledFailure::new(
+        ScheduledFailureKind::CredentialIsolationUnproven,
+        "credential_isolation_permit_state_unavailable",
+      )
+    })?;
+    let permit = slot.take().ok_or_else(|| {
+      ScheduledFailure::new(
+        ScheduledFailureKind::CredentialIsolationUnproven,
+        "credential_isolation_verifier_disabled",
+      )
+    })?;
+    let run_id = scheduled_run_id(&request.task).ok_or_else(|| {
+      ScheduledFailure::new(
+        ScheduledFailureKind::CredentialIsolationUnproven,
+        "credential_isolation_permit_missing_run_binding",
+      )
+    })?;
+    if permit.nonce == 0
+      || permit.expires_at <= Instant::now()
+      || permit.run_id != run_id
+      || permit.github_mcp_url != request.profile.github_mcp_url
+      || permit.endpoint_identity != request.profile.github_mcp_endpoint_identity
+      || permit.github_mcp_artifact_sha256 != request.profile.github_mcp_artifact_sha256
+      || permit.credential_reference != request.profile.credential_reference
+      || permit.codex_program_sha256 != request.profile.codex_program_sha256
+      || permit.config_sha256 != request.profile.config_sha256
+      || permit.permission_policy_revision != request.profile.permission_policy_revision
+      || permit.isolation_revision.trim().is_empty()
+    {
+      return Err(ScheduledFailure::new(
+        ScheduledFailureKind::CredentialIsolationUnproven,
+        "credential_isolation_permit_expired_or_mismatched",
+      ));
+    }
+    Ok(permit)
   }
 }
 
@@ -661,8 +787,8 @@ fn validate_request(request: &ScheduledCodexRequest) -> Result<(), ScheduledFail
   if !matches!(request.task.tool_policy, ToolPolicy::None) {
     return Err(preflight("scheduled_adapter_disallows_dynamic_tools"));
   }
-  if request.output_schema.as_object().is_none() {
-    return Err(preflight("scheduled_output_schema_must_be_object"));
+  if request.task.instruction.len() > MAX_INSTRUCTION_BYTES {
+    return Err(preflight("scheduled_instruction_too_large"));
   }
   if request.timeout.is_zero()
     || request.interrupt_grace.is_zero()
@@ -671,13 +797,34 @@ fn validate_request(request: &ScheduledCodexRequest) -> Result<(), ScheduledFail
   {
     return Err(preflight("scheduled_timeouts_must_be_positive"));
   }
+  if request.timeout > MAX_RUN_TIMEOUT
+    || request.interrupt_grace > MAX_INTERRUPT_GRACE
+    || request.terminate_grace > MAX_TERMINATE_GRACE
+    || request.kill_grace > MAX_KILL_GRACE
+  {
+    return Err(preflight("scheduled_timeouts_exceed_hard_limit"));
+  }
+  request
+    .timeout
+    .checked_add(request.interrupt_grace)
+    .and_then(|duration| duration.checked_add(request.terminate_grace))
+    .and_then(|duration| duration.checked_add(request.kill_grace))
+    .ok_or_else(|| preflight("scheduled_timeout_budget_overflow"))?;
+  validate_fixed_output_schema()?;
   request.profile.validate()
 }
 
 fn attest_runtime(
   requested: &RequestedCapabilityProfile,
   evidence: &ScheduledRuntimeEvidence,
+  isolation_permit: CredentialIsolationPermit,
 ) -> Result<AttestedCapabilityProfile, ScheduledFailure> {
+  if isolation_permit.expires_at <= Instant::now() {
+    return Err(ScheduledFailure::new(
+      ScheduledFailureKind::CredentialIsolationUnproven,
+      "credential_isolation_permit_expired_during_startup",
+    ));
+  }
   if evidence.codex_version != CODEX_CLI_VERSION {
     return Err(capability("codex_version_mismatch"));
   }
@@ -689,28 +836,6 @@ fn attest_runtime(
   }
   if evidence.config_sha256 != requested.config_sha256 {
     return Err(capability("scheduled_config_runtime_digest_mismatch"));
-  }
-  let isolation = &evidence.credential_isolation;
-  let now = now_unix_seconds();
-  let evidence_is_fresh = isolation.verified_at_unix_seconds <= now
-    && now.saturating_sub(isolation.verified_at_unix_seconds)
-      <= MAX_ISOLATION_EVIDENCE_AGE.as_secs();
-  if isolation.endpoint_identity != requested.github_mcp_endpoint_identity
-    || isolation.github_mcp_artifact_sha256 != requested.github_mcp_artifact_sha256
-    || isolation.credential_reference != requested.credential_reference
-    || isolation.permission_policy_revision != requested.permission_policy_revision
-    || isolation.isolation_revision.trim().is_empty()
-    || isolation.negative_test_revision != NEGATIVE_TEST_REVISION
-    || !evidence_is_fresh
-    || isolation.app_server_has_no_credentials != IsolationCheck::Verified
-    || isolation.parent_and_sibling_environ_denied != IsolationCheck::Verified
-    || isolation.secret_mounts_denied != IsolationCheck::Verified
-    || isolation.endpoint_holds_credential_out_of_process != IsolationCheck::Verified
-  {
-    return Err(ScheduledFailure::new(
-      ScheduledFailureKind::CredentialIsolationUnproven,
-      "credential_isolation_evidence_missing_or_mismatched",
-    ));
   }
   Ok(AttestedCapabilityProfile {
     codex_version: evidence.codex_version.clone(),
@@ -724,9 +849,9 @@ fn attest_runtime(
     permission_policy_revision: requested.permission_policy_revision.clone(),
     config_revision: requested.config_revision.clone(),
     config_sha256: requested.config_sha256.clone(),
-    credential_isolation_revision: isolation.isolation_revision.clone(),
+    credential_isolation_revision: isolation_permit.isolation_revision,
     credential_deny_policy_revision: CREDENTIAL_DENY_POLICY_REVISION.to_owned(),
-    negative_test_revision: isolation.negative_test_revision.clone(),
+    negative_test_revision: NEGATIVE_TEST_REVISION.to_owned(),
     output_schema_revision: OUTPUT_SCHEMA_REVISION.to_owned(),
     attested_at_unix_seconds: now_unix_seconds(),
     profile_sha256: String::new(),
@@ -792,7 +917,7 @@ fn execute_protocol<T: ScheduledJsonlTransport>(
     "cwd": request.profile.cwd,
     "approvalPolicy": "never",
     "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
-    "outputSchema": request.output_schema,
+    "outputSchema": fixed_output_schema(),
     "input": [{"type": "text", "text": request.task.instruction}],
   });
   let turn = match scheduled_request(transport, 4, "turn/start", &turn_params, deadline) {
@@ -922,11 +1047,22 @@ fn wait_for_scheduled_turn<T: ScheduledJsonlTransport>(
   deadline: Instant,
 ) -> ScheduledExecutionResult {
   let mut phased_final = None;
-  let mut unphased_final = None;
+  let mut final_item_ids = BTreeSet::new();
+  let mut final_delta_bytes = 0_usize;
   loop {
     match transport.read_json_until(deadline) {
       Ok(TimedRead::Message(message)) => {
         let params = &message["params"];
+        if let Err(failure) = observe_final_stream_event(
+          message["method"].as_str(),
+          params,
+          thread_id,
+          turn_id,
+          &mut final_item_ids,
+          &mut final_delta_bytes,
+        ) {
+          return ScheduledExecutionResult::Failed(failure);
+        }
         match message["method"].as_str() {
           Some("item/tool/call") => {
             let _ = transport.write_json(json!({
@@ -945,7 +1081,9 @@ fn wait_for_scheduled_turn<T: ScheduledJsonlTransport>(
             if params["threadId"].as_str() == Some(thread_id)
               && params["turnId"].as_str() == Some(turn_id) =>
           {
-            record_agent_message(&params["item"], &mut phased_final, &mut unphased_final);
+            if let Err(failure) = record_agent_message(&params["item"], &mut phased_final) {
+              return ScheduledExecutionResult::Failed(failure);
+            }
           }
           Some("turn/completed") if params["threadId"].as_str() == Some(thread_id) => {
             let turn = &params["turn"];
@@ -954,28 +1092,26 @@ fn wait_for_scheduled_turn<T: ScheduledJsonlTransport>(
             }
             if let Some(items) = turn["items"].as_array() {
               for item in items {
-                record_agent_message(item, &mut phased_final, &mut unphased_final);
+                if let Err(failure) = record_agent_message(item, &mut phased_final) {
+                  return ScheduledExecutionResult::Failed(failure);
+                }
               }
             }
             return match turn["status"].as_str() {
               Some("completed") => {
-                let final_response = phased_final.or(unphased_final);
-                if final_response
-                  .as_ref()
-                  .is_some_and(|value: &String| value.len() > MAX_FINAL_RESPONSE_BYTES)
+                match phased_final
+                  .as_deref()
+                  .ok_or_else(|| output_violation("scheduled_final_answer_missing"))
+                  .and_then(parse_final_output)
                 {
-                  ScheduledExecutionResult::Failed(ScheduledFailure::new(
-                    ScheduledFailureKind::OutputSchemaViolation,
-                    "scheduled_final_response_too_large",
-                  ))
-                } else {
-                  ScheduledExecutionResult::Completed {
-                    final_response,
+                  Ok(output) => ScheduledExecutionResult::Completed {
+                    output,
                     thread_id: thread_id.to_owned(),
                     turn_id: turn_id.to_owned(),
                     usage: parse_usage(turn),
                     attested_profile: Box::new(attested_profile),
-                  }
+                  },
+                  Err(failure) => ScheduledExecutionResult::Failed(failure),
                 }
               }
               Some("interrupted") => ScheduledExecutionResult::Interrupted {
@@ -1006,6 +1142,51 @@ fn wait_for_scheduled_turn<T: ScheduledJsonlTransport>(
   }
 }
 
+fn observe_final_stream_event(
+  method: Option<&str>,
+  params: &Value,
+  thread_id: &str,
+  turn_id: &str,
+  final_item_ids: &mut BTreeSet<String>,
+  final_delta_bytes: &mut usize,
+) -> Result<(), ScheduledFailure> {
+  if params["threadId"].as_str() != Some(thread_id) || params["turnId"].as_str() != Some(turn_id) {
+    return Ok(());
+  }
+  if method == Some("item/started")
+    && params["item"]["type"].as_str() == Some("agentMessage")
+    && params["item"]["phase"].as_str() == Some("final_answer")
+  {
+    let item_id = params["item"]["id"]
+      .as_str()
+      .ok_or_else(|| output_violation("scheduled_final_item_id_missing"))?;
+    if item_id.len() > MAX_ITEM_ID_BYTES
+      || (!final_item_ids.contains(item_id) && final_item_ids.len() >= MAX_FINAL_ITEM_COUNT)
+    {
+      return Err(output_violation(
+        "scheduled_final_item_inventory_exceeds_limit",
+      ));
+    }
+    final_item_ids.insert(item_id.to_owned());
+  } else if method == Some("item/agentMessage/delta")
+    && params["itemId"]
+      .as_str()
+      .is_some_and(|item_id| final_item_ids.contains(item_id))
+  {
+    let delta = params["delta"]
+      .as_str()
+      .ok_or_else(|| output_violation("scheduled_final_delta_invalid"))?;
+    let total = final_delta_bytes
+      .checked_add(delta.len())
+      .ok_or_else(|| output_violation("scheduled_final_delta_size_overflow"))?;
+    if total > MAX_FINAL_RESPONSE_BYTES {
+      return Err(output_violation("scheduled_final_deltas_too_large"));
+    }
+    *final_delta_bytes = total;
+  }
+  Ok(())
+}
+
 fn interrupt_timed_out_turn<T: ScheduledJsonlTransport>(
   transport: &mut T,
   request: &ScheduledCodexRequest,
@@ -1020,7 +1201,11 @@ fn interrupt_timed_out_turn<T: ScheduledJsonlTransport>(
   ) {
     return transport_failure(error);
   }
-  let deadline = Instant::now() + request.interrupt_grace;
+  let Some(deadline) = Instant::now().checked_add(request.interrupt_grace) else {
+    return ScheduledExecutionResult::TransportLost(preflight(
+      "scheduled_interrupt_deadline_overflow",
+    ));
+  };
   loop {
     match transport.read_json_until(deadline) {
       Ok(TimedRead::Message(message)) => {
@@ -1060,18 +1245,14 @@ fn bounded_shutdown<T: ScheduledJsonlTransport>(
   transport
     .close_stdin()
     .map_err(|error| ScheduledFailure::new(ScheduledFailureKind::Transport, error))?;
-  if transport
-    .reap_until(Instant::now() + request.terminate_grace)
-    .map_err(|error| ScheduledFailure::new(ScheduledFailureKind::Transport, error))?
-    == ProcessExit::Exited
-  {
-    return Ok(());
-  }
   transport
     .terminate_process_group()
     .map_err(|error| ScheduledFailure::new(ScheduledFailureKind::Transport, error))?;
+  let terminate_deadline = Instant::now()
+    .checked_add(request.terminate_grace)
+    .ok_or_else(|| preflight("scheduled_terminate_deadline_overflow"))?;
   if transport
-    .reap_until(Instant::now() + request.terminate_grace)
+    .reap_until(terminate_deadline)
     .map_err(|error| ScheduledFailure::new(ScheduledFailureKind::Transport, error))?
     == ProcessExit::Exited
   {
@@ -1080,8 +1261,11 @@ fn bounded_shutdown<T: ScheduledJsonlTransport>(
   transport
     .kill_process_group()
     .map_err(|error| ScheduledFailure::new(ScheduledFailureKind::Transport, error))?;
+  let kill_deadline = Instant::now()
+    .checked_add(request.kill_grace)
+    .ok_or_else(|| preflight("scheduled_kill_deadline_overflow"))?;
   if transport
-    .reap_until(Instant::now() + request.kill_grace)
+    .reap_until(kill_deadline)
     .map_err(|error| ScheduledFailure::new(ScheduledFailureKind::Transport, error))?
     == ProcessExit::Exited
   {
@@ -1096,22 +1280,91 @@ fn bounded_shutdown<T: ScheduledJsonlTransport>(
 fn record_agent_message(
   item: &Value,
   phased_final: &mut Option<String>,
-  unphased_final: &mut Option<String>,
-) {
+) -> Result<(), ScheduledFailure> {
   if item["type"].as_str() != Some("agentMessage") {
-    return;
+    return Ok(());
+  }
+  if item["phase"].as_str() != Some("final_answer") {
+    return Ok(());
   }
   let Some(text) = item["text"]
     .as_str()
     .map(str::trim)
     .filter(|text| !text.is_empty())
   else {
-    return;
+    return Ok(());
   };
-  match item["phase"].as_str() {
-    Some("final_answer") => *phased_final = Some(text.to_owned()),
-    None => *unphased_final = Some(text.to_owned()),
-    _ => {}
+  if text.len() > MAX_FINAL_RESPONSE_BYTES {
+    return Err(output_violation("scheduled_final_response_too_large"));
+  }
+  *phased_final = Some(text.to_owned());
+  Ok(())
+}
+
+fn fixed_output_schema() -> Value {
+  json!({
+    "type": "object",
+    "required": ["schema_version", "summary"],
+    "properties": {
+      "schema_version": {"type": "integer", "const": OUTPUT_SCHEMA_VERSION},
+      "summary": {"type": "string", "minLength": 1, "maxLength": MAX_FINAL_SUMMARY_BYTES},
+    },
+    "additionalProperties": false,
+  })
+}
+
+fn validate_fixed_output_schema() -> Result<(), ScheduledFailure> {
+  let schema = fixed_output_schema();
+  let bytes = serde_json::to_vec(&schema)
+    .map_err(|_| preflight("scheduled_fixed_output_schema_not_serializable"))?;
+  if bytes.len() > MAX_OUTPUT_SCHEMA_BYTES || json_depth(&schema) > MAX_OUTPUT_SCHEMA_DEPTH {
+    return Err(preflight(
+      "scheduled_fixed_output_schema_exceeds_hard_limit",
+    ));
+  }
+  Ok(())
+}
+
+fn parse_final_output(text: &str) -> Result<ScheduledFinalOutput, ScheduledFailure> {
+  if text.len() > MAX_FINAL_RESPONSE_BYTES {
+    return Err(output_violation("scheduled_final_response_too_large"));
+  }
+  let value: Value = serde_json::from_str(text)
+    .map_err(|_| output_violation("scheduled_final_response_invalid_json"))?;
+  if json_depth(&value) > MAX_OUTPUT_SCHEMA_DEPTH {
+    return Err(output_violation("scheduled_final_response_too_deep"));
+  }
+  let object = value
+    .as_object()
+    .ok_or_else(|| output_violation("scheduled_final_response_must_be_object"))?;
+  if object.len() != 2 || !object.contains_key("schema_version") || !object.contains_key("summary")
+  {
+    return Err(output_violation("scheduled_final_response_fields_mismatch"));
+  }
+  let schema_version = object["schema_version"]
+    .as_u64()
+    .filter(|version| *version == OUTPUT_SCHEMA_VERSION)
+    .ok_or_else(|| output_violation("scheduled_final_response_version_mismatch"))?;
+  let summary = object["summary"]
+    .as_str()
+    .filter(|summary| !summary.trim().is_empty())
+    .ok_or_else(|| output_violation("scheduled_final_response_summary_invalid"))?;
+  if summary.len() > MAX_FINAL_SUMMARY_BYTES {
+    return Err(output_violation(
+      "scheduled_final_response_summary_too_large",
+    ));
+  }
+  Ok(ScheduledFinalOutput {
+    schema_version,
+    summary: summary.to_owned(),
+  })
+}
+
+fn json_depth(value: &Value) -> usize {
+  match value {
+    Value::Array(values) => 1 + values.iter().map(json_depth).max().unwrap_or(0),
+    Value::Object(values) => 1 + values.values().map(json_depth).max().unwrap_or(0),
+    _ => 1,
   }
 }
 
@@ -1159,28 +1412,16 @@ fn is_loopback_http_url(url: &str) -> bool {
     && url.ends_with("/mcp")
 }
 
-fn validate_non_secret_env(key: &str, value: &str) -> Result<(), ScheduledFailure> {
-  if key.trim() != key || key.is_empty() || value.contains('\0') {
-    return Err(preflight("invalid_non_secret_child_environment"));
-  }
-  let upper = key.to_ascii_uppercase();
-  if [
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "CREDENTIAL",
-    "AUTH",
-    "COOKIE",
+#[cfg_attr(
+  not(test),
+  allow(dead_code, reason = "reserved for the issue 09 deployment verifier")
+)]
+fn fixed_child_environment() -> [(&'static str, &'static str); 3] {
+  [
+    ("PATH", CHILD_PATH),
+    ("LANG", CHILD_LOCALE),
+    ("LC_ALL", CHILD_LOCALE),
   ]
-  .iter()
-  .any(|marker| upper.contains(marker))
-  {
-    return Err(ScheduledFailure::new(
-      ScheduledFailureKind::CredentialIsolationUnproven,
-      "secret_like_child_environment_key_rejected",
-    ));
-  }
-  Ok(())
 }
 
 fn require_non_empty(field: &str, value: &str) -> Result<(), ScheduledFailure> {
@@ -1203,6 +1444,17 @@ fn preflight(message: impl AsRef<str>) -> ScheduledFailure {
 
 fn capability(message: impl AsRef<str>) -> ScheduledFailure {
   ScheduledFailure::new(ScheduledFailureKind::CapabilityMismatch, message)
+}
+
+fn output_violation(message: impl AsRef<str>) -> ScheduledFailure {
+  ScheduledFailure::new(ScheduledFailureKind::OutputSchemaViolation, message)
+}
+
+fn scheduled_run_id(task: &AgentTask) -> Option<&str> {
+  match &task.source {
+    InvocationSource::ScheduledRun { run_id, .. } => Some(run_id),
+    _ => None,
+  }
 }
 
 fn protocol_failure(failure: ScheduledFailure) -> ScheduledExecutionResult {
@@ -1244,6 +1496,10 @@ fn hex_encode(value: &[u8]) -> String {
   output
 }
 
+#[cfg_attr(
+  not(test),
+  allow(dead_code, reason = "reserved for the issue 09 deployment verifier")
+)]
 fn sha256_file(path: &Path) -> Result<String, String> {
   use std::io::Read;
   let mut file = fs::File::open(path)
@@ -1269,6 +1525,30 @@ fn now_unix_seconds() -> u64 {
 }
 
 #[cfg(test)]
+fn issue_test_isolation_permit(request: &ScheduledCodexRequest) -> CredentialIsolationPermit {
+  use std::sync::atomic::{AtomicU64, Ordering};
+
+  static NEXT_TEST_NONCE: AtomicU64 = AtomicU64::new(1);
+  CredentialIsolationPermit {
+    run_id: scheduled_run_id(&request.task)
+      .expect("test permit requires scheduled run")
+      .to_owned(),
+    nonce: NEXT_TEST_NONCE.fetch_add(1, Ordering::Relaxed),
+    github_mcp_url: request.profile.github_mcp_url.clone(),
+    endpoint_identity: request.profile.github_mcp_endpoint_identity.clone(),
+    github_mcp_artifact_sha256: request.profile.github_mcp_artifact_sha256.clone(),
+    credential_reference: request.profile.credential_reference.clone(),
+    codex_program_sha256: request.profile.codex_program_sha256.clone(),
+    config_sha256: request.profile.config_sha256.clone(),
+    permission_policy_revision: request.profile.permission_policy_revision.clone(),
+    isolation_revision: "test-only-process-isolation-v1".to_owned(),
+    expires_at: Instant::now()
+      .checked_add(TEST_PERMIT_TTL)
+      .expect("test permit expiry"),
+  }
+}
+
+#[cfg(test)]
 mod tests {
   use std::collections::VecDeque;
   use std::sync::{Arc, Mutex};
@@ -1280,6 +1560,7 @@ mod tests {
   #[derive(Debug, Default)]
   struct Actions {
     writes: Vec<Value>,
+    events: Vec<String>,
     close_count: usize,
     terminate_count: usize,
     kill_count: usize,
@@ -1294,7 +1575,12 @@ mod tests {
 
   impl JsonlTransport for MockTransport {
     fn write_json(&mut self, value: Value) -> Result<(), String> {
-      self.actions.lock().expect("actions").writes.push(value);
+      let mut actions = self.actions.lock().expect("actions");
+      actions.events.push(format!(
+        "write:{}",
+        value["method"].as_str().unwrap_or("response")
+      ));
+      actions.writes.push(value);
       Ok(())
     }
 
@@ -1309,30 +1595,41 @@ mod tests {
     }
 
     fn read_json_until(&mut self, _deadline: Instant) -> Result<TimedRead, String> {
+      self
+        .actions
+        .lock()
+        .expect("actions")
+        .events
+        .push("read".to_owned());
       Ok(self.reads.pop_front().unwrap_or(TimedRead::TimedOut))
     }
 
     fn close_stdin(&mut self) -> Result<(), String> {
-      self.actions.lock().expect("actions").close_count += 1;
+      let mut actions = self.actions.lock().expect("actions");
+      actions.close_count += 1;
+      actions.events.push("close".to_owned());
       Ok(())
     }
 
     fn terminate_process_group(&mut self) -> Result<(), String> {
-      self.actions.lock().expect("actions").terminate_count += 1;
+      let mut actions = self.actions.lock().expect("actions");
+      actions.terminate_count += 1;
+      actions.events.push("term".to_owned());
       Ok(())
     }
 
     fn kill_process_group(&mut self) -> Result<(), String> {
-      self.actions.lock().expect("actions").kill_count += 1;
+      let mut actions = self.actions.lock().expect("actions");
+      actions.kill_count += 1;
+      actions.events.push("kill".to_owned());
       Ok(())
     }
 
     fn reap_until(&mut self, _deadline: Instant) -> Result<ProcessExit, String> {
+      let mut actions = self.actions.lock().expect("actions");
+      actions.events.push("wait_group".to_owned());
       Ok(
-        self
-          .actions
-          .lock()
-          .expect("actions")
+        actions
           .reap_results
           .pop_front()
           .unwrap_or(ProcessExit::Exited),
@@ -1353,10 +1650,6 @@ mod tests {
       permission_policy_revision: "github-issues-read-v1".to_owned(),
       config_revision: "scheduled-codex-v1".to_owned(),
       config_sha256: String::new(),
-      non_secret_env: BTreeMap::from([
-        ("LANG".to_owned(), "C.UTF-8".to_owned()),
-        ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
-      ]),
     };
     profile.config_sha256 = sha256_hex(profile.dedicated_config().as_bytes());
     profile
@@ -1368,19 +1661,6 @@ mod tests {
       app_server_schema_sha256: CODEX_APP_SERVER_SCHEMA_SHA256.to_owned(),
       codex_program_sha256: profile.codex_program_sha256.clone(),
       config_sha256: profile.config_sha256.clone(),
-      credential_isolation: CredentialIsolationEvidence {
-        endpoint_identity: profile.github_mcp_endpoint_identity.clone(),
-        github_mcp_artifact_sha256: profile.github_mcp_artifact_sha256.clone(),
-        credential_reference: profile.credential_reference.clone(),
-        permission_policy_revision: profile.permission_policy_revision.clone(),
-        isolation_revision: "pod-process-isolation-v1".to_owned(),
-        negative_test_revision: NEGATIVE_TEST_REVISION.to_owned(),
-        verified_at_unix_seconds: now_unix_seconds(),
-        app_server_has_no_credentials: IsolationCheck::Verified,
-        parent_and_sibling_environ_denied: IsolationCheck::Verified,
-        secret_mounts_denied: IsolationCheck::Verified,
-        endpoint_holds_credential_out_of_process: IsolationCheck::Verified,
-      },
     }
   }
 
@@ -1406,12 +1686,6 @@ mod tests {
     ScheduledCodexRequest {
       task: task(),
       profile,
-      output_schema: json!({
-        "type": "object",
-        "required": ["summary"],
-        "properties": {"summary": {"type": "string"}},
-        "additionalProperties": false,
-      }),
       timeout: Duration::from_secs(30),
       interrupt_grace: Duration::from_secs(2),
       terminate_grace: Duration::from_secs(2),
@@ -1477,8 +1751,8 @@ mod tests {
             "status": "completed",
             "usage": {"inputTokens": 10, "cachedInputTokens": 2, "outputTokens": 3},
             "items": [
-              {"type": "agentMessage", "phase": "final_answer", "text": "First"},
-              {"type": "agentMessage", "phase": "final_answer", "text": "Last"}
+              {"type": "agentMessage", "phase": "final_answer", "text": "{\"schema_version\":1,\"summary\":\"First\"}"},
+              {"type": "agentMessage", "phase": "final_answer", "text": "{\"schema_version\":1,\"summary\":\"Last\"}"}
             ]
           }
         }
@@ -1486,18 +1760,40 @@ mod tests {
     ])
   }
 
+  fn reads_with_final_text(text: &str) -> VecDeque<TimedRead> {
+    let mut reads = successful_reads();
+    reads[5] = TimedRead::Message(json!({
+      "jsonrpc": "2.0",
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thread-1",
+        "turn": {
+          "id": "turn-1",
+          "status": "completed",
+          "items": [{"type": "agentMessage", "phase": "final_answer", "text": text}],
+        }
+      }
+    }));
+    reads
+  }
+
   fn executor_for(
     transport: MockTransport,
-  ) -> ScheduledCodexExecutor<impl Fn(RequestedCapabilityProfile) -> Result<MockTransport, String>>
-  {
+    request: &ScheduledCodexRequest,
+  ) -> ScheduledCodexExecutor<
+    impl Fn(RequestedCapabilityProfile) -> Result<MockTransport, String> + use<>,
+  > {
     let transport = Arc::new(Mutex::new(Some(transport)));
-    ScheduledCodexExecutor::new(move |_| {
-      transport
-        .lock()
-        .expect("transport")
-        .take()
-        .ok_or_else(|| "mock transport already used".to_owned())
-    })
+    ScheduledCodexExecutor::new_with_test_permit(
+      move |_| {
+        transport
+          .lock()
+          .expect("transport")
+          .take()
+          .ok_or_else(|| "mock transport already used".to_owned())
+      },
+      request,
+    )
   }
 
   #[test]
@@ -1509,10 +1805,11 @@ mod tests {
       reads: successful_reads(),
       actions: Arc::clone(&actions),
     };
-    let executor = executor_for(transport);
-    let result = executor.execute(request(profile));
+    let request = request(profile);
+    let executor = executor_for(transport, &request);
+    let result = executor.execute(request);
     let ScheduledExecutionResult::Completed {
-      final_response,
+      output,
       usage,
       attested_profile,
       ..
@@ -1520,7 +1817,8 @@ mod tests {
     else {
       panic!("unexpected result: {result:?}");
     };
-    assert_eq!(final_response.as_deref(), Some("Last"));
+    assert_eq!(output.schema_version, OUTPUT_SCHEMA_VERSION);
+    assert_eq!(output.summary, "Last");
     assert_eq!(usage.input, Some(10));
     assert!(!attested_profile.profile_sha256.is_empty());
     let writes = &actions.lock().expect("actions").writes;
@@ -1547,23 +1845,17 @@ mod tests {
       turn["params"]["sandboxPolicy"],
       json!({"type": "readOnly", "networkAccess": false})
     );
-    assert!(turn["params"]["outputSchema"].is_object());
+    assert_eq!(turn["params"]["outputSchema"], fixed_output_schema());
   }
 
   #[test]
-  fn missing_credential_isolation_rejects_before_protocol() {
+  fn production_executor_without_internal_issuer_rejects_before_transport() {
     let profile = profile();
-    let mut runtime = evidence(&profile);
-    runtime
-      .credential_isolation
-      .parent_and_sibling_environ_denied = IsolationCheck::Failed;
-    let actions = Arc::new(Mutex::new(Actions::default()));
-    let transport = MockTransport {
-      evidence: runtime,
-      reads: successful_reads(),
-      actions: Arc::clone(&actions),
-    };
-    let executor = executor_for(transport);
+    let executor = ScheduledCodexExecutor::new(
+      |_: RequestedCapabilityProfile| -> Result<MockTransport, String> {
+        panic!("disabled production executor must not start transport")
+      },
+    );
     let result = executor.execute(request(profile));
     assert!(matches!(
       result,
@@ -1572,7 +1864,184 @@ mod tests {
         ..
       })
     ));
-    assert!(actions.lock().expect("actions").writes.is_empty());
+  }
+
+  #[test]
+  fn test_isolation_permit_is_bound_and_single_use() {
+    let profile = profile();
+    let scheduled_request = request(profile.clone());
+    let first_nonce = issue_test_isolation_permit(&scheduled_request).nonce;
+    let second_nonce = issue_test_isolation_permit(&scheduled_request).nonce;
+    assert_ne!(first_nonce, second_nonce);
+    let actions = Arc::new(Mutex::new(Actions::default()));
+    let transport = Arc::new(Mutex::new(Some(MockTransport {
+      evidence: evidence(&profile),
+      reads: successful_reads(),
+      actions,
+    })));
+    let available = Arc::clone(&transport);
+    let executor = ScheduledCodexExecutor::new_with_test_permit(
+      move |_| {
+        available
+          .lock()
+          .expect("transport")
+          .take()
+          .ok_or_else(|| "transport already used".to_owned())
+      },
+      &scheduled_request,
+    );
+    assert!(matches!(
+      executor.execute(scheduled_request.clone()),
+      ScheduledExecutionResult::Completed { .. }
+    ));
+    assert!(matches!(
+      executor.execute(scheduled_request),
+      ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
+        kind: ScheduledFailureKind::CredentialIsolationUnproven,
+        ..
+      })
+    ));
+
+    let original = request(profile.clone());
+    let executor = ScheduledCodexExecutor::new_with_test_permit(
+      |_: RequestedCapabilityProfile| -> Result<MockTransport, String> {
+        panic!("mismatched permit must not start transport")
+      },
+      &original,
+    );
+    let mut mismatched = original;
+    if let InvocationSource::ScheduledRun { run_id, .. } = &mut mismatched.task.source {
+      *run_id = "different-run".to_owned();
+    }
+    assert!(matches!(
+      executor.execute(mismatched),
+      ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
+        kind: ScheduledFailureKind::CredentialIsolationUnproven,
+        ..
+      })
+    ));
+
+    let expired_request = request(profile);
+    let mut expired_permit = issue_test_isolation_permit(&expired_request);
+    expired_permit.expires_at = Instant::now();
+    let executor = ScheduledCodexExecutor {
+      transport_factory: |_: RequestedCapabilityProfile| -> Result<MockTransport, String> {
+        panic!("expired permit must not start transport")
+      },
+      isolation_permit: Mutex::new(Some(expired_permit)),
+    };
+    assert!(matches!(
+      executor.execute(expired_request),
+      ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
+        kind: ScheduledFailureKind::CredentialIsolationUnproven,
+        ..
+      })
+    ));
+  }
+
+  #[test]
+  fn malformed_mismatched_and_oversize_final_outputs_are_rejected() {
+    let oversized = format!(
+      "{{\"schema_version\":1,\"summary\":\"{}\"}}",
+      "x".repeat(MAX_FINAL_SUMMARY_BYTES + 1)
+    );
+    for text in [
+      "not-json".to_owned(),
+      "{\"schema_version\":2,\"summary\":\"wrong version\"}".to_owned(),
+      "{\"schema_version\":1,\"summary\":\"ok\",\"extra\":true}".to_owned(),
+      "{\"schema_version\":1,\"summary\":\"   \"}".to_owned(),
+      oversized,
+    ] {
+      let profile = profile();
+      let transport = MockTransport {
+        evidence: evidence(&profile),
+        reads: reads_with_final_text(&text),
+        actions: Arc::new(Mutex::new(Actions::default())),
+      };
+      let request = request(profile);
+      assert!(matches!(
+        executor_for(transport, &request).execute(request),
+        ScheduledExecutionResult::Failed(ScheduledFailure {
+          kind: ScheduledFailureKind::OutputSchemaViolation,
+          ..
+        })
+      ));
+    }
+  }
+
+  #[test]
+  fn cumulative_final_answer_deltas_are_bounded() {
+    let profile = profile();
+    let reads = VecDeque::from([
+      response(1, json!({"server": "codex-app-server"})),
+      response(2, json!({"thread": {"id": "thread-1"}})),
+      response(3, inventory()),
+      response(4, json!({"turn": {"id": "turn-1"}})),
+      TimedRead::Message(json!({
+        "jsonrpc": "2.0",
+        "method": "item/started",
+        "params": {
+          "threadId": "thread-1",
+          "turnId": "turn-1",
+          "item": {"id": "final-1", "type": "agentMessage", "phase": "final_answer"},
+        }
+      })),
+      TimedRead::Message(json!({
+        "jsonrpc": "2.0",
+        "method": "item/agentMessage/delta",
+        "params": {
+          "threadId": "thread-1",
+          "turnId": "turn-1",
+          "itemId": "final-1",
+          "delta": "x".repeat(MAX_FINAL_RESPONSE_BYTES + 1),
+        }
+      })),
+    ]);
+    let transport = MockTransport {
+      evidence: evidence(&profile),
+      reads,
+      actions: Arc::new(Mutex::new(Actions::default())),
+    };
+    let request = request(profile);
+    assert!(matches!(
+      executor_for(transport, &request).execute(request),
+      ScheduledExecutionResult::Failed(ScheduledFailure {
+        kind: ScheduledFailureKind::OutputSchemaViolation,
+        ..
+      })
+    ));
+  }
+
+  #[test]
+  fn instruction_and_time_budgets_reject_extreme_inputs_before_transport() {
+    let cases = ["instruction", "timeout", "interrupt", "terminate", "kill"];
+    for case in cases {
+      let mut request = request(profile());
+      match case {
+        "instruction" => request.task.instruction = "x".repeat(MAX_INSTRUCTION_BYTES + 1),
+        "timeout" => request.timeout = MAX_RUN_TIMEOUT + Duration::from_nanos(1),
+        "interrupt" => request.interrupt_grace = MAX_INTERRUPT_GRACE + Duration::from_nanos(1),
+        "terminate" => request.terminate_grace = MAX_TERMINATE_GRACE + Duration::from_nanos(1),
+        "kill" => request.kill_grace = MAX_KILL_GRACE + Duration::from_nanos(1),
+        _ => unreachable!(),
+      }
+      let executor = ScheduledCodexExecutor::new(
+        |_: RequestedCapabilityProfile| -> Result<MockTransport, String> {
+          panic!("invalid limits must not start transport")
+        },
+      );
+      assert!(matches!(
+        executor.execute(request),
+        ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
+          kind: ScheduledFailureKind::InvalidRequest,
+          ..
+        })
+      ));
+    }
+    assert!(validate_fixed_output_schema().is_ok());
+    let schema = fixed_output_schema();
+    assert!(serde_json::to_vec(&schema).expect("schema").len() <= MAX_OUTPUT_SCHEMA_BYTES);
+    assert!(json_depth(&schema) <= MAX_OUTPUT_SCHEMA_DEPTH);
   }
 
   #[test]
@@ -1598,9 +2067,10 @@ mod tests {
         reads,
         actions: Arc::clone(&actions),
       };
-      let executor = executor_for(transport);
+      let request = request(profile);
+      let executor = executor_for(transport, &request);
       assert!(matches!(
-        executor.execute(request(profile)),
+        executor.execute(request),
         ScheduledExecutionResult::PreflightRejected(_)
       ));
       assert!(
@@ -1624,11 +2094,7 @@ mod tests {
     reads.push_back(TimedRead::TimedOut);
     reads.push_back(TimedRead::TimedOut);
     let actions = Arc::new(Mutex::new(Actions {
-      reap_results: VecDeque::from([
-        ProcessExit::TimedOut,
-        ProcessExit::TimedOut,
-        ProcessExit::Exited,
-      ]),
+      reap_results: VecDeque::from([ProcessExit::TimedOut, ProcessExit::Exited]),
       ..Actions::default()
     }));
     let transport = MockTransport {
@@ -1636,9 +2102,10 @@ mod tests {
       reads,
       actions: Arc::clone(&actions),
     };
-    let executor = executor_for(transport);
+    let request = request(profile);
+    let executor = executor_for(transport, &request);
     assert!(matches!(
-      executor.execute(request(profile)),
+      executor.execute(request),
       ScheduledExecutionResult::TransportLost(ScheduledFailure {
         kind: ScheduledFailureKind::TimedOut,
         ..
@@ -1656,26 +2123,48 @@ mod tests {
     assert_eq!(actions.close_count, 1);
     assert_eq!(actions.terminate_count, 1);
     assert_eq!(actions.kill_count, 1);
+    let interrupt = actions
+      .events
+      .iter()
+      .position(|event| event == "write:turn/interrupt")
+      .expect("interrupt event");
+    assert_eq!(
+      &actions.events[interrupt..],
+      [
+        "write:turn/interrupt",
+        "read",
+        "close",
+        "term",
+        "wait_group",
+        "kill",
+        "wait_group",
+      ]
+    );
   }
 
   #[test]
-  fn child_environment_rejects_secret_like_keys() {
-    let mut profile = profile();
-    profile
-      .non_secret_env
-      .insert("SLACK_BOT_TOKEN".to_owned(), "sentinel".to_owned());
-    let executor = ScheduledCodexExecutor::new(
-      |_: RequestedCapabilityProfile| -> Result<MockTransport, String> {
-        panic!("transport must not start")
-      },
+  fn fixed_child_environment_contains_no_credential_or_injection_keys() {
+    let environment = fixed_child_environment();
+    assert_eq!(
+      environment,
+      [
+        ("PATH", CHILD_PATH),
+        ("LANG", CHILD_LOCALE),
+        ("LC_ALL", CHILD_LOCALE)
+      ]
     );
-    assert!(matches!(
-      executor.execute(request(profile)),
-      ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
-        kind: ScheduledFailureKind::CredentialIsolationUnproven,
-        ..
-      })
-    ));
+    assert!(environment.iter().all(|(key, _)| {
+      ![
+        "OPENAI_API_KEY",
+        "GITHUB_PAT",
+        "LD_PRELOAD",
+        "NODE_OPTIONS",
+        "HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+      ]
+      .contains(key)
+    }));
   }
 
   #[test]
@@ -1709,8 +2198,9 @@ mod tests {
         reads: successful_reads(),
         actions: Arc::clone(&actions),
       };
+      let request = request(profile);
       assert!(matches!(
-        executor_for(transport).execute(request(profile)),
+        executor_for(transport, &request).execute(request),
         ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
           kind: ScheduledFailureKind::CapabilityMismatch,
           ..
@@ -1750,8 +2240,9 @@ mod tests {
         reads,
         actions: Arc::clone(&actions),
       };
+      let request = request(profile);
       assert!(matches!(
-        executor_for(transport).execute(request(profile)),
+        executor_for(transport, &request).execute(request),
         ScheduledExecutionResult::PreflightRejected(_)
       ));
       assert!(
@@ -1766,7 +2257,7 @@ mod tests {
   }
 
   #[test]
-  fn commentary_only_completion_returns_no_final_response() {
+  fn commentary_only_completion_is_output_schema_violation() {
     let profile = profile();
     let runtime = evidence(&profile);
     let mut reads = successful_reads();
@@ -1789,12 +2280,13 @@ mod tests {
       reads,
       actions: Arc::new(Mutex::new(Actions::default())),
     };
+    let request = request(profile);
     assert!(matches!(
-      executor_for(transport).execute(request(profile)),
-      ScheduledExecutionResult::Completed {
-        final_response: None,
+      executor_for(transport, &request).execute(request),
+      ScheduledExecutionResult::Failed(ScheduledFailure {
+        kind: ScheduledFailureKind::OutputSchemaViolation,
         ..
-      }
+      })
     ));
   }
 
@@ -1821,8 +2313,9 @@ mod tests {
       reads,
       actions: Arc::clone(&actions),
     };
+    let request = request(profile);
     assert!(matches!(
-      executor_for(transport).execute(request(profile)),
+      executor_for(transport, &request).execute(request),
       ScheduledExecutionResult::Interrupted { .. }
     ));
     assert_eq!(
@@ -1848,7 +2341,7 @@ mod tests {
     let base = std::env::temp_dir().join(unique);
     let cwd = base.join("workspace");
     let codex_home = base.join("codex-home");
-    let pid_file = base.join("grandchild.pid");
+    let pid_file = cwd.join("grandchild.pid");
     fs::create_dir(&base).expect("base");
     fs::create_dir(&cwd).expect("cwd");
     let program =
@@ -1858,10 +2351,6 @@ mod tests {
     profile.codex_program_sha256 = sha256_file(&program).expect("program hash");
     profile.codex_home = codex_home.clone();
     profile.cwd = cwd.clone();
-    profile.non_secret_env.insert(
-      "TEST_GRANDCHILD_PID_FILE".to_owned(),
-      pid_file.display().to_string(),
-    );
     profile.config_sha256 = sha256_hex(profile.dedicated_config().as_bytes());
     prepare_scheduled_codex_home(&profile).expect("codex home");
     let runtime = evidence(&profile);

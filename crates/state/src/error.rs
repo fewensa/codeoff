@@ -122,12 +122,27 @@ pub enum StateError {
     #[source]
     source: sqlx::Error,
   },
+
+  #[error("invalid scheduler state: {reason}")]
+  InvalidSchedulerState { reason: String },
+
+  #[error("scheduler generation conflict")]
+  SchedulerGenerationConflict,
+
+  #[error("scheduled once occurrence is expired and cannot be resumed")]
+  ScheduledOnceExpired,
+
+  #[error("failed to manage scheduler state: {source}")]
+  Scheduler {
+    #[source]
+    source: sqlx::Error,
+  },
 }
 
 impl StateError {
   #[must_use]
   pub fn is_transient_storage_contention(&self) -> bool {
-    let Self::SlackDelivery { source } = self else {
+    let (Self::SlackDelivery { source } | Self::Scheduler { source }) = self else {
       return false;
     };
     let sqlx::Error::Database(error) = source else {

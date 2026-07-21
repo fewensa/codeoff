@@ -63,7 +63,7 @@ where updated_at < datetime(?1, 'unixepoch', ?2)
 
 #[derive(Debug, Clone)]
 pub struct StateStore {
-  pool: SqlitePool,
+  pub(crate) pool: SqlitePool,
   #[cfg(any(test, feature = "test-support"))]
   test_connect_options: SqliteConnectOptions,
 }

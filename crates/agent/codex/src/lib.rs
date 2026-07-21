@@ -1,5 +1,18 @@
 //! Codex App Server backend wiring for Codeoff.
 
+mod scheduled;
+
+#[cfg(unix)]
+pub use scheduled::StdioScheduledJsonlTransport;
+pub use scheduled::{
+  AttestedCapabilityProfile, CODEX_APP_SERVER_SCHEMA_SHA256, CODEX_CLI_VERSION,
+  CredentialIsolationEvidence, GITHUB_MCP_ARTIFACT_SHA256_ARM64, GITHUB_MCP_ARTIFACT_SHA256_X86_64,
+  GITHUB_MCP_SERVER_VERSION, IsolationCheck, ProcessExit, RequestedCapabilityProfile,
+  ScheduledCodexExecution, ScheduledCodexExecutor, ScheduledCodexRequest, ScheduledExecutionResult,
+  ScheduledFailure, ScheduledFailureKind, ScheduledJsonlTransport, ScheduledRuntimeEvidence,
+  TimedRead, prepare_scheduled_codex_home,
+};
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};

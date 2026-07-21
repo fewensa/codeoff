@@ -16,9 +16,12 @@ use crate::schedule_contract::{error_envelope, success_envelope};
 
 const DIGEST_ALGORITHM: &str = "sha256-canonical-json-v1";
 pub(crate) const SNAPSHOT_VERSION: u32 = 1;
+const DEFINITION_VERSION: u32 = 2;
 
 pub use crate::schedule_authorization::{
-  AuthorizationPolicy, OwnerOnlyAuthorizationPolicy, ScheduleInvocation,
+  AuthorizationPolicy, ConfiguredOperatorIdentityPolicy, DisabledOperatorIdentityPolicy,
+  OperatorAuthorizationPolicy, OperatorIdentityPolicy, OwnerOnlyAuthorizationPolicy,
+  ScheduleInvocation,
 };
 pub use crate::schedule_resolution::{
   CapabilityRegistry, CapabilityRequest, ChannelTargetVerifier, DefaultCapabilityRegistry,
@@ -127,6 +130,7 @@ impl ScheduleServiceError {
 pub struct CreateScheduleRequest {
   pub request_id: String,
   pub instruction: String,
+  pub previous_success: PreviousSuccessPolicy,
   pub schedule: ScheduleSpec,
   pub target: DeliveryTargetRequest,
   pub capability: String,
@@ -139,10 +143,27 @@ pub struct UpdateScheduleRequest {
   pub job_id: String,
   pub expected_generation: i64,
   pub instruction: String,
+  pub previous_success: PreviousSuccessPolicy,
   pub schedule: ScheduleSpec,
   pub target: DeliveryTargetRequest,
   pub capability: String,
   pub now: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousSuccessPolicy {
+  None,
+  LatestSuccess,
+}
+
+impl PreviousSuccessPolicy {
+  #[must_use]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::None => "none",
+      Self::LatestSuccess => "latest_success",
+    }
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +226,7 @@ impl ScheduleService {
     &self,
     invocation: &ScheduleInvocation,
   ) -> Result<Vec<&'static str>, ScheduleServiceError> {
-    self.authorization.authorize_create(invocation)?;
+    self.authorize_create_principal(invocation)?;
     Ok(self.target_resolver.describe_supported_targets(invocation))
   }
 
@@ -213,7 +234,7 @@ impl ScheduleService {
     &self,
     invocation: &ScheduleInvocation,
   ) -> Result<Vec<&'static str>, ScheduleServiceError> {
-    self.authorization.authorize_create(invocation)?;
+    self.authorize_create_principal(invocation)?;
     Ok(self.capability_registry.describe_authorized(invocation))
   }
 
@@ -226,7 +247,7 @@ impl ScheduleService {
     error: ScheduleServiceError,
     now: i64,
   ) -> ScheduleServiceError {
-    let attempt = ScheduleAuditAttempt::new(invocation, operation, request_id, job_id, now);
+    let attempt = self.audit_attempt(invocation, operation, request_id, job_id, now);
     match self
       .state
       .append_schedule_audit(&attempt.error_record(&error))
@@ -242,7 +263,7 @@ impl ScheduleService {
     invocation: &ScheduleInvocation,
     request: CreateScheduleRequest,
   ) -> Result<Value, ScheduleServiceError> {
-    let attempt = ScheduleAuditAttempt::new(
+    let attempt = self.audit_attempt(
       invocation,
       "create",
       Some(&request.request_id),
@@ -262,7 +283,7 @@ impl ScheduleService {
   ) -> Result<PreparedMutation, ScheduleServiceError> {
     validate_request_id(&request.request_id)?;
     validate_instruction(&request.instruction)?;
-    let owner = self.authorization.authorize_create(invocation)?;
+    let owner = self.authorize_create_principal(invocation)?;
     let job_id = format!(
       "job_{}",
       &digest_json(&json!({
@@ -286,6 +307,7 @@ impl ScheduleService {
       "create",
       &owner,
       &request.instruction,
+      request.previous_success,
       &request.schedule,
       &capability,
       &targets,
@@ -306,7 +328,7 @@ impl ScheduleService {
     let mutation = ScheduledJobMutation::Create(Box::new(CreateScheduledJob {
       job_id: job_id.clone(),
       schedule_id: format!("schedule_{job_id}"),
-      definition: definition(&request.instruction)?,
+      definition: definition(&request.instruction, request.previous_success)?,
       creator: owner.clone(),
       owner: owner.clone(),
       capability,
@@ -327,7 +349,7 @@ impl ScheduleService {
     invocation: &ScheduleInvocation,
     request: UpdateScheduleRequest,
   ) -> Result<Value, ScheduleServiceError> {
-    let attempt = ScheduleAuditAttempt::new(
+    let attempt = self.audit_attempt(
       invocation,
       "update",
       Some(&request.request_id),
@@ -364,6 +386,7 @@ impl ScheduleService {
       "update",
       &owner,
       &request.instruction,
+      request.previous_success,
       &request.schedule,
       &capability,
       &targets,
@@ -390,7 +413,7 @@ impl ScheduleService {
     let mutation = ScheduledJobMutation::Update(Box::new(UpdateScheduledJob {
       job_id: request.job_id,
       expected_generation: request.expected_generation,
-      definition: definition(&request.instruction)?,
+      definition: definition(&request.instruction, request.previous_success)?,
       capability,
       targets,
       schedule: request.schedule,
@@ -434,17 +457,17 @@ impl ScheduleService {
     job_id: &str,
     now: i64,
   ) -> Result<Value, ScheduleServiceError> {
-    let attempt = ScheduleAuditAttempt::new(invocation, "get", Some(job_id), Some(job_id), now);
+    let attempt = self.audit_attempt(invocation, "get", Some(job_id), Some(job_id), now);
     let result = async {
-      let (_, job) = self.authorize_job(invocation, job_id).await?;
+      let (owner, job) = self.authorize_job(invocation, job_id).await?;
       let targets = self
         .state
         .get_scheduled_job_delivery_targets(job_id)
         .await?;
-      Ok(success_envelope(job_json(&job, &targets)?))
+      Ok((success_envelope(job_json(&job, &targets)?), owner))
     }
     .await;
-    self.finish_read_attempt(&attempt, result).await
+    self.finish_authorized_read_attempt(&attempt, result).await
   }
 
   pub async fn list(
@@ -455,20 +478,24 @@ impl ScheduleService {
     limit: u32,
     now: i64,
   ) -> Result<Value, ScheduleServiceError> {
-    let attempt = ScheduleAuditAttempt::new(invocation, "list", Some("list"), None, now);
+    let attempt = self.audit_attempt(invocation, "list", Some("list"), None, now);
     let result = async {
-      let owner = self.authorization.authorize_create(invocation)?;
+      let owner = self.authorization.authenticate(invocation)?;
+      self.authorization.authorize_list(&owner)?;
       let page = self
         .state
         .list_scheduled_jobs_by_owner(&owner, status, cursor, limit)
         .await?;
-      Ok(success_envelope(json!({
-        "job_ids": page.job_ids,
-        "next_cursor": page.next_cursor,
-      })))
+      Ok((
+        success_envelope(json!({
+          "job_ids": page.job_ids,
+          "next_cursor": page.next_cursor,
+        })),
+        owner,
+      ))
     }
     .await;
-    self.finish_read_attempt(&attempt, result).await
+    self.finish_authorized_read_attempt(&attempt, result).await
   }
 
   async fn lifecycle(
@@ -477,7 +504,7 @@ impl ScheduleService {
     request: LifecycleScheduleRequest,
     operation: &'static str,
   ) -> Result<Value, ScheduleServiceError> {
-    let attempt = ScheduleAuditAttempt::new(
+    let attempt = self.audit_attempt(
       invocation,
       operation,
       Some(&request.request_id),
@@ -562,8 +589,38 @@ impl ScheduleService {
     invocation: &ScheduleInvocation,
     job_id: &str,
   ) -> Result<(PrincipalKey, ScheduledJob), ScheduleServiceError> {
-    let job = self.state.get_scheduled_job(job_id).await?;
-    self.authorization.authorize_existing(invocation, job)
+    let owner = self.authorization.authenticate(invocation)?;
+    bounded("job_id", job_id)?;
+    let job = self
+      .state
+      .get_scheduled_job_by_owner(&owner, job_id)
+      .await?;
+    let job = self.authorization.authorize_existing(&owner, job)?;
+    Ok((owner, job))
+  }
+
+  fn authorize_create_principal(
+    &self,
+    invocation: &ScheduleInvocation,
+  ) -> Result<PrincipalKey, ScheduleServiceError> {
+    let principal = self.authorization.authenticate(invocation)?;
+    self.authorization.authorize_create(&principal)?;
+    Ok(principal)
+  }
+
+  fn audit_attempt(
+    &self,
+    invocation: &ScheduleInvocation,
+    operation: &'static str,
+    request_id: Option<&str>,
+    job_id: Option<&str>,
+    now: i64,
+  ) -> ScheduleAuditAttempt {
+    let mut attempt = ScheduleAuditAttempt::new(invocation, operation, request_id, job_id, now);
+    if let Ok(principal) = self.authorization.authenticate(invocation) {
+      attempt.principal = Some(principal);
+    }
+    attempt
   }
 
   fn resolve_capability(
@@ -706,16 +763,16 @@ impl ScheduleService {
     }
   }
 
-  async fn finish_read_attempt(
+  async fn finish_authorized_read_attempt(
     &self,
     attempt: &ScheduleAuditAttempt,
-    result: Result<Value, ScheduleServiceError>,
+    result: Result<(Value, PrincipalKey), ScheduleServiceError>,
   ) -> Result<Value, ScheduleServiceError> {
     match result {
-      Ok(value) => {
-        self
-          .append_attempt(attempt.record("applied", "allow", None))
-          .await?;
+      Ok((value, owner)) => {
+        let mut audit = attempt.record("applied", "allow", None);
+        audit.principal = Some(owner);
+        self.append_attempt(audit).await?;
         Ok(value)
       }
       Err(error) => self.finish_error_attempt(attempt, error).await,
@@ -762,10 +819,17 @@ fn validate_instruction(value: &str) -> Result<(), ScheduleServiceError> {
   Ok(())
 }
 
-fn definition(instruction: &str) -> Result<ScheduledJobDefinition, ScheduleServiceError> {
+fn definition(
+  instruction: &str,
+  previous_success: PreviousSuccessPolicy,
+) -> Result<ScheduledJobDefinition, ScheduleServiceError> {
   ScheduledJobDefinition::new(
-    SNAPSHOT_VERSION,
-    canonical_json(&json!({"instruction": instruction}))?,
+    DEFINITION_VERSION,
+    canonical_json(&json!({
+      "schema_version": DEFINITION_VERSION,
+      "instruction": instruction,
+      "previous_success": {"kind": previous_success.as_str()},
+    }))?,
   )
   .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))
 }
@@ -775,18 +839,29 @@ fn mutation_semantics(
   operation: &str,
   owner: &PrincipalKey,
   instruction: &str,
+  previous_success: PreviousSuccessPolicy,
   schedule: &ScheduleSpec,
   capability: &CapabilityProfileSnapshot,
   targets: &[DeliveryTargetSnapshot],
   job_id: Option<&str>,
   expected_generation: Option<i64>,
 ) -> Result<Value, ScheduleServiceError> {
+  let definition = match previous_success {
+    PreviousSuccessPolicy::None => {
+      json!({"version": SNAPSHOT_VERSION, "instruction": instruction})
+    }
+    PreviousSuccessPolicy::LatestSuccess => json!({
+      "version": DEFINITION_VERSION,
+      "instruction": instruction,
+      "previous_success": {"kind": previous_success.as_str()},
+    }),
+  };
   Ok(json!({
     "operation": operation,
     "owner": principal_json(owner),
     "job_id": job_id,
     "expected_generation": expected_generation,
-    "definition": {"version": SNAPSHOT_VERSION, "instruction": instruction},
+    "definition": definition,
     "schedule": schedule_json(schedule),
     "capability": {
       "version": capability.schema_version(),
@@ -971,5 +1046,70 @@ fn canonicalize(value: &Value) -> Value {
     }
     Value::Array(values) => Value::Array(values.iter().map(canonicalize).collect()),
     _ => value.clone(),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn mutation_semantics_preserves_legacy_digest_for_no_previous_success() {
+    let owner = PrincipalKey::new("operator", "local", "realm-a", "ops-a").expect("owner");
+    let capability = CapabilityProfileSnapshot::new(
+      SNAPSHOT_VERSION,
+      "capability-digest",
+      json!({"name": "none", "tools": []}).to_string(),
+    )
+    .expect("capability");
+    let target = DeliveryTargetSnapshot::new(
+      "target-none",
+      "none",
+      "none",
+      owner.tenant(),
+      "none",
+      "{}",
+      SNAPSHOT_VERSION,
+      "default-none-v1",
+      "target-identity-digest",
+    )
+    .expect("target");
+    let schedule = ScheduleSpec::once(2_000_000_000);
+
+    let legacy = mutation_semantics(
+      "create",
+      &owner,
+      "Inspect durable work.",
+      PreviousSuccessPolicy::None,
+      &schedule,
+      &capability,
+      std::slice::from_ref(&target),
+      Some("job-1"),
+      Some(0),
+    )
+    .expect("legacy semantics");
+    let latest_success = mutation_semantics(
+      "create",
+      &owner,
+      "Inspect durable work.",
+      PreviousSuccessPolicy::LatestSuccess,
+      &schedule,
+      &capability,
+      &[target],
+      Some("job-1"),
+      Some(0),
+    )
+    .expect("latest-success semantics");
+
+    assert_eq!(
+      legacy["definition"],
+      json!({"version": 1, "instruction": "Inspect durable work."})
+    );
+    assert_eq!(latest_success["definition"]["version"], 2);
+    assert_eq!(
+      latest_success["definition"]["previous_success"]["kind"],
+      "latest_success"
+    );
+    assert_ne!(legacy, latest_success);
   }
 }

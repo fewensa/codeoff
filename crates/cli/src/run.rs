@@ -48,7 +48,8 @@ use codeoff_runtime::{
 };
 use codeoff_state::{RetentionPolicy, StateError, StateStore};
 
-use crate::command::{Cli, Command, ConfigCommand, WorkerCommand};
+use crate::command::{Cli, Command, ConfigCommand, SchedulerCommand, WorkerCommand};
+use crate::scheduler::{SchedulerCommandError, SchedulerOperatorConfig, execute_scheduler_command};
 
 /// Parses CLI arguments and runs the selected Codeoff command.
 ///
@@ -65,11 +66,31 @@ fn run_with_cli(cli: Cli) -> Result<(), Box<dyn Error>> {
     Command::Worker { command } => run_worker(command, cli.config, cli.state_dir),
     Command::Migrate => run_migrate(cli.config, cli.state_dir),
     Command::Config { command } => run_config(command, cli.config, cli.state_dir),
+    Command::Scheduler { command } => run_scheduler(command, cli.config, cli.state_dir),
     Command::Dev => {
       println!("codeoff dev is not implemented yet");
       Ok(())
     }
   }
+}
+
+fn run_scheduler(
+  command: SchedulerCommand,
+  config_path: Option<PathBuf>,
+  state_dir: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+  let operator = SchedulerOperatorConfig::from_environment()
+    .map_err(|error| SchedulerCommandError::service(&error))?;
+  let config = load_config(config_path, state_dir)?;
+  let runtime = tokio::runtime::Runtime::new()?;
+  let state = runtime.block_on(StateStore::initialize(
+    config.state_dir(),
+    config.database_url(),
+  ))?;
+  let now = i64::try_from(now_unix_seconds()).unwrap_or(i64::MAX);
+  let output = runtime.block_on(execute_scheduler_command(command, state, operator, now))?;
+  println!("{}", serde_json::to_string(&output)?);
+  Ok(())
 }
 
 fn run_serve(

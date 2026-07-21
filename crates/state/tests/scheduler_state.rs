@@ -848,7 +848,7 @@ async fn test_owner_list_isolated_cursor_bounded_and_uses_owner_status_index() {
     ("owner-a-1", owner_a.clone()),
     ("owner-a-2", owner_a.clone()),
     ("owner-a-paused", owner_a.clone()),
-    ("owner-b-1", owner_b),
+    ("owner-b-1", owner_b.clone()),
   ] {
     let mut request = create_request(job, ScheduleSpec::once(200), 100);
     request.owner = owner;
@@ -890,6 +890,28 @@ async fn test_owner_list_isolated_cursor_bounded_and_uses_owner_status_index() {
       .await
       .is_err()
   );
+
+  assert!(
+    store
+      .get_scheduled_job_by_owner(&owner_a, "owner-a-1")
+      .await
+      .expect("exact owner query")
+      .is_some()
+  );
+  for other in [
+    owner_b,
+    PrincipalKey::new("user", "github", "org-a", "bot").expect("other kind"),
+    PrincipalKey::new("service", "slack", "org-a", "bot").expect("other provider"),
+    PrincipalKey::new("service", "github", "org-a", "other").expect("other subject"),
+  ] {
+    assert!(
+      store
+        .get_scheduled_job_by_owner(&other, "owner-a-1")
+        .await
+        .expect("owner scoped query")
+        .is_none()
+    );
+  }
 
   let pool = SqlitePool::connect(&database_url(&state_dir))
     .await

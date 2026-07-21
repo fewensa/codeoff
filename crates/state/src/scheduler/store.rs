@@ -186,6 +186,32 @@ impl StateStore {
     row.map(|row| scheduled_job_from_row(&row)).transpose()
   }
 
+  /// Reads one durable job only when its complete owner key matches.
+  ///
+  /// # Errors
+  /// Returns an error when the owner or job id is invalid, persisted state is invalid, or `SQLite`
+  /// cannot execute the query.
+  pub async fn get_scheduled_job_by_owner(
+    &self,
+    owner: &PrincipalKey,
+    job_id: &str,
+  ) -> Result<Option<ScheduledJob>, StateError> {
+    owner.validate().map_err(invalid_value)?;
+    validate_text("job id", job_id).map_err(invalid_value)?;
+    let row = sqlx::query(
+      "select j.job_id, j.definition_version, j.definition_json, j.creator_kind, j.creator_provider, j.creator_tenant, j.creator_subject, j.owner_kind, j.owner_provider, j.owner_tenant, j.owner_subject, j.capability_schema_version, j.capability_digest, j.capability_json, j.status, j.generation, s.schedule_id, s.generation as schedule_generation, s.kind, s.canonical_spec, s.timezone, s.once_at, s.anchor_at, s.interval_seconds, s.next_run_at from scheduled_jobs j join schedules s on s.job_id = j.job_id where j.job_id = ?1 and j.owner_kind = ?2 and j.owner_provider = ?3 and j.owner_tenant = ?4 and j.owner_subject = ?5",
+    )
+    .bind(job_id)
+    .bind(owner.kind())
+    .bind(owner.provider())
+    .bind(owner.tenant())
+    .bind(owner.subject())
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    row.map(|row| scheduled_job_from_row(&row)).transpose()
+  }
+
   /// Reads the ordered durable delivery target snapshots for one scheduled job.
   ///
   /// # Errors

@@ -10,6 +10,7 @@
 
 mod command;
 mod run;
+mod scheduler;
 
 pub use command::Cli;
 pub use run::run;

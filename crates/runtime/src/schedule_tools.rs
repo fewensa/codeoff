@@ -5,8 +5,8 @@ use codeoff_state::{ScheduleSpec, ScheduledJobStatus, StateStore};
 use serde_json::{Map, Value, json};
 
 use crate::schedule_service::{
-  CreateScheduleRequest, DeliveryTargetRequest, LifecycleScheduleRequest, ScheduleInvocation,
-  ScheduleService, ScheduleServiceError, UpdateScheduleRequest,
+  CreateScheduleRequest, DeliveryTargetRequest, LifecycleScheduleRequest, PreviousSuccessPolicy,
+  ScheduleInvocation, ScheduleService, ScheduleServiceError, UpdateScheduleRequest,
 };
 
 pub const SCHEDULE_DYNAMIC_TOOL_NAMES: &[&str] = &[
@@ -196,6 +196,7 @@ impl ScheduleDynamicToolHandler {
         CreateScheduleRequest {
           request_id: string(&object, "request_id")?,
           instruction: string(&object, "instruction")?,
+          previous_success: PreviousSuccessPolicy::None,
           schedule: schedule(object.get("schedule").ok_or("missing schedule")?)?,
           target: target(object.get("target").ok_or("missing target")?)?,
           capability: optional_string(&object, "capability")?.unwrap_or_else(|| "none".to_owned()),
@@ -233,6 +234,7 @@ impl ScheduleDynamicToolHandler {
           job_id: string(&object, "job_id")?,
           expected_generation: integer(&object, "expected_generation")?,
           instruction: string(&object, "instruction")?,
+          previous_success: PreviousSuccessPolicy::None,
           schedule: schedule(object.get("schedule").ok_or("missing schedule")?)?,
           target: target(object.get("target").ok_or("missing target")?)?,
           capability: optional_string(&object, "capability")?.unwrap_or_else(|| "none".to_owned()),

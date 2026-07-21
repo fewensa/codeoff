@@ -26,12 +26,157 @@ fn test_cli_exposes_expected_subcommands() {
   assert!(worker.find_subcommand("slack").is_some());
   assert!(worker.find_subcommand("channel-events").is_some());
   assert!(worker.find_subcommand("temporal").is_none());
-  assert!(command.find_subcommand("schedule").is_none());
+
+  let mut scheduler = command
+    .find_subcommand("scheduler")
+    .expect("scheduler subcommand")
+    .clone();
+  for operation in [
+    "create", "get", "list", "update", "pause", "resume", "delete",
+  ] {
+    assert!(
+      scheduler.find_subcommand(operation).is_some(),
+      "{operation}"
+    );
+  }
+  assert!(
+    !scheduler
+      .render_long_help()
+      .to_string()
+      .contains("--as-user")
+  );
 
   let config = command
     .find_subcommand("config")
     .expect("config subcommand");
   assert!(config.find_subcommand("check").is_some());
+}
+
+#[test]
+fn test_scheduler_stdin_create_and_get_are_no_slack_sanitized_json() {
+  let dir = tempdir().expect("create tempdir");
+  let state_dir = dir.path().join("state");
+  let prompt = "private prompt sentinel Authorization: Bearer hidden";
+  let input = format!(
+    r#"{{
+      "schema_version": 1,
+      "request_id": "stdin-create",
+      "instruction": "{prompt}",
+      "schedule": {{"kind": "once", "at": "2030-01-01T00:00:00Z"}},
+      "capability": "none",
+      "previous_success": {{"kind": "none"}},
+      "delivery": {{"kind": "none"}}
+    }}"#
+  );
+  let created = Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env("CODEOFF_SCHEDULER_OPERATOR_ID", "ops-a")
+    .env("CODEOFF_SCHEDULER_OPERATOR_REALM", "test-realm")
+    .env_remove("SLACK_BOT_TOKEN")
+    .env_remove("SLACK_APP_TOKEN")
+    .env_remove("SLACK_SIGNING_SECRET")
+    .args([
+      "--state-dir",
+      state_dir.to_str().expect("state path"),
+      "scheduler",
+      "create",
+      "--file",
+      "-",
+      "--format",
+      "json",
+    ])
+    .write_stdin(input)
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+  let created_text = String::from_utf8(created).expect("stdout");
+  assert!(!created_text.contains(prompt));
+  let created: serde_json::Value = serde_json::from_str(&created_text).expect("created JSON");
+  assert_eq!(created["schema_version"], 1);
+  assert_eq!(created["ok"], true);
+  assert_eq!(created["data"]["targets"]["items"][0]["kind"], "none");
+  let job_id = created["data"]["job_id"].as_str().expect("job id");
+
+  let get = Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env("CODEOFF_SCHEDULER_OPERATOR_ID", "ops-a")
+    .env("CODEOFF_SCHEDULER_OPERATOR_REALM", "test-realm")
+    .env_remove("SLACK_BOT_TOKEN")
+    .env_remove("SLACK_APP_TOKEN")
+    .env_remove("SLACK_SIGNING_SECRET")
+    .args([
+      "--state-dir",
+      state_dir.to_str().expect("state path"),
+      "scheduler",
+      "get",
+      job_id,
+    ])
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+  let get_text = String::from_utf8(get).expect("get stdout");
+  assert!(!get_text.contains(prompt));
+  let get: serde_json::Value = serde_json::from_str(&get_text).expect("get JSON");
+  assert_eq!(get["data"]["job_id"], job_id);
+  assert!(get["data"]["definition"].get("instruction").is_none());
+  assert!(state_dir.join("codeoff.db").is_file());
+}
+
+#[test]
+fn test_scheduler_missing_identity_and_invalid_input_fail_closed_without_secret_echo() {
+  let dir = tempdir().expect("create tempdir");
+  let state_dir = dir.path().join("state");
+  let missing = Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env_remove("CODEOFF_SCHEDULER_OPERATOR_ID")
+    .env_remove("CODEOFF_SCHEDULER_OPERATOR_REALM")
+    .args([
+      "--state-dir",
+      state_dir.to_str().expect("state path"),
+      "scheduler",
+      "list",
+    ])
+    .assert()
+    .failure()
+    .get_output()
+    .stderr
+    .clone();
+  let missing: serde_json::Value =
+    serde_json::from_slice(&missing).expect("versioned identity error");
+  assert_eq!(missing["error"]["code"], "unauthorized");
+  assert!(!state_dir.exists());
+
+  let secret = "Authorization: Bearer invalid-secret";
+  let invalid = Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env("CODEOFF_SCHEDULER_OPERATOR_ID", "ops-a")
+    .env("CODEOFF_SCHEDULER_OPERATOR_REALM", "test-realm")
+    .args([
+      "--state-dir",
+      state_dir.to_str().expect("state path"),
+      "scheduler",
+      "create",
+      "--file",
+      "-",
+      "--format",
+      "json",
+    ])
+    .write_stdin(format!(
+      r#"{{"schema_version":1,"instruction":"{secret}","owner":"U1"}}"#
+    ))
+    .assert()
+    .failure()
+    .get_output()
+    .stderr
+    .clone();
+  let invalid_text = String::from_utf8(invalid).expect("stderr");
+  assert!(!invalid_text.contains(secret));
+  let invalid: serde_json::Value = serde_json::from_str(&invalid_text).expect("versioned error");
+  assert_eq!(invalid["error"]["code"], "validation_failed");
 }
 
 #[test]

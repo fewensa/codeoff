@@ -4,10 +4,11 @@ use codeoff_agent_contract::{
 };
 use codeoff_runtime::schedule_service::ScheduleInvocation;
 use codeoff_runtime::schedule_service::{
-  CapabilityRegistry, CapabilityRequest, ChannelTargetVerifier, CreateScheduleRequest,
-  DefaultCapabilityRegistry, DeliveryTargetRequest, OwnerOnlyAuthorizationPolicy, ScheduleService,
-  ScheduleServiceError, TargetResolver, TargetResolverRegistration, TargetResolverRegistry,
-  TargetVerificationError, VerifiedSlackTargetResolver,
+  CapabilityRegistry, CapabilityRequest, ChannelTargetVerifier, ConfiguredOperatorIdentityPolicy,
+  CreateScheduleRequest, DefaultCapabilityRegistry, DeliveryTargetRequest,
+  OperatorAuthorizationPolicy, OwnerOnlyAuthorizationPolicy, PreviousSuccessPolicy,
+  ScheduleService, ScheduleServiceError, TargetResolver, TargetResolverRegistration,
+  TargetResolverRegistry, TargetVerificationError, VerifiedSlackTargetResolver,
 };
 use codeoff_runtime::schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler};
 use codeoff_state::{
@@ -370,6 +371,8 @@ async fn test_schedule_tools_owner_lifecycle_idempotency_and_restart() {
     persisted["definition"]["instruction"],
     "Updated paused intent."
   );
+  assert_eq!(persisted["definition"]["schema_version"], 2);
+  assert_eq!(persisted["definition"]["previous_success"]["kind"], "none");
 }
 
 #[tokio::test]
@@ -521,6 +524,7 @@ async fn test_direct_schedule_service_call_records_exactly_one_attempt_audit() {
       CreateScheduleRequest {
         request_id: "direct-service".to_owned(),
         instruction: "Direct service audit.".to_owned(),
+        previous_success: PreviousSuccessPolicy::None,
         schedule: ScheduleSpec::once(200),
         target: DeliveryTargetRequest::None,
         capability: "none".to_owned(),
@@ -537,6 +541,102 @@ async fn test_direct_schedule_service_call_records_exactly_one_attempt_audit() {
   assert_eq!(audit.len(), 1);
   assert_eq!(audit[0].outcome, "denied");
   assert_eq!(audit[0].decision, "deny");
+}
+
+#[tokio::test]
+async fn test_operator_policy_requires_exact_trusted_mapping_and_persists_versioned_definition() {
+  let temp = tempdir().expect("tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("state");
+  let policy =
+    ConfiguredOperatorIdentityPolicy::new("ops-a", "realm-a", "alice").expect("operator policy");
+  let service = ScheduleService::with_components(
+    store.clone(),
+    Arc::new(TargetResolverRegistry::with_defaults()),
+    Arc::new(DefaultCapabilityRegistry),
+    Arc::new(OperatorAuthorizationPolicy::new(Arc::new(policy))),
+    Duration::from_millis(50),
+  );
+  let operator_invocation = ScheduleInvocation {
+    source: InvocationSource::TrustedOperator {
+      request_id: "operator-create".to_owned(),
+    },
+    principal: InvocationPrincipal::service("ops-a"),
+    channel: None,
+  };
+  let created = service
+    .create(
+      &operator_invocation,
+      CreateScheduleRequest {
+        request_id: "operator-create".to_owned(),
+        instruction: "Inspect durable work.".to_owned(),
+        previous_success: PreviousSuccessPolicy::LatestSuccess,
+        schedule: ScheduleSpec::once(200),
+        target: DeliveryTargetRequest::None,
+        capability: "none".to_owned(),
+        now: 100,
+      },
+    )
+    .await
+    .expect("operator create");
+  let job_id = created["data"]["job_id"].as_str().expect("job id");
+  let owner = PrincipalKey::new("operator", "local", "realm-a", "alice").expect("owner");
+  let job = store
+    .get_scheduled_job_by_owner(&owner, job_id)
+    .await
+    .expect("owner query")
+    .expect("job");
+  assert_eq!(job.definition.version(), 2);
+  let definition: Value =
+    serde_json::from_str(job.definition.canonical_json()).expect("definition");
+  assert_eq!(definition["schema_version"], 2);
+  assert_eq!(definition["previous_success"]["kind"], "latest_success");
+  let targets = store
+    .get_scheduled_job_delivery_targets(job_id)
+    .await
+    .expect("targets");
+  assert_eq!(targets.len(), 1);
+  assert_eq!(targets[0].kind(), "none");
+
+  for (index, rejected) in [
+    ScheduleInvocation {
+      source: InvocationSource::TrustedOperator {
+        request_id: "wrong-service".to_owned(),
+      },
+      principal: InvocationPrincipal::service("ops-b"),
+      channel: None,
+    },
+    ScheduleInvocation {
+      source: InvocationSource::InternalService {
+        service: "ops-a".to_owned(),
+        request_id: "wrong-source".to_owned(),
+      },
+      principal: InvocationPrincipal::service("ops-a"),
+      channel: None,
+    },
+    invocation("U1"),
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let error = service
+      .create(
+        &rejected,
+        CreateScheduleRequest {
+          request_id: format!("operator-denied-{index}"),
+          instruction: "Denied.".to_owned(),
+          previous_success: PreviousSuccessPolicy::None,
+          schedule: ScheduleSpec::once(300),
+          target: DeliveryTargetRequest::None,
+          capability: "none".to_owned(),
+          now: 100,
+        },
+      )
+      .await
+      .expect_err("mapping must fail closed");
+    assert_eq!(error.code(), "unauthorized");
+  }
 }
 
 #[tokio::test]

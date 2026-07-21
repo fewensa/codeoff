@@ -53,6 +53,11 @@ Payload 以 identifiers 為主：
 
 Active event 可以附帶 compact message text 與 context hints，但 Slack history 與 files 應透過 bounded channel tools 取得。
 
+Invocation provenance 與 trusted principal 是不同的 runtime values。Principal 由 authenticated
+adapter 建立，且絕不會 render 到 Codex prompt。Scheduled invocation 必須使用 fresh session，
+並且不能包含 channel context 或 interactive feedback；feedback wrapper 與 Codex backend 都會在
+任何 side effect 開始前拒絕非法組合。
+
 ## Dynamic Tools
 
 每個 task 都帶有 default-deny dynamic-tool policy。Interactive channel turn 只會宣告該 task

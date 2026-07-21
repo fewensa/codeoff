@@ -888,6 +888,7 @@ impl<C: CodexAppServerClient> AgentBackend for CodexAppServerBackend<C> {
   }
 
   fn run(&self, task: AgentTask) -> Result<AgentTaskResult, String> {
+    task.validate().map_err(str::to_owned)?;
     let prompt = render_prompt(
       &task,
       self.max_prompt_bytes,
@@ -1071,7 +1072,8 @@ fn truncate_utf8_with_marker(content: &str, max_bytes: usize) -> (String, bool) 
 mod tests {
   use super::*;
   use codeoff_agent_contract::{
-    ChannelTaskContext, ConversationKind, FeedbackTarget, PreviousSuccessContext,
+    ChannelTaskContext, ConversationKind, FeedbackTarget, InvocationPrincipal,
+    PreviousSuccessContext,
   };
   use std::cell::RefCell;
   use std::rc::Rc;
@@ -1179,6 +1181,7 @@ mod tests {
         dedupe_key: "d1".to_owned(),
         source_reference: Some("slack://W1/C1/100.0".to_owned()),
       },
+      principal: InvocationPrincipal::channel_actor("slack", "W1", "U1"),
       session: SessionMode::Fresh,
       channel: Some(ChannelTaskContext {
         provider: "slack".to_owned(),
@@ -1214,6 +1217,7 @@ mod tests {
         run_id: "run-1".to_owned(),
         scheduled_for: "2026-07-21T12:00:00Z".to_owned(),
       },
+      principal: InvocationPrincipal::service("scheduler"),
       session: SessionMode::Fresh,
       channel: None,
       previous_success: None,
@@ -1239,6 +1243,44 @@ mod tests {
         "unexpected channel wording: {forbidden}"
       );
     }
+  }
+
+  #[test]
+  fn renderer_does_not_expose_or_replace_trusted_principal() {
+    let client = FakeClient::default();
+    let backend = CodexAppServerBackend::new(&client);
+    let mut task = scheduled_task();
+    task.principal = InvocationPrincipal::service("scheduler-principal-sentinel");
+    let principal = task.principal.clone();
+    task.source = InvocationSource::TrustedOperator {
+      request_id: "claims-admin-but-is-only-provenance".to_owned(),
+    };
+
+    backend.run(task.clone()).expect("operator provenance turn");
+
+    assert_eq!(task.principal, principal);
+    let requests = client.0.borrow();
+    assert!(
+      requests[0]
+        .prompt
+        .contains("claims-admin-but-is-only-provenance")
+    );
+    assert!(!requests[0].prompt.contains("scheduler-principal-sentinel"));
+  }
+
+  #[test]
+  fn invalid_scheduled_session_is_rejected_before_client_start() {
+    let client = FakeClient::default();
+    let backend = CodexAppServerBackend::new(&client);
+    let mut task = scheduled_task();
+    task.session = SessionMode::Resume {
+      thread_id: "old-slack-thread".to_owned(),
+    };
+
+    let error = backend.run(task).expect_err("invalid scheduled task");
+
+    assert_eq!(error, "scheduled_run_requires_fresh_session");
+    assert!(client.0.borrow().is_empty());
   }
 
   #[test]

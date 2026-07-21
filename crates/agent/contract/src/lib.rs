@@ -1,5 +1,7 @@
 //! Provider-neutral agent contracts for Codeoff.
 
+use std::fmt;
+
 /// A bounded, ephemeral unit of work passed from the runtime to an agent backend.
 ///
 /// This execution request is deliberately separate from any persisted job definition. It contains
@@ -9,6 +11,7 @@ pub struct AgentTask {
   pub task_id: String,
   pub instruction: String,
   pub source: InvocationSource,
+  pub principal: InvocationPrincipal,
   pub session: SessionMode,
   pub channel: Option<ChannelTaskContext>,
   pub previous_success: Option<PreviousSuccessContext>,
@@ -38,6 +41,88 @@ pub enum InvocationSource {
     service: String,
     request_id: String,
   },
+}
+
+/// Trusted invocation identity supplied by an authenticated runtime adapter.
+///
+/// The identity is intentionally opaque to agent backends and prompts. Provenance, instructions,
+/// and tool arguments must never be used to construct, replace, or elevate this value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InvocationPrincipal {
+  identity: InvocationPrincipalIdentity,
+}
+
+impl fmt::Debug for InvocationPrincipal {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let kind = match &self.identity {
+      InvocationPrincipalIdentity::ChannelActor { .. } => "channel_actor",
+      InvocationPrincipalIdentity::Service { .. } => "service",
+    };
+    formatter
+      .debug_struct("InvocationPrincipal")
+      .field("kind", &kind)
+      .finish_non_exhaustive()
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InvocationPrincipalIdentity {
+  ChannelActor {
+    provider: String,
+    workspace_id: String,
+    actor_id: String,
+  },
+  Service {
+    service: String,
+  },
+}
+
+impl InvocationPrincipal {
+  #[must_use]
+  pub fn channel_actor(
+    provider: impl Into<String>,
+    workspace_id: impl Into<String>,
+    actor_id: impl Into<String>,
+  ) -> Self {
+    Self {
+      identity: InvocationPrincipalIdentity::ChannelActor {
+        provider: provider.into(),
+        workspace_id: workspace_id.into(),
+        actor_id: actor_id.into(),
+      },
+    }
+  }
+
+  #[must_use]
+  pub fn service(service: impl Into<String>) -> Self {
+    Self {
+      identity: InvocationPrincipalIdentity::Service {
+        service: service.into(),
+      },
+    }
+  }
+}
+
+impl AgentTask {
+  /// Validates cross-field invariants before execution or feedback side effects.
+  ///
+  /// # Errors
+  ///
+  /// Returns a stable error when a scheduled run attempts to reuse interactive channel state.
+  pub fn validate(&self) -> Result<(), &'static str> {
+    if matches!(self.source, InvocationSource::ScheduledRun { .. }) {
+      if !matches!(self.session, SessionMode::Fresh) {
+        return Err("scheduled_run_requires_fresh_session");
+      }
+      if self.channel.is_some() {
+        return Err("scheduled_run_disallows_channel_context");
+      }
+      if self.feedback_target.is_some() {
+        return Err("scheduled_run_disallows_feedback_target");
+      }
+    }
+    Ok(())
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,5 +338,82 @@ mod tests {
   #[test]
   fn tool_policy_defaults_to_deny_all() {
     assert_eq!(ToolPolicy::default(), ToolPolicy::None);
+  }
+
+  #[test]
+  fn scheduled_task_validation_rejects_non_fresh_or_interactive_context() {
+    let valid = AgentTask {
+      task_id: "run-1".to_owned(),
+      instruction: "Inspect issues".to_owned(),
+      source: InvocationSource::ScheduledRun {
+        job_id: "job-1".to_owned(),
+        run_id: "run-1".to_owned(),
+        scheduled_for: "2026-07-21T12:00:00Z".to_owned(),
+      },
+      principal: InvocationPrincipal::service("scheduler"),
+      session: SessionMode::Fresh,
+      channel: None,
+      previous_success: None,
+      tool_policy: ToolPolicy::None,
+      feedback_target: None,
+    };
+    assert_eq!(valid.validate(), Ok(()));
+
+    let mut resumed = valid.clone();
+    resumed.session = SessionMode::Resume {
+      thread_id: "old-slack-thread".to_owned(),
+    };
+    assert_eq!(
+      resumed.validate(),
+      Err("scheduled_run_requires_fresh_session")
+    );
+
+    let mut with_channel = valid.clone();
+    with_channel.channel = Some(ChannelTaskContext {
+      provider: "slack".to_owned(),
+      workspace_id: "W1".to_owned(),
+      conversation_key: "slack:W1:dm:D1:U1".to_owned(),
+      conversation_kind: ConversationKind::DirectMessage,
+      reply_strategy: ChannelReplyStrategy::FinalAnswer,
+      message_text: None,
+      channel_id: Some("D1".to_owned()),
+      thread_id: None,
+      message_ts: Some("1.0".to_owned()),
+      user_id: Some("U1".to_owned()),
+      recent_context: None,
+      conversation_summary: None,
+    });
+    assert_eq!(
+      with_channel.validate(),
+      Err("scheduled_run_disallows_channel_context")
+    );
+
+    let mut interactive = valid.clone();
+    interactive.feedback_target = Some(FeedbackTarget::Channel {
+      conversation_kind: ConversationKind::DirectMessage,
+      channel_id: "D1".to_owned(),
+      thread_id: None,
+      message_ts: Some("1.0".to_owned()),
+    });
+    assert_eq!(
+      interactive.validate(),
+      Err("scheduled_run_disallows_feedback_target")
+    );
+  }
+
+  #[test]
+  fn invocation_source_and_principal_are_independent_values() {
+    let principal = InvocationPrincipal::service("scheduler");
+    let other_source = InvocationSource::TrustedOperator {
+      request_id: "claims-admin-in-prompt".to_owned(),
+    };
+
+    assert_eq!(principal, principal.clone());
+    assert_ne!(principal, InvocationPrincipal::service("other-service"));
+    assert!(!format!("{principal:?}").contains("scheduler"));
+    assert!(matches!(
+      other_source,
+      InvocationSource::TrustedOperator { .. }
+    ));
   }
 }

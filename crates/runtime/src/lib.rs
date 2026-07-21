@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use codeoff_agent_contract::{
   AgentBackend, AgentTask, ChannelReplyStrategy, ChannelTaskContext, ConversationKind,
-  FeedbackTarget, InvocationSource, SessionMode, ToolPolicy,
+  FeedbackTarget, InvocationPrincipal, InvocationSource, SessionMode, ToolPolicy,
 };
 use codeoff_channel_contract::{ChannelEventKind, ChannelReplyTarget};
 use codeoff_state::{
@@ -465,6 +465,10 @@ fn build_slack_agent_task(
       thread_id: thread_id.clone(),
       message_ts: source.message_ts.clone(),
     });
+  let principal = source.user_id.as_ref().map_or_else(
+    || InvocationPrincipal::service("codeoff:slack-ingress"),
+    |user_id| InvocationPrincipal::channel_actor(&event.provider, &event.workspace_id, user_id),
+  );
   AgentTask {
     task_id: format!("slack:{}:{}", event.workspace_id, event.dedupe_key),
     instruction: "Prepare a bounded private draft or action plan for the queued Slack event."
@@ -476,6 +480,7 @@ fn build_slack_agent_task(
       dedupe_key: event.dedupe_key.clone(),
       source_reference: event.source_reference.clone(),
     },
+    principal,
     session: resume_thread_id.map_or(SessionMode::Fresh, |thread_id| SessionMode::Resume {
       thread_id,
     }),

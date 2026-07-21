@@ -686,6 +686,7 @@ impl<B: AgentBackend> AgentBackend for FeedbackAgentBackend<B> {
   }
 
   fn run(&self, task: AgentTask) -> Result<AgentTaskResult, String> {
+    task.validate().map_err(str::to_owned)?;
     let target = task.feedback_target.as_ref().and_then(|target| {
       let FeedbackTarget::Channel {
         conversation_kind,
@@ -3220,6 +3221,84 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn feedback_backend_has_no_side_effects_for_scheduled_tasks() {
+    #[derive(Clone)]
+    struct SpyBackend {
+      runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AgentBackend for SpyBackend {
+      fn provider_name(&self) -> &'static str {
+        "spy"
+      }
+
+      fn run(&self, _task: AgentTask) -> Result<AgentTaskResult, String> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(AgentTaskResult::draft("done"))
+      }
+    }
+
+    let transport = Arc::new(RecordingAssistantStatusTransport::new());
+    let assistant_status = assistant_status_controller_for_tests(transport.clone());
+    let slack_streams = SlackCodexStreamController::without_client_for_tests();
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend = build_feedback_agent_backend(
+      &CodeoffConfig::default(),
+      SpyBackend { runs: runs.clone() },
+      assistant_status,
+      slack_streams.clone(),
+    );
+
+    let result = backend.run(scheduled_task(None)).expect("scheduled result");
+
+    assert_eq!(result.draft_content(), Some("done"));
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert!(transport.operations.lock().expect("operations").is_empty());
+    assert!(
+      slack_streams
+        .active
+        .lock()
+        .expect("active stream")
+        .is_none()
+    );
+    assert!(
+      slack_streams
+        .observer_threads
+        .lock()
+        .expect("observer threads")
+        .is_empty()
+    );
+
+    let feedback = FeedbackTarget::Channel {
+      conversation_kind: ConversationKind::DirectMessage,
+      channel_id: "D1".to_owned(),
+      thread_id: None,
+      message_ts: Some("1.0".to_owned()),
+    };
+    let error = backend
+      .run(scheduled_task(Some(feedback)))
+      .expect_err("invalid scheduled feedback");
+
+    assert_eq!(error, "scheduled_run_disallows_feedback_target");
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert!(transport.operations.lock().expect("operations").is_empty());
+    assert!(
+      slack_streams
+        .active
+        .lock()
+        .expect("active stream")
+        .is_none()
+    );
+    assert!(
+      slack_streams
+        .observer_threads
+        .lock()
+        .expect("observer threads")
+        .is_empty()
+    );
+  }
+
+  #[tokio::test]
   async fn slack_codex_stream_start_uses_shared_reviewing_status() {
     let controller = SlackCodexStreamController::without_client_for_tests();
     let target = SlackCodexStreamTarget {
@@ -3428,6 +3507,11 @@ mod tests {
         dedupe_key: "dedupe-1".to_owned(),
         source_reference: None,
       },
+      principal: codeoff_agent_contract::InvocationPrincipal::channel_actor(
+        "slack",
+        "workspace-1",
+        "U1",
+      ),
       session: codeoff_agent_contract::SessionMode::Fresh,
       channel: Some(codeoff_agent_contract::ChannelTaskContext {
         provider: "slack".to_owned(),
@@ -3451,6 +3535,24 @@ mod tests {
         thread_id: thread_id.map(ToOwned::to_owned),
         message_ts: message_ts.map(ToOwned::to_owned),
       }),
+    }
+  }
+
+  fn scheduled_task(feedback_target: Option<FeedbackTarget>) -> AgentTask {
+    AgentTask {
+      task_id: "run-1".to_owned(),
+      instruction: "Inspect issues".to_owned(),
+      source: codeoff_agent_contract::InvocationSource::ScheduledRun {
+        job_id: "job-1".to_owned(),
+        run_id: "run-1".to_owned(),
+        scheduled_for: "2026-07-21T12:00:00Z".to_owned(),
+      },
+      principal: codeoff_agent_contract::InvocationPrincipal::service("scheduler"),
+      session: codeoff_agent_contract::SessionMode::Fresh,
+      channel: None,
+      previous_success: None,
+      tool_policy: codeoff_agent_contract::ToolPolicy::None,
+      feedback_target,
     }
   }
 

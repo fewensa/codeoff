@@ -53,6 +53,11 @@ The payload is identifier-first:
 
 Compact message text and context hints may be included for the active event, but Slack history and files should remain behind bounded channel tools.
 
+Invocation provenance and trusted principal are separate runtime values. The principal is created by
+the authenticated adapter and is never rendered into the Codex prompt. A scheduled invocation must
+use a fresh session without channel context or interactive feedback; both the feedback wrapper and
+Codex backend reject invalid combinations before starting any side effect.
+
 ## Dynamic Tools
 
 Each task carries a default-deny dynamic-tool policy. During an interactive channel turn, Codeoff

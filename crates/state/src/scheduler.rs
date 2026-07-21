@@ -669,6 +669,41 @@ pub enum LateEvidenceAppendOutcome {
   QuotaExceeded,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledRunResult {
+  summary: String,
+  previous_success_context: String,
+}
+
+impl ScheduledRunResult {
+  /// Builds a bounded version-one scheduled execution result.
+  ///
+  /// # Errors
+  /// Returns an error when the summary is empty or either field exceeds its storage bound.
+  pub fn new(
+    summary: impl Into<String>,
+    previous_success_context: impl Into<String>,
+  ) -> Result<Self, StateValueError> {
+    let value = Self {
+      summary: summary.into(),
+      previous_success_context: previous_success_context.into(),
+    };
+    validate_text("scheduled result summary", &value.summary)?;
+    if value.previous_success_context.len() > MAX_CONTEXT_BYTES {
+      return Err(StateValueError::TooLarge {
+        field: "scheduled result previous success context",
+      });
+    }
+    Ok(value)
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledRunSuccessOutcome {
+  Committed,
+  LateEvidence(LateEvidenceAppendOutcome),
+}
+
 impl AttestedExecutionProfileSnapshot {
   /// Builds the bounded profile attested before a scheduled turn starts.
   ///
@@ -745,6 +780,7 @@ impl FromStr for ScheduledRunState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledDeliveryState {
+  Intent,
   Pending,
   Leased,
   Sending,
@@ -758,6 +794,7 @@ impl ScheduledDeliveryState {
   #[must_use]
   pub const fn as_str(self) -> &'static str {
     match self {
+      Self::Intent => "intent",
       Self::Pending => "pending",
       Self::Leased => "leased",
       Self::Sending => "sending",
@@ -774,6 +811,7 @@ impl FromStr for ScheduledDeliveryState {
 
   fn from_str(value: &str) -> Result<Self, Self::Err> {
     match value {
+      "intent" => Ok(Self::Intent),
       "pending" => Ok(Self::Pending),
       "leased" => Ok(Self::Leased),
       "sending" => Ok(Self::Sending),

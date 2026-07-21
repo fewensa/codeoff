@@ -1,22 +1,52 @@
+use std::fmt::Write as _;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use codeoff_state::{
   AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot, ClaimedScheduledRun,
   CreateScheduledJob, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome, LateEvidenceAppendOutcome,
   MaterializationOutcome, OccurrenceError, PreflightFailureDisposition, PrincipalKey,
-  ScheduleMutationIdempotency, ScheduleSpec, ScheduledJobDefinition, ScheduledJobMutation,
-  ScheduledJobStatus, ScheduledRunLateEvidenceKind, StateError, StateStore, StateValueError,
+  ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryState, ScheduledJobDefinition,
+  ScheduledJobMutation, ScheduledJobStatus, ScheduledRunLateEvidenceKind, ScheduledRunResult,
+  ScheduledRunSuccessOutcome, StateError, StateStore, StateValueError,
   TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
   UpdateScheduledJob,
 };
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::tempdir;
 use tokio::sync::Barrier;
+
+type LegacyDeliveryMigrationRow = (
+  String,
+  i64,
+  Option<i64>,
+  Option<String>,
+  Option<i64>,
+  i64,
+  Option<String>,
+  Option<String>,
+  String,
+  Option<String>,
+  Option<Vec<u8>>,
+);
+type DeliveryIntentAuthorityRow = (
+  String,
+  String,
+  String,
+  i64,
+  i64,
+  i64,
+  Option<i64>,
+  Option<String>,
+  Option<Vec<u8>>,
+  String,
+);
 
 fn database_url(state_dir: &Path) -> String {
   format!("sqlite://{}", state_dir.join("codeoff.db").display())
@@ -35,6 +65,38 @@ fn target(job: &str) -> DeliveryTargetSnapshot {
     "none-v1",
   )
   .expect("target")
+}
+
+fn second_target(job: &str) -> DeliveryTargetSnapshot {
+  DeliveryTargetSnapshot::new(
+    format!("target-{job}-second"),
+    "slack",
+    "slack-primary",
+    "workspace",
+    "channel",
+    r#"{"channel_id":"C1"}"#,
+    1,
+    "resolver-v1",
+    "slack-channel-v1",
+  )
+  .expect("second target")
+}
+
+fn test_digest_identity(parts: &[&str]) -> String {
+  let mut digest = Sha256::new();
+  for part in parts {
+    digest.update(
+      u64::try_from(part.len())
+        .expect("test identity part fits u64")
+        .to_be_bytes(),
+    );
+    digest.update(part.as_bytes());
+  }
+  let mut encoded = String::with_capacity(64);
+  for byte in digest.finalize() {
+    write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+  }
+  encoded
 }
 
 fn owner() -> PrincipalKey {
@@ -71,6 +133,18 @@ fn test_fixed_interval_uses_anchor_without_drift() {
   let schedule = ScheduleSpec::fixed_interval(100, 30).expect("valid interval");
   assert_eq!(schedule.next_after(100).expect("next occurrence"), 130);
   assert_eq!(schedule.next_after(189).expect("next occurrence"), 190);
+}
+
+#[test]
+fn test_scheduled_run_result_is_typed_and_bounded() {
+  assert_eq!(
+    ScheduledDeliveryState::from_str("intent").expect("intent state"),
+    ScheduledDeliveryState::Intent
+  );
+  assert!(ScheduledRunResult::new("", "context").is_err());
+  assert!(ScheduledRunResult::new("summary", "x".repeat(65_537)).is_err());
+  assert!(ScheduledRunResult::new("x".repeat(65_537), "context").is_err());
+  assert!(ScheduledRunResult::new("summary", "").is_ok());
 }
 
 #[test]
@@ -515,7 +589,10 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
     let entry = entry.expect("migration entry");
     if !matches!(
       entry.file_name().to_str(),
-      Some("20260721030000_scheduler_execution_hardening.sql")
+      Some(
+        "20260721030000_scheduler_execution_hardening.sql"
+          | "20260721040000_scheduler_delivery_intents.sql"
+      )
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy historical migration");
@@ -831,7 +908,9 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
   let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
   for entry in std::fs::read_dir(source).expect("read migrations") {
     let entry = entry.expect("migration entry");
-    if entry.file_name() != "20260721030000_scheduler_execution_hardening.sql" {
+    if entry.file_name() != "20260721030000_scheduler_execution_hardening.sql"
+      && entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
+    {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
     }
@@ -906,7 +985,9 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
   let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
   for entry in std::fs::read_dir(source).expect("read migrations") {
     let entry = entry.expect("migration entry");
-    if entry.file_name() != "20260721030000_scheduler_execution_hardening.sql" {
+    if entry.file_name() != "20260721030000_scheduler_execution_hardening.sql"
+      && entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
+    {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
     }
@@ -970,6 +1051,236 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       "succeeded".to_owned()
     )
   );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_delivery_intent_migration_preserves_all_legacy_states_and_baselines() {
+  let temp = tempdir().expect("create tempdir");
+  let parent_migrations = temp.path().join("parent-migrations");
+  std::fs::create_dir(&parent_migrations).expect("create migration fixture");
+  let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+  for entry in std::fs::read_dir(source).expect("read migrations") {
+    let entry = entry.expect("migration entry");
+    if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql" {
+      std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
+        .expect("copy parent migration");
+    }
+  }
+  let state_dir = temp.path().join("state");
+  std::fs::create_dir(&state_dir).expect("create state dir");
+  let options = SqliteConnectOptions::from_str(&database_url(&state_dir))
+    .expect("database options")
+    .create_if_missing(true);
+  let pool = SqlitePoolOptions::new()
+    .max_connections(1)
+    .connect_with(options)
+    .await
+    .expect("connect parent database");
+  Migrator::new(parent_migrations)
+    .await
+    .expect("load parent migrator")
+    .run(&pool)
+    .await
+    .expect("run parent migrations");
+  sqlx::query("insert into scheduled_jobs (job_id, definition_version, definition_json, creator_kind, creator_provider, creator_tenant, creator_subject, owner_kind, owner_provider, owner_tenant, owner_subject, status, generation, capability_schema_version, capability_digest, capability_json, created_at, updated_at) values ('delivery-upgrade', 1, '{}', 'user', 'test', 'tenant', 'creator', 'user', 'test', 'tenant', 'owner', 'active', 0, 1, 'profile', '{}', 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed job");
+  sqlx::query("insert into schedules (schedule_id, job_id, kind, canonical_spec, once_at, next_run_at, created_at, updated_at) values ('schedule-delivery-upgrade', 'delivery-upgrade', 'once', '200', 200, 200, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed schedule");
+  sqlx::query("insert into scheduled_execution_baselines (job_id) values ('delivery-upgrade')")
+    .execute(&pool)
+    .await
+    .expect("seed execution baseline");
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, state, overlap_slot, created_at, updated_at) values ('delivery-upgrade-run', 'delivery-upgrade', 'schedule-delivery-upgrade', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{}]', '{\"baseline_version\":0,\"completed_at\":null,\"hash_algorithm\":null,\"previous_success_context\":null,\"result_hash\":null,\"source_run_id\":null}', 'pending', 1, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed run");
+  for (ordinal, state) in [
+    "pending",
+    "leased",
+    "sending",
+    "delivered",
+    "failed",
+    "delivery_unknown",
+    "skipped",
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let ordinal = i64::try_from(ordinal).expect("ordinal");
+    let active = matches!(state, "leased" | "sending");
+    let next_attempt_at = (state == "pending").then_some(150_i64);
+    let provider_receipt = (state == "delivered").then_some("receipt");
+    let error_message = matches!(state, "failed" | "delivery_unknown").then_some("error");
+    sqlx::query("insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, next_attempt_at, lease_owner, lease_expires_at, fence, provider_receipt, error_message, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values (?1, 'delivery-upgrade-run', 'delivery-upgrade', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, 100, 101)")
+      .bind(format!("legacy-{state}"))
+      .bind(format!("identity-{state}"))
+      .bind(format!(r#"{{"state":"{state}"}}"#))
+      .bind(state)
+      .bind(ordinal)
+      .bind(next_attempt_at)
+      .bind(active.then_some("worker"))
+      .bind(active.then_some(200_i64))
+      .bind(ordinal + 10)
+      .bind(provider_receipt)
+      .bind(error_message)
+      .bind(ordinal + 1)
+      .bind(format!("hash-{state}"))
+      .bind(format!("payload-{state}"))
+      .bind(ordinal)
+      .execute(&pool)
+      .await
+      .expect("seed legacy delivery");
+  }
+  sqlx::query("insert into scheduled_delivery_baselines (job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_hash, accepted_at, baseline_version) values ('delivery-upgrade', 'identity-delivered', 1, 4, 'hash-delivered', 'payload-delivered', 'legacy-delivered', 'delivery-upgrade-run', 'result', 101, 3)")
+    .execute(&pool)
+    .await
+    .expect("seed delivery baseline");
+  let deliveries_before: String = sqlx::query_scalar(
+    "select json_group_array(json_object('delivery_id', delivery_id, 'run_id', run_id, 'job_id', job_id, 'target_identity_digest', target_identity_digest, 'target_json', json(target_json), 'state', state, 'attempt', attempt, 'next_attempt_at', next_attempt_at, 'lease_owner', lease_owner, 'lease_expires_at', lease_expires_at, 'fence', fence, 'provider_receipt', provider_receipt, 'error_message', error_message, 'delivery_policy_version', delivery_policy_version, 'render_version', render_version, 'hash_algorithm', hash_algorithm, 'payload_digest', payload_digest, 'expected_baseline_version', expected_baseline_version, 'created_at', created_at, 'updated_at', updated_at)) from (select * from scheduled_run_deliveries order by delivery_id)",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("snapshot parent deliveries");
+  let baselines_before: String = sqlx::query_scalar(
+    "select json_group_array(json_object('job_id', job_id, 'target_identity_digest', target_identity_digest, 'delivery_policy_version', delivery_policy_version, 'render_version', render_version, 'hash_algorithm', hash_algorithm, 'accepted_payload_digest', accepted_payload_digest, 'source_delivery_id', source_delivery_id, 'source_run_id', source_run_id, 'source_result_hash', source_result_hash, 'accepted_at', accepted_at, 'baseline_version', baseline_version)) from (select * from scheduled_delivery_baselines order by job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm)",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("snapshot parent baselines");
+  pool.close().await;
+
+  StateStore::initialize(&state_dir, None)
+    .await
+    .expect("upgrade delivery schema");
+  StateStore::initialize(&state_dir, None)
+    .await
+    .expect("repeat upgraded initialize");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect upgraded database");
+  let deliveries_after: String = sqlx::query_scalar(
+    "select json_group_array(json_object('delivery_id', delivery_id, 'run_id', run_id, 'job_id', job_id, 'target_identity_digest', target_identity_digest, 'target_json', json(target_json), 'state', state, 'attempt', attempt, 'next_attempt_at', next_attempt_at, 'lease_owner', lease_owner, 'lease_expires_at', lease_expires_at, 'fence', fence, 'provider_receipt', provider_receipt, 'error_message', error_message, 'delivery_policy_version', delivery_policy_version, 'render_version', render_version, 'hash_algorithm', hash_algorithm, 'payload_digest', payload_digest, 'expected_baseline_version', expected_baseline_version, 'created_at', created_at, 'updated_at', updated_at)) from (select * from scheduled_run_deliveries order by delivery_id)",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("snapshot upgraded deliveries");
+  let baselines_after: String = sqlx::query_scalar(
+    "select json_group_array(json_object('job_id', job_id, 'target_identity_digest', target_identity_digest, 'delivery_policy_version', delivery_policy_version, 'render_version', render_version, 'hash_algorithm', hash_algorithm, 'accepted_payload_digest', accepted_payload_digest, 'source_delivery_id', source_delivery_id, 'source_run_id', source_run_id, 'source_result_hash', source_result_hash, 'accepted_at', accepted_at, 'baseline_version', baseline_version)) from (select * from scheduled_delivery_baselines order by job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm)",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("snapshot upgraded baselines");
+  assert_eq!(deliveries_after, deliveries_before);
+  assert_eq!(baselines_after, baselines_before);
+  let rows: Vec<LegacyDeliveryMigrationRow> = sqlx::query_as(
+    "select state, attempt, next_attempt_at, lease_owner, lease_expires_at, fence, provider_receipt, error_message, authority_kind, intent_key, payload_snapshot from scheduled_run_deliveries order by delivery_id",
+  )
+  .fetch_all(&pool)
+  .await
+  .expect("read upgraded deliveries");
+  assert_eq!(rows.len(), 7);
+  for row in &rows {
+    assert_eq!(row.8, "legacy");
+    assert_eq!(row.9, None);
+    assert_eq!(row.10, None);
+  }
+  let baseline: (String, String, i64) = sqlx::query_as(
+    "select source_delivery_id, accepted_payload_digest, baseline_version from scheduled_delivery_baselines where job_id = 'delivery-upgrade'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read preserved baseline");
+  assert_eq!(
+    baseline,
+    (
+      "legacy-delivered".to_owned(),
+      "payload-delivered".to_owned(),
+      3
+    )
+  );
+  let foreign_key_errors: i64 = sqlx::query_scalar("select count(*) from pragma_foreign_key_check")
+    .fetch_one(&pool)
+    .await
+    .expect("check upgraded foreign keys");
+  assert_eq!(foreign_key_errors, 0);
+  let migration_applied: i64 = sqlx::query_scalar(
+    "select count(*) from _sqlx_migrations where version = 20260721040000 and success = true",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read migration state");
+  assert_eq!(migration_applied, 1);
+}
+
+#[tokio::test]
+async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key() {
+  let temp = tempdir().expect("create tempdir");
+  let parent_migrations = temp.path().join("parent-migrations");
+  std::fs::create_dir(&parent_migrations).expect("create migration fixture");
+  let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+  for entry in std::fs::read_dir(source).expect("read migrations") {
+    let entry = entry.expect("migration entry");
+    if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql" {
+      std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
+        .expect("copy parent migration");
+    }
+  }
+  let state_dir = temp.path().join("state");
+  std::fs::create_dir(&state_dir).expect("create state dir");
+  let options = SqliteConnectOptions::from_str(&database_url(&state_dir))
+    .expect("database options")
+    .create_if_missing(true);
+  let pool = SqlitePoolOptions::new()
+    .max_connections(1)
+    .connect_with(options)
+    .await
+    .expect("connect parent database");
+  Migrator::new(parent_migrations)
+    .await
+    .expect("load parent migrator")
+    .run(&pool)
+    .await
+    .expect("run parent migrations");
+  sqlx::query("pragma foreign_keys = off")
+    .execute(&pool)
+    .await
+    .expect("disable fixture foreign keys");
+  sqlx::query("insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values ('dangling', 'missing-run', 'missing-job', 'identity', '{}', 'pending', 1, 1, 'sha256-v1', 'payload', 0, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed invalid parent row");
+  sqlx::query("pragma foreign_keys = on")
+    .execute(&pool)
+    .await
+    .expect("restore foreign keys");
+  pool.close().await;
+
+  assert!(matches!(
+    StateStore::initialize(&state_dir, None).await,
+    Err(StateError::Migrate { .. })
+  ));
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("reopen rejected database");
+  let unchanged: (String, String) = sqlx::query_as(
+    "select delivery_id, run_id from scheduled_run_deliveries where delivery_id = 'dangling'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled back delivery");
+  assert_eq!(unchanged, ("dangling".to_owned(), "missing-run".to_owned()));
+  let migration_applied: i64 = sqlx::query_scalar(
+    "select count(*) from _sqlx_migrations where version = 20260721040000 and success = true",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read migration state");
+  assert_eq!(migration_applied, 0);
 }
 
 #[tokio::test]
@@ -1305,6 +1616,493 @@ async fn test_two_independent_stores_cannot_apply_equal_heartbeat_extension() {
   .await
   .expect("read heartbeat expiries");
   assert_eq!(expiries, (180, 180));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_complete_success_atomically_persists_result_baseline_and_exact_delivery_intents() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let mut request = create_request("complete-success", ScheduleSpec::once(110), 100);
+  request.definition =
+    ScheduledJobDefinition::new(2, r#"{"prompt":"check","schema_version":2}"#).expect("definition");
+  request.targets.push(second_target("complete-success"));
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule("complete-success", 0, 110)
+    .await
+    .expect("materialize");
+  let claim = store
+    .claim_next_scheduled_run("worker", 111, 200)
+    .await
+    .expect("claim")
+    .expect("claimed run");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&claim.binding, &profile, 112)
+    .await
+    .expect("mark executing");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect mutable job database");
+  sqlx::query("update scheduled_job_delivery_targets set identity_digest = 'mutated-' || ordinal, address_json = '{\"mutated\":true}' where job_id = 'complete-success'")
+    .execute(&pool)
+    .await
+    .expect("mutate current job targets after materialization");
+  pool.close().await;
+  let result =
+    ScheduledRunResult::new("completed summary", "bounded previous context").expect("result");
+  assert_eq!(
+    store
+      .complete_scheduled_run_success(&claim.binding, &result, 120)
+      .await
+      .expect("complete success"),
+    ScheduledRunSuccessOutcome::Committed
+  );
+
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let authority: (String, String, i64, i64, i64, i64) = sqlx::query_as(
+    "select r.state, a.state, b.baseline_version, (select count(*) from scheduled_run_result_artifacts x where x.run_id = r.run_id), (select count(*) from scheduled_run_deliveries d where d.run_id = r.run_id), (select count(*) from scheduled_delivery_baselines db where db.job_id = r.job_id) from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.attempt = r.attempt join scheduled_execution_baselines b on b.job_id = r.job_id where r.run_id = ?1",
+  )
+  .bind(claim.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read success authority");
+  assert_eq!(
+    authority,
+    ("succeeded".to_owned(), "succeeded".to_owned(), 1, 1, 2, 0)
+  );
+  let intents: Vec<DeliveryIntentAuthorityRow> = sqlx::query_as(
+    "select state, authority_kind, target_identity_digest, attempt, fence, delivery_policy_version, render_version, payload_digest, payload_snapshot, target_snapshot_digest_algorithm from scheduled_run_deliveries where run_id = ?1 order by target_identity_digest",
+  )
+  .bind(claim.binding.run_id())
+  .fetch_all(&pool)
+  .await
+  .expect("read intents");
+  assert_eq!(intents.len(), 2);
+  assert_eq!(intents[0].2, "none-v1");
+  assert_eq!(intents[1].2, "slack-channel-v1");
+  for intent in intents {
+    assert_eq!(intent.0, "intent");
+    assert_eq!(intent.1, "intent_v1");
+    assert_eq!((intent.3, intent.4, intent.5), (0, 0, 1));
+    assert_eq!((intent.6, intent.7, intent.8), (None, None, None));
+    assert_eq!(intent.9, "sha256-v1");
+  }
+  assert!(
+    sqlx::query("update scheduled_run_deliveries set target_json = '{}' where run_id = ?1 limit 1")
+      .bind(claim.binding.run_id())
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  assert!(
+    sqlx::query(
+      "update scheduled_run_deliveries set state = 'pending', render_version = 1, hash_algorithm = 'sha256-v1', payload_digest = 'payload', expected_baseline_version = 0 where run_id = ?1 limit 1"
+    )
+    .bind(claim.binding.run_id())
+    .execute(&pool)
+    .await
+    .is_err(),
+    "intent enrichment requires immutable payload bytes"
+  );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_complete_success_baseline_and_insert_conflicts_roll_back_all_authority() {
+  for conflict in ["baseline", "artifact", "delivery"] {
+    let temp = tempdir().expect("create tempdir");
+    let state_dir = temp.path().join("state");
+    let store = StateStore::initialize(&state_dir, None)
+      .await
+      .expect("initialize store");
+    let job_id = format!("success-conflict-{conflict}");
+    store
+      .create_scheduled_job(&create_request(&job_id, ScheduleSpec::once(110), 100))
+      .await
+      .expect("create job");
+    store
+      .materialize_due_schedule(&job_id, 0, 110)
+      .await
+      .expect("materialize");
+    let claim = store
+      .claim_next_scheduled_run("worker", 111, 200)
+      .await
+      .expect("claim")
+      .expect("claimed run");
+    let profile =
+      AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+    store
+      .mark_scheduled_run_executing(&claim.binding, &profile, 112)
+      .await
+      .expect("mark executing");
+    let pool = SqlitePool::connect(&database_url(&state_dir))
+      .await
+      .expect("connect database");
+    match conflict {
+      "baseline" => {
+        sqlx::query(
+          "update scheduled_execution_baselines set baseline_version = 1 where job_id = ?1",
+        )
+        .bind(&job_id)
+        .execute(&pool)
+        .await
+        .expect("advance baseline");
+      }
+      "artifact" => {
+        sqlx::query("insert into scheduled_run_result_artifacts (artifact_id, run_id, job_id, accepted_attempt, accepted_fence, schema_version, result_json, hash_algorithm, result_hash, previous_success_context, completed_at) values ('preexisting', ?1, ?2, ?3, ?4, 1, '{\"schema_version\":1,\"summary\":\"other\"}', 'sha256-v1', 'other', 'other', 119)")
+          .bind(claim.binding.run_id())
+          .bind(&job_id)
+          .bind(claim.binding.attempt())
+          .bind(claim.binding.fence())
+          .execute(&pool)
+          .await
+          .expect("seed artifact collision");
+      }
+      "delivery" => {
+        let target_json: String = sqlx::query_scalar(
+          "select json_extract(targets_json, '$[0]') from scheduled_runs where run_id = ?1",
+        )
+        .bind(claim.binding.run_id())
+        .fetch_one(&pool)
+        .await
+        .expect("read target snapshot");
+        let target: serde_json::Value =
+          serde_json::from_str(&target_json).expect("parse target snapshot");
+        let identity = target["identity_digest"].as_str().expect("identity digest");
+        let intent_key = test_digest_identity(&[
+          "scheduled-delivery-intent-v1",
+          claim.binding.run_id(),
+          identity,
+          "1",
+          "sha256-v1",
+        ]);
+        sqlx::query("insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values (?1, ?2, ?3, 'collision', '{}', 'pending', 1, 1, 'sha256-v1', 'collision', 0, 119, 119)")
+          .bind(format!("intent:{intent_key}"))
+          .bind(claim.binding.run_id())
+          .bind(&job_id)
+          .execute(&pool)
+          .await
+          .expect("seed delivery id collision");
+      }
+      _ => unreachable!(),
+    }
+    let result = ScheduledRunResult::new("completed summary", "context").expect("result");
+    assert!(matches!(
+      store
+        .complete_scheduled_run_success(&claim.binding, &result, 120)
+        .await,
+      Err(StateError::ScheduledRunCompletionConflict)
+    ));
+    let unchanged: (String, String, i64, i64, i64) = sqlx::query_as(
+      "select r.state, a.state, b.baseline_version, (select count(*) from scheduled_run_result_artifacts x where x.run_id = r.run_id), (select count(*) from scheduled_run_deliveries d where d.run_id = r.run_id and d.authority_kind = 'intent_v1') from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.attempt = r.attempt join scheduled_execution_baselines b on b.job_id = r.job_id where r.run_id = ?1",
+    )
+    .bind(claim.binding.run_id())
+    .fetch_one(&pool)
+    .await
+    .expect("read rolled back authority");
+    let expected_artifacts = i64::from(conflict == "artifact");
+    let expected_baseline = i64::from(conflict == "baseline");
+    assert_eq!(
+      unchanged,
+      (
+        "executing".to_owned(),
+        "executing".to_owned(),
+        expected_baseline,
+        expected_artifacts,
+        0
+      )
+    );
+  }
+}
+
+#[tokio::test]
+async fn test_two_stores_complete_one_success_and_record_repeated_completion_as_late_evidence() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let first = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize first store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  let claim = prepare_executing_run(&first, "success-race", 200).await;
+  let result = ScheduledRunResult::new("completed summary", "context").expect("result");
+  let barrier = Arc::new(Barrier::new(3));
+  let first_task = tokio::spawn(complete_success_after_barrier(
+    first,
+    claim.binding.clone(),
+    result.clone(),
+    Arc::clone(&barrier),
+    120,
+  ));
+  let second_task = tokio::spawn(complete_success_after_barrier(
+    second,
+    claim.binding.clone(),
+    result,
+    Arc::clone(&barrier),
+    120,
+  ));
+  barrier.wait().await;
+  let outcomes = [
+    first_task.await.expect("first completion task"),
+    second_task.await.expect("second completion task"),
+  ];
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| matches!(outcome, Ok(ScheduledRunSuccessOutcome::Committed)))
+      .count(),
+    1
+  );
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| matches!(
+        outcome,
+        Ok(ScheduledRunSuccessOutcome::LateEvidence(
+          LateEvidenceAppendOutcome::Recorded
+        ))
+      ))
+      .count(),
+    1,
+    "completion outcomes: {outcomes:?}"
+  );
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let authority: (String, i64, i64, i64, i64) = sqlx::query_as(
+    "select state, (select count(*) from scheduled_run_result_artifacts where run_id = ?1), (select baseline_version from scheduled_execution_baselines where job_id = 'success-race'), (select count(*) from scheduled_run_deliveries where run_id = ?1 and authority_kind = 'intent_v1'), (select count(*) from scheduled_run_late_evidence where run_id = ?1) from scheduled_runs where run_id = ?1",
+  )
+  .bind(claim.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read converged success");
+  assert_eq!(authority, ("succeeded".to_owned(), 1, 1, 1, 1));
+}
+
+#[tokio::test]
+async fn test_success_racing_expired_reclaim_commits_one_complete_authority_outcome() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let completer = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize completer");
+  let reclaimer = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize reclaimer");
+  let claim = prepare_executing_run(&completer, "success-reclaim-race", 121).await;
+  let result = ScheduledRunResult::new("completed summary", "context").expect("result");
+  let barrier = Arc::new(Barrier::new(3));
+  let completion_task = tokio::spawn(complete_success_after_barrier(
+    completer,
+    claim.binding.clone(),
+    result,
+    Arc::clone(&barrier),
+    120,
+  ));
+  let reclaim_task = tokio::spawn(success_reclaim_after_barrier(
+    reclaimer,
+    Arc::clone(&barrier),
+    122,
+  ));
+  barrier.wait().await;
+  let completion = completion_task.await.expect("completion task");
+  let reclaim = reclaim_task.await.expect("reclaim task");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let authority: (String, i64, i64, i64, i64) = sqlx::query_as(
+    "select state, (select count(*) from scheduled_run_result_artifacts where run_id = ?1), (select baseline_version from scheduled_execution_baselines where job_id = 'success-reclaim-race'), (select count(*) from scheduled_run_deliveries where run_id = ?1 and authority_kind = 'intent_v1'), (select count(*) from scheduled_run_late_evidence where run_id = ?1) from scheduled_runs where run_id = ?1",
+  )
+  .bind(claim.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read race authority");
+  match authority.0.as_str() {
+    "succeeded" => {
+      assert_eq!(authority, ("succeeded".to_owned(), 1, 1, 1, 0));
+      assert!(matches!(
+        completion,
+        Ok(ScheduledRunSuccessOutcome::Committed)
+      ));
+      assert!(
+        matches!(
+          &reclaim,
+          Ok(ExpiredRunReclaimOutcome::Idle) | Err(StateError::ScheduledRunLostLease)
+        ),
+        "reclaim outcome: {reclaim:?}"
+      );
+    }
+    "outcome_unknown" => {
+      assert_eq!(
+        authority,
+        ("outcome_unknown".to_owned(), 0, 0, 0, 1),
+        "completion={completion:?} reclaim={reclaim:?}"
+      );
+      assert!(matches!(
+        completion,
+        Ok(ScheduledRunSuccessOutcome::LateEvidence(
+          LateEvidenceAppendOutcome::Recorded
+        ))
+      ));
+      assert!(matches!(
+        reclaim,
+        Ok(ExpiredRunReclaimOutcome::OutcomeUnknown { .. })
+      ));
+    }
+    state => panic!("unexpected race state {state}"),
+  }
+}
+
+#[tokio::test]
+async fn test_stale_fence_completion_only_records_late_evidence() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  store
+    .create_scheduled_job(&create_request(
+      "stale-completion",
+      ScheduleSpec::once(110),
+      100,
+    ))
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule("stale-completion", 0, 110)
+    .await
+    .expect("materialize");
+  let stale = store
+    .claim_next_scheduled_run("worker-a", 111, 120)
+    .await
+    .expect("first claim")
+    .expect("claimed run");
+  assert!(matches!(
+    store
+      .reclaim_next_expired_scheduled_run(121, 3, 130)
+      .await
+      .expect("reclaim"),
+    ExpiredRunReclaimOutcome::Retried { .. }
+  ));
+  let current = store
+    .claim_next_scheduled_run("worker-b", 130, 200)
+    .await
+    .expect("second claim")
+    .expect("claimed run");
+  let result = ScheduledRunResult::new("late summary", "late context").expect("result");
+  assert_eq!(
+    store
+      .complete_scheduled_run_success(&stale.binding, &result, 140)
+      .await
+      .expect("late completion"),
+    ScheduledRunSuccessOutcome::LateEvidence(LateEvidenceAppendOutcome::Recorded)
+  );
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let authority: (String, i64, i64, i64, i64, i64) = sqlx::query_as(
+    "select state, attempt, fence, (select count(*) from scheduled_run_result_artifacts where run_id = ?1), (select count(*) from scheduled_run_deliveries where run_id = ?1), (select count(*) from scheduled_run_late_evidence where run_id = ?1) from scheduled_runs where run_id = ?1",
+  )
+  .bind(current.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read current authority");
+  assert_eq!(
+    authority,
+    (
+      "leased".to_owned(),
+      current.binding.attempt(),
+      current.binding.fence(),
+      0,
+      0,
+      1
+    )
+  );
+}
+
+async fn prepare_executing_run(
+  store: &StateStore,
+  job_id: &str,
+  lease_expires_at: i64,
+) -> ClaimedScheduledRun {
+  store
+    .create_scheduled_job(&create_request(job_id, ScheduleSpec::once(110), 100))
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule(job_id, 0, 110)
+    .await
+    .expect("materialize");
+  let claim = store
+    .claim_next_scheduled_run("worker", 111, lease_expires_at)
+    .await
+    .expect("claim")
+    .expect("claimed run");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&claim.binding, &profile, 112)
+    .await
+    .expect("mark executing");
+  claim
+}
+
+async fn complete_success_after_barrier(
+  store: StateStore,
+  binding: codeoff_state::RunLeaseBinding,
+  result: ScheduledRunResult,
+  barrier: Arc<Barrier>,
+  completed_at: i64,
+) -> Result<ScheduledRunSuccessOutcome, StateError> {
+  barrier.wait().await;
+  for _ in 0..20 {
+    match store
+      .complete_scheduled_run_success(&binding, &result, completed_at)
+      .await
+    {
+      Err(error) if error.is_transient_storage_contention() => {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      outcome => return outcome,
+    }
+  }
+  store
+    .complete_scheduled_run_success(&binding, &result, completed_at)
+    .await
+}
+
+async fn success_reclaim_after_barrier(
+  store: StateStore,
+  barrier: Arc<Barrier>,
+  now: i64,
+) -> Result<ExpiredRunReclaimOutcome, StateError> {
+  barrier.wait().await;
+  for _ in 0..20 {
+    match store
+      .reclaim_next_expired_scheduled_run(now, 3, now + 10)
+      .await
+    {
+      Err(error) if error.is_transient_storage_contention() => {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      outcome => return outcome,
+    }
+  }
+  store
+    .reclaim_next_expired_scheduled_run(now, 3, now + 10)
+    .await
 }
 
 async fn heartbeat_after_barrier(

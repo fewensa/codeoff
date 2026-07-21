@@ -135,6 +135,9 @@ pub enum StateError {
   #[error("scheduled run attempt or fence counter is exhausted")]
   ScheduledRunCounterExhausted,
 
+  #[error("scheduled run completion conflicts with durable authority")]
+  ScheduledRunCompletionConflict,
+
   #[error("scheduled once occurrence is expired and cannot be resumed")]
   ScheduledOnceExpired,
 

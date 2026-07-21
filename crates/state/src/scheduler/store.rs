@@ -1,4 +1,7 @@
+use std::fmt::Write as _;
+
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 
 use super::{
@@ -9,11 +12,14 @@ use super::{
   PrincipalKey, RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit,
   ScheduleMutationIdempotency, ScheduleSpec, ScheduledJob, ScheduledJobDefinition,
   ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus, ScheduledRunLateEvidenceKind,
-  StateError, TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline,
-  UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
-  invalid_value, materialized_run, positive_u32, scheduler_error, validate_text,
+  ScheduledRunResult, ScheduledRunSuccessOutcome, StateError, TransactionalMutationOutcome,
+  UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json,
+  invalid_occurrence, invalid_value, materialized_run, positive_u32, scheduler_error,
+  validate_text,
 };
 use crate::StateStore;
+
+const DELIVERY_POLICY_VERSION_V1: i64 = 1;
 
 impl StateStore {
   /// Creates a job, current schedule, resolved targets, and empty execution baseline atomically.
@@ -582,6 +588,270 @@ impl StateStore {
     transaction.commit().await.map_err(scheduler_error)
   }
 
+  /// Atomically accepts a live execution result, advances its execution baseline, and records
+  /// immutable delivery intents derived from the materialized run snapshot.
+  ///
+  /// A stale or repeated binding can only append bounded late evidence. It cannot change result,
+  /// baseline, delivery, attempt, or run authority.
+  ///
+  /// # Errors
+  /// Returns an error for invalid result data, malformed persisted snapshots, authority conflicts,
+  /// or storage failures. Every current-binding error rolls back the complete success transaction.
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps the ordered terminal authority transaction auditable in one scope"
+  )]
+  pub async fn complete_scheduled_run_success(
+    &self,
+    binding: &RunLeaseBinding,
+    result: &ScheduledRunResult,
+    completed_at: i64,
+  ) -> Result<ScheduledRunSuccessOutcome, StateError> {
+    validate_lease_binding(binding)?;
+    if completed_at < 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled completion timestamp must be nonnegative".to_owned(),
+      });
+    }
+    validate_text("scheduled result summary", &result.summary).map_err(invalid_value)?;
+    if result.previous_success_context.len() > MAX_CONTEXT_BYTES {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled result previous success context exceeds its storage bound".to_owned(),
+      });
+    }
+    let result_json = json!({
+      "schema_version": 1,
+      "summary": result.summary,
+    })
+    .to_string();
+    let result_hash = sha256_hex(result_json.as_bytes());
+    let artifact_id = format!(
+      "result:{}",
+      digest_identity(&[
+        "scheduled-result-artifact-v1",
+        binding.run_id(),
+        &binding.attempt().to_string(),
+        &binding.fence().to_string(),
+      ])
+    );
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let row = sqlx::query(
+      "select r.targets_json, r.execution_baseline_json, r.lease_expires_at, a.claimed_at, a.executing_at from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner where r.run_id = ?1 and r.job_id = ?2 and r.attempt = ?3 and r.fence = ?4 and r.lease_owner = ?5 and r.state = 'executing' and a.state = 'executing' and r.lease_expires_at > ?6 and a.lease_expires_at > ?6",
+    )
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .bind(completed_at)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(row) = row else {
+      let evidence = append_late_evidence_in_transaction(
+        &mut transaction,
+        binding,
+        ScheduledRunLateEvidenceKind::CompletionAfterLeaseLoss,
+        &result_hash,
+        completed_at,
+      )
+      .await?;
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ScheduledRunSuccessOutcome::LateEvidence(evidence));
+    };
+    let claimed_at: i64 = row.try_get("claimed_at").map_err(scheduler_error)?;
+    let executing_at: i64 = row
+      .try_get::<Option<i64>, _>("executing_at")
+      .map_err(scheduler_error)?
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "executing scheduled attempt has no execution timestamp".to_owned(),
+      })?;
+    if completed_at < claimed_at || completed_at < executing_at {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled completion precedes its accepted execution".to_owned(),
+      });
+    }
+    let delivery_policy_version = DELIVERY_POLICY_VERSION_V1;
+    let targets_json: String = row.try_get("targets_json").map_err(scheduler_error)?;
+    let targets = delivery_intent_targets(&targets_json)?;
+    let execution_baseline_json: String = row
+      .try_get::<Option<String>, _>("execution_baseline_json")
+      .map_err(scheduler_error)?
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "materialized run has no execution baseline snapshot".to_owned(),
+      })?;
+    let expected_baseline_version = execution_baseline_version(&execution_baseline_json)?;
+
+    let artifact_insert = sqlx::query(
+      "insert into scheduled_run_result_artifacts (artifact_id, run_id, job_id, accepted_attempt, accepted_fence, schema_version, result_json, hash_algorithm, result_hash, previous_success_context, completed_at, provenance, provenance_version) values (?1, ?2, ?3, ?4, ?5, 1, ?6, 'sha256-v1', ?7, ?8, ?9, 'native', 1)",
+    )
+    .bind(&artifact_id)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(&result_json)
+    .bind(&result_hash)
+    .bind(&result.previous_success_context)
+    .bind(completed_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(completion_storage_error);
+    if let Err(error) = artifact_insert {
+      if matches!(error, StateError::ScheduledRunCompletionConflict) {
+        return self
+          .resolve_scheduled_run_completion_conflict(
+            transaction,
+            binding,
+            &result_hash,
+            completed_at,
+          )
+          .await;
+      }
+      return Err(error);
+    }
+
+    let baseline = UpdateExecutionBaseline {
+      job_id: binding.job_id().to_owned(),
+      expected_version: expected_baseline_version,
+      hash_algorithm: "sha256-v1".to_owned(),
+      result_hash: result_hash.clone(),
+      previous_success_context: result.previous_success_context.clone(),
+      source_run_id: binding.run_id().to_owned(),
+      completed_at,
+    };
+    if !compare_and_swap_execution_baseline_in_transaction(&mut transaction, &baseline).await? {
+      return self
+        .resolve_scheduled_run_completion_conflict(transaction, binding, &result_hash, completed_at)
+        .await;
+    }
+
+    for target in targets {
+      let intent_key = digest_identity(&[
+        "scheduled-delivery-intent-v1",
+        binding.run_id(),
+        &target.identity_digest,
+        &delivery_policy_version.to_string(),
+        "sha256-v1",
+      ]);
+      let delivery_id = format!("intent:{intent_key}");
+      let intent_insert = sqlx::query(
+        "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'intent', 0, 0, ?6, ?7, ?8, ?9, 'sha256-v1', ?10, ?11, 'intent_v1', ?12, ?12)",
+      )
+      .bind(delivery_id)
+      .bind(binding.run_id())
+      .bind(binding.job_id())
+      .bind(target.identity_digest)
+      .bind(target.canonical_json)
+      .bind(delivery_policy_version)
+      .bind(&artifact_id)
+      .bind(binding.attempt())
+      .bind(binding.fence())
+      .bind(target.snapshot_digest)
+      .bind(intent_key)
+      .bind(completed_at)
+      .execute(&mut *transaction)
+      .await
+      .map_err(completion_storage_error);
+      if let Err(error) = intent_insert {
+        if matches!(error, StateError::ScheduledRunCompletionConflict) {
+          return self
+            .resolve_scheduled_run_completion_conflict(
+              transaction,
+              binding,
+              &result_hash,
+              completed_at,
+            )
+            .await;
+        }
+        return Err(error);
+      }
+    }
+
+    let attempt = sqlx::query(
+      "update scheduled_run_attempts set state = 'succeeded', completed_at = ?1 where run_id = ?2 and job_id = ?3 and attempt = ?4 and fence = ?5 and lease_owner = ?6 and state = 'executing' and lease_expires_at > ?1",
+    )
+    .bind(completed_at)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if attempt.rows_affected() != 1 {
+      return self
+        .resolve_scheduled_run_completion_conflict(transaction, binding, &result_hash, completed_at)
+        .await;
+    }
+    let run = sqlx::query(
+      "update scheduled_runs set state = 'succeeded', overlap_slot = null, lease_owner = null, lease_expires_at = null, result_artifact_id = ?1, result_context = ?2, result_hash_algorithm = 'sha256-v1', result_hash = ?3, updated_at = ?4 where run_id = ?5 and job_id = ?6 and attempt = ?7 and fence = ?8 and lease_owner = ?9 and state = 'executing' and lease_expires_at > ?4",
+    )
+    .bind(&artifact_id)
+    .bind(&result.previous_success_context)
+    .bind(&result_hash)
+    .bind(completed_at)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .execute(&mut *transaction)
+    .await
+    .map_err(completion_storage_error);
+    if matches!(run, Err(StateError::ScheduledRunCompletionConflict)) {
+      return self
+        .resolve_scheduled_run_completion_conflict(transaction, binding, &result_hash, completed_at)
+        .await;
+    }
+    let run = run?;
+    if run.rows_affected() != 1 {
+      return self
+        .resolve_scheduled_run_completion_conflict(transaction, binding, &result_hash, completed_at)
+        .await;
+    }
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(ScheduledRunSuccessOutcome::Committed)
+  }
+
+  async fn resolve_scheduled_run_completion_conflict(
+    &self,
+    transaction: Transaction<'_, Sqlite>,
+    binding: &RunLeaseBinding,
+    evidence_sha256: &str,
+    observed_at: i64,
+  ) -> Result<ScheduledRunSuccessOutcome, StateError> {
+    transaction.rollback().await.map_err(scheduler_error)?;
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let remains_current: i64 = sqlx::query_scalar(
+      "select exists(select 1 from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner where r.run_id = ?1 and r.job_id = ?2 and r.attempt = ?3 and r.fence = ?4 and r.lease_owner = ?5 and r.state = 'executing' and a.state = 'executing' and r.lease_expires_at > ?6 and a.lease_expires_at > ?6)",
+    )
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .bind(observed_at)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if remains_current != 0 {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Err(StateError::ScheduledRunCompletionConflict);
+    }
+    let evidence = append_late_evidence_in_transaction(
+      &mut transaction,
+      binding,
+      ScheduledRunLateEvidenceKind::CompletionAfterLeaseLoss,
+      evidence_sha256,
+      observed_at,
+    )
+    .await?;
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(ScheduledRunSuccessOutcome::LateEvidence(evidence))
+  }
+
   /// Records a preflight failure without allowing the run to enter executing.
   ///
   /// # Errors
@@ -755,47 +1025,16 @@ impl StateStore {
       });
     }
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
-    let duplicate: i64 = sqlx::query_scalar(
-      "select exists(select 1 from scheduled_run_late_evidence where run_id = ?1 and attempt = ?2 and fence = ?3 and evidence_kind = ?4 and hash_algorithm = 'sha256-v1' and evidence_digest = ?5)",
+    let outcome = append_late_evidence_in_transaction(
+      &mut transaction,
+      binding,
+      kind,
+      evidence_sha256,
+      observed_at,
     )
-    .bind(binding.run_id())
-    .bind(binding.attempt())
-    .bind(binding.fence())
-    .bind(kind.as_str())
-    .bind(evidence_sha256)
-    .fetch_one(&mut *transaction)
-    .await
-    .map_err(scheduler_error)?;
-    if duplicate != 0 {
-      transaction.commit().await.map_err(scheduler_error)?;
-      return Ok(LateEvidenceAppendOutcome::Duplicate);
-    }
-    let evidence_count: i64 = sqlx::query_scalar(
-      "select count(*) from scheduled_run_late_evidence where run_id = ?1 and attempt = ?2",
-    )
-    .bind(binding.run_id())
-    .bind(binding.attempt())
-    .fetch_one(&mut *transaction)
-    .await
-    .map_err(scheduler_error)?;
-    if evidence_count >= 32 {
-      transaction.commit().await.map_err(scheduler_error)?;
-      return Ok(LateEvidenceAppendOutcome::QuotaExceeded);
-    }
-    sqlx::query(
-      "insert into scheduled_run_late_evidence (evidence_id, run_id, attempt, fence, evidence_kind, hash_algorithm, evidence_digest, redacted_message, observed_at) values ('late:' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, 'sha256-v1', ?5, null, ?6)",
-    )
-    .bind(binding.run_id())
-    .bind(binding.attempt())
-    .bind(binding.fence())
-    .bind(kind.as_str())
-    .bind(evidence_sha256)
-    .bind(observed_at)
-    .execute(&mut *transaction)
-    .await
-    .map_err(scheduler_error)?;
+    .await?;
     transaction.commit().await.map_err(scheduler_error)?;
-    Ok(LateEvidenceAppendOutcome::Recorded)
+    Ok(outcome)
   }
 
   /// Pauses a matching job generation and cancels pre-execution work.
@@ -1014,7 +1253,7 @@ pub(crate) async fn compare_and_swap_execution_baseline_in_transaction(
     });
   }
   let result = sqlx::query(
-      "update scheduled_execution_baselines set baseline_version = baseline_version + 1, hash_algorithm = ?1, result_hash = ?2, previous_success_context = ?3, source_run_id = ?4, completed_at = ?5 where job_id = ?6 and baseline_version = ?7",
+      "update scheduled_execution_baselines set baseline_version = baseline_version + 1, hash_algorithm = ?1, result_hash = ?2, previous_success_context = ?3, source_run_id = ?4, completed_at = ?5 where job_id = ?6 and baseline_version = ?7 and baseline_version < 9223372036854775807",
     )
     .bind(&update.hash_algorithm)
     .bind(&update.result_hash)
@@ -1052,6 +1291,183 @@ pub(crate) async fn compare_and_swap_accepted_delivery_baseline_in_transaction(
     .await
     .map_err(scheduler_error)?;
   Ok(result.rows_affected() == 1)
+}
+
+async fn append_late_evidence_in_transaction(
+  transaction: &mut Transaction<'_, Sqlite>,
+  binding: &RunLeaseBinding,
+  kind: ScheduledRunLateEvidenceKind,
+  evidence_sha256: &str,
+  observed_at: i64,
+) -> Result<LateEvidenceAppendOutcome, StateError> {
+  let duplicate: i64 = sqlx::query_scalar(
+    "select exists(select 1 from scheduled_run_late_evidence where run_id = ?1 and attempt = ?2 and fence = ?3 and evidence_kind = ?4 and hash_algorithm = 'sha256-v1' and evidence_digest = ?5)",
+  )
+  .bind(binding.run_id())
+  .bind(binding.attempt())
+  .bind(binding.fence())
+  .bind(kind.as_str())
+  .bind(evidence_sha256)
+  .fetch_one(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  if duplicate != 0 {
+    return Ok(LateEvidenceAppendOutcome::Duplicate);
+  }
+  let evidence_count: i64 = sqlx::query_scalar(
+    "select count(*) from scheduled_run_late_evidence where run_id = ?1 and attempt = ?2",
+  )
+  .bind(binding.run_id())
+  .bind(binding.attempt())
+  .fetch_one(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  if evidence_count >= 32 {
+    return Ok(LateEvidenceAppendOutcome::QuotaExceeded);
+  }
+  sqlx::query(
+    "insert into scheduled_run_late_evidence (evidence_id, run_id, attempt, fence, evidence_kind, hash_algorithm, evidence_digest, redacted_message, observed_at) values ('late:' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, 'sha256-v1', ?5, null, ?6)",
+  )
+  .bind(binding.run_id())
+  .bind(binding.attempt())
+  .bind(binding.fence())
+  .bind(kind.as_str())
+  .bind(evidence_sha256)
+  .bind(observed_at)
+  .execute(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  Ok(LateEvidenceAppendOutcome::Recorded)
+}
+
+fn completion_storage_error(error: sqlx::Error) -> StateError {
+  let is_constraint = error.as_database_error().is_some_and(|database| {
+    database.is_unique_violation()
+      || matches!(
+        database.code().as_deref(),
+        Some("19" | "275" | "787" | "1299" | "1555" | "1811" | "2067")
+      )
+  });
+  if is_constraint {
+    StateError::ScheduledRunCompletionConflict
+  } else {
+    scheduler_error(error)
+  }
+}
+
+struct DeliveryIntentTarget {
+  identity_digest: String,
+  canonical_json: String,
+  snapshot_digest: String,
+}
+
+fn delivery_intent_targets(targets_json: &str) -> Result<Vec<DeliveryIntentTarget>, StateError> {
+  let targets: Vec<Value> = serde_json::from_str(targets_json).map_err(invalid_json)?;
+  if targets.is_empty() || targets.len() > MAX_DELIVERY_TARGETS {
+    return Err(StateError::InvalidSchedulerState {
+      reason: format!(
+        "materialized delivery targets must contain 1..={MAX_DELIVERY_TARGETS} entries"
+      ),
+    });
+  }
+  if serde_json::to_string(&targets).map_err(invalid_json)? != targets_json {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "materialized delivery targets must use canonical JSON encoding".to_owned(),
+    });
+  }
+  let mut identities = Vec::with_capacity(targets.len());
+  let mut prepared = Vec::with_capacity(targets.len());
+  for target in targets {
+    let object = target
+      .as_object()
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "materialized delivery target must be an object".to_owned(),
+      })?;
+    for field in [
+      "provider",
+      "connector",
+      "tenant",
+      "kind",
+      "resolver_digest",
+      "identity_digest",
+    ] {
+      let value = object.get(field).and_then(Value::as_str).ok_or_else(|| {
+        StateError::InvalidSchedulerState {
+          reason: format!("materialized delivery target has no {field}"),
+        }
+      })?;
+      validate_text("materialized delivery target field", value).map_err(invalid_value)?;
+    }
+    if object
+      .get("resolver_version")
+      .and_then(Value::as_u64)
+      .is_none_or(|version| version == 0 || version > u64::from(u32::MAX))
+      || !object.contains_key("address")
+    {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "materialized delivery target has an invalid resolver snapshot".to_owned(),
+      });
+    }
+    let identity_digest = object["identity_digest"]
+      .as_str()
+      .expect("validated identity digest")
+      .to_owned();
+    if identities.contains(&identity_digest) {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "materialized delivery target identities must be unique".to_owned(),
+      });
+    }
+    identities.push(identity_digest.clone());
+    let canonical_json = serde_json::to_string(&target).map_err(invalid_json)?;
+    let snapshot_digest = sha256_hex(canonical_json.as_bytes());
+    prepared.push(DeliveryIntentTarget {
+      identity_digest,
+      canonical_json,
+      snapshot_digest,
+    });
+  }
+  Ok(prepared)
+}
+
+fn execution_baseline_version(snapshot_json: &str) -> Result<i64, StateError> {
+  let snapshot: Value = serde_json::from_str(snapshot_json).map_err(invalid_json)?;
+  if serde_json::to_string(&snapshot).map_err(invalid_json)? != snapshot_json {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "materialized execution baseline must use canonical JSON encoding".to_owned(),
+    });
+  }
+  snapshot
+    .get("baseline_version")
+    .and_then(Value::as_i64)
+    .filter(|version| *version >= 0)
+    .ok_or_else(|| StateError::InvalidSchedulerState {
+      reason: "materialized execution baseline has no valid version".to_owned(),
+    })
+}
+
+fn digest_identity(parts: &[&str]) -> String {
+  let mut digest = Sha256::new();
+  for part in parts {
+    digest.update(
+      u64::try_from(part.len())
+        .expect("bounded scheduler identity part fits u64")
+        .to_be_bytes(),
+    );
+    digest.update(part.as_bytes());
+  }
+  hex_digest(digest.finalize())
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+  hex_digest(Sha256::digest(value))
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+  let mut encoded = String::with_capacity(64);
+  for byte in digest.as_ref() {
+    write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+  }
+  encoded
 }
 
 fn scheduled_job_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduledJob, StateError> {

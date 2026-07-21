@@ -140,8 +140,8 @@ create table scheduled_runs (
   check (execution_baseline_json is null or json_valid(execution_baseline_json)),
   check (state in ('pending', 'leased', 'executing', 'succeeded', 'failed', 'timed_out', 'cancelled', 'outcome_unknown')),
   check (attempt >= 0 and fence >= 0),
-  check ((lease_owner is null and lease_expires_at is null)
-    or (lease_owner is not null and lease_expires_at is not null and state in ('leased', 'executing'))),
+  check ((state in ('leased', 'executing') and lease_owner is not null and lease_expires_at is not null)
+    or (state not in ('leased', 'executing') and lease_owner is null and lease_expires_at is null)),
   check (next_attempt_at is null or state = 'pending'),
   check ((result_hash_algorithm is null and result_hash is null)
     or (result_hash_algorithm is not null and result_hash is not null and state = 'succeeded')),
@@ -186,8 +186,8 @@ create table scheduled_run_deliveries (
   check (state in ('pending', 'leased', 'sending', 'delivered', 'failed', 'delivery_unknown', 'skipped')),
   check (attempt >= 0 and fence >= 0 and delivery_policy_version > 0 and render_version > 0 and expected_baseline_version >= 0),
   check (length(hash_algorithm) > 0 and length(payload_digest) > 0),
-  check ((lease_owner is null and lease_expires_at is null)
-    or (lease_owner is not null and lease_expires_at is not null and state in ('leased', 'sending'))),
+  check ((state in ('leased', 'sending') and lease_owner is not null and lease_expires_at is not null)
+    or (state not in ('leased', 'sending') and lease_owner is null and lease_expires_at is null)),
   check (next_attempt_at is null or state = 'pending'),
   check (provider_receipt is null or state = 'delivered'),
   check (error_message is null or state in ('failed', 'delivery_unknown'))

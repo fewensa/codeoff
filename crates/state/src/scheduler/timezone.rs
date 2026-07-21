@@ -1,6 +1,6 @@
 use chrono::{
   Datelike, FixedOffset, MappedLocalTime, NaiveDate, NaiveDateTime, Offset as ChronoOffset,
-  TimeZone as ChronoTimeZone, Timelike,
+  TimeZone as ChronoTimeZone, Timelike, Utc,
 };
 use jiff::{
   Timestamp,
@@ -36,32 +36,45 @@ impl BundledTimeZone {
     self.timezone.iana_name()
   }
 
+  pub(super) fn supports_timestamp(timestamp: i64) -> bool {
+    Timestamp::from_second(timestamp).is_ok()
+  }
+
   fn local_offset(&self, local: &NaiveDateTime) -> MappedLocalTime<BundledOffset> {
     let Ok(local) = to_civil(local) else {
       return MappedLocalTime::None;
     };
     match self.timezone.to_ambiguous_timestamp(local).offset() {
-      AmbiguousOffset::Unambiguous { offset } => {
-        MappedLocalTime::Single(self.offset(offset.seconds()))
-      }
+      AmbiguousOffset::Unambiguous { offset } => self
+        .offset(offset.seconds())
+        .map_or(MappedLocalTime::None, MappedLocalTime::Single),
       AmbiguousOffset::Gap { .. } => MappedLocalTime::None,
       AmbiguousOffset::Fold { before, after } => {
-        MappedLocalTime::Ambiguous(self.offset(before.seconds()), self.offset(after.seconds()))
+        match (self.offset(before.seconds()), self.offset(after.seconds())) {
+          (Some(before), Some(after)) => MappedLocalTime::Ambiguous(before, after),
+          _ => MappedLocalTime::None,
+        }
       }
     }
   }
 
-  fn offset(&self, seconds: i32) -> BundledOffset {
-    BundledOffset {
-      fixed: FixedOffset::east_opt(seconds).expect("IANA offset must fit chrono FixedOffset"),
+  fn offset(&self, seconds: i32) -> Option<BundledOffset> {
+    Some(BundledOffset {
+      fixed: FixedOffset::east_opt(seconds)?,
       timezone: self.timezone.clone(),
-    }
+    })
   }
 
-  fn utc_offset(&self, utc: &NaiveDateTime) -> BundledOffset {
-    let timestamp = Timestamp::from_second(utc.and_utc().timestamp())
-      .expect("scheduler cron timestamps must fit the bundled Jiff range");
+  fn utc_offset(&self, utc: &NaiveDateTime) -> Option<BundledOffset> {
+    let timestamp = Timestamp::from_second(utc.and_utc().timestamp()).ok()?;
     self.offset(self.timezone.to_offset(timestamp).seconds())
+  }
+
+  fn fallback_offset(&self) -> BundledOffset {
+    BundledOffset {
+      fixed: Utc.fix(),
+      timezone: self.timezone.clone(),
+    }
   }
 }
 
@@ -91,11 +104,16 @@ impl ChronoTimeZone for BundledTimeZone {
   }
 
   fn offset_from_utc_date(&self, utc: &NaiveDate) -> Self::Offset {
-    self.utc_offset(&utc.and_hms_opt(0, 0, 0).expect("midnight must be valid"))
+    utc
+      .and_hms_opt(0, 0, 0)
+      .and_then(|utc| self.utc_offset(&utc))
+      .unwrap_or_else(|| self.fallback_offset())
   }
 
   fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> Self::Offset {
-    self.utc_offset(utc)
+    self
+      .utc_offset(utc)
+      .unwrap_or_else(|| self.fallback_offset())
   }
 }
 

@@ -3,11 +3,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use codeoff_state::{
-  CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, IdempotencyDecision,
-  MaterializationOutcome, OccurrenceError, PrincipalKey, ScheduleMutationIdempotency, ScheduleSpec,
-  ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, StateError, StateStore,
-  StateValueError, TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline,
-  UpdateExecutionBaseline, UpdateScheduledJob,
+  CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, MaterializationOutcome,
+  OccurrenceError, PrincipalKey, ScheduleMutationIdempotency, ScheduleSpec, ScheduledJobDefinition,
+  ScheduledJobMutation, ScheduledJobStatus, StateError, StateStore, StateValueError,
+  TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
+  UpdateScheduledJob,
 };
 use sqlx::Row;
 use sqlx::SqlitePool;
@@ -87,6 +87,16 @@ fn test_cron_rejects_seconds_and_preserves_dst_utc_order() {
     spring.next_after(1_710_028_800).expect("after gap"),
     1_710_054_000
   );
+}
+
+#[test]
+fn test_cron_outside_bundled_timezone_range_returns_error_without_panicking() {
+  let schedule = ScheduleSpec::cron("* * * * *", "UTC").expect("valid cron");
+  let result = std::panic::catch_unwind(|| schedule.next_after(253_402_300_800));
+  assert!(matches!(
+    result,
+    Ok(Err(OccurrenceError::ArithmeticOverflow))
+  ));
 }
 
 #[test]
@@ -358,51 +368,6 @@ async fn test_pause_resume_and_update_use_generation_cas() {
 }
 
 #[tokio::test]
-async fn test_schedule_idempotency_replays_exact_response_and_detects_conflict() {
-  let temp = tempdir().expect("create tempdir");
-  let state_dir = temp.path().join("state");
-  let store = StateStore::initialize(&state_dir, None)
-    .await
-    .expect("initialize state store");
-  let idempotency = mutation_idempotency("request-1", "digest-a");
-  assert_eq!(
-    store
-      .claim_schedule_idempotency("create", &idempotency, 100)
-      .await
-      .expect("claim"),
-    IdempotencyDecision::Claimed
-  );
-  assert_eq!(
-    store
-      .claim_schedule_idempotency("create", &idempotency, 100)
-      .await
-      .expect("in progress"),
-    IdempotencyDecision::InProgress
-  );
-  let conflicting = mutation_idempotency("request-1", "digest-b");
-  assert_eq!(
-    store
-      .claim_schedule_idempotency("create", &conflicting, 100)
-      .await
-      .expect("conflict"),
-    IdempotencyDecision::Conflict
-  );
-  assert!(
-    store
-      .complete_schedule_idempotency("create", &idempotency, 101)
-      .await
-      .expect("complete")
-  );
-  assert_eq!(
-    store
-      .claim_schedule_idempotency("create", &idempotency, 102)
-      .await
-      .expect("replay"),
-    IdempotencyDecision::Replay(r#"{"job_id":"stable"}"#.to_owned())
-  );
-}
-
-#[tokio::test]
 async fn test_idempotent_mutation_commits_mutation_and_exact_response_together() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -499,13 +464,15 @@ async fn test_idempotent_typed_lifecycle_mutation_and_in_progress_result() {
     now: 101,
   };
   let idempotency = mutation_idempotency("pause-request", "pause-digest");
-  assert_eq!(
-    store
-      .claim_schedule_idempotency("pause", &idempotency, 100)
-      .await
-      .expect("claim in progress"),
-    IdempotencyDecision::Claimed
-  );
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  sqlx::query(
+    r#"insert into idempotency_keys (scope, key, status, request_digest, digest_algorithm) values ('{"kind":"user","operation":"pause","provider":"slack","subject":"U1","tenant":"workspace"}', 'pause-request', 'claimed', 'pause-digest', 'sha256-v1')"#,
+  )
+  .execute(&pool)
+  .await
+  .expect("insert in-progress fixture");
   assert_eq!(
     store
       .apply_idempotent_schedule_mutation(&mutation, &idempotency)
@@ -662,48 +629,6 @@ async fn materialize_after_barrier(
 }
 
 #[tokio::test]
-async fn test_two_independent_stores_share_idempotency_digest_authority() {
-  let temp = tempdir().expect("create tempdir");
-  let state_dir = temp.path().join("state");
-  let first = StateStore::initialize(&state_dir, None)
-    .await
-    .expect("initialize first store");
-  let second = StateStore::initialize(&state_dir, None)
-    .await
-    .expect("initialize second store");
-  let idempotency = mutation_idempotency("request-race", "same");
-  let barrier = Arc::new(Barrier::new(3));
-  let first_barrier = Arc::clone(&barrier);
-  let first_idempotency = idempotency.clone();
-  let first_task = tokio::spawn(async move {
-    first_barrier.wait().await;
-    first
-      .claim_schedule_idempotency("update", &first_idempotency, 100)
-      .await
-  });
-  let second_barrier = Arc::clone(&barrier);
-  let second_task = tokio::spawn(async move {
-    second_barrier.wait().await;
-    second
-      .claim_schedule_idempotency("update", &idempotency, 100)
-      .await
-  });
-  barrier.wait().await;
-  let decisions = [
-    first_task
-      .await
-      .expect("first task")
-      .expect("first decision"),
-    second_task
-      .await
-      .expect("second task")
-      .expect("second decision"),
-  ];
-  assert!(decisions.contains(&IdempotencyDecision::Claimed));
-  assert!(decisions.contains(&IdempotencyDecision::InProgress));
-}
-
-#[tokio::test]
 async fn test_two_independent_stores_reject_different_digest_race() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -713,47 +638,41 @@ async fn test_two_independent_stores_reject_different_digest_race() {
   let second = StateStore::initialize(&state_dir, None)
     .await
     .expect("initialize second store");
+  let mutation = ScheduledJobMutation::Create(Box::new(create_request(
+    "different-digest-race",
+    ScheduleSpec::once(110),
+    100,
+  )));
   let barrier = Arc::new(Barrier::new(3));
-  let first_task = tokio::spawn(claim_after_barrier(
+  let first_task = tokio::spawn(apply_mutation_after_barrier(
     first,
+    mutation.clone(),
     mutation_idempotency("different-digest-race", "digest-a"),
     Arc::clone(&barrier),
   ));
-  let second_task = tokio::spawn(claim_after_barrier(
+  let second_task = tokio::spawn(apply_mutation_after_barrier(
     second,
+    mutation,
     mutation_idempotency("different-digest-race", "digest-b"),
     Arc::clone(&barrier),
   ));
   barrier.wait().await;
-  let decisions = [
-    first_task.await.expect("first task").expect("first claim"),
+  let outcomes = [
+    first_task
+      .await
+      .expect("first task")
+      .expect("first outcome"),
     second_task
       .await
       .expect("second task")
-      .expect("second claim"),
+      .expect("second outcome"),
   ];
-  assert!(decisions.contains(&IdempotencyDecision::Claimed));
-  assert!(decisions.contains(&IdempotencyDecision::Conflict));
-}
-
-async fn claim_after_barrier(
-  store: StateStore,
-  idempotency: ScheduleMutationIdempotency,
-  barrier: Arc<Barrier>,
-) -> Result<IdempotencyDecision, StateError> {
-  barrier.wait().await;
-  for _ in 0..3 {
-    match store
-      .claim_schedule_idempotency("update", &idempotency, 100)
-      .await
-    {
-      Err(error) if error.is_transient_storage_contention() => {}
-      result => return result,
-    }
-  }
-  store
-    .claim_schedule_idempotency("update", &idempotency, 100)
-    .await
+  assert!(
+    outcomes
+      .iter()
+      .any(|outcome| { matches!(outcome, TransactionalMutationOutcome::Applied(_)) })
+  );
+  assert!(outcomes.contains(&TransactionalMutationOutcome::Conflict));
 }
 
 #[tokio::test]
@@ -1220,6 +1139,9 @@ async fn test_schema_rejects_cross_job_ownership_and_invalid_run_delivery_states
 
   for statement in [
     "update scheduled_runs set lease_owner = 'worker' where run_id = ?1",
+    "update scheduled_runs set lease_owner = 'worker', lease_expires_at = 120 where run_id = ?1",
+    "update scheduled_runs set state = 'leased' where run_id = ?1",
+    "update scheduled_runs set state = 'executing' where run_id = ?1",
     "update scheduled_runs set result_hash_algorithm = 'sha256-v1', result_hash = 'result' where run_id = ?1",
     "update scheduled_runs set next_attempt_at = 120, state = 'executing' where run_id = ?1",
   ] {
@@ -1241,6 +1163,23 @@ async fn test_schema_rejects_cross_job_ownership_and_invalid_run_delivery_states
     .await
     .is_err()
   );
+  sqlx::query(
+    "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values ('lease-delivery', ?1, 'ownership-a', 'identity', '{}', 'pending', 1, 1, 'sha256-v1', 'payload', 0, 111, 111)",
+  )
+  .bind(&run.run_id)
+  .execute(&pool)
+  .await
+  .expect("insert valid pending delivery");
+  for statement in [
+    "update scheduled_run_deliveries set state = 'leased' where delivery_id = 'lease-delivery'",
+    "update scheduled_run_deliveries set state = 'sending' where delivery_id = 'lease-delivery'",
+    "update scheduled_run_deliveries set lease_owner = 'worker', lease_expires_at = 120 where delivery_id = 'lease-delivery'",
+  ] {
+    assert!(
+      sqlx::query(statement).execute(&pool).await.is_err(),
+      "delivery lease invariant must reject {statement}"
+    );
+  }
   assert!(
     sqlx::query(
       "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values ('cross-job-delivery', ?1, 'ownership-b', 'identity', '{}', 'pending', 1, 1, 'sha256-v1', 'payload', 0, 111, 111)",

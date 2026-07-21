@@ -846,6 +846,14 @@ fn coalesce_fixed_interval(
 }
 
 fn next_cron(expression: &str, timezone: &str, reference: i64) -> Result<i64, OccurrenceError> {
+  let horizon_end = reference
+    .checked_add(MAX_CRON_HORIZON_SECONDS)
+    .ok_or(OccurrenceError::ArithmeticOverflow)?;
+  if !BundledTimeZone::supports_timestamp(reference)
+    || !BundledTimeZone::supports_timestamp(horizon_end)
+  {
+    return Err(OccurrenceError::ArithmeticOverflow);
+  }
   let cron = CronParser::new()
     .parse(expression)
     .map_err(|_| OccurrenceError::NoFutureOccurrence)?;

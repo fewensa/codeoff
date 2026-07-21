@@ -28,6 +28,8 @@ ENV CODEOFF_CONFIG=/etc/codeoff/codeoff.toml \
   CODEOFF_STATE_DIR=/var/lib/codeoff \
   CODEX_HOME=/var/lib/codex
 
+RUN install -d -m 0755 /usr/local/libexec/codeoff
+
 COPY --chmod=0644 scripts/codex-schema-hash.py /usr/local/libexec/codeoff/codex-schema-hash.py
 
 RUN apt-get update \

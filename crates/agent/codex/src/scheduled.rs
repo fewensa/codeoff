@@ -2013,6 +2013,34 @@ mod tests {
   }
 
   #[test]
+  fn deeply_nested_final_json_is_rejected_by_depth_limit() {
+    let mut nested = json!(null);
+    for _ in 0..=MAX_OUTPUT_SCHEMA_DEPTH {
+      nested = json!({"nested": nested});
+    }
+    let final_text = json!({
+      "schema_version": OUTPUT_SCHEMA_VERSION,
+      "summary": "looks valid at the surface",
+      "unexpected": nested,
+    })
+    .to_string();
+    let profile = profile();
+    let transport = MockTransport {
+      evidence: evidence(&profile),
+      reads: reads_with_final_text(&final_text),
+      actions: Arc::new(Mutex::new(Actions::default())),
+    };
+    let request = request(profile);
+    assert!(matches!(
+      executor_for(transport, &request).execute(request),
+      ScheduledExecutionResult::Failed(ScheduledFailure {
+        kind: ScheduledFailureKind::OutputSchemaViolation,
+        message,
+      }) if message == "scheduled_final_response_too_deep"
+    ));
+  }
+
+  #[test]
   fn instruction_and_time_budgets_reject_extreme_inputs_before_transport() {
     let cases = ["instruction", "timeout", "interrupt", "terminate", "kill"];
     for case in cases {

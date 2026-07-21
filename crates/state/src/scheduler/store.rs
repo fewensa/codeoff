@@ -782,17 +782,9 @@ impl StateStore {
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(LateEvidenceAppendOutcome::QuotaExceeded);
     }
-    let evidence_id = format!(
-      "late:{}:{}:{}:{}:{evidence_sha256}",
-      binding.run_id(),
-      binding.attempt(),
-      binding.fence(),
-      kind.as_str(),
-    );
     sqlx::query(
-      "insert into scheduled_run_late_evidence (evidence_id, run_id, attempt, fence, evidence_kind, hash_algorithm, evidence_digest, redacted_message, observed_at) values (?1, ?2, ?3, ?4, ?5, 'sha256-v1', ?6, null, ?7)",
+      "insert into scheduled_run_late_evidence (evidence_id, run_id, attempt, fence, evidence_kind, hash_algorithm, evidence_digest, redacted_message, observed_at) values ('late:' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, 'sha256-v1', ?5, null, ?6)",
     )
-    .bind(evidence_id)
     .bind(binding.run_id())
     .bind(binding.attempt())
     .bind(binding.fence())

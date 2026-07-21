@@ -515,10 +515,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
     let entry = entry.expect("migration entry");
     if !matches!(
       entry.file_name().to_str(),
-      Some(
-        "20260721020000_scheduler_execution.sql"
-          | "20260721030000_scheduler_execution_hardening.sql"
-      )
+      Some("20260721030000_scheduler_execution_hardening.sql")
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy historical migration");
@@ -547,12 +544,19 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
   .execute(&pool)
   .await
   .expect("insert representative legacy idempotency row");
-  for (ordinal, state) in ["pending", "leased", "executing", "succeeded"]
-    .into_iter()
-    .enumerate()
+  for (ordinal, (label, state)) in [
+    ("pending", "pending"),
+    ("leased", "leased"),
+    ("executing", "executing"),
+    ("succeeded-valid", "succeeded"),
+    ("succeeded-matching", "succeeded"),
+    ("succeeded-invalid", "succeeded"),
+  ]
+  .into_iter()
+  .enumerate()
   {
-    let job_id = format!("upgrade-{state}");
-    let schedule_id = format!("schedule-{state}");
+    let job_id = format!("upgrade-{label}");
+    let schedule_id = format!("schedule-{label}");
     sqlx::query("insert into scheduled_jobs (job_id, definition_version, definition_json, creator_kind, creator_provider, creator_tenant, creator_subject, owner_kind, owner_provider, owner_tenant, owner_subject, status, generation, capability_schema_version, capability_digest, capability_json, created_at, updated_at) values (?1, 1, '{}', 'user', 'test', 'tenant', 'creator', 'user', 'test', 'tenant', 'owner', 'active', 0, 1, 'profile', '{}', 100, 100)")
       .bind(&job_id)
       .execute(&pool)
@@ -569,22 +573,51 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
       .execute(&pool)
       .await
       .expect("seed parent baseline");
-    let run_id = format!("upgrade-run-{state}");
+    let run_id = format!("upgrade-run-{label}");
     let overlap_slot = (state != "succeeded").then_some(1_i64);
     let lease_owner = matches!(state, "leased" | "executing").then_some("legacy-worker");
     let lease_expires_at = lease_owner.map(|_| 200_i64);
-    sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, lease_owner, lease_expires_at, overlap_slot, created_at, updated_at) values (?1, ?2, ?3, 0, 0, ?4, ?4, 1, '{}', 1, 'profile', '{}', '[{}]', ?5, ?6, ?7, ?8, 100, 100)")
+    let has_legacy_result = matches!(label, "succeeded-valid" | "succeeded-matching");
+    let result_context = has_legacy_result.then_some("legacy context");
+    let result_hash_algorithm = has_legacy_result.then_some("legacy-digest-v1");
+    let result_hash = has_legacy_result.then_some(label);
+    let has_current_attempt =
+      matches!(state, "leased" | "executing") || label == "succeeded-matching";
+    let attempt = i64::from(has_current_attempt);
+    let fence = attempt * 2;
+    sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, attempt, fence, lease_owner, lease_expires_at, overlap_slot, result_context, result_hash_algorithm, result_hash, created_at, updated_at) values (?1, ?2, ?3, 0, 0, ?4, ?4, 1, '{}', 1, 'profile', '{}', '[{}]', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 100, 100)")
       .bind(run_id)
       .bind(&job_id)
       .bind(&schedule_id)
       .bind(110 + i64::try_from(ordinal).expect("ordinal"))
       .bind(state)
+      .bind(attempt)
+      .bind(fence)
       .bind(lease_owner)
       .bind(lease_expires_at)
       .bind(overlap_slot)
+      .bind(result_context)
+      .bind(result_hash_algorithm)
+      .bind(result_hash)
       .execute(&pool)
       .await
       .expect("seed parent run");
+    if has_current_attempt {
+      let attested = (state != "leased").then_some(r#"{"legacy_test":true}"#);
+      sqlx::query("insert into scheduled_run_attempts (run_id, job_id, attempt, fence, lease_owner, state, claimed_at, lease_expires_at, preflight_completed_at, executing_at, completed_at, attested_profile_schema_version, attested_profile_json, attested_profile_hash_algorithm, attested_profile_digest) values (?1, ?2, 1, 2, 'legacy-worker', ?3, 90, 200, ?4, ?4, ?5, ?6, ?7, ?8, ?9)")
+        .bind(format!("upgrade-run-{label}"))
+        .bind(&job_id)
+        .bind(state)
+        .bind((state != "leased").then_some(100_i64))
+        .bind((state == "succeeded").then_some(100_i64))
+        .bind(attested.map(|_| 1_i64))
+        .bind(attested)
+        .bind(attested.map(|_| "sha256-v1"))
+        .bind(attested.map(|_| "attested"))
+        .execute(&pool)
+        .await
+        .expect("seed parent current attempt");
+    }
   }
   pool.close().await;
 
@@ -621,12 +654,35 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
       ("upgrade-run-leased".to_owned(), "pending".to_owned(), 1),
       ("upgrade-run-pending".to_owned(), "pending".to_owned(), 0),
       (
-        "upgrade-run-succeeded".to_owned(),
+        "upgrade-run-succeeded-invalid".to_owned(),
+        "outcome_unknown".to_owned(),
+        1
+      ),
+      (
+        "upgrade-run-succeeded-matching".to_owned(),
         "succeeded".to_owned(),
-        0
+        1
+      ),
+      (
+        "upgrade-run-succeeded-valid".to_owned(),
+        "succeeded".to_owned(),
+        1
       ),
     ]
   );
+  let legacy_artifacts: Vec<(String, String, String, String, String)> = sqlx::query_as(
+    "select r.run_id, r.result_artifact_id, a.provenance, a.hash_algorithm, a.previous_success_context from scheduled_runs r join scheduled_run_result_artifacts a on a.artifact_id = r.result_artifact_id where r.run_id like 'upgrade-run-succeeded-%' order by r.run_id",
+  )
+  .fetch_all(&pool)
+  .await
+  .expect("read migrated legacy artifacts");
+  assert_eq!(legacy_artifacts.len(), 2);
+  for (run_id, artifact_id, provenance, hash_algorithm, context) in legacy_artifacts {
+    assert_eq!(artifact_id, format!("legacy-result:{run_id}"));
+    assert_eq!(provenance, "legacy");
+    assert_eq!(hash_algorithm, "legacy-digest-v1");
+    assert_eq!(context, "legacy context");
+  }
   let foreign_key_errors: i64 = sqlx::query_scalar("select count(*) from pragma_foreign_key_check")
     .fetch_one(&pool)
     .await
@@ -647,6 +703,81 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
       None
     )
   );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_execution_hardening_migration_rejects_mismatched_current_attempt() {
+  let temp = tempdir().expect("create tempdir");
+  let old_migrations = temp.path().join("old-migrations");
+  std::fs::create_dir(&old_migrations).expect("create migration fixture");
+  let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+  for entry in std::fs::read_dir(source).expect("read migrations") {
+    let entry = entry.expect("migration entry");
+    if entry.file_name() != "20260721030000_scheduler_execution_hardening.sql" {
+      std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
+        .expect("copy parent migration");
+    }
+  }
+  let state_dir = temp.path().join("state");
+  std::fs::create_dir(&state_dir).expect("create state dir");
+  let options = SqliteConnectOptions::from_str(&database_url(&state_dir))
+    .expect("database options")
+    .create_if_missing(true);
+  let pool = SqlitePoolOptions::new()
+    .max_connections(1)
+    .connect_with(options)
+    .await
+    .expect("connect parent database");
+  Migrator::new(old_migrations)
+    .await
+    .expect("load parent migrator")
+    .run(&pool)
+    .await
+    .expect("run parent migrations");
+  sqlx::query("insert into scheduled_jobs (job_id, definition_version, definition_json, creator_kind, creator_provider, creator_tenant, creator_subject, owner_kind, owner_provider, owner_tenant, owner_subject, status, generation, capability_schema_version, capability_digest, capability_json, created_at, updated_at) values ('mismatch', 1, '{}', 'user', 'test', 'tenant', 'creator', 'user', 'test', 'tenant', 'owner', 'active', 0, 1, 'profile', '{}', 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed job");
+  sqlx::query("insert into schedules (schedule_id, job_id, kind, canonical_spec, once_at, next_run_at, created_at, updated_at) values ('schedule-mismatch', 'mismatch', 'once', '200', 200, 200, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed schedule");
+  sqlx::query("insert into scheduled_execution_baselines (job_id) values ('mismatch')")
+    .execute(&pool)
+    .await
+    .expect("seed baseline");
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, attempt, fence, lease_owner, lease_expires_at, overlap_slot, created_at, updated_at) values ('mismatch-run', 'mismatch', 'schedule-mismatch', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{}]', 'leased', 1, 2, 'worker', 200, 1, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed run");
+  sqlx::query("insert into scheduled_run_attempts (run_id, job_id, attempt, fence, lease_owner, state, claimed_at, lease_expires_at) values ('mismatch-run', 'mismatch', 1, 3, 'worker', 'leased', 100, 200)")
+    .execute(&pool)
+    .await
+    .expect("seed mismatched attempt");
+  pool.close().await;
+
+  assert!(matches!(
+    StateStore::initialize(&state_dir, None).await,
+    Err(StateError::Migrate { .. })
+  ));
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("reopen rejected database");
+  let unchanged: (String, i64, i64, String) = sqlx::query_as(
+    "select r.state, r.fence, a.fence, a.state from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id where r.run_id = 'mismatch-run'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled back mismatch");
+  assert_eq!(unchanged, ("leased".to_owned(), 2, 3, "leased".to_owned()));
+  let hardening_applied: i64 = sqlx::query_scalar(
+    "select count(*) from _sqlx_migrations where version = 20260721030000 and success = true",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read hardening migration state");
+  assert_eq!(hardening_applied, 0);
 }
 
 #[tokio::test]
@@ -1206,6 +1337,19 @@ async fn test_late_evidence_is_typed_bounded_and_quota_safe_across_two_stores() 
       .await,
     Err(StateError::InvalidSchedulerState { .. })
   ));
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  assert!(
+    sqlx::query("insert into scheduled_run_late_evidence (evidence_id, run_id, attempt, fence, evidence_kind, hash_algorithm, evidence_digest, observed_at) values (?1, ?2, ?3, ?4, 'completion_after_lease_loss', 'sha256-v1', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 122)")
+      .bind("x".repeat(129))
+      .bind(claim.binding.run_id())
+      .bind(claim.binding.attempt())
+      .bind(claim.binding.fence())
+      .execute(&pool)
+      .await
+      .is_err()
+  );
   for ordinal in 0..31 {
     let digest = format!("{ordinal:064x}");
     assert_eq!(
@@ -1284,9 +1428,6 @@ async fn test_late_evidence_is_typed_bounded_and_quota_safe_across_two_stores() 
     LateEvidenceAppendOutcome::QuotaExceeded
   );
 
-  let pool = SqlitePool::connect(&database_url(&state_dir))
-    .await
-    .expect("connect database");
   for statement in [
     "insert into scheduled_run_late_evidence (evidence_id, run_id, attempt, fence, evidence_kind, hash_algorithm, evidence_digest, observed_at) values ('unknown-kind', ?1, ?2, ?3, 'raw_final_output', 'sha256-v1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 202)",
     "insert into scheduled_run_late_evidence (evidence_id, run_id, attempt, fence, evidence_kind, hash_algorithm, evidence_digest, redacted_message, observed_at) values ('secret-message', ?1, ?2, ?3, 'completion_after_lease_loss', 'sha256-v1', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'secret payload', 202)",

@@ -16,6 +16,7 @@ codeoff-config = { path = "../config" }
 codeoff-state = { path = "../state" }
 serde_json.workspace = true
 sha2.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

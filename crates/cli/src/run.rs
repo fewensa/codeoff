@@ -18,8 +18,8 @@ use codeoff_agent_contract::{
   InvocationPrincipalRef, InvocationSource,
 };
 use codeoff_channel_contract::{
-  ChannelContextPage, ChannelContextRequest, ChannelEvent, ChannelMessageReceipt,
-  ChannelReplyTarget,
+  ChannelContextPage, ChannelContextRequest, ChannelEvent, ChannelLookupRequest,
+  ChannelMessageReceipt, ChannelReplyTarget, ChannelWorkspaceRequest,
 };
 use codeoff_channel_slack::{
   SlackConfigError, SlackDeliveryQueue, SlackIntake, SlackIntakeResult, SlackReqwestWebApiClient,
@@ -35,11 +35,15 @@ use codeoff_runtime::{
   ProcessingStreamFinishRequest, ProcessingStreamManager, ProcessingStreamStartRequest,
   StateProcessingStreamManager,
   channel_tools::{
-    ChannelContextProvider, ChannelContextProviderError, ChannelDynamicToolHandler,
-    ChannelResourceProvider,
+    ChannelChannelProvider, ChannelContextProvider, ChannelContextProviderError,
+    ChannelDynamicToolHandler, ChannelResourceProvider, ChannelStatusProvider, ChannelUserProvider,
   },
   dispatch_next_channel_event_with_processing_streams_context_and_locks,
-  schedule_service::ScheduleInvocation,
+  schedule_service::{
+    ChannelTargetVerifier, DefaultCapabilityRegistry, OwnerOnlyAuthorizationPolicy,
+    ScheduleInvocation, ScheduleService, TargetResolverRegistry, TargetVerificationError,
+    VerifiedSlackTargetResolver,
+  },
   schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler},
 };
 use codeoff_state::{RetentionPolicy, StateError, StateStore};
@@ -1890,14 +1894,18 @@ fn build_serve_codex_app_server_backend(
   if codex.command.trim().is_empty() {
     return Err("codex app server command must not be empty".to_owned());
   }
+  let address_provider = build_channel_address_provider(config);
   Ok(
     CodexAppServerBackend::new(
       StdioCodexAppServerClient::with_dynamic_tool_handler(
         codex.command.clone(),
         codex.ephemeral_threads,
         ServeCodexDynamicToolHandler {
-          schedule: ScheduleDynamicToolHandler::new(state.clone()),
-          inner: build_serve_channel_dynamic_tool_handler(config, state),
+          schedule: build_serve_schedule_dynamic_tool_handler(
+            state.clone(),
+            address_provider.clone(),
+          ),
+          inner: build_serve_channel_dynamic_tool_handler(config, state, address_provider),
           runtime: tokio::runtime::Handle::current(),
           assistant_status,
           slack_streams: slack_streams.clone(),
@@ -1915,11 +1923,12 @@ fn build_serve_codex_app_server_backend(
 fn build_serve_channel_dynamic_tool_handler(
   config: &CodeoffConfig,
   state: StateStore,
+  address_provider: Option<Arc<SlackWebApiClient<SlackReqwestWebApiClient>>>,
 ) -> ChannelDynamicToolHandler {
   let context_provider: Arc<dyn ChannelContextProvider> =
     Arc::new(build_channel_context_provider(config));
   match build_channel_resource_provider(config) {
-    Some(resource_provider) => match build_channel_address_provider(config) {
+    Some(resource_provider) => match address_provider {
       Some(address_provider) => ChannelDynamicToolHandler::new_with_all_providers_and_now(
         state,
         context_provider,
@@ -1938,6 +1947,90 @@ fn build_serve_channel_dynamic_tool_handler(
   }
 }
 
+fn build_serve_schedule_dynamic_tool_handler(
+  state: StateStore,
+  address_provider: Option<Arc<SlackWebApiClient<SlackReqwestWebApiClient>>>,
+) -> ScheduleDynamicToolHandler {
+  let mut targets = TargetResolverRegistry::with_defaults();
+  if let Some(provider) = address_provider {
+    targets.register(Arc::new(VerifiedSlackTargetResolver::new(
+      Arc::new(SlackScheduleTargetVerifier { provider }),
+      Duration::from_secs(5),
+    )));
+  }
+  ScheduleDynamicToolHandler::from_service(
+    ScheduleService::with_components(
+      state,
+      Arc::new(targets),
+      Arc::new(DefaultCapabilityRegistry),
+      Arc::new(OwnerOnlyAuthorizationPolicy),
+      Duration::from_secs(5),
+    ),
+    None,
+  )
+}
+
+struct SlackScheduleTargetVerifier {
+  provider: Arc<SlackWebApiClient<SlackReqwestWebApiClient>>,
+}
+
+#[async_trait]
+impl ChannelTargetVerifier for SlackScheduleTargetVerifier {
+  async fn verify_connector(
+    &self,
+    workspace_id: &str,
+    _actor_id: &str,
+  ) -> Result<(), TargetVerificationError> {
+    ChannelStatusProvider::get_connector_status(
+      self.provider.as_ref(),
+      ChannelWorkspaceRequest::new("slack-default", workspace_id)
+        .map_err(|_| TargetVerificationError::NotAllowed)?,
+    )
+    .await
+    .map_err(|_| TargetVerificationError::Unavailable)
+    .and_then(|status| {
+      status
+        .connected
+        .then_some(())
+        .ok_or(TargetVerificationError::NotAllowed)
+    })
+  }
+
+  async fn verify_channel(
+    &self,
+    workspace_id: &str,
+    _actor_id: &str,
+    channel_id: &str,
+  ) -> Result<(), TargetVerificationError> {
+    ChannelChannelProvider::get_channel(
+      self.provider.as_ref(),
+      ChannelLookupRequest::new("slack-default", workspace_id, channel_id)
+        .map_err(|_| TargetVerificationError::NotAllowed)?,
+    )
+    .await
+    .map_err(|_| TargetVerificationError::Unavailable)?
+    .map(|_| ())
+    .ok_or(TargetVerificationError::NotAllowed)
+  }
+
+  async fn verify_user(
+    &self,
+    workspace_id: &str,
+    _actor_id: &str,
+    user_id: &str,
+  ) -> Result<(), TargetVerificationError> {
+    ChannelUserProvider::get_user(
+      self.provider.as_ref(),
+      ChannelLookupRequest::new("slack-default", workspace_id, user_id)
+        .map_err(|_| TargetVerificationError::NotAllowed)?,
+    )
+    .await
+    .map_err(|_| TargetVerificationError::Unavailable)?
+    .map(|_| ())
+    .ok_or(TargetVerificationError::NotAllowed)
+  }
+}
+
 #[derive(Clone)]
 struct ServeCodexDynamicToolHandler {
   inner: ChannelDynamicToolHandler,
@@ -1950,8 +2043,8 @@ struct ServeCodexDynamicToolHandler {
 impl CodexDynamicToolHandler for ServeCodexDynamicToolHandler {
   fn tool_specs(&self, context: &CodexDynamicToolContext) -> Vec<serde_json::Value> {
     let mut specs = self.inner.tool_specs();
-    if schedule_invocation(context).is_some() {
-      specs.extend(self.schedule.tool_specs());
+    if let Some(invocation) = schedule_invocation(context) {
+      specs.extend(self.schedule.tool_specs(&invocation));
     }
     specs
   }

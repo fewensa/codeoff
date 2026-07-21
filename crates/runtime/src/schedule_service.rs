@@ -1,10 +1,7 @@
 use std::fmt::{self, Write as _};
+use std::sync::Arc;
+use std::time::Duration;
 
-use async_trait::async_trait;
-use codeoff_agent_contract::{
-  ChannelTaskContext, ConversationKind, InvocationPrincipal, InvocationPrincipalRef,
-  InvocationSource,
-};
 use codeoff_state::{
   CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, PrincipalKey,
   ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledJob,
@@ -15,14 +12,29 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 const DIGEST_ALGORITHM: &str = "sha256-canonical-json-v1";
-const SNAPSHOT_VERSION: u32 = 1;
+pub(crate) const SNAPSHOT_VERSION: u32 = 1;
+
+pub use crate::schedule_authorization::{
+  AuthorizationPolicy, OwnerOnlyAuthorizationPolicy, ScheduleInvocation,
+};
+pub use crate::schedule_resolution::{
+  CapabilityRegistry, CapabilityRequest, ChannelTargetVerifier, DefaultCapabilityRegistry,
+  DefaultTargetResolver, DeliveryTargetRequest, TargetResolver, TargetResolverRegistry,
+  TargetVerificationError, VerifiedSlackTargetResolver,
+};
+use crate::schedule_resolution::{
+  scope_targets, validate_capability_snapshot, validate_resolved_targets,
+};
 
 #[derive(Debug)]
 pub enum ScheduleServiceError {
   Unauthorized,
-  Forbidden,
-  NotFound,
+  NotVisible,
   InvalidRequest(String),
+  ResolverUnavailable,
+  ResolverNotAllowed,
+  ResolverTimeout,
+  CapabilityUnavailable,
   IdempotencyInProgress,
   IdempotencyConflict,
   State(StateError),
@@ -35,17 +47,17 @@ impl fmt::Display for ScheduleServiceError {
         formatter,
         "schedule operation requires an authenticated actor"
       ),
-      Self::Forbidden => write!(
-        formatter,
-        "schedule is not owned by the authenticated actor"
-      ),
-      Self::NotFound => write!(formatter, "schedule was not found"),
+      Self::NotVisible => write!(formatter, "schedule was not found or is not visible"),
       Self::InvalidRequest(reason) => write!(formatter, "invalid schedule request: {reason}"),
+      Self::ResolverUnavailable => write!(formatter, "target resolver is unavailable"),
+      Self::ResolverNotAllowed => write!(formatter, "target is not allowed"),
+      Self::ResolverTimeout => write!(formatter, "target resolver timed out"),
+      Self::CapabilityUnavailable => write!(formatter, "capability is unavailable"),
       Self::IdempotencyInProgress => write!(formatter, "schedule request is already in progress"),
       Self::IdempotencyConflict => {
         write!(formatter, "request id was reused with different semantics")
       }
-      Self::State(error) => write!(formatter, "schedule state operation failed: {error}"),
+      Self::State(_) => write!(formatter, "schedule storage operation failed"),
     }
   }
 }
@@ -58,178 +70,55 @@ impl From<StateError> for ScheduleServiceError {
   }
 }
 
-#[derive(Debug, Clone)]
-pub struct ScheduleInvocation {
-  pub source: InvocationSource,
-  pub principal: InvocationPrincipal,
-  pub channel: Option<ChannelTaskContext>,
-}
-
-impl ScheduleInvocation {
-  fn authorized_owner(&self) -> Result<PrincipalKey, ScheduleServiceError> {
-    let InvocationPrincipalRef::ChannelActor {
-      provider,
-      workspace_id,
-      actor_id,
-    } = self.principal.as_ref()
-    else {
-      return Err(ScheduleServiceError::Unauthorized);
-    };
-    let InvocationSource::ChannelEvent {
-      provider: source_provider,
-      workspace_id: source_workspace,
-      ..
-    } = &self.source
-    else {
-      return Err(ScheduleServiceError::Unauthorized);
-    };
-    if source_provider != provider || source_workspace != workspace_id {
-      return Err(ScheduleServiceError::Unauthorized);
-    }
-    PrincipalKey::new("channel_actor", provider, workspace_id, actor_id)
-      .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))
+impl From<String> for ScheduleServiceError {
+  fn from(reason: String) -> Self {
+    Self::InvalidRequest(reason)
   }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeliveryTargetRequest {
-  None,
-  Origin,
-  Channel {
-    channel_id: String,
-  },
-  DirectMessage {
-    user_id: String,
-  },
-  Thread {
-    channel_id: String,
-    thread_id: String,
-  },
-}
-
-#[async_trait]
-pub trait TargetResolver: Send + Sync {
-  async fn resolve(
-    &self,
-    invocation: &ScheduleInvocation,
-    owner: &PrincipalKey,
-    target: &DeliveryTargetRequest,
-  ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError>;
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DefaultTargetResolver;
-
-#[async_trait]
-impl TargetResolver for DefaultTargetResolver {
-  async fn resolve(
-    &self,
-    invocation: &ScheduleInvocation,
-    owner: &PrincipalKey,
-    target: &DeliveryTargetRequest,
-  ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
-    let (provider, connector, tenant, kind, address) = match target {
-      DeliveryTargetRequest::None => (
-        "none".to_owned(),
-        "none".to_owned(),
-        owner.tenant().to_owned(),
-        "none".to_owned(),
-        json!({}),
-      ),
-      DeliveryTargetRequest::Origin => {
-        let context = invocation.channel.as_ref().ok_or_else(|| {
-          ScheduleServiceError::InvalidRequest("origin target requires channel context".to_owned())
-        })?;
-        ensure_context_matches_owner(context, owner)?;
-        let (kind, address) = origin_address(context)?;
-        (
-          context.provider.clone(),
-          "channel".to_owned(),
-          context.workspace_id.clone(),
-          kind,
-          address,
-        )
-      }
-      DeliveryTargetRequest::Channel { channel_id } => (
-        owner.provider().to_owned(),
-        "channel".to_owned(),
-        owner.tenant().to_owned(),
-        "channel".to_owned(),
-        json!({"channel_id": bounded("channel_id", channel_id)?}),
-      ),
-      DeliveryTargetRequest::DirectMessage { user_id } => (
-        owner.provider().to_owned(),
-        "channel".to_owned(),
-        owner.tenant().to_owned(),
-        "direct_message".to_owned(),
-        json!({"user_id": bounded("user_id", user_id)?}),
-      ),
-      DeliveryTargetRequest::Thread {
-        channel_id,
-        thread_id,
-      } => (
-        owner.provider().to_owned(),
-        "channel".to_owned(),
-        owner.tenant().to_owned(),
-        "thread".to_owned(),
-        json!({
-          "channel_id": bounded("channel_id", channel_id)?,
-          "thread_id": bounded("thread_id", thread_id)?,
-        }),
-      ),
-    };
-    let address_json = canonical_json(&address)?;
-    let identity_digest = digest_json(&json!({
-      "provider": provider,
-      "connector": connector,
-      "tenant": tenant,
-      "kind": kind,
-      "address": address,
-    }))?;
-    let target_id = format!("target_{}", &identity_digest[..32]);
-    let resolver_digest = digest_json(&json!({"resolver": "default", "version": 1}))?;
-    let snapshot = DeliveryTargetSnapshot::new(
-      target_id,
-      provider,
-      connector,
-      tenant,
-      kind,
-      address_json,
-      SNAPSHOT_VERSION,
-      resolver_digest,
-      identity_digest,
-    )
-    .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?;
-    Ok(vec![snapshot])
+impl From<&str> for ScheduleServiceError {
+  fn from(reason: &str) -> Self {
+    Self::InvalidRequest(reason.to_owned())
   }
 }
 
-pub trait CapabilityRegistry: Send + Sync {
-  fn resolve(
-    &self,
-    owner: &PrincipalKey,
-    capability: &str,
-  ) -> Result<CapabilityProfileSnapshot, ScheduleServiceError>;
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DefaultCapabilityRegistry;
-
-impl CapabilityRegistry for DefaultCapabilityRegistry {
-  fn resolve(
-    &self,
-    _owner: &PrincipalKey,
-    capability: &str,
-  ) -> Result<CapabilityProfileSnapshot, ScheduleServiceError> {
-    if capability != "none" {
-      return Err(ScheduleServiceError::InvalidRequest(format!(
-        "unknown or unauthorized capability profile: {capability}"
-      )));
+impl ScheduleServiceError {
+  #[must_use]
+  pub fn code(&self) -> &'static str {
+    match self {
+      Self::Unauthorized => "unauthorized",
+      Self::NotVisible => "not_found_or_not_visible",
+      Self::InvalidRequest(_) => "validation_failed",
+      Self::ResolverUnavailable => "resolver_unavailable",
+      Self::ResolverNotAllowed => "resolver_not_allowed",
+      Self::ResolverTimeout => "resolver_timeout",
+      Self::CapabilityUnavailable => "capability_unavailable",
+      Self::IdempotencyInProgress => "idempotency_in_progress",
+      Self::IdempotencyConflict => "idempotency_conflict",
+      Self::State(StateError::SchedulerGenerationConflict) => "stale_generation",
+      Self::State(StateError::ScheduledOnceExpired) => "expired_not_resumable",
+      Self::State(error) if error.is_transient_storage_contention() => "storage_busy",
+      Self::State(_) => "storage_error",
     }
-    let profile = json!({"name": "none", "tools": []});
-    let canonical = canonical_json(&profile)?;
-    CapabilityProfileSnapshot::new(SNAPSHOT_VERSION, digest_json(&profile)?, canonical)
-      .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))
+  }
+
+  #[must_use]
+  pub fn retryable(&self) -> bool {
+    match self {
+      Self::ResolverUnavailable | Self::ResolverTimeout | Self::IdempotencyInProgress => true,
+      Self::State(error) => error.is_transient_storage_contention(),
+      _ => false,
+    }
+  }
+
+  #[must_use]
+  pub fn structured_json(&self) -> Value {
+    json!({
+      "code": self.code(),
+      "retryable": self.retryable(),
+      "message": self.to_string(),
+      "details": {},
+    })
   }
 }
 
@@ -264,10 +153,12 @@ pub struct LifecycleScheduleRequest {
 }
 
 #[derive(Clone)]
-pub struct ScheduleService<R = DefaultTargetResolver, C = DefaultCapabilityRegistry> {
+pub struct ScheduleService {
   state: StateStore,
-  target_resolver: R,
-  capability_registry: C,
+  target_resolver: Arc<dyn TargetResolver>,
+  capability_registry: Arc<dyn CapabilityRegistry>,
+  authorization: Arc<dyn AuthorizationPolicy>,
+  resolver_timeout: Duration,
 }
 
 impl ScheduleService {
@@ -275,28 +166,99 @@ impl ScheduleService {
   pub fn new(state: StateStore) -> Self {
     Self {
       state,
-      target_resolver: DefaultTargetResolver,
-      capability_registry: DefaultCapabilityRegistry,
+      target_resolver: Arc::new(TargetResolverRegistry::with_defaults()),
+      capability_registry: Arc::new(DefaultCapabilityRegistry),
+      authorization: Arc::new(OwnerOnlyAuthorizationPolicy),
+      resolver_timeout: Duration::from_secs(5),
     }
   }
 }
 
-impl<R, C> ScheduleService<R, C>
-where
-  R: TargetResolver,
-  C: CapabilityRegistry,
-{
+impl ScheduleService {
   #[must_use]
-  pub const fn with_components(
+  pub fn with_components(
     state: StateStore,
-    target_resolver: R,
-    capability_registry: C,
+    target_resolver: Arc<dyn TargetResolver>,
+    capability_registry: Arc<dyn CapabilityRegistry>,
+    authorization: Arc<dyn AuthorizationPolicy>,
+    resolver_timeout: Duration,
   ) -> Self {
     Self {
       state,
       target_resolver,
       capability_registry,
+      authorization,
+      resolver_timeout,
     }
+  }
+
+  pub fn describe_supported_targets(
+    &self,
+    invocation: &ScheduleInvocation,
+  ) -> Result<Vec<&'static str>, ScheduleServiceError> {
+    self.authorization.authorize_create(invocation)?;
+    Ok(self.target_resolver.describe_supported_targets(invocation))
+  }
+
+  pub fn describe_authorized_capabilities(
+    &self,
+    invocation: &ScheduleInvocation,
+  ) -> Result<Vec<&'static str>, ScheduleServiceError> {
+    self.authorization.authorize_create(invocation)?;
+    Ok(self.capability_registry.describe_authorized(invocation))
+  }
+
+  pub async fn record_error_audit(
+    &self,
+    invocation: &ScheduleInvocation,
+    operation: &str,
+    request_id: Option<&str>,
+    job_id: Option<&str>,
+    error: &ScheduleServiceError,
+    now: i64,
+  ) {
+    let outcome = match error.code() {
+      "unauthorized" | "not_found_or_not_visible" => "denied",
+      "validation_failed" => "validation",
+      "resolver_unavailable" | "resolver_not_allowed" | "resolver_timeout" => "resolver",
+      "capability_unavailable" => "capability",
+      _ => "storage",
+    };
+    let correlation_id = request_id
+      .filter(|value| !value.is_empty() && value.len() <= 255)
+      .unwrap_or("uncorrelated");
+    let principal = invocation.canonical_actor().ok();
+    let audit = ScheduleMutationAudit {
+      audit_id: format!(
+        "audit_error_{}",
+        &digest_json(&json!({
+          "principal": principal.as_ref().map(principal_json), "operation": operation,
+          "correlation_id": correlation_id, "job_id": job_id, "code": error.code(),
+        }))
+        .unwrap_or_else(|_| "invalid".to_owned())[..32]
+      ),
+      principal,
+      operation: operation.to_owned(),
+      job_id: job_id.map(ToOwned::to_owned),
+      request_id: correlation_id.to_owned(),
+      outcome: outcome.to_owned(),
+      decision: if outcome == "denied" { "deny" } else { "error" }.to_owned(),
+      reason: Some(error.code().to_owned()),
+      error_code: Some(error.code().to_owned()),
+      old_generation: None,
+      new_generation: None,
+      resolver_provider: None,
+      target_kind: None,
+      resolver_version: None,
+      resolver_digest: None,
+      capability_version: None,
+      capability_digest: None,
+      idempotency_outcome: None,
+      latency_ms: 0,
+      correlation_id: correlation_id.to_owned(),
+      occurred_at: now,
+    };
+    let _ = self.state.append_schedule_audit(&audit).await;
   }
 
   pub async fn create(
@@ -306,7 +268,7 @@ where
   ) -> Result<Value, ScheduleServiceError> {
     validate_request_id(&request.request_id)?;
     validate_instruction(&request.instruction)?;
-    let owner = invocation.authorized_owner()?;
+    let owner = self.authorization.authorize_create(invocation)?;
     let job_id = format!(
       "job_{}",
       &digest_json(&json!({
@@ -314,15 +276,16 @@ where
         "request_id": request.request_id,
       }))?[..32]
     );
-    let capability = self
-      .capability_registry
-      .resolve(&owner, &request.capability)?;
+    let capability = self.resolve_capability(invocation, &owner, &request.capability)?;
     let targets = scope_targets(
       &job_id,
-      self
-        .target_resolver
-        .resolve(invocation, &owner, &request.target)
-        .await?,
+      validate_resolved_targets(
+        &owner,
+        &request.target,
+        self
+          .resolve_targets(invocation, &owner, &request.target)
+          .await?,
+      )?,
     )?;
     let semantic = mutation_semantics(
       "create",
@@ -366,17 +329,17 @@ where
   ) -> Result<Value, ScheduleServiceError> {
     validate_request_id(&request.request_id)?;
     validate_instruction(&request.instruction)?;
-    let owner = invocation.authorized_owner()?;
-    let current = self.require_owned_job(&owner, &request.job_id).await?;
-    let capability = self
-      .capability_registry
-      .resolve(&owner, &request.capability)?;
+    let (owner, current) = self.authorize_job(invocation, &request.job_id).await?;
+    let capability = self.resolve_capability(invocation, &owner, &request.capability)?;
     let targets = scope_targets(
       &request.job_id,
-      self
-        .target_resolver
-        .resolve(invocation, &owner, &request.target)
-        .await?,
+      validate_resolved_targets(
+        &owner,
+        &request.target,
+        self
+          .resolve_targets(invocation, &owner, &request.target)
+          .await?,
+      )?,
     )?;
     let semantic = mutation_semantics(
       "update",
@@ -443,8 +406,7 @@ where
     invocation: &ScheduleInvocation,
     job_id: &str,
   ) -> Result<Value, ScheduleServiceError> {
-    let owner = invocation.authorized_owner()?;
-    let job = self.require_owned_job(&owner, job_id).await?;
+    let (_, job) = self.authorize_job(invocation, job_id).await?;
     job_json(&job)
   }
 
@@ -455,7 +417,7 @@ where
     cursor: Option<&str>,
     limit: u32,
   ) -> Result<ScheduledJobListPage, ScheduleServiceError> {
-    let owner = invocation.authorized_owner()?;
+    let owner = self.authorization.authorize_create(invocation)?;
     self
       .state
       .list_scheduled_jobs_by_owner(&owner, status, cursor, limit)
@@ -470,8 +432,7 @@ where
     operation: &'static str,
   ) -> Result<Value, ScheduleServiceError> {
     validate_request_id(&request.request_id)?;
-    let owner = invocation.authorized_owner()?;
-    self.require_owned_job(&owner, &request.job_id).await?;
+    let (owner, _) = self.authorize_job(invocation, &request.job_id).await?;
     let semantic = json!({
       "operation": operation,
       "owner": principal_json(&owner),
@@ -519,20 +480,50 @@ where
       .await
   }
 
-  async fn require_owned_job(
+  async fn authorize_job(
     &self,
-    owner: &PrincipalKey,
+    invocation: &ScheduleInvocation,
     job_id: &str,
-  ) -> Result<ScheduledJob, ScheduleServiceError> {
-    let job = self
-      .state
-      .get_scheduled_job(job_id)
-      .await?
-      .ok_or(ScheduleServiceError::NotFound)?;
-    if &job.owner != owner {
-      return Err(ScheduleServiceError::Forbidden);
+  ) -> Result<(PrincipalKey, ScheduledJob), ScheduleServiceError> {
+    let job = self.state.get_scheduled_job(job_id).await?;
+    self.authorization.authorize_existing(invocation, job)
+  }
+
+  fn resolve_capability(
+    &self,
+    invocation: &ScheduleInvocation,
+    owner: &PrincipalKey,
+    name: &str,
+  ) -> Result<CapabilityProfileSnapshot, ScheduleServiceError> {
+    if !self
+      .capability_registry
+      .describe_authorized(invocation)
+      .contains(&name)
+    {
+      return Err(ScheduleServiceError::CapabilityUnavailable);
     }
-    Ok(job)
+    let snapshot = self.capability_registry.resolve(
+      invocation,
+      owner,
+      &CapabilityRequest {
+        name: name.to_owned(),
+      },
+    )?;
+    validate_capability_snapshot(name, snapshot)
+  }
+
+  async fn resolve_targets(
+    &self,
+    invocation: &ScheduleInvocation,
+    owner: &PrincipalKey,
+    target: &DeliveryTargetRequest,
+  ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
+    tokio::time::timeout(
+      self.resolver_timeout,
+      self.target_resolver.resolve(invocation, owner, target),
+    )
+    .await
+    .map_err(|_| ScheduleServiceError::ResolverTimeout)?
   }
 
   async fn apply_mutation(
@@ -547,6 +538,15 @@ where
     let response_json = canonical_json(&response)?;
     let operation = mutation_operation(&mutation);
     let job_id = mutation_job_id(&mutation).to_owned();
+    let (old_generation, new_generation) = mutation_generations(&mutation);
+    let (
+      resolver_provider,
+      target_kind,
+      resolver_version,
+      resolver_digest,
+      capability_version,
+      capability_digest,
+    ) = mutation_audit_snapshots(&mutation);
     let audit = ScheduleMutationAudit {
       audit_id: format!(
         "audit_{}",
@@ -556,11 +556,25 @@ where
           "request_id": request_id,
         }))?[..32]
       ),
-      principal: owner.clone(),
+      principal: Some(owner.clone()),
       operation: operation.to_owned(),
-      job_id,
+      job_id: Some(job_id),
       request_id: request_id.clone(),
       outcome: "applied".to_owned(),
+      decision: "allow".to_owned(),
+      reason: None,
+      error_code: None,
+      old_generation,
+      new_generation,
+      resolver_provider,
+      target_kind,
+      resolver_version,
+      resolver_digest,
+      capability_version,
+      capability_digest,
+      idempotency_outcome: Some("applied".to_owned()),
+      latency_ms: 0,
+      correlation_id: request_id.clone(),
       occurred_at: now,
     };
     let idempotency = ScheduleMutationIdempotency {
@@ -570,60 +584,51 @@ where
       request_digest,
       response_json,
     };
-    match self
+    let outcome = self
       .state
       .apply_idempotent_schedule_mutation_with_audit(&mutation, &idempotency, Some(&audit))
-      .await?
-    {
-      TransactionalMutationOutcome::Applied(response)
-      | TransactionalMutationOutcome::Replay(response) => {
-        serde_json::from_str(&response).map_err(|error| {
+      .await;
+    match outcome {
+      Err(error) => {
+        let service_error = ScheduleServiceError::State(error);
+        let mut failed = audit_for_outcome(&audit, "storage", "error", Some(service_error.code()));
+        failed.idempotency_outcome = None;
+        let _ = self.state.append_schedule_audit(&failed).await;
+        Err(service_error)
+      }
+      Ok(TransactionalMutationOutcome::Applied(response)) => serde_json::from_str(&response)
+        .map_err(|error| {
           ScheduleServiceError::State(StateError::InvalidSchedulerState {
             reason: format!("invalid persisted schedule response: {error}"),
           })
+        }),
+      Ok(TransactionalMutationOutcome::Replay(response)) => {
+        let replay = audit_for_outcome(&audit, "replay", "allow", None);
+        let _ = self.state.append_schedule_audit(&replay).await;
+        serde_json::from_str(&response).map_err(|_| {
+          ScheduleServiceError::InvalidRequest("invalid persisted response".to_owned())
         })
       }
-      TransactionalMutationOutcome::InProgress => Err(ScheduleServiceError::IdempotencyInProgress),
-      TransactionalMutationOutcome::Conflict => Err(ScheduleServiceError::IdempotencyConflict),
+      Ok(TransactionalMutationOutcome::InProgress) => {
+        let pending = audit_for_outcome(
+          &audit,
+          "in_progress",
+          "error",
+          Some("idempotency_in_progress"),
+        );
+        let _ = self.state.append_schedule_audit(&pending).await;
+        Err(ScheduleServiceError::IdempotencyInProgress)
+      }
+      Ok(TransactionalMutationOutcome::Conflict) => {
+        let conflict = audit_for_outcome(&audit, "conflict", "deny", Some("idempotency_conflict"));
+        let _ = self.state.append_schedule_audit(&conflict).await;
+        Err(ScheduleServiceError::IdempotencyConflict)
+      }
     }
   }
 }
 
-fn ensure_context_matches_owner(
-  context: &ChannelTaskContext,
-  owner: &PrincipalKey,
-) -> Result<(), ScheduleServiceError> {
-  if context.provider != owner.provider() || context.workspace_id != owner.tenant() {
-    return Err(ScheduleServiceError::Unauthorized);
-  }
-  Ok(())
-}
-
-fn origin_address(context: &ChannelTaskContext) -> Result<(String, Value), ScheduleServiceError> {
-  match context.conversation_kind {
-    ConversationKind::Channel => Ok((
-      "channel".to_owned(),
-      json!({"channel_id": required("channel_id", context.channel_id.as_deref())?}),
-    )),
-    ConversationKind::DirectMessage => Ok((
-      "direct_message".to_owned(),
-      json!({"user_id": required("user_id", context.user_id.as_deref())?}),
-    )),
-    ConversationKind::Thread => Ok((
-      "thread".to_owned(),
-      json!({
-        "channel_id": required("channel_id", context.channel_id.as_deref())?,
-        "thread_id": required("thread_id", context.thread_id.as_deref())?,
-      }),
-    )),
-  }
-}
-
-fn required<'a>(field: &str, value: Option<&'a str>) -> Result<&'a str, ScheduleServiceError> {
-  bounded(field, value.unwrap_or_default())
-}
-
-fn bounded<'a>(field: &str, value: &'a str) -> Result<&'a str, ScheduleServiceError> {
+pub(crate) fn bounded<'a>(field: &str, value: &'a str) -> Result<&'a str, ScheduleServiceError> {
   if value.trim().is_empty() || value.len() > 255 || value != value.trim() {
     return Err(ScheduleServiceError::InvalidRequest(format!(
       "{field} must be a bounded non-empty string"
@@ -693,29 +698,6 @@ fn target_json(target: &DeliveryTargetSnapshot) -> Result<Value, ScheduleService
   }))
 }
 
-fn scope_targets(
-  job_id: &str,
-  targets: Vec<DeliveryTargetSnapshot>,
-) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
-  targets
-    .into_iter()
-    .enumerate()
-    .map(|(ordinal, target)| {
-      let target_id = format!(
-        "target_{}",
-        &digest_json(&json!({
-          "job_id": job_id,
-          "ordinal": ordinal,
-          "identity_digest": target.identity_digest(),
-        }))?[..32]
-      );
-      target
-        .with_target_id(target_id)
-        .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))
-    })
-    .collect()
-}
-
 fn next_generation(generation: i64) -> Result<i64, ScheduleServiceError> {
   generation.checked_add(1).ok_or_else(|| {
     ScheduleServiceError::InvalidRequest("expected_generation is too large".to_owned())
@@ -765,6 +747,76 @@ fn mutation_job_id(mutation: &ScheduledJobMutation) -> &str {
   }
 }
 
+fn mutation_generations(mutation: &ScheduledJobMutation) -> (Option<i64>, Option<i64>) {
+  match mutation {
+    ScheduledJobMutation::Create(_) => (None, Some(0)),
+    ScheduledJobMutation::Update(request) => (
+      Some(request.expected_generation),
+      request.expected_generation.checked_add(1),
+    ),
+    ScheduledJobMutation::Pause {
+      expected_generation,
+      ..
+    }
+    | ScheduledJobMutation::Resume {
+      expected_generation,
+      ..
+    }
+    | ScheduledJobMutation::Delete {
+      expected_generation,
+      ..
+    } => (
+      Some(*expected_generation),
+      expected_generation.checked_add(1),
+    ),
+  }
+}
+
+type MutationAuditSnapshots = (
+  Option<String>,
+  Option<String>,
+  Option<i64>,
+  Option<String>,
+  Option<i64>,
+  Option<String>,
+);
+
+fn mutation_audit_snapshots(mutation: &ScheduledJobMutation) -> MutationAuditSnapshots {
+  let (targets, capability) = match mutation {
+    ScheduledJobMutation::Create(request) => {
+      (Some(request.targets.as_slice()), Some(&request.capability))
+    }
+    ScheduledJobMutation::Update(request) => {
+      (Some(request.targets.as_slice()), Some(&request.capability))
+    }
+    _ => (None, None),
+  };
+  let target = targets.and_then(|targets| targets.first());
+  (
+    target.map(|target| target.provider().to_owned()),
+    target.map(|target| target.kind().to_owned()),
+    target.map(|target| i64::from(target.resolver_version())),
+    target.map(|target| target.resolver_digest().to_owned()),
+    capability.map(|capability| i64::from(capability.schema_version())),
+    capability.map(|capability| capability.digest().to_owned()),
+  )
+}
+
+fn audit_for_outcome(
+  audit: &ScheduleMutationAudit,
+  outcome: &str,
+  decision: &str,
+  error_code: Option<&str>,
+) -> ScheduleMutationAudit {
+  let mut derived = audit.clone();
+  derived.audit_id = format!("{}-{outcome}", audit.audit_id);
+  outcome.clone_into(&mut derived.outcome);
+  decision.clone_into(&mut derived.decision);
+  derived.error_code = error_code.map(ToOwned::to_owned);
+  derived.idempotency_outcome = Some(outcome.to_owned());
+  derived
+}
+
 fn job_json(job: &ScheduledJob) -> Result<Value, ScheduleServiceError> {
   Ok(json!({
     "job_id": job.job_id,
@@ -777,12 +829,12 @@ fn job_json(job: &ScheduledJob) -> Result<Value, ScheduleServiceError> {
   }))
 }
 
-fn canonical_json(value: &Value) -> Result<String, ScheduleServiceError> {
+pub(crate) fn canonical_json(value: &Value) -> Result<String, ScheduleServiceError> {
   serde_json::to_string(&canonicalize(value))
     .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))
 }
 
-fn digest_json(value: &Value) -> Result<String, ScheduleServiceError> {
+pub(crate) fn digest_json(value: &Value) -> Result<String, ScheduleServiceError> {
   let mut digest = Sha256::new();
   digest.update(canonical_json(value)?.as_bytes());
   let mut encoded = String::with_capacity(64);
@@ -805,5 +857,49 @@ fn canonicalize(value: &Value) -> Value {
     }
     Value::Array(values) => Value::Array(values.iter().map(canonicalize).collect()),
     _ => value.clone(),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{ScheduleMutationAudit, audit_for_outcome};
+
+  #[test]
+  fn test_in_progress_audit_uses_stable_sanitized_outcome() {
+    let base = ScheduleMutationAudit {
+      audit_id: "audit".to_owned(),
+      principal: None,
+      operation: "create".to_owned(),
+      job_id: Some("job".to_owned()),
+      request_id: "request".to_owned(),
+      outcome: "applied".to_owned(),
+      decision: "allow".to_owned(),
+      reason: None,
+      error_code: None,
+      old_generation: None,
+      new_generation: Some(0),
+      resolver_provider: None,
+      target_kind: None,
+      resolver_version: None,
+      resolver_digest: None,
+      capability_version: None,
+      capability_digest: None,
+      idempotency_outcome: Some("applied".to_owned()),
+      latency_ms: 0,
+      correlation_id: "request".to_owned(),
+      occurred_at: 1,
+    };
+
+    let audit = audit_for_outcome(
+      &base,
+      "in_progress",
+      "error",
+      Some("idempotency_in_progress"),
+    );
+
+    assert_eq!(audit.outcome, "in_progress");
+    assert_eq!(audit.decision, "error");
+    assert_eq!(audit.error_code.as_deref(), Some("idempotency_in_progress"));
+    assert_eq!(audit.idempotency_outcome.as_deref(), Some("in_progress"));
   }
 }

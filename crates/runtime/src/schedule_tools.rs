@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 
 use crate::schedule_service::{
   CreateScheduleRequest, DeliveryTargetRequest, LifecycleScheduleRequest, ScheduleInvocation,
-  ScheduleService, UpdateScheduleRequest,
+  ScheduleService, ScheduleServiceError, UpdateScheduleRequest,
 };
 
 pub const SCHEDULE_DYNAMIC_TOOL_NAMES: &[&str] = &[
@@ -43,12 +43,25 @@ impl ScheduleDynamicToolHandler {
   }
 
   #[must_use]
-  pub fn tool_specs(&self) -> Vec<Value> {
+  pub const fn from_service(service: ScheduleService, now: Option<i64>) -> Self {
+    Self { service, now }
+  }
+
+  #[must_use]
+  pub fn tool_specs(&self, invocation: &ScheduleInvocation) -> Vec<Value> {
+    let targets = self
+      .service
+      .describe_supported_targets(invocation)
+      .unwrap_or_default();
+    let capabilities = self
+      .service
+      .describe_authorized_capabilities(invocation)
+      .unwrap_or_default();
     vec![
       tool_spec(
         "schedule_create",
         "Create an owner-scoped durable schedule.",
-        create_schema(),
+        create_schema(&targets, &capabilities),
       ),
       tool_spec(
         "schedule_get",
@@ -63,7 +76,7 @@ impl ScheduleDynamicToolHandler {
       tool_spec(
         "schedule_update",
         "Replace one owner-scoped schedule using generation CAS.",
-        update_schema(),
+        update_schema(&targets, &capabilities),
       ),
       tool_spec(
         "schedule_pause",
@@ -89,6 +102,14 @@ impl ScheduleDynamicToolHandler {
     tool: &str,
     arguments: Value,
   ) -> Value {
+    let request_id = arguments
+      .get("request_id")
+      .and_then(Value::as_str)
+      .map(ToOwned::to_owned);
+    let job_id = arguments
+      .get("job_id")
+      .and_then(Value::as_str)
+      .map(ToOwned::to_owned);
     let result = match tool {
       "schedule_create" => self.create(invocation, arguments).await,
       "schedule_get" => self.get(invocation, arguments).await,
@@ -97,11 +118,26 @@ impl ScheduleDynamicToolHandler {
       "schedule_pause" => self.lifecycle(invocation, arguments, "pause").await,
       "schedule_resume" => self.lifecycle(invocation, arguments, "resume").await,
       "schedule_delete" => self.lifecycle(invocation, arguments, "delete").await,
-      _ => Err(format!("unsupported dynamic tool: {tool}")),
+      _ => Err(ScheduleServiceError::InvalidRequest(format!(
+        "unsupported dynamic tool: {tool}"
+      ))),
     };
     match result {
       Ok(content) => success(content),
-      Err(error) => failure(error),
+      Err(error) => {
+        self
+          .service
+          .record_error_audit(
+            invocation,
+            tool.strip_prefix("schedule_").unwrap_or("list"),
+            request_id.as_deref(),
+            job_id.as_deref(),
+            &error,
+            self.now(),
+          )
+          .await;
+        failure(error.structured_json())
+      }
     }
   }
 
@@ -109,7 +145,7 @@ impl ScheduleDynamicToolHandler {
     &self,
     invocation: &ScheduleInvocation,
     arguments: Value,
-  ) -> Result<Value, String> {
+  ) -> Result<Value, ScheduleServiceError> {
     let object = object(arguments)?;
     reject_unknown(
       &object,
@@ -135,14 +171,13 @@ impl ScheduleDynamicToolHandler {
         },
       )
       .await
-      .map_err(|error| error.to_string())
   }
 
   async fn update(
     &self,
     invocation: &ScheduleInvocation,
     arguments: Value,
-  ) -> Result<Value, String> {
+  ) -> Result<Value, ScheduleServiceError> {
     let object = object(arguments)?;
     reject_unknown(
       &object,
@@ -172,20 +207,26 @@ impl ScheduleDynamicToolHandler {
         },
       )
       .await
-      .map_err(|error| error.to_string())
   }
 
-  async fn get(&self, invocation: &ScheduleInvocation, arguments: Value) -> Result<Value, String> {
+  async fn get(
+    &self,
+    invocation: &ScheduleInvocation,
+    arguments: Value,
+  ) -> Result<Value, ScheduleServiceError> {
     let object = object(arguments)?;
     reject_unknown(&object, &["job_id"])?;
     self
       .service
       .get(invocation, &string(&object, "job_id")?)
       .await
-      .map_err(|error| error.to_string())
   }
 
-  async fn list(&self, invocation: &ScheduleInvocation, arguments: Value) -> Result<Value, String> {
+  async fn list(
+    &self,
+    invocation: &ScheduleInvocation,
+    arguments: Value,
+  ) -> Result<Value, ScheduleServiceError> {
     let object = object(arguments)?;
     reject_unknown(&object, &["status", "cursor", "limit"])?;
     let status = match optional_string(&object, "status")?
@@ -196,7 +237,11 @@ impl ScheduleDynamicToolHandler {
       "paused" => ScheduledJobStatus::Paused,
       "completed" => ScheduledJobStatus::Completed,
       "deleted" => ScheduledJobStatus::Deleted,
-      value => return Err(format!("invalid status: {value}")),
+      value => {
+        return Err(ScheduleServiceError::InvalidRequest(format!(
+          "invalid status: {value}"
+        )));
+      }
     };
     let cursor = optional_string(&object, "cursor")?;
     let limit = object.get("limit").map_or(Ok(50), |value| {
@@ -208,8 +253,7 @@ impl ScheduleDynamicToolHandler {
     let page = self
       .service
       .list(invocation, status, cursor.as_deref(), limit)
-      .await
-      .map_err(|error| error.to_string())?;
+      .await?;
     Ok(json!({"job_ids": page.job_ids, "next_cursor": page.next_cursor}))
   }
 
@@ -218,7 +262,7 @@ impl ScheduleDynamicToolHandler {
     invocation: &ScheduleInvocation,
     arguments: Value,
     operation: &str,
-  ) -> Result<Value, String> {
+  ) -> Result<Value, ScheduleServiceError> {
     let object = object(arguments)?;
     reject_unknown(&object, &["request_id", "job_id", "expected_generation"])?;
     let request = LifecycleScheduleRequest {
@@ -233,7 +277,6 @@ impl ScheduleDynamicToolHandler {
       "delete" => self.service.delete(invocation, request).await,
       _ => unreachable!("bounded lifecycle operation"),
     }
-    .map_err(|error| error.to_string())
   }
 
   fn now(&self) -> i64 {
@@ -253,7 +296,7 @@ fn tool_spec(name: &str, description: &str, input_schema: Value) -> Value {
   json!({"name": name, "description": description, "inputSchema": input_schema})
 }
 
-fn create_schema() -> Value {
+fn create_schema(targets: &[&str], capabilities: &[&str]) -> Value {
   json!({
     "type": "object",
     "additionalProperties": false,
@@ -262,14 +305,14 @@ fn create_schema() -> Value {
       "request_id": bounded_string_schema(),
       "instruction": {"type": "string", "minLength": 1, "maxLength": 65536},
       "schedule": schedule_schema(),
-      "target": target_schema(),
-      "capability": {"type": "string", "enum": ["none"]}
+      "target": target_schema(targets),
+      "capability": {"type": "string", "enum": capabilities}
     }
   })
 }
 
-fn update_schema() -> Value {
-  let mut schema = create_schema();
+fn update_schema(targets: &[&str], capabilities: &[&str]) -> Value {
+  let mut schema = create_schema(targets, capabilities);
   schema["required"] = json!([
     "request_id",
     "job_id",
@@ -322,16 +365,16 @@ fn schedule_schema() -> Value {
   })
 }
 
-fn target_schema() -> Value {
-  json!({
-    "oneOf": [
-      {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "none"}}},
-      {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "origin"}}},
-      {"type": "object", "additionalProperties": false, "required": ["kind", "channel_id"], "properties": {"kind": {"const": "channel"}, "channel_id": bounded_string_schema()}},
-      {"type": "object", "additionalProperties": false, "required": ["kind", "user_id"], "properties": {"kind": {"const": "direct_message"}, "user_id": bounded_string_schema()}},
-      {"type": "object", "additionalProperties": false, "required": ["kind", "channel_id", "thread_id"], "properties": {"kind": {"const": "thread"}, "channel_id": bounded_string_schema(), "thread_id": bounded_string_schema()}}
-    ]
-  })
+fn target_schema(targets: &[&str]) -> Value {
+  let variants = targets.iter().filter_map(|target| match *target {
+    "none" => Some(json!({"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "none"}}})),
+    "origin" => Some(json!({"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "origin"}}})),
+    "channel" => Some(json!({"type": "object", "additionalProperties": false, "required": ["kind", "channel_id"], "properties": {"kind": {"const": "channel"}, "channel_id": bounded_string_schema()}})),
+    "direct_message" => Some(json!({"type": "object", "additionalProperties": false, "required": ["kind", "user_id"], "properties": {"kind": {"const": "direct_message"}, "user_id": bounded_string_schema()}})),
+    "thread" => Some(json!({"type": "object", "additionalProperties": false, "required": ["kind", "channel_id", "thread_id"], "properties": {"kind": {"const": "thread"}, "channel_id": bounded_string_schema(), "thread_id": bounded_string_schema()}})),
+    _ => None,
+  }).collect::<Vec<_>>();
+  json!({"oneOf": variants})
 }
 
 fn bounded_string_schema() -> Value {
@@ -434,6 +477,6 @@ fn success(content: Value) -> Value {
   json!({"success": true, "contentItems": [{"type": "inputText", "text": content.to_string()}]})
 }
 
-fn failure(message: impl Into<String>) -> Value {
-  json!({"success": false, "contentItems": [{"type": "inputText", "text": message.into()}]})
+fn failure(error: Value) -> Value {
+  json!({"success": false, "contentItems": [{"type": "inputText", "text": error.to_string()}]})
 }

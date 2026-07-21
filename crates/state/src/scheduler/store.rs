@@ -5,9 +5,9 @@ use super::{
   AcceptedDeliveryBaseline, CapabilityProfileSnapshot, CreateScheduledJob,
   DEFAULT_OCCURRENCE_STEPS, DeliveryTargetSnapshot, IdempotencyDecision, MAX_CONTEXT_BYTES,
   MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES, MaterializationOutcome, PrincipalKey,
-  ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledJob,
-  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
-  StateError, TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline,
+  ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec,
+  ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation,
+  ScheduledJobStatus, StateError, TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline,
   UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
   invalid_value, materialized_run, positive_u32, scheduler_error, validate_text,
 };
@@ -120,6 +120,52 @@ impl StateStore {
         Ok(TransactionalMutationOutcome::Conflict)
       }
     }
+  }
+
+  /// Appends a sanitized schedule decision audit outside a mutation transaction.
+  ///
+  /// # Errors
+  /// Returns an error when the audit contract is invalid or `SQLite` rejects the transaction.
+  pub async fn append_schedule_audit(
+    &self,
+    audit: &ScheduleMutationAudit,
+  ) -> Result<(), StateError> {
+    validate_schedule_audit(audit)?;
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    insert_mutation_audit(&mut transaction, audit).await?;
+    transaction.commit().await.map_err(scheduler_error)
+  }
+
+  /// Lists sanitized schedule audit outcomes for one correlation identifier.
+  ///
+  /// # Errors
+  /// Returns an error when the correlation identifier is invalid or `SQLite` cannot execute the
+  /// query.
+  pub async fn list_schedule_audit_summaries(
+    &self,
+    correlation_id: &str,
+  ) -> Result<Vec<ScheduleAuditSummary>, StateError> {
+    validate_text("audit correlation id", correlation_id).map_err(invalid_value)?;
+    let rows = sqlx::query(
+      "select outcome, decision, error_code, idempotency_outcome from schedule_mutation_audit where correlation_id = ?1 order by audit_id",
+    )
+    .bind(correlation_id)
+    .fetch_all(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    rows
+      .into_iter()
+      .map(|row| {
+        Ok(ScheduleAuditSummary {
+          outcome: row.try_get("outcome").map_err(scheduler_error)?,
+          decision: row.try_get("decision").map_err(scheduler_error)?,
+          error_code: row.try_get("error_code").map_err(scheduler_error)?,
+          idempotency_outcome: row
+            .try_get("idempotency_outcome")
+            .map_err(scheduler_error)?,
+        })
+      })
+      .collect()
   }
 
   /// Reads the durable job and current schedule snapshot.
@@ -963,16 +1009,7 @@ fn validate_mutation_audit(
   idempotency: &ScheduleMutationIdempotency,
   audit: &ScheduleMutationAudit,
 ) -> Result<(), StateError> {
-  for (field, value) in [
-    ("audit id", audit.audit_id.as_str()),
-    ("audit operation", audit.operation.as_str()),
-    ("audit job id", audit.job_id.as_str()),
-    ("audit request id", audit.request_id.as_str()),
-    ("audit outcome", audit.outcome.as_str()),
-  ] {
-    validate_text(field, value).map_err(invalid_value)?;
-  }
-  audit.principal.validate().map_err(invalid_value)?;
+  validate_schedule_audit(audit)?;
   let job_id = match mutation {
     ScheduledJobMutation::Create(request) => &request.job_id,
     ScheduledJobMutation::Update(request) => &request.job_id,
@@ -980,15 +1017,57 @@ fn validate_mutation_audit(
     | ScheduledJobMutation::Resume { job_id, .. }
     | ScheduledJobMutation::Delete { job_id, .. } => job_id,
   };
-  if audit.principal != idempotency.principal
+  if audit.principal.as_ref() != Some(&idempotency.principal)
     || audit.operation != mutation.operation()
-    || audit.job_id != *job_id
+    || audit.job_id.as_deref() != Some(job_id)
     || audit.request_id != idempotency.request_id
     || audit.outcome != "applied"
+    || audit.decision != "allow"
     || audit.occurred_at != mutation.now()
   {
     return Err(StateError::InvalidSchedulerState {
       reason: "schedule mutation audit does not match the authorized mutation".to_owned(),
+    });
+  }
+  Ok(())
+}
+
+fn validate_schedule_audit(audit: &ScheduleMutationAudit) -> Result<(), StateError> {
+  for (field, value) in [
+    ("audit id", Some(audit.audit_id.as_str())),
+    ("audit operation", Some(audit.operation.as_str())),
+    ("audit request id", Some(audit.request_id.as_str())),
+    ("audit outcome", Some(audit.outcome.as_str())),
+    ("audit decision", Some(audit.decision.as_str())),
+    ("audit correlation id", Some(audit.correlation_id.as_str())),
+    ("audit job id", audit.job_id.as_deref()),
+    ("audit reason", audit.reason.as_deref()),
+    ("audit error code", audit.error_code.as_deref()),
+  ] {
+    if let Some(value) = value {
+      validate_text(field, value).map_err(invalid_value)?;
+    }
+  }
+  if let Some(principal) = &audit.principal {
+    principal.validate().map_err(invalid_value)?;
+  }
+  if audit.latency_ms < 0
+    || !matches!(audit.decision.as_str(), "allow" | "deny" | "error")
+    || !matches!(
+      audit.outcome.as_str(),
+      "applied"
+        | "replay"
+        | "conflict"
+        | "in_progress"
+        | "denied"
+        | "validation"
+        | "resolver"
+        | "capability"
+        | "storage"
+    )
+  {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "invalid schedule audit outcome".to_owned(),
     });
   }
   Ok(())
@@ -999,17 +1078,31 @@ async fn insert_mutation_audit(
   audit: &ScheduleMutationAudit,
 ) -> Result<(), StateError> {
   sqlx::query(
-    "insert into schedule_mutation_audit (audit_id, principal_kind, principal_provider, principal_tenant, principal_subject, operation, job_id, request_id, outcome, occurred_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    "insert into schedule_mutation_audit (audit_id, principal_kind, principal_provider, principal_tenant, principal_subject, operation, job_id, request_id, outcome, decision, reason, error_code, old_generation, new_generation, resolver_provider, target_kind, resolver_version, resolver_digest, capability_version, capability_digest, idempotency_outcome, latency_ms, correlation_id, occurred_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) on conflict(audit_id) do nothing",
   )
   .bind(&audit.audit_id)
-  .bind(audit.principal.kind())
-  .bind(audit.principal.provider())
-  .bind(audit.principal.tenant())
-  .bind(audit.principal.subject())
+  .bind(audit.principal.as_ref().map(PrincipalKey::kind))
+  .bind(audit.principal.as_ref().map(PrincipalKey::provider))
+  .bind(audit.principal.as_ref().map(PrincipalKey::tenant))
+  .bind(audit.principal.as_ref().map(PrincipalKey::subject))
   .bind(&audit.operation)
   .bind(&audit.job_id)
   .bind(&audit.request_id)
   .bind(&audit.outcome)
+  .bind(&audit.decision)
+  .bind(&audit.reason)
+  .bind(&audit.error_code)
+  .bind(audit.old_generation)
+  .bind(audit.new_generation)
+  .bind(&audit.resolver_provider)
+  .bind(&audit.target_kind)
+  .bind(audit.resolver_version)
+  .bind(&audit.resolver_digest)
+  .bind(audit.capability_version)
+  .bind(&audit.capability_digest)
+  .bind(&audit.idempotency_outcome)
+  .bind(audit.latency_ms)
+  .bind(&audit.correlation_id)
   .bind(audit.occurred_at)
   .execute(&mut **transaction)
   .await
@@ -1284,9 +1377,79 @@ mod tests {
     PrincipalKey, ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec,
     ScheduledJobDefinition, ScheduledJobMutation, StateError, StateStore,
     TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
-    compare_and_swap_accepted_delivery_baseline_in_transaction,
+    canonical_idempotency_scope, compare_and_swap_accepted_delivery_baseline_in_transaction,
     compare_and_swap_execution_baseline_in_transaction,
   };
+
+  fn audited_create_fixture(
+    job_id: &str,
+    definition_json: &str,
+    address_json: &str,
+    at: i64,
+    now: i64,
+  ) -> (
+    ScheduledJobMutation,
+    ScheduleMutationIdempotency,
+    ScheduleMutationAudit,
+  ) {
+    let owner = PrincipalKey::new("user", "test", "tenant", "owner").expect("owner");
+    let request_id = format!("request-{job_id}");
+    let mutation = ScheduledJobMutation::Create(Box::new(CreateScheduledJob {
+      job_id: job_id.to_owned(),
+      schedule_id: format!("schedule-{job_id}"),
+      definition: ScheduledJobDefinition::new(1, definition_json).expect("definition"),
+      creator: owner.clone(),
+      owner: owner.clone(),
+      capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("profile"),
+      targets: vec![
+        DeliveryTargetSnapshot::new(
+          format!("target-{job_id}"),
+          "test",
+          "test",
+          "tenant",
+          "channel",
+          address_json,
+          1,
+          "resolver",
+          "identity",
+        )
+        .expect("target"),
+      ],
+      schedule: ScheduleSpec::once(at),
+      now,
+    }));
+    let idempotency = ScheduleMutationIdempotency {
+      principal: owner.clone(),
+      request_id: request_id.clone(),
+      digest_algorithm: "sha256-v1".to_owned(),
+      request_digest: format!("digest-{job_id}"),
+      response_json: format!(r#"{{"job_id":"{job_id}"}}"#),
+    };
+    let audit = ScheduleMutationAudit {
+      audit_id: format!("audit-{job_id}"),
+      principal: Some(owner),
+      operation: "create".to_owned(),
+      job_id: Some(job_id.to_owned()),
+      request_id: request_id.clone(),
+      outcome: "applied".to_owned(),
+      decision: "allow".to_owned(),
+      reason: None,
+      error_code: None,
+      old_generation: None,
+      new_generation: Some(0),
+      resolver_provider: Some("test".to_owned()),
+      target_kind: Some("channel".to_owned()),
+      resolver_version: Some(1),
+      resolver_digest: Some("resolver".to_owned()),
+      capability_version: Some(1),
+      capability_digest: Some("profile".to_owned()),
+      idempotency_outcome: Some("applied".to_owned()),
+      latency_ms: 0,
+      correlation_id: request_id,
+      occurred_at: now,
+    };
+    (mutation, idempotency, audit)
+  }
 
   #[tokio::test]
   async fn test_audited_idempotent_mutation_commits_once_with_schedule() {
@@ -1320,11 +1483,25 @@ mod tests {
     };
     let audit = ScheduleMutationAudit {
       audit_id: "audit-1".to_owned(),
-      principal: owner,
+      principal: Some(owner),
       operation: "create".to_owned(),
-      job_id: "audited".to_owned(),
+      job_id: Some("audited".to_owned()),
       request_id: "request-1".to_owned(),
       outcome: "applied".to_owned(),
+      decision: "allow".to_owned(),
+      reason: None,
+      error_code: None,
+      old_generation: None,
+      new_generation: Some(0),
+      resolver_provider: Some("none".to_owned()),
+      target_kind: Some("none".to_owned()),
+      resolver_version: Some(1),
+      resolver_digest: Some("resolver".to_owned()),
+      capability_version: Some(1),
+      capability_digest: Some("profile".to_owned()),
+      idempotency_outcome: Some("applied".to_owned()),
+      latency_ms: 0,
+      correlation_id: "request-1".to_owned(),
       occurred_at: 1,
     };
 
@@ -1346,6 +1523,101 @@ mod tests {
     .await
     .expect("read committed rows");
     assert_eq!(counts, (1, 1));
+  }
+
+  #[tokio::test]
+  async fn test_failed_mutation_rolls_back_idempotency_and_applied_audit() {
+    let temp = tempdir().expect("create tempdir");
+    let store = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("initialize store");
+    let (mutation, idempotency, audit) = audited_create_fixture("rollback", "{}", "{}", 1, 1);
+
+    store
+      .apply_idempotent_schedule_mutation_with_audit(&mutation, &idempotency, Some(&audit))
+      .await
+      .expect_err("expired once schedule must fail");
+
+    let counts: (i64, i64, i64) = sqlx::query_as(
+      "select (select count(*) from scheduled_jobs where job_id = 'rollback'), (select count(*) from idempotency_keys where key = 'request-rollback'), (select count(*) from schedule_mutation_audit where audit_id = 'audit-rollback')",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .expect("read rolled back rows");
+    assert_eq!(counts, (0, 0, 0));
+  }
+
+  #[tokio::test]
+  async fn test_claimed_idempotency_returns_in_progress_without_applied_audit() {
+    let temp = tempdir().expect("create tempdir");
+    let store = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("initialize store");
+    let (mutation, idempotency, audit) = audited_create_fixture("in-progress", "{}", "{}", 2, 1);
+    let scope = canonical_idempotency_scope(&idempotency.principal, "create");
+    sqlx::query(
+      "insert into idempotency_keys (scope, key, status, request_digest, digest_algorithm, created_at, updated_at) values (?1, ?2, 'claimed', ?3, ?4, datetime(1, 'unixepoch'), datetime(1, 'unixepoch'))",
+    )
+    .bind(scope)
+    .bind(&idempotency.request_id)
+    .bind(&idempotency.request_digest)
+    .bind(&idempotency.digest_algorithm)
+    .execute(&store.pool)
+    .await
+    .expect("seed claimed idempotency");
+
+    let outcome = store
+      .apply_idempotent_schedule_mutation_with_audit(&mutation, &idempotency, Some(&audit))
+      .await
+      .expect("read in-progress outcome");
+    assert!(matches!(outcome, TransactionalMutationOutcome::InProgress));
+    let count: i64 = sqlx::query_scalar(
+      "select count(*) from schedule_mutation_audit where audit_id = 'audit-in-progress'",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .expect("read audit count");
+    assert_eq!(count, 0);
+  }
+
+  #[tokio::test]
+  async fn test_schedule_audit_excludes_instruction_target_address_and_secret_payloads() {
+    const INSTRUCTION_MARKER: &str = "private-instruction-marker";
+    const ADDRESS_MARKER: &str = "private-target-marker";
+    const SECRET_MARKER: &str = "private-token-marker";
+    let temp = tempdir().expect("create tempdir");
+    let store = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("initialize store");
+    let definition = format!(r#"{{"instruction":"{INSTRUCTION_MARKER} {SECRET_MARKER}"}}"#);
+    let address = format!(r#"{{"channel_id":"{ADDRESS_MARKER}"}}"#);
+    let (mutation, idempotency, audit) =
+      audited_create_fixture("sanitized", &definition, &address, 2, 1);
+
+    store
+      .apply_idempotent_schedule_mutation_with_audit(&mutation, &idempotency, Some(&audit))
+      .await
+      .expect("apply audited mutation");
+    let audit_text: String = sqlx::query_scalar(
+      "select coalesce(audit_id, '') || '|' || coalesce(principal_kind, '') || '|' || coalesce(principal_provider, '') || '|' || coalesce(principal_tenant, '') || '|' || coalesce(principal_subject, '') || '|' || operation || '|' || coalesce(job_id, '') || '|' || request_id || '|' || outcome || '|' || decision || '|' || coalesce(reason, '') || '|' || coalesce(error_code, '') || '|' || coalesce(resolver_provider, '') || '|' || coalesce(target_kind, '') || '|' || coalesce(resolver_digest, '') || '|' || coalesce(capability_digest, '') || '|' || coalesce(idempotency_outcome, '') || '|' || correlation_id from schedule_mutation_audit where audit_id = 'audit-sanitized'",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .expect("read sanitized audit");
+    for marker in [INSTRUCTION_MARKER, ADDRESS_MARKER, SECRET_MARKER] {
+      assert!(!audit_text.contains(marker), "audit leaked {marker}");
+    }
+    let columns: Vec<String> =
+      sqlx::query_scalar("select name from pragma_table_info('schedule_mutation_audit')")
+        .fetch_all(&store.pool)
+        .await
+        .expect("read audit columns");
+    for forbidden in ["instruction", "address", "payload", "token", "secret"] {
+      assert!(
+        columns.iter().all(|column| !column.contains(forbidden)),
+        "audit schema contains forbidden payload column: {forbidden}"
+      );
+    }
   }
 
   #[tokio::test]

@@ -8,9 +8,9 @@ pub use error::StateError;
 pub use scheduler::{
   AcceptedDeliveryBaseline, CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot,
   IdempotencyDecision, MaterializationOutcome, OccurrenceError, OccurrenceWindow, PrincipalKey,
-  ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryState,
-  ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation,
-  ScheduledJobStatus, ScheduledRun, ScheduledRunState, StateValueError,
+  ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec,
+  ScheduledDeliveryState, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
+  ScheduledJobMutation, ScheduledJobStatus, ScheduledRun, ScheduledRunState, StateValueError,
   TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
   UpdateScheduledJob,
 };

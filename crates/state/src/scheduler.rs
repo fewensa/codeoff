@@ -781,12 +781,34 @@ pub struct ScheduleMutationIdempotency {
 #[derive(Debug, Clone)]
 pub struct ScheduleMutationAudit {
   pub audit_id: String,
-  pub principal: PrincipalKey,
+  pub principal: Option<PrincipalKey>,
   pub operation: String,
-  pub job_id: String,
+  pub job_id: Option<String>,
   pub request_id: String,
   pub outcome: String,
+  pub decision: String,
+  pub reason: Option<String>,
+  pub error_code: Option<String>,
+  pub old_generation: Option<i64>,
+  pub new_generation: Option<i64>,
+  pub resolver_provider: Option<String>,
+  pub target_kind: Option<String>,
+  pub resolver_version: Option<i64>,
+  pub resolver_digest: Option<String>,
+  pub capability_version: Option<i64>,
+  pub capability_digest: Option<String>,
+  pub idempotency_outcome: Option<String>,
+  pub latency_ms: i64,
+  pub correlation_id: String,
   pub occurred_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleAuditSummary {
+  pub outcome: String,
+  pub decision: String,
+  pub error_code: Option<String>,
+  pub idempotency_outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

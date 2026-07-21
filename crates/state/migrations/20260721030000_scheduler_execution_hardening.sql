@@ -162,6 +162,7 @@ set state = 'outcome_unknown',
 where state = 'executing';
 
 drop trigger trg_scheduled_run_result_artifacts_acceptance;
+drop trigger trg_scheduled_runs_result_artifact_binding;
 
 create table _scheduler_legacy_success (
   run_id text primary key,
@@ -172,9 +173,15 @@ insert into _scheduler_legacy_success (run_id, is_valid)
 select
   r.run_id,
   case when r.result_artifact_id is null
-    and r.result_context is not null
-    and r.result_hash_algorithm is not null
-    and r.result_hash is not null
+    and length(cast(r.result_context as blob)) between 1 and 65536
+    and length(cast(r.result_hash_algorithm as blob)) between 1 and 65536
+    and length(cast(r.result_hash as blob)) between 1 and 65536
+    and length(cast('legacy-result:' || r.run_id as blob)) between 1 and 65536
+    and not exists (
+      select 1
+      from scheduled_run_result_artifacts collision
+      where collision.artifact_id = 'legacy-result:' || r.run_id
+    )
     and (
       not exists (select 1 from scheduled_run_attempts a where a.run_id = r.run_id)
       or exists (
@@ -214,15 +221,9 @@ where r.state = 'succeeded'
       and a.previous_success_context = r.result_context
       and a.provenance = 'native'
       and a.provenance_version = 1
+      and a.schema_version = 1
       and t.state = 'succeeded'
   );
-
-insert into _scheduler_execution_hardening_guard (invalid_count)
-select count(*)
-from _scheduler_legacy_success s
-join scheduled_runs r on r.run_id = s.run_id
-where s.is_valid = 0
-  and exists (select 1 from scheduled_runs active where active.job_id = r.job_id and active.overlap_slot = 1);
 
 insert into _scheduler_execution_hardening_guard (invalid_count)
 select count(*)
@@ -246,7 +247,7 @@ set attempt = case when attempt < 1 then 1 else attempt end,
 where run_id in (select run_id from _scheduler_legacy_success);
 
 update scheduled_run_attempts
-set state = 'outcome_unknown',
+set state = 'failed',
     error_kind = 'legacy_result_unverified',
     error_message = 'legacy_result_unverified'
 where state = 'succeeded'
@@ -277,7 +278,7 @@ select
   r.attempt,
   r.fence,
   'legacy-result-migration',
-  case when s.is_valid = 1 then 'succeeded' else 'outcome_unknown' end,
+  case when s.is_valid = 1 then 'succeeded' else 'failed' end,
   -1,
   0,
   r.updated_at,
@@ -331,8 +332,10 @@ set result_artifact_id = 'legacy-result:' || run_id
 where run_id in (select run_id from _scheduler_legacy_success where is_valid = 1);
 
 update scheduled_runs
-set state = 'outcome_unknown',
-    overlap_slot = 1,
+set state = 'failed',
+    overlap_slot = null,
+    lease_owner = null,
+    lease_expires_at = null,
     result_artifact_id = null,
     result_context = null,
     result_hash_algorithm = null,
@@ -341,6 +344,44 @@ set state = 'outcome_unknown',
     error_message = 'legacy_result_unverified'
 where run_id in (select run_id from _scheduler_legacy_success where is_valid = 0);
 
+insert into _scheduler_execution_hardening_guard (invalid_count)
+select count(*)
+from scheduled_execution_baselines b
+where b.source_run_id in (
+  select run_id from _scheduler_legacy_success where is_valid = 0
+)
+  and b.baseline_version = 9223372036854775807;
+
+update scheduled_execution_baselines
+set baseline_version = baseline_version + 1,
+    hash_algorithm = null,
+    result_hash = null,
+    previous_success_context = null,
+    source_run_id = null,
+    completed_at = null
+where source_run_id in (
+  select run_id from _scheduler_legacy_success where is_valid = 0
+);
+
+update scheduled_runs
+set execution_baseline_json = json_object(
+  'baseline_version', (
+    select b.baseline_version
+    from scheduled_execution_baselines b
+    where b.job_id = scheduled_runs.job_id
+  ),
+  'hash_algorithm', null,
+  'result_hash', null,
+  'previous_success_context', null,
+  'source_run_id', null,
+  'completed_at', null
+)
+where state = 'pending'
+  and execution_baseline_json is not null
+  and json_extract(execution_baseline_json, '$.source_run_id') in (
+    select run_id from _scheduler_legacy_success where is_valid = 0
+  );
+
 drop table _scheduler_legacy_success;
 drop table _scheduler_execution_hardening_guard;
 
@@ -348,6 +389,7 @@ create trigger trg_scheduled_run_result_artifacts_acceptance
 before insert on scheduled_run_result_artifacts
 when new.provenance != 'native'
   or new.provenance_version != 1
+  or new.schema_version != 1
   or not exists (
     select 1
     from scheduled_runs r
@@ -364,6 +406,24 @@ when new.provenance != 'native'
   )
 begin
   select raise(abort, 'scheduled run result acceptance binding mismatch');
+end;
+
+create trigger trg_scheduled_runs_result_artifact_binding
+before update of result_artifact_id on scheduled_runs
+when new.result_artifact_id is not null
+begin
+  select case when not exists (
+    select 1
+    from scheduled_run_result_artifacts a
+    where a.artifact_id = new.result_artifact_id
+      and a.run_id = new.run_id
+      and a.job_id = new.job_id
+      and a.accepted_attempt = new.attempt
+      and a.accepted_fence = new.fence
+      and a.schema_version = 1
+      and a.provenance = 'native'
+      and a.provenance_version = 1
+  ) then raise(abort, 'scheduled run result artifact binding mismatch') end;
 end;
 
 create trigger trg_scheduled_run_result_artifacts_delete_guard
@@ -418,6 +478,7 @@ begin
       and a.previous_success_context = new.result_context
       and a.provenance = 'native'
       and a.provenance_version = 1
+      and a.schema_version = 1
       and t.state = 'succeeded'
       and t.completed_at is not null
   ) then raise(abort, 'scheduled run success requires its accepted result artifact') end;

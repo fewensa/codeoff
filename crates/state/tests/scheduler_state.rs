@@ -551,6 +551,8 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
     ("succeeded-valid", "succeeded"),
     ("succeeded-matching", "succeeded"),
     ("succeeded-invalid", "succeeded"),
+    ("succeeded-empty", "succeeded"),
+    ("succeeded-collision", "succeeded"),
   ]
   .into_iter()
   .enumerate()
@@ -577,10 +579,25 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
     let overlap_slot = (state != "succeeded").then_some(1_i64);
     let lease_owner = matches!(state, "leased" | "executing").then_some("legacy-worker");
     let lease_expires_at = lease_owner.map(|_| 200_i64);
-    let has_legacy_result = matches!(label, "succeeded-valid" | "succeeded-matching");
-    let result_context = has_legacy_result.then_some("legacy context");
-    let result_hash_algorithm = has_legacy_result.then_some("legacy-digest-v1");
-    let result_hash = has_legacy_result.then_some(label);
+    let has_legacy_result = matches!(
+      label,
+      "succeeded-valid" | "succeeded-matching" | "succeeded-collision"
+    );
+    let result_context = if label == "succeeded-empty" {
+      Some("")
+    } else {
+      has_legacy_result.then_some("legacy context")
+    };
+    let result_hash_algorithm = if label == "succeeded-empty" {
+      Some("")
+    } else {
+      has_legacy_result.then_some("legacy-digest-v1")
+    };
+    let result_hash = if label == "succeeded-empty" {
+      Some("")
+    } else {
+      has_legacy_result.then_some(label)
+    };
     let has_current_attempt =
       matches!(state, "leased" | "executing") || label == "succeeded-matching";
     let attempt = i64::from(has_current_attempt);
@@ -619,6 +636,26 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
         .expect("seed parent current attempt");
     }
   }
+  sqlx::query("insert into scheduled_run_result_artifacts (artifact_id, run_id, job_id, accepted_attempt, accepted_fence, schema_version, result_json, hash_algorithm, result_hash, previous_success_context, completed_at) values ('legacy-result:upgrade-run-succeeded-collision', 'upgrade-run-executing', 'upgrade-executing', 1, 2, 1, '{}', 'sha256-v1', 'collision-owner', 'collision-owner', 100)")
+    .execute(&pool)
+    .await
+    .expect("seed legacy artifact id collision");
+  sqlx::query("update scheduled_execution_baselines set baseline_version = 3, hash_algorithm = 'legacy-digest-v1', result_hash = 'succeeded-invalid', previous_success_context = 'invalid context', source_run_id = 'upgrade-run-succeeded-invalid', completed_at = 100 where job_id = 'upgrade-succeeded-invalid'")
+    .execute(&pool)
+    .await
+    .expect("seed invalid legacy baseline");
+  sqlx::query("update scheduled_execution_baselines set baseline_version = 4, hash_algorithm = 'legacy-digest-v1', result_hash = 'succeeded-valid', previous_success_context = 'legacy context', source_run_id = 'upgrade-run-succeeded-valid', completed_at = 100 where job_id = 'upgrade-succeeded-valid'")
+    .execute(&pool)
+    .await
+    .expect("seed valid legacy baseline");
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, state, overlap_slot, created_at, updated_at) values ('upgrade-run-after-invalid', 'upgrade-succeeded-invalid', 'schedule-succeeded-invalid', 0, 0, 150, 150, 1, '{}', 1, 'profile', '{}', '[{}]', '{\"baseline_version\":3,\"hash_algorithm\":\"legacy-digest-v1\",\"result_hash\":\"succeeded-invalid\",\"previous_success_context\":\"invalid context\",\"source_run_id\":\"upgrade-run-succeeded-invalid\",\"completed_at\":100}', 'pending', 1, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed pending run with invalid baseline snapshot");
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, state, overlap_slot, created_at, updated_at) values ('upgrade-run-after-valid', 'upgrade-succeeded-valid', 'schedule-succeeded-valid', 0, 0, 151, 151, 1, '{}', 1, 'profile', '{}', '[{}]', '{\"baseline_version\":4,\"hash_algorithm\":\"legacy-digest-v1\",\"result_hash\":\"succeeded-valid\",\"previous_success_context\":\"legacy context\",\"source_run_id\":\"upgrade-run-succeeded-valid\",\"completed_at\":100}', 'pending', 1, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed pending run with valid baseline snapshot");
   pool.close().await;
 
   StateStore::initialize(&state_dir, None)
@@ -647,6 +684,16 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
     upgraded,
     vec![
       (
+        "upgrade-run-after-invalid".to_owned(),
+        "pending".to_owned(),
+        0
+      ),
+      (
+        "upgrade-run-after-valid".to_owned(),
+        "pending".to_owned(),
+        0
+      ),
+      (
         "upgrade-run-executing".to_owned(),
         "outcome_unknown".to_owned(),
         1
@@ -654,8 +701,18 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
       ("upgrade-run-leased".to_owned(), "pending".to_owned(), 1),
       ("upgrade-run-pending".to_owned(), "pending".to_owned(), 0),
       (
+        "upgrade-run-succeeded-collision".to_owned(),
+        "failed".to_owned(),
+        1
+      ),
+      (
+        "upgrade-run-succeeded-empty".to_owned(),
+        "failed".to_owned(),
+        1
+      ),
+      (
         "upgrade-run-succeeded-invalid".to_owned(),
-        "outcome_unknown".to_owned(),
+        "failed".to_owned(),
         1
       ),
       (
@@ -683,6 +740,66 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
     assert_eq!(hash_algorithm, "legacy-digest-v1");
     assert_eq!(context, "legacy context");
   }
+  let invalid_baseline: (i64, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+    "select baseline_version, source_run_id, result_hash, previous_success_context from scheduled_execution_baselines where job_id = 'upgrade-succeeded-invalid'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read invalid baseline quarantine");
+  assert_eq!(invalid_baseline, (4, None, None, None));
+  let valid_baseline: (i64, Option<String>, Option<String>) = sqlx::query_as(
+    "select baseline_version, source_run_id, previous_success_context from scheduled_execution_baselines where job_id = 'upgrade-succeeded-valid'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read preserved valid baseline");
+  assert_eq!(
+    valid_baseline,
+    (
+      4,
+      Some("upgrade-run-succeeded-valid".to_owned()),
+      Some("legacy context".to_owned())
+    )
+  );
+  let pending_snapshot: (String, Option<String>, Option<String>, i64) = sqlx::query_as(
+    "select state, json_extract(execution_baseline_json, '$.source_run_id'), json_extract(execution_baseline_json, '$.previous_success_context'), json_extract(execution_baseline_json, '$.baseline_version') from scheduled_runs where run_id = 'upgrade-run-after-invalid'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read quarantined pending snapshot");
+  assert_eq!(pending_snapshot, ("pending".to_owned(), None, None, 4));
+  let valid_snapshot: (String, Option<String>, Option<String>, i64) = sqlx::query_as(
+    "select state, json_extract(execution_baseline_json, '$.source_run_id'), json_extract(execution_baseline_json, '$.previous_success_context'), json_extract(execution_baseline_json, '$.baseline_version') from scheduled_runs where run_id = 'upgrade-run-after-valid'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read preserved valid snapshot");
+  assert_eq!(
+    valid_snapshot,
+    (
+      "pending".to_owned(),
+      Some("upgrade-run-succeeded-valid".to_owned()),
+      Some("legacy context".to_owned()),
+      4
+    )
+  );
+  let invalid_terminal: (String, Option<i64>, Option<i64>, Option<String>, String) =
+    sqlx::query_as(
+      "select state, overlap_slot, next_attempt_at, lease_owner, error_kind from scheduled_runs where run_id = 'upgrade-run-succeeded-invalid'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read invalid terminal state");
+  assert_eq!(
+    invalid_terminal,
+    (
+      "failed".to_owned(),
+      None,
+      None,
+      None,
+      "legacy_result_unverified".to_owned()
+    )
+  );
   let foreign_key_errors: i64 = sqlx::query_scalar("select count(*) from pragma_foreign_key_check")
     .fetch_one(&pool)
     .await
@@ -778,6 +895,81 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
   .await
   .expect("read hardening migration state");
   assert_eq!(hardening_applied, 0);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline() {
+  let temp = tempdir().expect("create tempdir");
+  let old_migrations = temp.path().join("old-migrations");
+  std::fs::create_dir(&old_migrations).expect("create migration fixture");
+  let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+  for entry in std::fs::read_dir(source).expect("read migrations") {
+    let entry = entry.expect("migration entry");
+    if entry.file_name() != "20260721030000_scheduler_execution_hardening.sql" {
+      std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
+        .expect("copy parent migration");
+    }
+  }
+  let state_dir = temp.path().join("state");
+  std::fs::create_dir(&state_dir).expect("create state dir");
+  let options = SqliteConnectOptions::from_str(&database_url(&state_dir))
+    .expect("database options")
+    .create_if_missing(true);
+  let pool = SqlitePoolOptions::new()
+    .max_connections(1)
+    .connect_with(options)
+    .await
+    .expect("connect parent database");
+  Migrator::new(old_migrations)
+    .await
+    .expect("load parent migrator")
+    .run(&pool)
+    .await
+    .expect("run parent migrations");
+  sqlx::query("insert into scheduled_jobs (job_id, definition_version, definition_json, creator_kind, creator_provider, creator_tenant, creator_subject, owner_kind, owner_provider, owner_tenant, owner_subject, status, generation, capability_schema_version, capability_digest, capability_json, created_at, updated_at) values ('baseline-max', 1, '{}', 'user', 'test', 'tenant', 'creator', 'user', 'test', 'tenant', 'owner', 'active', 0, 1, 'profile', '{}', 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed job");
+  sqlx::query("insert into schedules (schedule_id, job_id, kind, canonical_spec, once_at, next_run_at, created_at, updated_at) values ('schedule-baseline-max', 'baseline-max', 'once', '200', 200, 200, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed schedule");
+  sqlx::query("insert into scheduled_execution_baselines (job_id) values ('baseline-max')")
+    .execute(&pool)
+    .await
+    .expect("seed baseline");
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, overlap_slot, created_at, updated_at) values ('baseline-max-run', 'baseline-max', 'schedule-baseline-max', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{}]', 'succeeded', null, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed invalid success");
+  sqlx::query("update scheduled_execution_baselines set baseline_version = 9223372036854775807, hash_algorithm = 'legacy-v1', result_hash = 'invalid', previous_success_context = 'invalid', source_run_id = 'baseline-max-run', completed_at = 100 where job_id = 'baseline-max'")
+    .execute(&pool)
+    .await
+    .expect("seed exhausted invalid baseline");
+  pool.close().await;
+
+  assert!(matches!(
+    StateStore::initialize(&state_dir, None).await,
+    Err(StateError::Migrate { .. })
+  ));
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("reopen rejected database");
+  let unchanged: (i64, Option<String>, String) = sqlx::query_as(
+    "select b.baseline_version, b.source_run_id, r.state from scheduled_execution_baselines b join scheduled_runs r on r.run_id = b.source_run_id where b.job_id = 'baseline-max'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled back baseline");
+  assert_eq!(
+    unchanged,
+    (
+      i64::MAX,
+      Some("baseline-max-run".to_owned()),
+      "succeeded".to_owned()
+    )
+  );
 }
 
 #[tokio::test]
@@ -1485,7 +1677,7 @@ async fn test_result_artifact_is_single_immutable_and_bound_to_accepted_attempt(
   )
   .expect("profile");
   let mut claims = Vec::new();
-  for job in ["artifact-a", "artifact-b"] {
+  for job in ["artifact-a", "artifact-b", "artifact-schema"] {
     store
       .create_scheduled_job(&create_request(job, ScheduleSpec::once(110), 100))
       .await
@@ -1509,6 +1701,21 @@ async fn test_result_artifact_is_single_immutable_and_bound_to_accepted_attempt(
     .await
     .expect("connect database");
   for (ordinal, claim) in claims.iter().enumerate() {
+    if ordinal == 0 {
+      assert!(
+        sqlx::query("insert into scheduled_run_result_artifacts (artifact_id, run_id, job_id, accepted_attempt, accepted_fence, schema_version, result_json, hash_algorithm, result_hash, previous_success_context, completed_at) values ('schema-999', ?1, ?2, ?3, ?4, 999, '{}', 'sha256-v1', 'schema-999', 'summary', 119)")
+          .bind(claim.binding.run_id())
+          .bind(claim.binding.job_id())
+          .bind(claim.binding.attempt())
+          .bind(claim.binding.fence())
+          .execute(&pool)
+          .await
+          .is_err()
+      );
+    }
+    if ordinal == 2 {
+      continue;
+    }
     sqlx::query(
       "insert into scheduled_run_result_artifacts (artifact_id, run_id, job_id, accepted_attempt, accepted_fence, schema_version, result_json, hash_algorithm, result_hash, previous_success_context, completed_at) values (?1, ?2, ?3, ?4, ?5, 1, '{}', 'sha256-v1', ?6, 'summary', 120)",
     )
@@ -1522,6 +1729,40 @@ async fn test_result_artifact_is_single_immutable_and_bound_to_accepted_attempt(
     .await
     .expect("insert accepted artifact");
   }
+  sqlx::query("drop trigger trg_scheduled_run_result_artifacts_acceptance")
+    .execute(&pool)
+    .await
+    .expect("simulate immediate-parent schema artifact");
+  sqlx::query("insert into scheduled_run_result_artifacts (artifact_id, run_id, job_id, accepted_attempt, accepted_fence, schema_version, result_json, hash_algorithm, result_hash, previous_success_context, completed_at, provenance, provenance_version) values ('schema-existing', ?1, ?2, ?3, ?4, 999, '{}', 'sha256-v1', 'schema-existing', 'summary', 120, 'native', 1)")
+    .bind(claims[2].binding.run_id())
+    .bind(claims[2].binding.job_id())
+    .bind(claims[2].binding.attempt())
+    .bind(claims[2].binding.fence())
+    .execute(&pool)
+    .await
+    .expect("seed immediate-parent schema artifact");
+  assert!(
+    sqlx::query(
+      "update scheduled_runs set result_artifact_id = 'schema-existing' where run_id = ?1"
+    )
+    .bind(claims[2].binding.run_id())
+    .execute(&pool)
+    .await
+    .is_err()
+  );
+  sqlx::query("update scheduled_run_attempts set state = 'succeeded', completed_at = 120 where run_id = ?1 and attempt = ?2")
+    .bind(claims[2].binding.run_id())
+    .bind(claims[2].binding.attempt())
+    .execute(&pool)
+    .await
+    .expect("complete schema test attempt");
+  assert!(
+    sqlx::query("update scheduled_runs set state = 'succeeded', overlap_slot = null, lease_owner = null, lease_expires_at = null, result_artifact_id = 'schema-existing', result_context = 'summary', result_hash_algorithm = 'sha256-v1', result_hash = 'schema-existing' where run_id = ?1")
+      .bind(claims[2].binding.run_id())
+      .execute(&pool)
+      .await
+      .is_err()
+  );
   assert!(
     sqlx::query(
       "insert into scheduled_run_result_artifacts (artifact_id, run_id, job_id, accepted_attempt, accepted_fence, schema_version, result_json, hash_algorithm, result_hash, previous_success_context, completed_at) values ('duplicate', ?1, ?2, ?3, ?4, 1, '{}', 'sha256-v1', 'different', 'summary', 121)",

@@ -1,29 +1,107 @@
 //! Provider-neutral agent contracts for Codeoff.
 
-/// A bounded unit of work passed from the runtime to an agent backend.
+/// A bounded, ephemeral unit of work passed from the runtime to an agent backend.
+///
+/// This execution request is deliberately separate from any persisted job definition. It contains
+/// run-time provenance and policy and must not be serialized as scheduled user intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTask {
   pub task_id: String,
-  pub objective: String,
-  pub context: AgentTaskContext,
+  pub instruction: String,
+  pub source: InvocationSource,
+  pub session: SessionMode,
+  pub channel: Option<ChannelTaskContext>,
+  pub previous_success: Option<PreviousSuccessContext>,
+  pub tool_policy: ToolPolicy,
+  pub feedback_target: Option<FeedbackTarget>,
+}
+
+/// Provenance for one invocation. This records origin and never grants authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvocationSource {
+  ChannelEvent {
+    provider: String,
+    workspace_id: String,
+    event_id: String,
+    dedupe_key: String,
+    source_reference: Option<String>,
+  },
+  ScheduledRun {
+    job_id: String,
+    run_id: String,
+    scheduled_for: String,
+  },
+  TrustedOperator {
+    request_id: String,
+  },
+  InternalService {
+    service: String,
+    request_id: String,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentTaskContext {
+pub enum SessionMode {
+  Fresh,
+  Resume { thread_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationKind {
+  Channel,
+  Thread,
+  DirectMessage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelReplyStrategy {
+  DynamicTool,
+  FinalAnswer,
+}
+
+/// Optional communication context for interactive channel tasks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelTaskContext {
   pub provider: String,
   pub workspace_id: String,
   pub conversation_key: String,
-  pub resume_thread_id: Option<String>,
+  pub conversation_kind: ConversationKind,
+  pub reply_strategy: ChannelReplyStrategy,
   pub message_text: Option<String>,
   pub channel_id: Option<String>,
   pub thread_id: Option<String>,
   pub message_ts: Option<String>,
   pub user_id: Option<String>,
-  pub channel_context: Option<String>,
+  pub recent_context: Option<String>,
   pub conversation_summary: Option<String>,
-  pub event_id: String,
-  pub dedupe_key: String,
-  pub source_reference: Option<String>,
+}
+
+/// Snapshot of a previous successful execution, bounded again by the backend before rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviousSuccessContext {
+  pub content: String,
+  pub was_truncated: bool,
+}
+
+/// Per-task policy for Codeoff dynamic tools only.
+///
+/// This does not govern shell, filesystem, network, sandbox, approval, or configured MCP access.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ToolPolicy {
+  #[default]
+  None,
+  NamedSet(Vec<String>),
+}
+
+/// Explicit opt-in for interactive feedback side effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedbackTarget {
+  Channel {
+    conversation_kind: ConversationKind,
+    channel_id: String,
+    thread_id: Option<String>,
+    message_ts: Option<String>,
+  },
 }
 
 /// Private agent output or dispatch state.
@@ -98,6 +176,26 @@ impl AgentTaskResult {
       Self::AcceptedDispatch { .. } => Self::AcceptedDispatch { codex_thread_id },
     }
   }
+
+  /// Validates the final result seam required by a scheduled run.
+  ///
+  /// # Errors
+  ///
+  /// Returns stable `missing_result` or `result_too_large` errors when the output cannot become a
+  /// durable scheduled result.
+  pub fn scheduled_final_text(&self, max_bytes: usize) -> Result<&str, &'static str> {
+    let Some(content) = self.draft_content() else {
+      return Err("missing_result");
+    };
+    let content = content.trim();
+    if content.is_empty() {
+      return Err("missing_result");
+    }
+    if content.len() > max_bytes {
+      return Err("result_too_large");
+    }
+    Ok(content)
+  }
 }
 
 /// Replaceable boundary for agent implementations such as Codex, Hermes, or `OpenClaw`.
@@ -130,5 +228,30 @@ mod tests {
 
     assert_eq!(result.draft_content(), None);
     assert_eq!(result.codex_thread_id(), Some("thread-1"));
+  }
+
+  #[test]
+  fn scheduled_result_requires_bounded_non_empty_final_text() {
+    assert_eq!(
+      AgentTaskResult::accepted_dispatch().scheduled_final_text(100),
+      Err("missing_result")
+    );
+    assert_eq!(
+      AgentTaskResult::draft(" \n ").scheduled_final_text(100),
+      Err("missing_result")
+    );
+    assert_eq!(
+      AgentTaskResult::draft("result").scheduled_final_text(5),
+      Err("result_too_large")
+    );
+    assert_eq!(
+      AgentTaskResult::draft(" result ").scheduled_final_text(100),
+      Ok("result")
+    );
+  }
+
+  #[test]
+  fn tool_policy_defaults_to_deny_all() {
+    assert_eq!(ToolPolicy::default(), ToolPolicy::None);
   }
 }

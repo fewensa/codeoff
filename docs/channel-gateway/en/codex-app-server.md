@@ -14,6 +14,8 @@ command = "codex app-server --listen stdio://"
 transport = "stdio"
 ephemeral_threads = true
 max_parallel_turns = 10
+max_prompt_bytes = 65536
+previous_success_context_max_bytes = 8192
 ```
 
 The current client uses stdio JSONL. Dispatch waits for the Codex turn to complete and records final draft text only when Codex returns it.
@@ -53,7 +55,9 @@ Compact message text and context hints may be included for the active event, but
 
 ## Dynamic Tools
 
-During a turn, Codex can call Codeoff channel tools to:
+Each task carries a default-deny dynamic-tool policy. During an interactive channel turn, Codeoff
+declares only the channel tools in that task's allowlist and checks the same policy again on every
+tool call. Codex can use those allowed tools to:
 
 - Reply to the current event or a known thread.
 - Send a message as the bot or a configured user token.

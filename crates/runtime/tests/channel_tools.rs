@@ -11,14 +11,15 @@ use codeoff_channel_contract::{
   ChannelWorkspaceSummary,
 };
 use codeoff_runtime::channel_tools::{
-  ChannelChannelProvider, ChannelContextProvider, ChannelContextProviderError,
-  ChannelSenderProvider, ChannelStatusProvider, ChannelThreadReplyProvider, ChannelToolError,
-  ChannelUserProvider, GetDeliveryStatusRequest, GetRecentMessagesRequest, GetThreadContextRequest,
-  ReplyToEventRequest, SendMessageRequest, SlackContextBootstrapRequest, bootstrap_slack_context,
-  get_channel, get_connector_status, get_context_pack, get_current_conversation, get_current_event,
-  get_delivery_status, get_recent_messages, get_thread_context, get_user, list_senders,
-  list_workspaces, reply_to_event, reply_to_event_with_processing_streams, reply_to_thread,
-  resolve_channel, resolve_user, search_channels, search_users, send_message,
+  CHANNEL_DYNAMIC_TOOL_NAMES, ChannelChannelProvider, ChannelContextProvider,
+  ChannelContextProviderError, ChannelSenderProvider, ChannelStatusProvider,
+  ChannelThreadReplyProvider, ChannelToolError, ChannelUserProvider, GetDeliveryStatusRequest,
+  GetRecentMessagesRequest, GetThreadContextRequest, ReplyToEventRequest, SendMessageRequest,
+  SlackContextBootstrapRequest, bootstrap_slack_context, get_channel, get_connector_status,
+  get_context_pack, get_current_conversation, get_current_event, get_delivery_status,
+  get_recent_messages, get_thread_context, get_user, list_senders, list_workspaces, reply_to_event,
+  reply_to_event_with_processing_streams, reply_to_thread, resolve_channel, resolve_user,
+  search_channels, search_users, send_message,
 };
 use codeoff_runtime::channel_tools::{ChannelResourceProvider, ChannelResourceProviderError};
 use codeoff_runtime::{
@@ -792,30 +793,10 @@ async fn channel_dynamic_tool_handler_lists_context_tools() {
 
   assert_eq!(
     names,
-    [
-      "channel_reply_to_event",
-      "channel_send_message",
-      "channel_get_thread_context",
-      "channel_get_recent_messages",
-      "channel_get_current_event",
-      "channel_get_current_conversation",
-      "channel_get_context_pack",
-      "channel_get_delivery_status",
-      "channel_get_message",
-      "channel_get_resource_info",
-      "channel_read_resource_text",
-      "channel_download_resource",
-      "channel_search_users",
-      "channel_get_user",
-      "channel_resolve_user",
-      "channel_search_channels",
-      "channel_get_channel",
-      "channel_resolve_channel",
-      "channel_list_senders",
-      "channel_list_workspaces",
-      "channel_get_connector_status",
-      "channel_reply_to_thread",
-    ]
+    CHANNEL_DYNAMIC_TOOL_NAMES
+      .iter()
+      .map(|name| (*name).to_owned())
+      .collect::<Vec<_>>()
   );
 
   let specs = handler.tool_specs();

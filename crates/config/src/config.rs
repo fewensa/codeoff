@@ -382,6 +382,8 @@ pub struct CodexAppServerConfig {
   pub transport: String,
   pub ephemeral_threads: bool,
   pub max_parallel_turns: usize,
+  pub max_prompt_bytes: usize,
+  pub previous_success_context_max_bytes: usize,
 }
 
 impl Default for CodexAppServerConfig {
@@ -391,6 +393,8 @@ impl Default for CodexAppServerConfig {
       transport: "stdio".to_owned(),
       ephemeral_threads: true,
       max_parallel_turns: 2,
+      max_prompt_bytes: 64 * 1024,
+      previous_success_context_max_bytes: 8 * 1024,
     }
   }
 }

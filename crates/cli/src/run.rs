@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::future::Future;
 use std::path::PathBuf;
@@ -13,7 +13,9 @@ use codeoff_agent_codex::{
   CodexAppServerBackend, CodexDynamicToolHandler, CodexTurnEvent, CodexTurnEventObserver,
   StdioCodexAppServerClient, build_codex_app_server_backend,
 };
-use codeoff_agent_contract::{AgentBackend, AgentTask, AgentTaskResult};
+use codeoff_agent_contract::{
+  AgentBackend, AgentTask, AgentTaskResult, ConversationKind, FeedbackTarget,
+};
 use codeoff_channel_contract::{
   ChannelContextPage, ChannelContextRequest, ChannelEvent, ChannelMessageReceipt,
   ChannelReplyTarget,
@@ -684,12 +686,21 @@ impl<B: AgentBackend> AgentBackend for FeedbackAgentBackend<B> {
   }
 
   fn run(&self, task: AgentTask) -> Result<AgentTaskResult, String> {
-    let target = assistant_status_target(
-      &self.config,
-      task.context.channel_id.as_deref(),
-      task.context.thread_id.as_deref(),
-      task.context.message_ts.as_deref(),
-    );
+    let target = task.feedback_target.as_ref().and_then(|target| {
+      let FeedbackTarget::Channel {
+        conversation_kind,
+        channel_id,
+        thread_id,
+        message_ts,
+      } = target;
+      assistant_status_target(
+        &self.config,
+        *conversation_kind,
+        channel_id,
+        thread_id.as_deref(),
+        message_ts.as_deref(),
+      )
+    });
     let guard = target.map(|target| {
       self
         .assistant_status
@@ -725,7 +736,8 @@ struct AssistantStatusTarget {
 
 fn assistant_status_target(
   config: &CodeoffConfig,
-  channel_id: Option<&str>,
+  conversation_kind: ConversationKind,
+  channel_id: &str,
   thread_ts: Option<&str>,
   message_ts: Option<&str>,
 ) -> Option<AssistantStatusTarget> {
@@ -735,8 +747,7 @@ fn assistant_status_target(
   ) {
     return None;
   }
-  let channel_id = channel_id?;
-  if channel_id.starts_with('D')
+  if conversation_kind == ConversationKind::DirectMessage
     && config.slack.response_feedback.direct_message_feedback
       != SlackDirectMessageFeedbackMode::AssistantStatus
   {
@@ -1287,6 +1298,7 @@ struct SlackCodexStreamController {
   direct_update_min_chars: usize,
   direct_message_feedback: SlackDirectMessageFeedbackMode,
   active: Arc<Mutex<Option<ActiveSlackCodexStream>>>,
+  observer_threads: Arc<Mutex<HashSet<std::thread::ThreadId>>>,
 }
 
 #[derive(Clone)]
@@ -1351,6 +1363,7 @@ fn build_slack_codex_stream_controller(
       .direct_message_feedback
       .clone(),
     active: Arc::new(Mutex::new(None)),
+    observer_threads: Arc::new(Mutex::new(HashSet::new())),
   }
 }
 
@@ -1364,8 +1377,13 @@ fn slack_codex_stream_target(
   ) {
     return None;
   }
-  let channel_id = task.context.channel_id.as_deref()?;
-  if !channel_id.starts_with('D') {
+  let FeedbackTarget::Channel {
+    conversation_kind,
+    channel_id,
+    thread_id,
+    message_ts,
+  } = task.feedback_target.as_ref()?;
+  if *conversation_kind != ConversationKind::DirectMessage {
     return None;
   }
   if config.slack.response_feedback.direct_message_feedback
@@ -1373,10 +1391,7 @@ fn slack_codex_stream_target(
   {
     return None;
   }
-  let kind = match (
-    task.context.thread_id.as_deref(),
-    task.context.message_ts.as_deref(),
-  ) {
+  let kind = match (thread_id.as_deref(), message_ts.as_deref()) {
     (Some(thread_ts), Some(message_ts)) if thread_ts != message_ts => {
       SlackCodexStreamTargetKind::ThreadStream {
         thread_ts: thread_ts.to_owned(),
@@ -1385,7 +1400,7 @@ fn slack_codex_stream_target(
     _ => SlackCodexStreamTargetKind::DirectMessageUpdate,
   };
   Some(SlackCodexStreamTarget {
-    channel_id: channel_id.to_owned(),
+    channel_id: channel_id.clone(),
     kind,
   })
 }
@@ -1405,7 +1420,20 @@ impl SlackCodexStreamController {
     }
   }
 
+  fn observer_enabled_for_current_thread(&self) -> bool {
+    self
+      .observer_threads
+      .lock()
+      .expect("slack codex stream observer threads")
+      .contains(&std::thread::current().id())
+  }
+
   fn start(&self, target: SlackCodexStreamTarget) -> SlackCodexStreamGuard {
+    self
+      .observer_threads
+      .lock()
+      .expect("slack codex stream observer threads")
+      .insert(std::thread::current().id());
     if self.reuse_existing_direct_message_loading(&target) {
       self.update_direct_message_loading_state(AssistantState::ReviewingFindings);
       return SlackCodexStreamGuard {
@@ -1794,6 +1822,9 @@ impl SlackCodexStreamController {
 
 impl CodexTurnEventObserver for SlackCodexStreamObserver {
   fn observe_codex_turn_event(&self, event: CodexTurnEvent) {
+    if !self.controller.observer_enabled_for_current_thread() {
+      return;
+    }
     match event {
       CodexTurnEvent::AgentMessageStarted(started) => {
         self
@@ -1814,6 +1845,12 @@ impl CodexTurnEventObserver for SlackCodexStreamObserver {
 
 impl Drop for SlackCodexStreamGuard {
   fn drop(&mut self) {
+    self
+      .controller
+      .observer_threads
+      .lock()
+      .expect("slack codex stream observer threads")
+      .remove(&std::thread::current().id());
     let active = self
       .controller
       .active
@@ -1849,19 +1886,25 @@ fn build_serve_codex_app_server_backend(
   if codex.command.trim().is_empty() {
     return Err("codex app server command must not be empty".to_owned());
   }
-  Ok(CodexAppServerBackend::new(
-    StdioCodexAppServerClient::with_dynamic_tool_handler(
-      codex.command.clone(),
-      codex.ephemeral_threads,
-      ServeCodexDynamicToolHandler {
-        inner: build_serve_channel_dynamic_tool_handler(config, state),
-        runtime: tokio::runtime::Handle::current(),
-        assistant_status,
-        slack_streams: slack_streams.clone(),
-      },
+  Ok(
+    CodexAppServerBackend::new(
+      StdioCodexAppServerClient::with_dynamic_tool_handler(
+        codex.command.clone(),
+        codex.ephemeral_threads,
+        ServeCodexDynamicToolHandler {
+          inner: build_serve_channel_dynamic_tool_handler(config, state),
+          runtime: tokio::runtime::Handle::current(),
+          assistant_status,
+          slack_streams: slack_streams.clone(),
+        },
+      )
+      .with_event_observer(slack_streams.observer()),
     )
-    .with_event_observer(slack_streams.observer()),
-  ))
+    .with_prompt_limits(
+      codex.max_prompt_bytes,
+      codex.previous_success_context_max_bytes,
+    ),
+  )
 }
 
 fn build_serve_channel_dynamic_tool_handler(
@@ -2527,8 +2570,14 @@ mod tests {
   #[test]
   fn assistant_status_target_uses_channel_thread_or_message_ts() {
     let config = CodeoffConfig::default();
-    let target = assistant_status_target(&config, Some("C1"), Some("100.0"), Some("100.0"))
-      .expect("status target");
+    let target = assistant_status_target(
+      &config,
+      ConversationKind::Thread,
+      "C1",
+      Some("100.0"),
+      Some("100.0"),
+    )
+    .expect("status target");
 
     assert_eq!(target.channel_id, "C1");
     assert_eq!(target.thread_ts, "100.0");
@@ -2537,7 +2586,16 @@ mod tests {
   #[test]
   fn assistant_status_target_ignores_direct_message_main_message_ts() {
     let config = CodeoffConfig::default();
-    assert!(assistant_status_target(&config, Some("D1"), Some("200.0"), Some("200.0")).is_none());
+    assert!(
+      assistant_status_target(
+        &config,
+        ConversationKind::DirectMessage,
+        "not-a-dm-prefix",
+        Some("200.0"),
+        Some("200.0")
+      )
+      .is_none()
+    );
   }
 
   #[test]
@@ -2546,8 +2604,14 @@ mod tests {
     config.slack.response_feedback.direct_message_feedback =
       SlackDirectMessageFeedbackMode::AssistantStatus;
 
-    let target = assistant_status_target(&config, Some("D1"), Some("200.0"), Some("200.0"))
-      .expect("status target");
+    let target = assistant_status_target(
+      &config,
+      ConversationKind::DirectMessage,
+      "D1",
+      Some("200.0"),
+      Some("200.0"),
+    )
+    .expect("status target");
 
     assert_eq!(target.channel_id, "D1");
     assert_eq!(target.thread_ts, "200.0");
@@ -2556,8 +2620,14 @@ mod tests {
   #[test]
   fn assistant_status_target_allows_threaded_direct_messages() {
     let config = CodeoffConfig::default();
-    let target = assistant_status_target(&config, Some("D1"), Some("199.0"), Some("200.0"))
-      .expect("status target");
+    let target = assistant_status_target(
+      &config,
+      ConversationKind::DirectMessage,
+      "D1",
+      Some("199.0"),
+      Some("200.0"),
+    )
+    .expect("status target");
 
     assert_eq!(target.channel_id, "D1");
     assert_eq!(target.thread_ts, "199.0");
@@ -2568,7 +2638,16 @@ mod tests {
     let mut config = CodeoffConfig::default();
     config.slack.response_feedback.mode = codeoff_config::SlackResponseFeedbackMode::Off;
 
-    assert!(assistant_status_target(&config, Some("C1"), Some("100.0"), Some("100.0")).is_none());
+    assert!(
+      assistant_status_target(
+        &config,
+        ConversationKind::Channel,
+        "C1",
+        Some("100.0"),
+        Some("100.0")
+      )
+      .is_none()
+    );
   }
 
   #[tokio::test]
@@ -3071,15 +3150,30 @@ mod tests {
   #[test]
   fn slack_codex_stream_target_only_uses_direct_messages_when_enabled() {
     let config = CodeoffConfig::default();
-    let dm_task = stream_target_task(Some("D1"), Some("200.0"), Some("200.0"));
-    let channel_task = stream_target_task(Some("C1"), Some("100.0"), Some("100.0"));
+    let dm_task = stream_target_task(
+      ConversationKind::DirectMessage,
+      Some("not-a-dm-prefix"),
+      Some("200.0"),
+      Some("200.0"),
+    );
+    let channel_task = stream_target_task(
+      ConversationKind::Channel,
+      Some("C1"),
+      Some("100.0"),
+      Some("100.0"),
+    );
 
     let target = slack_codex_stream_target(&config, &dm_task).expect("dm stream target");
-    assert_eq!(target.channel_id, "D1");
+    assert_eq!(target.channel_id, "not-a-dm-prefix");
     assert_eq!(target.kind, SlackCodexStreamTargetKind::DirectMessageUpdate);
     assert!(slack_codex_stream_target(&config, &channel_task).is_none());
 
-    let threaded_dm_task = stream_target_task(Some("D1"), Some("199.0"), Some("200.0"));
+    let threaded_dm_task = stream_target_task(
+      ConversationKind::DirectMessage,
+      Some("D1"),
+      Some("199.0"),
+      Some("200.0"),
+    );
     let target =
       slack_codex_stream_target(&config, &threaded_dm_task).expect("threaded dm stream target");
     assert_eq!(target.channel_id, "D1");
@@ -3100,9 +3194,29 @@ mod tests {
     let mut config = CodeoffConfig::default();
     config.slack.response_feedback.direct_message_feedback =
       SlackDirectMessageFeedbackMode::AssistantStatus;
-    let dm_task = stream_target_task(Some("D1"), Some("200.0"), Some("200.0"));
+    let dm_task = stream_target_task(
+      ConversationKind::DirectMessage,
+      Some("D1"),
+      Some("200.0"),
+      Some("200.0"),
+    );
 
     assert!(slack_codex_stream_target(&config, &dm_task).is_none());
+  }
+
+  #[test]
+  fn task_without_feedback_target_cannot_start_slack_feedback() {
+    let config = CodeoffConfig::default();
+    let mut task = stream_target_task(
+      ConversationKind::DirectMessage,
+      Some("D1"),
+      Some("200.0"),
+      Some("200.0"),
+    );
+    task.feedback_target = None;
+
+    assert!(slack_codex_stream_target(&config, &task).is_none());
+    assert!(task.feedback_target.is_none());
   }
 
   #[tokio::test]
@@ -3118,6 +3232,32 @@ mod tests {
     let active = controller.active.lock().expect("active stream");
     let active = active.as_ref().expect("active");
     assert_eq!(active.assistant_state, AssistantState::ReviewingFindings);
+  }
+
+  #[tokio::test]
+  async fn codex_observer_ignores_events_without_feedback_guard() {
+    let controller = SlackCodexStreamController::without_client_for_tests();
+    let target = SlackCodexStreamTarget {
+      channel_id: "D1".to_owned(),
+      kind: SlackCodexStreamTargetKind::DirectMessageUpdate,
+    };
+    controller.prime_direct_message_loading_for_tests(target, AssistantState::Searching);
+
+    controller
+      .observer()
+      .observe_codex_turn_event(CodexTurnEvent::AgentMessageStarted(
+        codeoff_agent_codex::CodexAgentMessageStartedEvent {
+          thread_id: "thread-1".to_owned(),
+          turn_id: "turn-1".to_owned(),
+          item_id: "item-1".to_owned(),
+          phase: Some("final_answer".to_owned()),
+        },
+      ));
+
+    let active = controller.active.lock().expect("active stream");
+    let active = active.as_ref().expect("active");
+    assert_eq!(active.assistant_state, AssistantState::Searching);
+    assert!(active.final_text.is_empty());
   }
 
   #[tokio::test]
@@ -3273,29 +3413,44 @@ mod tests {
   }
 
   fn stream_target_task(
+    conversation_kind: ConversationKind,
     channel_id: Option<&str>,
     thread_id: Option<&str>,
     message_ts: Option<&str>,
   ) -> AgentTask {
     AgentTask {
       task_id: "task-1".to_owned(),
-      objective: "Handle event".to_owned(),
-      context: codeoff_agent_contract::AgentTaskContext {
+      instruction: "Handle event".to_owned(),
+      source: codeoff_agent_contract::InvocationSource::ChannelEvent {
+        provider: "slack".to_owned(),
+        workspace_id: "workspace-1".to_owned(),
+        event_id: "event-1".to_owned(),
+        dedupe_key: "dedupe-1".to_owned(),
+        source_reference: None,
+      },
+      session: codeoff_agent_contract::SessionMode::Fresh,
+      channel: Some(codeoff_agent_contract::ChannelTaskContext {
         provider: "slack".to_owned(),
         workspace_id: "workspace-1".to_owned(),
         conversation_key: "conversation-1".to_owned(),
-        resume_thread_id: None,
+        conversation_kind,
+        reply_strategy: codeoff_agent_contract::ChannelReplyStrategy::FinalAnswer,
         message_text: None,
         channel_id: channel_id.map(ToOwned::to_owned),
         thread_id: thread_id.map(ToOwned::to_owned),
         message_ts: message_ts.map(ToOwned::to_owned),
         user_id: Some("U1".to_owned()),
-        channel_context: None,
+        recent_context: None,
         conversation_summary: None,
-        event_id: "event-1".to_owned(),
-        dedupe_key: "dedupe-1".to_owned(),
-        source_reference: None,
-      },
+      }),
+      previous_success: None,
+      tool_policy: codeoff_agent_contract::ToolPolicy::None,
+      feedback_target: channel_id.map(|channel_id| FeedbackTarget::Channel {
+        conversation_kind,
+        channel_id: channel_id.to_owned(),
+        thread_id: thread_id.map(ToOwned::to_owned),
+        message_ts: message_ts.map(ToOwned::to_owned),
+      }),
     }
   }
 
@@ -3426,6 +3581,7 @@ mod tests {
         direct_update_min_chars: 120,
         direct_message_feedback: SlackDirectMessageFeedbackMode::Message,
         active: Arc::new(Mutex::new(None)),
+        observer_threads: Arc::new(Mutex::new(HashSet::new())),
       }
     }
 

@@ -379,6 +379,8 @@ fn test_codex_app_server_config_loads_from_toml() {
 command = "codex app-server --sandbox workspace-write"
 transport = "stdio"
 ephemeral_threads = false
+max_prompt_bytes = 32768
+previous_success_context_max_bytes = 4096
 "#,
   )
   .expect("write config");
@@ -392,6 +394,14 @@ ephemeral_threads = false
   );
   assert_eq!(loaded.agent.codex_app_server.transport, "stdio");
   assert!(!loaded.agent.codex_app_server.ephemeral_threads);
+  assert_eq!(loaded.agent.codex_app_server.max_prompt_bytes, 32_768);
+  assert_eq!(
+    loaded
+      .agent
+      .codex_app_server
+      .previous_success_context_max_bytes,
+    4_096
+  );
 }
 
 #[test]

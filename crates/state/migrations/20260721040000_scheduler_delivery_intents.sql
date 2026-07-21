@@ -90,11 +90,15 @@ create table scheduled_run_deliveries (
       and length(result_artifact_id) > 0
       and result_attempt > 0
       and result_fence > 0
+      and delivery_policy_version = 1
       and target_snapshot_digest_algorithm = 'sha256-v1'
       and length(target_snapshot_digest) = 64
       and target_snapshot_digest not glob '*[^0-9a-f]*'
-      and length(intent_key) = 64
-      and intent_key not glob '*[^0-9a-f]*')
+      and length(run_id) between 1 and 65536
+      and length(target_identity_digest) between 1 and 65536
+      and length(intent_key) between 8 and 131080
+      and intent_key = 'v1:' || run_id || ':' || target_identity_digest || ':1'
+      and delivery_id = 'intent:' || intent_key)
   ),
   check (
     (state = 'intent'
@@ -113,6 +117,7 @@ create table scheduled_run_deliveries (
       and render_version is not null
       and (intent_key is null or length(payload_snapshot) > 0))
   ),
+  check (authority_kind != 'intent_v1' or state in ('intent', 'pending')),
   check ((state in ('leased', 'sending') and lease_owner is not null and lease_expires_at is not null)
     or (state not in ('leased', 'sending') and lease_owner is null and lease_expires_at is null)),
   check (next_attempt_at is null or state = 'pending'),
@@ -180,7 +185,7 @@ create unique index idx_scheduled_delivery_intent_key
 
 create trigger trg_scheduled_delivery_intent_acceptance
 before insert on scheduled_run_deliveries
-when new.intent_key is not null
+when new.authority_kind = 'intent_v1' or new.intent_key is not null
 begin
   select case when not exists (
     select 1
@@ -202,28 +207,89 @@ begin
       and r.attempt = a.accepted_attempt
       and r.fence = a.accepted_fence
       and t.state = 'executing'
+      and new.target_json = json(new.target_json)
+      and json_type(new.target_json) = 'object'
+      and json_extract(new.target_json, '$.identity_digest') = new.target_identity_digest
+      and exists (
+        select 1
+        from json_each(r.targets_json) target
+        where json(target.value) = new.target_json
+          and json_type(target.value) = 'object'
+          and json_extract(target.value, '$.identity_digest') = new.target_identity_digest
+      )
   ) then raise(abort, 'scheduled delivery intent result authority mismatch') end;
 end;
 
-create trigger trg_scheduled_delivery_intent_identity_immutable
-before update on scheduled_run_deliveries
-when old.intent_key is not null and (
-  new.delivery_id is not old.delivery_id
-  or new.run_id is not old.run_id
-  or new.job_id is not old.job_id
-  or new.target_identity_digest is not old.target_identity_digest
-  or new.target_json is not old.target_json
-  or new.delivery_policy_version is not old.delivery_policy_version
-  or new.result_artifact_id is not old.result_artifact_id
-  or new.result_attempt is not old.result_attempt
-  or new.result_fence is not old.result_fence
-  or new.target_snapshot_digest_algorithm is not old.target_snapshot_digest_algorithm
-  or new.target_snapshot_digest is not old.target_snapshot_digest
-  or new.intent_key is not old.intent_key
-  or new.authority_kind is not old.authority_kind
+create trigger trg_scheduled_delivery_intent_insert_collision
+before insert on scheduled_run_deliveries
+when exists (
+  select 1
+  from scheduled_run_deliveries existing
+  where existing.authority_kind = 'intent_v1'
+    and (
+      existing.delivery_id = new.delivery_id
+      or (new.intent_key is not null and existing.intent_key = new.intent_key)
+    )
 )
 begin
-  select raise(abort, 'scheduled delivery intent identity is immutable');
+  select raise(abort, 'scheduled delivery intent cannot be replaced');
+end;
+
+create trigger trg_scheduled_delivery_intent_enrichment_only
+before update on scheduled_run_deliveries
+when old.authority_kind = 'intent_v1' and not (
+  old.state = 'intent'
+  and new.state = 'pending'
+  and old.render_version is null
+  and old.hash_algorithm is null
+  and old.payload_digest is null
+  and old.payload_snapshot is null
+  and old.expected_baseline_version is null
+  and new.render_version > 0
+  and length(new.hash_algorithm) > 0
+  and length(new.payload_digest) > 0
+  and length(new.payload_snapshot) > 0
+  and new.expected_baseline_version >= 0
+  and new.delivery_id is old.delivery_id
+  and new.run_id is old.run_id
+  and new.job_id is old.job_id
+  and new.target_identity_digest is old.target_identity_digest
+  and new.target_json is old.target_json
+  and new.attempt is old.attempt
+  and new.next_attempt_at is old.next_attempt_at
+  and new.lease_owner is old.lease_owner
+  and new.lease_expires_at is old.lease_expires_at
+  and new.fence is old.fence
+  and new.provider_receipt is old.provider_receipt
+  and new.error_message is old.error_message
+  and new.delivery_policy_version is old.delivery_policy_version
+  and new.result_artifact_id is old.result_artifact_id
+  and new.result_attempt is old.result_attempt
+  and new.result_fence is old.result_fence
+  and new.target_snapshot_digest_algorithm is old.target_snapshot_digest_algorithm
+  and new.target_snapshot_digest is old.target_snapshot_digest
+  and new.intent_key is old.intent_key
+  and new.authority_kind is old.authority_kind
+  and new.created_at is old.created_at
+  and new.updated_at >= old.updated_at
+)
+begin
+  select raise(abort, 'scheduled delivery intent only permits one complete enrichment');
+end;
+
+create trigger trg_scheduled_delivery_intent_promotion_forbidden
+before update on scheduled_run_deliveries
+when old.authority_kind != 'intent_v1'
+  and (new.authority_kind = 'intent_v1' or new.intent_key is not null)
+begin
+  select raise(abort, 'existing delivery cannot become an intent');
+end;
+
+create trigger trg_scheduled_delivery_intent_delete_forbidden
+before delete on scheduled_run_deliveries
+when old.authority_kind = 'intent_v1'
+begin
+  select raise(abort, 'scheduled delivery intent cannot be deleted');
 end;
 
 create table scheduled_delivery_baselines (

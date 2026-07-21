@@ -82,16 +82,9 @@ fn second_target(job: &str) -> DeliveryTargetSnapshot {
   .expect("second target")
 }
 
-fn test_digest_identity(parts: &[&str]) -> String {
+fn test_sha256_hex(value: &str) -> String {
   let mut digest = Sha256::new();
-  for part in parts {
-    digest.update(
-      u64::try_from(part.len())
-        .expect("test identity part fits u64")
-        .to_be_bytes(),
-    );
-    digest.update(part.as_bytes());
-  }
+  digest.update(value.as_bytes());
   let mut encoded = String::with_capacity(64);
   for byte in digest.finalize() {
     write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
@@ -1698,6 +1691,18 @@ async fn test_complete_success_atomically_persists_result_baseline_and_exact_del
     assert_eq!((intent.6, intent.7, intent.8), (None, None, None));
     assert_eq!(intent.9, "sha256-v1");
   }
+  let delivery_id: String = sqlx::query_scalar(
+    "select delivery_id from scheduled_run_deliveries where run_id = ?1 order by delivery_id limit 1",
+  )
+  .bind(claim.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read delivery intent id");
+  let target_snapshot = store
+    .load_scheduled_delivery_intent_target_snapshot(&delivery_id)
+    .await
+    .expect("validate intent target snapshot");
+  assert!(target_snapshot.contains("identity_digest"));
   assert!(
     sqlx::query("update scheduled_run_deliveries set target_json = '{}' where run_id = ?1 limit 1")
       .bind(claim.binding.run_id())
@@ -1714,6 +1719,226 @@ async fn test_complete_success_atomically_persists_result_baseline_and_exact_del
     .await
     .is_err(),
     "intent enrichment requires immutable payload bytes"
+  );
+  sqlx::query(
+    "update scheduled_run_deliveries set state = 'pending', render_version = 1, hash_algorithm = 'sha256-v1', payload_digest = 'payload-v1', payload_snapshot = ?1, expected_baseline_version = 0, updated_at = 121 where delivery_id = ?2",
+  )
+  .bind(b"rendered payload".as_slice())
+  .bind(&delivery_id)
+  .execute(&pool)
+  .await
+  .expect("enrich intent exactly once");
+  assert!(
+    sqlx::query(
+      "update scheduled_run_deliveries set payload_snapshot = ?1, payload_digest = 'payload-v2', updated_at = 122 where delivery_id = ?2"
+    )
+    .bind(b"rewritten payload".as_slice())
+    .bind(&delivery_id)
+    .execute(&pool)
+    .await
+    .is_err(),
+    "enriched payload cannot be rewritten"
+  );
+  assert!(
+    sqlx::query(
+      "update scheduled_run_deliveries set payload_snapshot = null, payload_digest = null, updated_at = 122 where delivery_id = ?1"
+    )
+    .bind(&delivery_id)
+    .execute(&pool)
+    .await
+    .is_err(),
+    "enriched payload cannot be cleared"
+  );
+  assert!(
+    sqlx::query("update scheduled_run_deliveries set state = 'intent' where delivery_id = ?1")
+      .bind(&delivery_id)
+      .execute(&pool)
+      .await
+      .is_err(),
+    "pending intent cannot return to intent state"
+  );
+  assert!(
+    sqlx::query("delete from scheduled_run_deliveries where delivery_id = ?1")
+      .bind(&delivery_id)
+      .execute(&pool)
+      .await
+      .is_err(),
+    "intent authority cannot be deleted"
+  );
+  assert!(
+    sqlx::query(
+      "insert or replace into scheduled_run_deliveries select * from scheduled_run_deliveries where delivery_id = ?1"
+    )
+    .bind(&delivery_id)
+    .execute(&pool)
+    .await
+    .is_err(),
+    "intent authority cannot be replaced"
+  );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_direct_delivery_intents_require_database_verifiable_authority() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let job_id = "direct-intent-authority";
+  store
+    .create_scheduled_job(&create_request(job_id, ScheduleSpec::once(110), 100))
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule(job_id, 0, 110)
+    .await
+    .expect("materialize");
+  let claim = store
+    .claim_next_scheduled_run("worker", 111, 200)
+    .await
+    .expect("claim")
+    .expect("claimed run");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&claim.binding, &profile, 112)
+    .await
+    .expect("mark executing");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let artifact_id = "direct-intent-artifact";
+  sqlx::query(
+    "insert into scheduled_run_result_artifacts (artifact_id, run_id, job_id, accepted_attempt, accepted_fence, schema_version, result_json, hash_algorithm, result_hash, previous_success_context, completed_at, provenance, provenance_version) values (?1, ?2, ?3, ?4, ?5, 1, '{\"schema_version\":1,\"summary\":\"direct\"}', 'sha256-v1', 'direct-result', '', 113, 'native', 1)",
+  )
+  .bind(artifact_id)
+  .bind(claim.binding.run_id())
+  .bind(job_id)
+  .bind(claim.binding.attempt())
+  .bind(claim.binding.fence())
+  .execute(&pool)
+  .await
+  .expect("insert native result artifact");
+  let target_json: String = sqlx::query_scalar(
+    "select json_extract(targets_json, '$[0]') from scheduled_runs where run_id = ?1",
+  )
+  .bind(claim.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read target snapshot");
+  let identity = "none-v1";
+  let natural_key = format!("v1:{}:{identity}:1", claim.binding.run_id());
+  let natural_delivery_id = format!("intent:{natural_key}");
+  let mut foreign_target: serde_json::Value =
+    serde_json::from_str(&target_json).expect("parse target");
+  foreign_target["address"] = serde_json::json!({"foreign": true});
+  let foreign_target = serde_json::to_string(&foreign_target).expect("serialize foreign target");
+  let invalid = [
+    (
+      "policy-2",
+      2,
+      identity,
+      target_json.as_str(),
+      format!("v1:{}:{identity}:2", claim.binding.run_id()),
+      format!("intent:v1:{}:{identity}:2", claim.binding.run_id()),
+    ),
+    (
+      "empty-target",
+      1,
+      identity,
+      "{}",
+      natural_key.clone(),
+      natural_delivery_id.clone(),
+    ),
+    (
+      "foreign-target",
+      1,
+      identity,
+      foreign_target.as_str(),
+      natural_key.clone(),
+      natural_delivery_id.clone(),
+    ),
+    (
+      "identity-mismatch",
+      1,
+      "other-identity",
+      target_json.as_str(),
+      format!("v1:{}:other-identity:1", claim.binding.run_id()),
+      format!("intent:v1:{}:other-identity:1", claim.binding.run_id()),
+    ),
+    (
+      "key-mismatch",
+      1,
+      identity,
+      target_json.as_str(),
+      "v1:wrong:key:1".to_owned(),
+      "intent:v1:wrong:key:1".to_owned(),
+    ),
+    (
+      "delivery-id-mismatch",
+      1,
+      identity,
+      target_json.as_str(),
+      natural_key.clone(),
+      "intent:wrong".to_owned(),
+    ),
+  ];
+  for (name, policy, target_identity, candidate_target, intent_key, delivery_id) in invalid {
+    let insert = sqlx::query(
+      "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'intent', 0, 0, ?6, ?7, ?8, ?9, 'sha256-v1', ?10, ?11, 'intent_v1', 114, 114)",
+    )
+    .bind(delivery_id)
+    .bind(claim.binding.run_id())
+    .bind(job_id)
+    .bind(target_identity)
+    .bind(candidate_target)
+    .bind(policy)
+    .bind(artifact_id)
+    .bind(claim.binding.attempt())
+    .bind(claim.binding.fence())
+    .bind(test_sha256_hex(candidate_target))
+    .bind(intent_key)
+    .execute(&pool)
+    .await;
+    assert!(insert.is_err(), "{name} intent must be rejected");
+  }
+
+  sqlx::query(
+    "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'intent', 0, 0, 1, ?6, ?7, ?8, 'sha256-v1', ?9, ?10, 'intent_v1', 114, 114)",
+  )
+  .bind(&natural_delivery_id)
+  .bind(claim.binding.run_id())
+  .bind(job_id)
+  .bind(identity)
+  .bind(&target_json)
+  .bind(artifact_id)
+  .bind(claim.binding.attempt())
+  .bind(claim.binding.fence())
+  .bind("0".repeat(64))
+  .bind(&natural_key)
+  .execute(&pool)
+  .await
+  .expect("database accepts non-authoritative derived digest metadata");
+  assert!(matches!(
+    store
+      .load_scheduled_delivery_intent_target_snapshot(&natural_delivery_id)
+      .await,
+    Err(StateError::InvalidSchedulerState { reason })
+      if reason == "scheduled delivery intent target snapshot digest mismatch"
+  ));
+  assert!(
+    sqlx::query(
+      "insert or replace into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, payload_snapshot, expected_baseline_version, created_at, updated_at) values (?1, ?2, ?3, 'legacy-replacement', '{}', 'pending', 1, 1, 'sha256-v1', 'replacement', ?4, 0, 115, 115)"
+    )
+    .bind(&natural_delivery_id)
+    .bind(claim.binding.run_id())
+    .bind(job_id)
+    .bind(b"replacement".as_slice())
+    .execute(&pool)
+    .await
+    .is_err(),
+    "OR REPLACE cannot remove intent authority even while its run remains executing"
   );
 }
 
@@ -1780,13 +2005,7 @@ async fn test_complete_success_baseline_and_insert_conflicts_roll_back_all_autho
         let target: serde_json::Value =
           serde_json::from_str(&target_json).expect("parse target snapshot");
         let identity = target["identity_digest"].as_str().expect("identity digest");
-        let intent_key = test_digest_identity(&[
-          "scheduled-delivery-intent-v1",
-          claim.binding.run_id(),
-          identity,
-          "1",
-          "sha256-v1",
-        ]);
+        let intent_key = format!("v1:{}:{identity}:1", claim.binding.run_id());
         sqlx::query("insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values (?1, ?2, ?3, 'collision', '{}', 'pending', 1, 1, 'sha256-v1', 'collision', 0, 119, 119)")
           .bind(format!("intent:{intent_key}"))
           .bind(claim.binding.run_id())

@@ -588,6 +588,45 @@ impl StateStore {
     transaction.commit().await.map_err(scheduler_error)
   }
 
+  /// Loads and validates the immutable target snapshot carried by a delivery intent.
+  ///
+  /// The database enforces the intent's natural identity. This read boundary independently
+  /// verifies the derived snapshot digest before a later delivery stage may use the target.
+  ///
+  /// # Errors
+  /// Returns an error when the identifier is invalid, the intent does not exist, the persisted
+  /// target is malformed, or its derived digest does not match its canonical bytes.
+  pub async fn load_scheduled_delivery_intent_target_snapshot(
+    &self,
+    delivery_id: &str,
+  ) -> Result<String, StateError> {
+    validate_text("scheduled delivery id", delivery_id).map_err(invalid_value)?;
+    let row = sqlx::query(
+      "select target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest from scheduled_run_deliveries where delivery_id = ?1 and authority_kind = 'intent_v1'",
+    )
+    .bind(delivery_id)
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?
+    .ok_or_else(|| StateError::InvalidSchedulerState {
+      reason: "scheduled delivery intent does not exist".to_owned(),
+    })?;
+    let target_json: String = row.try_get("target_json").map_err(scheduler_error)?;
+    validate_delivery_intent_target_snapshot(
+      &target_json,
+      row
+        .try_get("target_identity_digest")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("target_snapshot_digest_algorithm")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("target_snapshot_digest")
+        .map_err(scheduler_error)?,
+    )?;
+    Ok(target_json)
+  }
+
   /// Atomically accepts a live execution result, advances its execution baseline, and records
   /// immutable delivery intents derived from the materialized run snapshot.
   ///
@@ -727,16 +766,14 @@ impl StateStore {
     }
 
     for target in targets {
-      let intent_key = digest_identity(&[
-        "scheduled-delivery-intent-v1",
+      let intent_key = format!(
+        "v1:{}:{}:{delivery_policy_version}",
         binding.run_id(),
-        &target.identity_digest,
-        &delivery_policy_version.to_string(),
-        "sha256-v1",
-      ]);
+        target.identity_digest
+      );
       let delivery_id = format!("intent:{intent_key}");
       let intent_insert = sqlx::query(
-        "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'intent', 0, 0, ?6, ?7, ?8, ?9, 'sha256-v1', ?10, ?11, 'intent_v1', ?12, ?12)",
+        "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'intent', 0, 0, ?6, ?7, ?8, ?9, 'sha256-v1', ?10, ?11, 'intent_v1', ?12, ?12) returning target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest",
       )
       .bind(delivery_id)
       .bind(binding.run_id())
@@ -750,11 +787,12 @@ impl StateStore {
       .bind(target.snapshot_digest)
       .bind(intent_key)
       .bind(completed_at)
-      .execute(&mut *transaction)
+      .fetch_one(&mut *transaction)
       .await
       .map_err(completion_storage_error);
-      if let Err(error) = intent_insert {
-        if matches!(error, StateError::ScheduledRunCompletionConflict) {
+      let intent = match intent_insert {
+        Ok(intent) => intent,
+        Err(StateError::ScheduledRunCompletionConflict) => {
           return self
             .resolve_scheduled_run_completion_conflict(
               transaction,
@@ -764,8 +802,20 @@ impl StateStore {
             )
             .await;
         }
-        return Err(error);
-      }
+        Err(error) => return Err(error),
+      };
+      validate_delivery_intent_target_snapshot(
+        intent.try_get("target_json").map_err(scheduler_error)?,
+        intent
+          .try_get("target_identity_digest")
+          .map_err(scheduler_error)?,
+        intent
+          .try_get("target_snapshot_digest_algorithm")
+          .map_err(scheduler_error)?,
+        intent
+          .try_get("target_snapshot_digest")
+          .map_err(scheduler_error)?,
+      )?;
     }
 
     let attempt = sqlx::query(
@@ -1427,6 +1477,38 @@ fn delivery_intent_targets(targets_json: &str) -> Result<Vec<DeliveryIntentTarge
     });
   }
   Ok(prepared)
+}
+
+fn validate_delivery_intent_target_snapshot(
+  target_json: &str,
+  target_identity_digest: &str,
+  digest_algorithm: &str,
+  snapshot_digest: &str,
+) -> Result<(), StateError> {
+  if digest_algorithm != "sha256-v1" {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery intent has an unsupported target snapshot digest algorithm"
+        .to_owned(),
+    });
+  }
+  let target: Value = serde_json::from_str(target_json).map_err(invalid_json)?;
+  if serde_json::to_string(&target).map_err(invalid_json)? != target_json
+    || target
+      .as_object()
+      .and_then(|object| object.get("identity_digest"))
+      .and_then(Value::as_str)
+      != Some(target_identity_digest)
+  {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery intent target snapshot identity is invalid".to_owned(),
+    });
+  }
+  if sha256_hex(target_json.as_bytes()) != snapshot_digest {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery intent target snapshot digest mismatch".to_owned(),
+    });
+  }
+  Ok(())
 }
 
 fn execution_baseline_version(snapshot_json: &str) -> Result<i64, StateError> {

@@ -279,6 +279,44 @@ impl DeliveryTargetSnapshot {
   pub fn identity_digest(&self) -> &str {
     &self.identity_digest
   }
+  #[must_use]
+  pub fn provider(&self) -> &str {
+    &self.provider
+  }
+  #[must_use]
+  pub fn connector(&self) -> &str {
+    &self.connector
+  }
+  #[must_use]
+  pub fn tenant(&self) -> &str {
+    &self.tenant
+  }
+  #[must_use]
+  pub fn kind(&self) -> &str {
+    &self.kind
+  }
+  #[must_use]
+  pub fn address_json(&self) -> &str {
+    &self.address_json
+  }
+  #[must_use]
+  pub const fn resolver_version(&self) -> u32 {
+    self.resolver_version
+  }
+  #[must_use]
+  pub fn resolver_digest(&self) -> &str {
+    &self.resolver_digest
+  }
+
+  /// Replaces the storage identity while preserving the resolved target snapshot.
+  ///
+  /// # Errors
+  /// Returns an error when the job-scoped target id is invalid.
+  pub fn with_target_id(mut self, target_id: impl Into<String>) -> Result<Self, StateValueError> {
+    self.target_id = target_id.into();
+    self.validate()?;
+    Ok(self)
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -738,6 +776,17 @@ pub struct ScheduleMutationIdempotency {
   pub digest_algorithm: String,
   pub request_digest: String,
   pub response_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScheduleMutationAudit {
+  pub audit_id: String,
+  pub principal: PrincipalKey,
+  pub operation: String,
+  pub job_id: String,
+  pub request_id: String,
+  pub outcome: String,
+  pub occurred_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

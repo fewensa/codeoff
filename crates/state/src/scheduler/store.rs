@@ -5,11 +5,11 @@ use super::{
   AcceptedDeliveryBaseline, CapabilityProfileSnapshot, CreateScheduledJob,
   DEFAULT_OCCURRENCE_STEPS, DeliveryTargetSnapshot, IdempotencyDecision, MAX_CONTEXT_BYTES,
   MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES, MaterializationOutcome, PrincipalKey,
-  ScheduleMutationIdempotency, ScheduleSpec, ScheduledJob, ScheduledJobDefinition,
-  ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus, StateError,
-  TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
-  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
-  positive_u32, scheduler_error, validate_text,
+  ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledJob,
+  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
+  StateError, TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline,
+  UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
+  invalid_value, materialized_run, positive_u32, scheduler_error, validate_text,
 };
 use crate::StateStore;
 
@@ -57,7 +57,26 @@ impl StateStore {
     mutation: &ScheduledJobMutation,
     idempotency: &ScheduleMutationIdempotency,
   ) -> Result<TransactionalMutationOutcome, StateError> {
+    self
+      .apply_idempotent_schedule_mutation_with_audit(mutation, idempotency, None)
+      .await
+  }
+
+  /// Applies a typed scheduler mutation and writes its sanitized audit record atomically.
+  ///
+  /// # Errors
+  /// Returns an error when the mutation, idempotency, or audit contract is invalid, or when
+  /// `SQLite` rejects the transaction.
+  pub async fn apply_idempotent_schedule_mutation_with_audit(
+    &self,
+    mutation: &ScheduledJobMutation,
+    idempotency: &ScheduleMutationIdempotency,
+    audit: Option<&ScheduleMutationAudit>,
+  ) -> Result<TransactionalMutationOutcome, StateError> {
     validate_mutation_idempotency(mutation, idempotency)?;
+    if let Some(audit) = audit {
+      validate_mutation_audit(mutation, idempotency, audit)?;
+    }
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let decision = claim_idempotency_in_transaction(
       &mut transaction,
@@ -72,6 +91,9 @@ impl StateStore {
     match decision {
       IdempotencyDecision::Claimed => {
         apply_typed_mutation(&mut transaction, mutation).await?;
+        if let Some(audit) = audit {
+          insert_mutation_audit(&mut transaction, audit).await?;
+        }
         complete_idempotency_in_transaction(
           &mut transaction,
           &idempotency.principal,
@@ -936,6 +958,65 @@ fn validate_mutation_idempotency(
   Ok(())
 }
 
+fn validate_mutation_audit(
+  mutation: &ScheduledJobMutation,
+  idempotency: &ScheduleMutationIdempotency,
+  audit: &ScheduleMutationAudit,
+) -> Result<(), StateError> {
+  for (field, value) in [
+    ("audit id", audit.audit_id.as_str()),
+    ("audit operation", audit.operation.as_str()),
+    ("audit job id", audit.job_id.as_str()),
+    ("audit request id", audit.request_id.as_str()),
+    ("audit outcome", audit.outcome.as_str()),
+  ] {
+    validate_text(field, value).map_err(invalid_value)?;
+  }
+  audit.principal.validate().map_err(invalid_value)?;
+  let job_id = match mutation {
+    ScheduledJobMutation::Create(request) => &request.job_id,
+    ScheduledJobMutation::Update(request) => &request.job_id,
+    ScheduledJobMutation::Pause { job_id, .. }
+    | ScheduledJobMutation::Resume { job_id, .. }
+    | ScheduledJobMutation::Delete { job_id, .. } => job_id,
+  };
+  if audit.principal != idempotency.principal
+    || audit.operation != mutation.operation()
+    || audit.job_id != *job_id
+    || audit.request_id != idempotency.request_id
+    || audit.outcome != "applied"
+    || audit.occurred_at != mutation.now()
+  {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "schedule mutation audit does not match the authorized mutation".to_owned(),
+    });
+  }
+  Ok(())
+}
+
+async fn insert_mutation_audit(
+  transaction: &mut Transaction<'_, Sqlite>,
+  audit: &ScheduleMutationAudit,
+) -> Result<(), StateError> {
+  sqlx::query(
+    "insert into schedule_mutation_audit (audit_id, principal_kind, principal_provider, principal_tenant, principal_subject, operation, job_id, request_id, outcome, occurred_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+  )
+  .bind(&audit.audit_id)
+  .bind(audit.principal.kind())
+  .bind(audit.principal.provider())
+  .bind(audit.principal.tenant())
+  .bind(audit.principal.subject())
+  .bind(&audit.operation)
+  .bind(&audit.job_id)
+  .bind(&audit.request_id)
+  .bind(&audit.outcome)
+  .bind(audit.occurred_at)
+  .execute(&mut **transaction)
+  .await
+  .map(|_| ())
+  .map_err(scheduler_error)
+}
+
 async fn claim_idempotency_in_transaction(
   transaction: &mut Transaction<'_, Sqlite>,
   principal: &PrincipalKey,
@@ -1200,11 +1281,72 @@ mod tests {
 
   use super::{
     CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, MaterializationOutcome,
-    PrincipalKey, ScheduleSpec, ScheduledJobDefinition, StateError, StateStore,
-    UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
+    PrincipalKey, ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec,
+    ScheduledJobDefinition, ScheduledJobMutation, StateError, StateStore,
+    TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
     compare_and_swap_accepted_delivery_baseline_in_transaction,
     compare_and_swap_execution_baseline_in_transaction,
   };
+
+  #[tokio::test]
+  async fn test_audited_idempotent_mutation_commits_once_with_schedule() {
+    let temp = tempdir().expect("create tempdir");
+    let store = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("initialize store");
+    let owner = PrincipalKey::new("user", "test", "tenant", "owner").expect("owner");
+    let mutation = ScheduledJobMutation::Create(Box::new(CreateScheduledJob {
+      job_id: "audited".to_owned(),
+      schedule_id: "schedule-audited".to_owned(),
+      definition: ScheduledJobDefinition::new(1, "{}").expect("definition"),
+      creator: owner.clone(),
+      owner: owner.clone(),
+      capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("profile"),
+      targets: vec![
+        DeliveryTargetSnapshot::new(
+          "none", "none", "none", "tenant", "none", "{}", 1, "resolver", "identity",
+        )
+        .expect("target"),
+      ],
+      schedule: ScheduleSpec::once(2),
+      now: 1,
+    }));
+    let idempotency = ScheduleMutationIdempotency {
+      principal: owner.clone(),
+      request_id: "request-1".to_owned(),
+      digest_algorithm: "sha256-v1".to_owned(),
+      request_digest: "digest".to_owned(),
+      response_json: r#"{"job_id":"audited"}"#.to_owned(),
+    };
+    let audit = ScheduleMutationAudit {
+      audit_id: "audit-1".to_owned(),
+      principal: owner,
+      operation: "create".to_owned(),
+      job_id: "audited".to_owned(),
+      request_id: "request-1".to_owned(),
+      outcome: "applied".to_owned(),
+      occurred_at: 1,
+    };
+
+    let applied = store
+      .apply_idempotent_schedule_mutation_with_audit(&mutation, &idempotency, Some(&audit))
+      .await
+      .expect("apply mutation");
+    assert!(matches!(applied, TransactionalMutationOutcome::Applied(_)));
+    let replay = store
+      .apply_idempotent_schedule_mutation_with_audit(&mutation, &idempotency, Some(&audit))
+      .await
+      .expect("replay mutation");
+    assert!(matches!(replay, TransactionalMutationOutcome::Replay(_)));
+
+    let counts: (i64, i64) = sqlx::query_as(
+      "select (select count(*) from scheduled_jobs where job_id = 'audited'), (select count(*) from schedule_mutation_audit where audit_id = 'audit-1')",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .expect("read committed rows");
+    assert_eq!(counts, (1, 1));
+  }
 
   #[tokio::test]
   async fn test_scheduler_busy_error_is_classified_as_transient() {

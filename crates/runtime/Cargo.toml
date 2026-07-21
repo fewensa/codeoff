@@ -15,6 +15,7 @@ codeoff-channel-contract = { path = "../channel/contract" }
 codeoff-config = { path = "../config" }
 codeoff-state = { path = "../state" }
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

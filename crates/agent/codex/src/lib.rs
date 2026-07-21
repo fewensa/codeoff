@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use codeoff_agent_contract::{
   AgentBackend, AgentTask, AgentTaskResult, ChannelReplyStrategy, ChannelTaskContext,
-  InvocationSource, SessionMode, ToolPolicy,
+  InvocationPrincipal, InvocationSource, SessionMode, ToolPolicy,
 };
 use codeoff_config::CodeoffConfig;
 use serde_json::{Value, json};
@@ -18,6 +18,14 @@ pub struct CodexAppServerRequest {
   pub resume_thread_id: Option<String>,
   pub prompt: String,
   pub tool_policy: ToolPolicy,
+  pub dynamic_tool_context: CodexDynamicToolContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexDynamicToolContext {
+  pub source: InvocationSource,
+  pub principal: InvocationPrincipal,
+  pub channel: Option<ChannelTaskContext>,
 }
 
 const DEFAULT_MAX_PROMPT_BYTES: usize = 64 * 1024;
@@ -101,9 +109,14 @@ pub trait JsonlTransport {
 }
 
 pub trait CodexDynamicToolHandler {
-  fn tool_specs(&self) -> Vec<Value>;
+  fn tool_specs(&self, context: &CodexDynamicToolContext) -> Vec<Value>;
 
-  fn handle_tool_call(&self, tool: &str, arguments: Value) -> Value;
+  fn handle_tool_call(
+    &self,
+    context: &CodexDynamicToolContext,
+    tool: &str,
+    arguments: Value,
+  ) -> Value;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,11 +157,16 @@ impl CodexTurnEventObserver for NoopCodexTurnEventObserver {
 pub struct NoopCodexDynamicToolHandler;
 
 impl CodexDynamicToolHandler for NoopCodexDynamicToolHandler {
-  fn tool_specs(&self) -> Vec<Value> {
+  fn tool_specs(&self, _context: &CodexDynamicToolContext) -> Vec<Value> {
     Vec::new()
   }
 
-  fn handle_tool_call(&self, tool: &str, _arguments: Value) -> Value {
+  fn handle_tool_call(
+    &self,
+    _context: &CodexDynamicToolContext,
+    tool: &str,
+    _arguments: Value,
+  ) -> Value {
     dynamic_tool_failure(format!("unsupported dynamic tool: {tool}"))
   }
 }
@@ -407,8 +425,10 @@ where
   H: CodexDynamicToolHandler,
   O: CodexTurnEventObserver,
 {
-  let (dynamic_tools, allowed_dynamic_tools) =
-    resolve_dynamic_tools(dynamic_tool_handler.tool_specs(), &request.tool_policy)?;
+  let (dynamic_tools, allowed_dynamic_tools) = resolve_dynamic_tools(
+    dynamic_tool_handler.tool_specs(&request.dynamic_tool_context),
+    &request.tool_policy,
+  )?;
   let mut transport = (transport_factory)()?;
   let mut initialize_params = json!({
     "clientInfo": {
@@ -490,6 +510,7 @@ where
     turn_id,
     dynamic_tool_handler,
     &allowed_dynamic_tools,
+    &request.dynamic_tool_context,
     event_observer,
   )
   .map(|result| result.with_codex_thread_id(thread_id))
@@ -593,6 +614,7 @@ fn wait_for_terminal_turn<T, H, O>(
   turn_id: &str,
   dynamic_tool_handler: &H,
   allowed_dynamic_tools: &HashSet<String>,
+  dynamic_tool_context: &CodexDynamicToolContext,
   event_observer: &O,
 ) -> Result<AgentTaskResult, String>
 where
@@ -619,6 +641,7 @@ where
           turn_id,
           dynamic_tool_handler,
           allowed_dynamic_tools,
+          dynamic_tool_context,
         )?;
       }
       Some(method) if is_unsupported_interaction_request(method) => {
@@ -736,6 +759,7 @@ fn respond_to_tool_call<T, H>(
   turn_id: &str,
   dynamic_tool_handler: &H,
   allowed_dynamic_tools: &HashSet<String>,
+  dynamic_tool_context: &CodexDynamicToolContext,
 ) -> Result<(), String>
 where
   T: JsonlTransport,
@@ -755,7 +779,7 @@ where
     } else if !allowed_dynamic_tools.contains(tool) {
       dynamic_tool_failure(format!("dynamic tool denied by task policy: {tool}"))
     } else {
-      dynamic_tool_handler.handle_tool_call(tool, params["arguments"].clone())
+      dynamic_tool_handler.handle_tool_call(dynamic_tool_context, tool, params["arguments"].clone())
     }
   } else {
     dynamic_tool_failure("tool call thread or turn did not match active turn")
@@ -907,6 +931,11 @@ impl<C: CodexAppServerClient> AgentBackend for CodexAppServerBackend<C> {
       resume_thread_id,
       prompt,
       tool_policy: task.tool_policy,
+      dynamic_tool_context: CodexDynamicToolContext {
+        source: task.source,
+        principal: task.principal,
+        channel: task.channel,
+      },
     })
   }
 }
@@ -1077,6 +1106,20 @@ mod tests {
   };
   use std::cell::RefCell;
   use std::rc::Rc;
+
+  fn test_dynamic_tool_context() -> CodexDynamicToolContext {
+    CodexDynamicToolContext {
+      source: InvocationSource::ChannelEvent {
+        provider: "slack".to_owned(),
+        workspace_id: "W1".to_owned(),
+        event_id: "E1".to_owned(),
+        dedupe_key: "d1".to_owned(),
+        source_reference: None,
+      },
+      principal: InvocationPrincipal::channel_actor("slack", "W1", "U1"),
+      channel: None,
+    }
+  }
 
   #[derive(Debug, Clone)]
   struct FakeJsonlTransport {
@@ -1484,6 +1527,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Source references:\n- channel_id: C1\n- event_id: E1\n- dedupe_key: d1".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("accepted turn");
 
@@ -1538,6 +1582,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::NamedSet(vec!["channel_reply_to_event".to_owned()]),
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1570,6 +1615,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Run".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1610,6 +1656,7 @@ mod tests {
           resume_thread_id: None,
           prompt: "Run".to_owned(),
           tool_policy: policy,
+          dynamic_tool_context: test_dynamic_tool_context(),
         })
         .expect_err("invalid policy");
       assert_eq!(error, expected);
@@ -1643,6 +1690,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::NamedSet(vec!["channel_reply_to_event".to_owned()]),
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1652,6 +1700,10 @@ mod tests {
         "channel_reply_to_event".to_owned(),
         json!({"text": "hello"})
       )]
+    );
+    assert_eq!(
+      handler.contexts.borrow().as_slice(),
+      &[test_dynamic_tool_context()]
     );
     let writes = transport.writes();
     let response = writes
@@ -1681,6 +1733,7 @@ mod tests {
         resume_thread_id: Some("thread-existing".to_owned()),
         prompt: "Continue".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1721,6 +1774,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1756,6 +1810,7 @@ mod tests {
         resume_thread_id: Some("thread-existing".to_owned()),
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1795,6 +1850,7 @@ mod tests {
         resume_thread_id: Some("thread-archived".to_owned()),
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1839,6 +1895,7 @@ mod tests {
         resume_thread_id: Some("thread-missing-rollout".to_owned()),
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1882,6 +1939,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn after server notification");
 
@@ -1909,6 +1967,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1943,6 +2002,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -2002,6 +2062,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -2059,6 +2120,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -2083,6 +2145,7 @@ mod tests {
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
         tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect_err("turn/start error");
 
@@ -2126,11 +2189,16 @@ mod tests {
   }
 
   impl CodexDynamicToolHandler for StaticDynamicToolHandler {
-    fn tool_specs(&self) -> Vec<Value> {
+    fn tool_specs(&self, _context: &CodexDynamicToolContext) -> Vec<Value> {
       self.specs.clone()
     }
 
-    fn handle_tool_call(&self, _tool: &str, _arguments: Value) -> Value {
+    fn handle_tool_call(
+      &self,
+      _context: &CodexDynamicToolContext,
+      _tool: &str,
+      _arguments: Value,
+    ) -> Value {
       json!({
         "success": false,
         "contentItems": [
@@ -2147,6 +2215,7 @@ mod tests {
   struct RecordingDynamicToolHandler {
     result: Value,
     calls: Rc<RefCell<Vec<(String, Value)>>>,
+    contexts: Rc<RefCell<Vec<CodexDynamicToolContext>>>,
   }
 
   impl RecordingDynamicToolHandler {
@@ -2154,12 +2223,13 @@ mod tests {
       Self {
         result,
         calls: Rc::new(RefCell::new(Vec::new())),
+        contexts: Rc::new(RefCell::new(Vec::new())),
       }
     }
   }
 
   impl CodexDynamicToolHandler for RecordingDynamicToolHandler {
-    fn tool_specs(&self) -> Vec<Value> {
+    fn tool_specs(&self, _context: &CodexDynamicToolContext) -> Vec<Value> {
       ["channel_reply_to_event", "old_tool"]
         .into_iter()
         .map(|name| {
@@ -2172,7 +2242,13 @@ mod tests {
         .collect()
     }
 
-    fn handle_tool_call(&self, tool: &str, arguments: Value) -> Value {
+    fn handle_tool_call(
+      &self,
+      context: &CodexDynamicToolContext,
+      tool: &str,
+      arguments: Value,
+    ) -> Value {
+      self.contexts.borrow_mut().push(context.clone());
       self.calls.borrow_mut().push((tool.to_owned(), arguments));
       self.result.clone()
     }

@@ -10,11 +10,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use clap::Parser;
 use codeoff_agent_codex::{
-  CodexAppServerBackend, CodexDynamicToolHandler, CodexTurnEvent, CodexTurnEventObserver,
-  StdioCodexAppServerClient, build_codex_app_server_backend,
+  CodexAppServerBackend, CodexDynamicToolContext, CodexDynamicToolHandler, CodexTurnEvent,
+  CodexTurnEventObserver, StdioCodexAppServerClient, build_codex_app_server_backend,
 };
 use codeoff_agent_contract::{
   AgentBackend, AgentTask, AgentTaskResult, ConversationKind, FeedbackTarget,
+  InvocationPrincipalRef, InvocationSource,
 };
 use codeoff_channel_contract::{
   ChannelContextPage, ChannelContextRequest, ChannelEvent, ChannelMessageReceipt,
@@ -38,6 +39,8 @@ use codeoff_runtime::{
     ChannelResourceProvider,
   },
   dispatch_next_channel_event_with_processing_streams_context_and_locks,
+  schedule_service::ScheduleInvocation,
+  schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler},
 };
 use codeoff_state::{RetentionPolicy, StateError, StateStore};
 
@@ -1893,6 +1896,7 @@ fn build_serve_codex_app_server_backend(
         codex.command.clone(),
         codex.ephemeral_threads,
         ServeCodexDynamicToolHandler {
+          schedule: ScheduleDynamicToolHandler::new(state.clone()),
           inner: build_serve_channel_dynamic_tool_handler(config, state),
           runtime: tokio::runtime::Handle::current(),
           assistant_status,
@@ -1937,17 +1941,27 @@ fn build_serve_channel_dynamic_tool_handler(
 #[derive(Clone)]
 struct ServeCodexDynamicToolHandler {
   inner: ChannelDynamicToolHandler,
+  schedule: ScheduleDynamicToolHandler,
   runtime: tokio::runtime::Handle,
   assistant_status: AssistantStatusController,
   slack_streams: SlackCodexStreamController,
 }
 
 impl CodexDynamicToolHandler for ServeCodexDynamicToolHandler {
-  fn tool_specs(&self) -> Vec<serde_json::Value> {
-    self.inner.tool_specs()
+  fn tool_specs(&self, context: &CodexDynamicToolContext) -> Vec<serde_json::Value> {
+    let mut specs = self.inner.tool_specs();
+    if schedule_invocation(context).is_some() {
+      specs.extend(self.schedule.tool_specs());
+    }
+    specs
   }
 
-  fn handle_tool_call(&self, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+  fn handle_tool_call(
+    &self,
+    context: &CodexDynamicToolContext,
+    tool: &str,
+    arguments: serde_json::Value,
+  ) -> serde_json::Value {
     self.assistant_status.update_for_tool(tool);
     self.slack_streams.update_for_tool(tool);
     if let Some((request_dedupe_key, text)) =
@@ -1957,11 +1971,52 @@ impl CodexDynamicToolHandler for ServeCodexDynamicToolHandler {
       return direct_message_reply_to_event_override_success(request_dedupe_key);
     }
     tokio::task::block_in_place(|| {
-      self
-        .runtime
-        .block_on(self.inner.handle_tool_call_async(tool, arguments))
+      if SCHEDULE_DYNAMIC_TOOL_NAMES.contains(&tool) {
+        let Some(invocation) = schedule_invocation(context) else {
+          return serde_json::json!({
+            "success": false,
+            "contentItems": [{"type": "inputText", "text": "schedule operation requires an authenticated channel actor"}],
+          });
+        };
+        self.runtime.block_on(
+          self
+            .schedule
+            .handle_tool_call_async(&invocation, tool, arguments),
+        )
+      } else {
+        self
+          .runtime
+          .block_on(self.inner.handle_tool_call_async(tool, arguments))
+      }
     })
   }
+}
+
+fn schedule_invocation(context: &CodexDynamicToolContext) -> Option<ScheduleInvocation> {
+  let InvocationPrincipalRef::ChannelActor {
+    provider,
+    workspace_id,
+    ..
+  } = context.principal.as_ref()
+  else {
+    return None;
+  };
+  let InvocationSource::ChannelEvent {
+    provider: source_provider,
+    workspace_id: source_workspace,
+    ..
+  } = &context.source
+  else {
+    return None;
+  };
+  if provider != source_provider || workspace_id != source_workspace {
+    return None;
+  }
+  Some(ScheduleInvocation {
+    source: context.source.clone(),
+    principal: context.principal.clone(),
+    channel: context.channel.clone(),
+  })
 }
 
 fn direct_message_reply_to_event_override<'a>(

@@ -77,6 +77,18 @@ enum InvocationPrincipalIdentity {
   },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvocationPrincipalRef<'a> {
+  ChannelActor {
+    provider: &'a str,
+    workspace_id: &'a str,
+    actor_id: &'a str,
+  },
+  Service {
+    service: &'a str,
+  },
+}
+
 impl InvocationPrincipal {
   #[must_use]
   pub fn channel_actor(
@@ -99,6 +111,25 @@ impl InvocationPrincipal {
       identity: InvocationPrincipalIdentity::Service {
         service: service.into(),
       },
+    }
+  }
+
+  /// Returns a read-only view of the identity established by the trusted ingress adapter.
+  #[must_use]
+  pub fn as_ref(&self) -> InvocationPrincipalRef<'_> {
+    match &self.identity {
+      InvocationPrincipalIdentity::ChannelActor {
+        provider,
+        workspace_id,
+        actor_id,
+      } => InvocationPrincipalRef::ChannelActor {
+        provider,
+        workspace_id,
+        actor_id,
+      },
+      InvocationPrincipalIdentity::Service { service } => {
+        InvocationPrincipalRef::Service { service }
+      }
     }
   }
 }

@@ -10,6 +10,8 @@
 )]
 
 pub mod channel_tools;
+pub mod schedule_service;
+pub mod schedule_tools;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -33,6 +35,7 @@ use crate::channel_tools::{
   CHANNEL_DYNAMIC_TOOL_NAMES, ChannelContextProvider, ChannelContextProviderError,
   ChannelToolError, SlackContextBootstrapRequest, bootstrap_slack_context,
 };
+use crate::schedule_tools::SCHEDULE_DYNAMIC_TOOL_NAMES;
 
 const CHANNEL_CONVERSATION_SUMMARY_LIMIT: usize = 2_000;
 
@@ -502,6 +505,13 @@ fn build_slack_agent_task(
     tool_policy: ToolPolicy::NamedSet(
       CHANNEL_DYNAMIC_TOOL_NAMES
         .iter()
+        .chain(
+          source
+            .user_id
+            .as_ref()
+            .into_iter()
+            .flat_map(|_| SCHEDULE_DYNAMIC_TOOL_NAMES.iter()),
+        )
         .map(|name| (*name).to_owned())
         .collect(),
     ),

@@ -289,7 +289,9 @@ version = "0.1.0"
 dependencies = [
  "codeoff-agent-contract",
  "codeoff-config",
+ "nix",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -330,6 +332,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
+ "chrono",
  "clap",
  "codeoff-agent-codex",
  "codeoff-agent-contract",
@@ -340,9 +343,11 @@ dependencies = [
  "codeoff-runtime",
  "codeoff-state",
  "predicates",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -1348,6 +1353,18 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]

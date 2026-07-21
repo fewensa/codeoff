@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 async-trait = "0.1"
 clap.workspace = true
+chrono.workspace = true
 codeoff-config = { path = "../config" }
 codeoff-agent-contract = { path = "../agent/contract" }
 codeoff-agent-codex = { path = "../agent/codex" }
@@ -20,8 +21,10 @@ codeoff-channel-slack = { path = "../channel/slack" }
 codeoff-mcp = { path = "../mcp" }
 codeoff-runtime = { path = "../runtime" }
 codeoff-state = { version = "0.1.0", path = "../state" }
+serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+toml.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

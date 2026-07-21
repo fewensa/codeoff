@@ -119,14 +119,7 @@ impl ScheduleDynamicToolHandler {
     tool: &str,
     arguments: Value,
   ) -> Value {
-    let request_id = arguments
-      .get("request_id")
-      .and_then(Value::as_str)
-      .map(ToOwned::to_owned);
-    let job_id = arguments
-      .get("job_id")
-      .and_then(Value::as_str)
-      .map(ToOwned::to_owned);
+    let (request_id, job_id) = audit_hints(&arguments);
     let result = match tool {
       "schedule_create" => self.create(invocation, arguments).await,
       "schedule_get" => self.get(invocation, arguments).await,
@@ -157,6 +150,27 @@ impl ScheduleDynamicToolHandler {
       }
       Err(ScheduleToolCallError::Service(error)) => failure(error.structured_json()),
     }
+  }
+
+  pub async fn reject_unauthorized_tool_call_async(
+    &self,
+    invocation: &ScheduleInvocation,
+    tool: &str,
+    arguments: &Value,
+  ) -> Value {
+    let (request_id, job_id) = audit_hints(arguments);
+    let error = self
+      .service
+      .reject_invalid_attempt(
+        invocation,
+        schedule_operation(tool),
+        request_id.as_deref(),
+        job_id.as_deref(),
+        ScheduleServiceError::Unauthorized,
+        self.now(),
+      )
+      .await;
+    failure(error.structured_json())
   }
 
   async fn create(
@@ -326,6 +340,17 @@ fn schedule_operation(tool: &str) -> &'static str {
     "schedule_delete" => "delete",
     _ => "list",
   }
+}
+
+fn audit_hints(arguments: &Value) -> (Option<String>, Option<String>) {
+  let bounded_hint = |field| {
+    arguments
+      .get(field)
+      .and_then(Value::as_str)
+      .filter(|value| !value.is_empty() && value.len() <= 255)
+      .map(ToOwned::to_owned)
+  };
+  (bounded_hint("request_id"), bounded_hint("job_id"))
 }
 
 fn create_schema(targets: &[&str], capabilities: &[&str]) -> Value {

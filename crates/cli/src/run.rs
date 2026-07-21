@@ -2092,10 +2092,16 @@ impl CodexDynamicToolHandler for ServeCodexDynamicToolHandler {
     tokio::task::block_in_place(|| {
       if SCHEDULE_DYNAMIC_TOOL_NAMES.contains(&tool) {
         let Some(invocation) = schedule_invocation(context) else {
-          return serde_json::json!({
-            "success": false,
-            "contentItems": [{"type": "inputText", "text": "schedule operation requires an authenticated channel actor"}],
-          });
+          let rejected = ScheduleInvocation {
+            source: context.source.clone(),
+            principal: context.principal.clone(),
+            channel: context.channel.clone(),
+          };
+          return self.runtime.block_on(
+            self
+              .schedule
+              .reject_unauthorized_tool_call_async(&rejected, tool, &arguments),
+          );
         };
         self.runtime.block_on(
           self
@@ -2701,6 +2707,81 @@ mod tests {
     assert!(should_spawn_background_dispatch_loop(None, true));
     assert!(!should_spawn_background_dispatch_loop(None, false));
     assert!(!should_spawn_background_dispatch_loop(Some(1), true));
+  }
+
+  #[test]
+  fn schedule_dynamic_tool_ingress_audits_invalid_context_with_versioned_denial() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .worker_threads(1)
+      .enable_all()
+      .build()
+      .expect("runtime");
+    runtime.block_on(async {
+      let temp = tempfile::tempdir().expect("tempdir");
+      let state = StateStore::initialize(&temp.path().join("state"), None)
+        .await
+        .expect("state");
+      let slack_streams = SlackCodexStreamController::without_client_for_tests();
+      let handler = ServeCodexDynamicToolHandler {
+        inner: ChannelDynamicToolHandler::new(state.clone()),
+        schedule: ScheduleDynamicToolHandler::new_with_now(state.clone(), 100),
+        runtime: tokio::runtime::Handle::current(),
+        assistant_status: slack_streams.assistant_status.clone(),
+        slack_streams,
+      };
+      let context = CodexDynamicToolContext {
+        source: InvocationSource::ScheduledRun {
+          job_id: "source-job".to_owned(),
+          run_id: "source-run".to_owned(),
+          scheduled_for: "100".to_owned(),
+        },
+        principal: codeoff_agent_contract::InvocationPrincipal::service("scheduler"),
+        channel: None,
+      };
+
+      for (tool, operation) in [
+        ("schedule_create", "create"),
+        ("schedule_get", "get"),
+        ("schedule_list", "list"),
+        ("schedule_update", "update"),
+        ("schedule_pause", "pause"),
+        ("schedule_resume", "resume"),
+        ("schedule_delete", "delete"),
+      ] {
+        let request_id = format!("invalid-ingress-{operation}");
+        let response = handler.handle_tool_call(
+          &context,
+          tool,
+          serde_json::json!({"request_id": request_id}),
+        );
+        assert_eq!(response["success"], false, "{tool}: {response}");
+        let envelope: serde_json::Value = serde_json::from_str(
+          response["contentItems"][0]["text"]
+            .as_str()
+            .expect("response text"),
+        )
+        .expect("versioned envelope");
+        assert_eq!(envelope["schema_version"], 1, "{tool}");
+        assert_eq!(envelope["ok"], false, "{tool}");
+        assert_eq!(envelope["error"]["schema_version"], 1, "{tool}");
+        assert_eq!(envelope["error"]["code"], "unauthorized", "{tool}");
+        assert_eq!(envelope["error"]["retryable"], false, "{tool}");
+
+        let audit = state
+          .list_schedule_audit_summaries(&request_id)
+          .await
+          .expect("audit");
+        assert_eq!(audit.len(), 1, "{tool}");
+        assert_eq!(audit[0].operation, operation, "{tool}");
+        assert_eq!(audit[0].outcome, "denied", "{tool}");
+        assert_eq!(audit[0].decision, "deny", "{tool}");
+        assert_eq!(
+          audit[0].error_code.as_deref(),
+          Some("unauthorized"),
+          "{tool}"
+        );
+      }
+    });
   }
 
   #[test]

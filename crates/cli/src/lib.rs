@@ -9,6 +9,7 @@
 )]
 
 mod command;
+mod observability;
 mod run;
 mod scheduler;
 

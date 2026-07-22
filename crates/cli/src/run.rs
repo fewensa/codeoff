@@ -56,7 +56,6 @@ use codeoff_runtime::{
     GlobalTurnBudget, ScheduledWorkerConfig, ScheduledWorkerHandle, ScheduledWorkerShutdown,
     spawn_scheduled_worker,
   },
-  scheduler_observability::NoopSchedulerTelemetry,
 };
 use codeoff_state::{RetentionPolicy, StateError, StateStore};
 use tokio::sync::OnceCell;
@@ -64,6 +63,10 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::command::{Cli, Command, ConfigCommand, SchedulerCommand, WorkerCommand};
+use crate::observability::{
+  OperationalHttpServer, PrometheusSchedulerTelemetry, SNAPSHOT_INTERVAL, init_scheduler_tracing,
+  refresh_scheduler_snapshot,
+};
 use crate::scheduler::{
   SchedulerCommandError, SchedulerOperatorConfig, UnavailableSchedulerAuthorityVerifier,
   execute_scheduler_command_with_policy_and_verifier, render_scheduler_human,
@@ -158,6 +161,7 @@ fn run_serve(
     return Ok(());
   }
 
+  init_scheduler_tracing();
   let mcp_server = runtime.block_on(maybe_build_mcp_tcp_server(&config, state.clone()))?;
   let mcp_server_started = mcp_server.is_some();
   let status = ServeStatus::from_config(&config, check, mcp_server_started);
@@ -532,14 +536,8 @@ where
 {
   let tick_limit = serve_tick_limit();
   let turn_budget = GlobalTurnBudget::new(config.agent.codex_app_server.max_parallel_turns);
-  let scheduled_delivery = build_scheduled_delivery_provider(&config)?;
-  let mut lifecycle = ServeLifecycle::new(
-    state.clone(),
-    turn_budget.clone(),
-    &config.scheduler,
-    scheduled_delivery,
-    mcp_server,
-  );
+  let mut lifecycle =
+    build_serve_lifecycle(&config, state.clone(), turn_budget.clone(), mcp_server).await?;
   if tick_limit.is_none() {
     maybe_spawn_slack_intake_loop(&config, state.clone(), &mut lifecycle.background_tasks);
     maybe_spawn_retention_cleanup_loop(&config, state.clone(), &mut lifecycle.background_tasks);
@@ -632,6 +630,29 @@ where
   lifecycle.finish(result).await
 }
 
+async fn build_serve_lifecycle(
+  config: &CodeoffConfig,
+  state: StateStore,
+  turn_budget: GlobalTurnBudget,
+  mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
+) -> Result<ServeLifecycle, Box<dyn Error>> {
+  let scheduled_delivery = build_scheduled_delivery_provider(config)?;
+  let telemetry =
+    PrometheusSchedulerTelemetry::new(&config.scheduler, scheduled_delivery.is_some());
+  refresh_scheduler_snapshot(&state, &telemetry).await;
+  let operational_server =
+    OperationalHttpServer::bind(&config.server.bind, Arc::clone(&telemetry), state.clone()).await?;
+  Ok(ServeLifecycle::new(
+    state,
+    turn_budget,
+    &config.scheduler,
+    scheduled_delivery,
+    telemetry,
+    operational_server,
+    mcp_server,
+  ))
+}
+
 async fn run_background_serve_loops<F>(
   config: &CodeoffConfig,
   state: StateStore,
@@ -681,6 +702,8 @@ impl ServeLifecycle {
     turn_budget: GlobalTurnBudget,
     scheduler: &SchedulerRuntimeConfig,
     scheduled_delivery: Option<Arc<dyn DeliveryProvider>>,
+    telemetry: Arc<PrometheusSchedulerTelemetry>,
+    operational_server: OperationalHttpServer,
     mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
   ) -> Self {
     let mut lifecycle = Self {
@@ -688,17 +711,19 @@ impl ServeLifecycle {
         state.clone(),
         turn_budget,
         scheduled_worker_config(scheduler),
-        Arc::new(NoopSchedulerTelemetry),
+        telemetry.clone(),
       ),
       background_tasks: ServeTaskGroup::new(),
     };
     if scheduler.enabled {
       if let Some(provider) = scheduled_delivery {
-        lifecycle.spawn_scheduled_delivery_worker(state, provider);
+        lifecycle.spawn_scheduled_delivery_worker(state.clone(), provider, telemetry.clone());
       } else {
-        lifecycle.spawn_scheduled_delivery_preparation_worker(state);
+        lifecycle.spawn_scheduled_delivery_preparation_worker(state.clone(), telemetry.clone());
       }
     }
+    lifecycle.spawn_scheduler_snapshot_refresh(state, telemetry);
+    lifecycle.spawn_operational_http_server(operational_server);
     if let Some(server) = mcp_server {
       lifecycle.spawn_mcp_server(server);
     }
@@ -709,37 +734,63 @@ impl ServeLifecycle {
     &mut self,
     state: StateStore,
     provider: Arc<dyn DeliveryProvider>,
+    telemetry: Arc<PrometheusSchedulerTelemetry>,
   ) {
     let shutdown = self.background_tasks.subscribe();
     let lease_owner = format!("codeoff-delivery-{}", std::process::id());
     self
       .background_tasks
       .spawn("scheduled delivery", async move {
-        run_scheduled_delivery_worker(
-          state,
-          provider,
-          lease_owner,
-          shutdown,
-          Arc::new(NoopSchedulerTelemetry),
-        )
-        .await
-        .map_err(|error| Box::new(error) as ServeTaskError)?;
+        run_scheduled_delivery_worker(state, provider, lease_owner, shutdown, telemetry)
+          .await
+          .map_err(|error| Box::new(error) as ServeTaskError)?;
         Ok(ServeTaskExit::Cancelled)
       });
   }
 
-  fn spawn_scheduled_delivery_preparation_worker(&mut self, state: StateStore) {
+  fn spawn_scheduled_delivery_preparation_worker(
+    &mut self,
+    state: StateStore,
+    telemetry: Arc<PrometheusSchedulerTelemetry>,
+  ) {
     let shutdown = self.background_tasks.subscribe();
     self
       .background_tasks
       .spawn("scheduled delivery preparation", async move {
-        run_scheduled_delivery_preparation_worker(
-          state,
-          shutdown,
-          Arc::new(NoopSchedulerTelemetry),
-        )
-        .await
-        .map_err(|error| Box::new(error) as ServeTaskError)?;
+        run_scheduled_delivery_preparation_worker(state, shutdown, telemetry)
+          .await
+          .map_err(|error| Box::new(error) as ServeTaskError)?;
+        Ok(ServeTaskExit::Cancelled)
+      });
+  }
+
+  fn spawn_scheduler_snapshot_refresh(
+    &mut self,
+    state: StateStore,
+    telemetry: Arc<PrometheusSchedulerTelemetry>,
+  ) {
+    let shutdown = self.background_tasks.subscribe();
+    self
+      .background_tasks
+      .spawn("scheduler snapshot refresh", async move {
+        loop {
+          if sleep_until_serve_shutdown(SNAPSHOT_INTERVAL, shutdown.clone()).await {
+            return Ok(ServeTaskExit::Cancelled);
+          }
+          refresh_scheduler_snapshot(&state, &telemetry).await;
+        }
+      });
+  }
+
+  fn spawn_operational_http_server(&mut self, server: OperationalHttpServer) {
+    let shutdown = self.background_tasks.subscribe();
+    self
+      .background_tasks
+      .spawn("operational HTTP server", async move {
+        server
+          .run_until(shutdown)
+          .await
+          .map_err(|error| Box::new(error) as ServeTaskError)?;
         Ok(ServeTaskExit::Cancelled)
       });
   }
@@ -3319,6 +3370,7 @@ mod tests {
       .await
       .expect("state");
     let mut config = CodeoffConfig::default();
+    config.server.bind = "127.0.0.1:0".to_owned();
     config.scheduler.run_claims_enabled = false;
     config.data_retention.enabled = false;
 
@@ -3403,6 +3455,7 @@ mod tests {
     );
     let observer = state.clone();
     let mut config = CodeoffConfig::default();
+    config.server.bind = "127.0.0.1:0".to_owned();
     config.scheduler.enabled = true;
     config.scheduler.run_claims_enabled = false;
     config.data_retention.enabled = false;
@@ -3445,6 +3498,7 @@ mod tests {
     .expect("bind MCP server");
     let address = server.local_addr().expect("MCP address");
     let mut config = CodeoffConfig::default();
+    config.server.bind = "127.0.0.1:0".to_owned();
     config.scheduler.run_claims_enabled = false;
     config.data_retention.enabled = false;
     let (request_shutdown, shutdown_requested) = tokio::sync::oneshot::channel();

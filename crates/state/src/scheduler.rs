@@ -9,9 +9,16 @@ use thiserror::Error;
 
 use crate::StateError;
 
+mod delivery;
 mod store;
 mod timezone;
 
+pub use delivery::{
+  AcceptedDeliveryBaseline, AcceptedDeliveryBaselineIdentity, ClaimedScheduledDelivery,
+  DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION, DeliveryPayloadSnapshot,
+  PreparedScheduledDelivery, ScheduledDeliveryBinding, ScheduledDeliveryFailure,
+  ScheduledDeliveryState, SkippedNoneBaselinePolicy,
+};
 use timezone::BundledTimeZone;
 
 type ScheduleStorageParts = (
@@ -1040,54 +1047,6 @@ impl FromStr for ScheduledRunState {
   }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScheduledDeliveryState {
-  Intent,
-  Pending,
-  Leased,
-  Sending,
-  Delivered,
-  Failed,
-  DeliveryUnknown,
-  Skipped,
-}
-
-impl ScheduledDeliveryState {
-  #[must_use]
-  pub const fn as_str(self) -> &'static str {
-    match self {
-      Self::Intent => "intent",
-      Self::Pending => "pending",
-      Self::Leased => "leased",
-      Self::Sending => "sending",
-      Self::Delivered => "delivered",
-      Self::Failed => "failed",
-      Self::DeliveryUnknown => "delivery_unknown",
-      Self::Skipped => "skipped",
-    }
-  }
-}
-
-impl FromStr for ScheduledDeliveryState {
-  type Err = StateError;
-
-  fn from_str(value: &str) -> Result<Self, Self::Err> {
-    match value {
-      "intent" => Ok(Self::Intent),
-      "pending" => Ok(Self::Pending),
-      "leased" => Ok(Self::Leased),
-      "sending" => Ok(Self::Sending),
-      "delivered" => Ok(Self::Delivered),
-      "failed" => Ok(Self::Failed),
-      "delivery_unknown" => Ok(Self::DeliveryUnknown),
-      "skipped" => Ok(Self::Skipped),
-      _ => Err(StateError::InvalidSchedulerState {
-        reason: format!("invalid delivery state {value}"),
-      }),
-    }
-  }
-}
-
 impl ScheduledJobStatus {
   #[must_use]
   pub const fn as_str(self) -> &'static str {
@@ -1145,31 +1104,6 @@ pub struct UpdateExecutionBaseline {
   pub previous_success_context: String,
   pub source_run_id: String,
   pub completed_at: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct UpdateAcceptedDeliveryBaseline {
-  pub job_id: String,
-  pub target_identity_digest: String,
-  pub delivery_policy_version: i64,
-  pub render_version: i64,
-  pub hash_algorithm: String,
-  pub accepted_payload_digest: String,
-  pub source_delivery_id: String,
-  pub source_run_id: String,
-  pub source_result_hash: String,
-  pub accepted_at: i64,
-  pub expected_version: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcceptedDeliveryBaseline {
-  pub accepted_payload_digest: String,
-  pub source_delivery_id: String,
-  pub source_run_id: String,
-  pub source_result_hash: String,
-  pub accepted_at: i64,
-  pub baseline_version: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

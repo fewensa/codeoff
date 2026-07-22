@@ -2,19 +2,22 @@ use std::fmt::Write as _;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, Transaction};
 
 use super::{
-  AcceptedDeliveryBaseline, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
-  ClaimedScheduledRun, CreateScheduledJob, DEFAULT_OCCURRENCE_STEPS, DeliveryTargetSnapshot,
-  ExpiredRunReclaimOutcome, IdempotencyDecision, LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES,
-  MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES, MaterializationOutcome, PreflightFailureDisposition,
-  PrincipalKey, RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit,
-  ScheduleMutationIdempotency, ScheduleSpec, ScheduledExecutionDisposition,
+  AcceptedDeliveryBaseline, AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot,
+  CapabilityProfileSnapshot, ClaimedScheduledDelivery, ClaimedScheduledRun, CreateScheduledJob,
+  DEFAULT_OCCURRENCE_STEPS, DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION,
+  DeliveryPayloadSnapshot, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome, IdempotencyDecision,
+  LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES, MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES,
+  MaterializationOutcome, PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey,
+  RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency,
+  ScheduleSpec, ScheduledDeliveryBinding, ScheduledDeliveryFailure, ScheduledExecutionDisposition,
   ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
   ScheduledJobMutation, ScheduledJobStatus, ScheduledRunExecutionOutcome,
-  ScheduledRunLateEvidenceKind, ScheduledRunResult, ScheduledRunSuccessOutcome, StateError,
-  TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
+  ScheduledRunLateEvidenceKind, ScheduledRunResult, ScheduledRunSuccessOutcome,
+  SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome, UpdateExecutionBaseline,
   UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
   positive_u32, scheduler_error, validate_text,
 };
@@ -24,6 +27,7 @@ const DELIVERY_POLICY_VERSION_V1: i64 = 1;
 const MAX_DELIVERY_INTENT_RUN_ID_BYTES: usize = 1050;
 const MAX_DELIVERY_INTENT_KEY_BYTES: usize = 70 + (MAX_DELIVERY_INTENT_RUN_ID_BYTES * 2);
 const MAX_DELIVERY_INTENT_ID_BYTES: usize = "intent:".len() + MAX_DELIVERY_INTENT_KEY_BYTES;
+const MAX_DELIVERY_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
 
 impl StateStore {
   /// Reads scheduler authority counts for cross-pool lifecycle tests.
@@ -350,32 +354,19 @@ impl StateStore {
   #[allow(clippy::too_many_arguments)]
   pub async fn get_accepted_delivery_baseline(
     &self,
-    job_id: &str,
-    target_identity_digest: &str,
-    delivery_policy_version: i64,
-    render_version: i64,
-    hash_algorithm: &str,
+    identity: &AcceptedDeliveryBaselineIdentity,
   ) -> Result<Option<AcceptedDeliveryBaseline>, StateError> {
-    for (field, value) in [
-      ("job id", job_id),
-      ("target identity digest", target_identity_digest),
-      ("delivery hash algorithm", hash_algorithm),
-    ] {
-      validate_text(field, value).map_err(invalid_value)?;
-    }
-    if delivery_policy_version <= 0 || render_version <= 0 {
-      return Err(StateError::InvalidSchedulerState {
-        reason: "delivery baseline identity versions must be positive".to_owned(),
-      });
-    }
+    identity.validate().map_err(invalid_value)?;
     let row = sqlx::query(
-      "select accepted_payload_digest, source_delivery_id, source_run_id, source_result_hash, accepted_at, baseline_version from scheduled_delivery_baselines where job_id = ?1 and target_identity_digest = ?2 and delivery_policy_version = ?3 and render_version = ?4 and hash_algorithm = ?5",
+      "select accepted_payload_digest, source_delivery_id, source_run_id, source_result_id, source_result_hash, accepted_at, baseline_version from scheduled_delivery_baselines where job_id = ?1 and target_identity_digest = ?2 and target_snapshot_digest_algorithm = ?3 and target_snapshot_digest = ?4 and delivery_policy_version = ?5 and render_version = ?6 and hash_algorithm = ?7",
     )
-    .bind(job_id)
-    .bind(target_identity_digest)
-    .bind(delivery_policy_version)
-    .bind(render_version)
-    .bind(hash_algorithm)
+    .bind(&identity.job_id)
+    .bind(&identity.target_identity_digest)
+    .bind(&identity.target_snapshot_digest_algorithm)
+    .bind(&identity.target_snapshot_digest)
+    .bind(identity.delivery_policy_version)
+    .bind(identity.render_version)
+    .bind(&identity.hash_algorithm)
     .fetch_optional(&self.pool)
     .await
     .map_err(scheduler_error)?;
@@ -387,6 +378,7 @@ impl StateStore {
             .map_err(scheduler_error)?,
           source_delivery_id: row.try_get("source_delivery_id").map_err(scheduler_error)?,
           source_run_id: row.try_get("source_run_id").map_err(scheduler_error)?,
+          source_result_id: row.try_get("source_result_id").map_err(scheduler_error)?,
           source_result_hash: row.try_get("source_result_hash").map_err(scheduler_error)?,
           accepted_at: row.try_get("accepted_at").map_err(scheduler_error)?,
           baseline_version: row.try_get("baseline_version").map_err(scheduler_error)?,
@@ -672,6 +664,370 @@ impl StateStore {
     Ok(target_json)
   }
 
+  /// Freezes the exact UTF-8 payload for an issue-06 delivery intent.
+  ///
+  /// A `none` target is completed locally as `skipped_none`; no provider client is involved.
+  /// Repeating the same preparation is idempotent, while different bytes or versions conflict
+  /// with the immutable payload authority.
+  ///
+  /// # Errors
+  /// Returns an error for invalid input, a missing intent, immutable payload conflict, baseline
+  /// generation conflict, or storage failure.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn prepare_scheduled_delivery(
+    &self,
+    delivery_id: &str,
+    content_type: &str,
+    body: &str,
+    render_version: u32,
+    now: i64,
+    skipped_none_policy: SkippedNoneBaselinePolicy,
+  ) -> Result<PreparedScheduledDelivery, StateError> {
+    validate_delivery_preparation(delivery_id, content_type, body, render_version, now)?;
+    let payload_digest = sha256_hex(body.as_bytes());
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let row = sqlx::query(
+      "select d.delivery_id, d.run_id, d.job_id, d.target_identity_digest, d.target_json, d.state, d.delivery_policy_version, d.render_version, d.payload_schema_version, d.content_type, d.hash_algorithm, d.payload_digest, d.payload_snapshot, d.payload_created_at, d.expected_baseline_version, d.result_artifact_id, d.target_snapshot_digest_algorithm, d.target_snapshot_digest, d.target_snapshot_version, d.created_at, a.result_hash from scheduled_run_deliveries d join scheduled_run_result_artifacts a on a.artifact_id = d.result_artifact_id and a.run_id = d.run_id and a.job_id = d.job_id where d.delivery_id = ?1 and d.authority_kind = 'intent_v1'",
+    )
+    .bind(delivery_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?
+    .ok_or_else(|| StateError::InvalidSchedulerState {
+      reason: "scheduled delivery intent does not exist".to_owned(),
+    })?;
+    let (skipped_none, target_snapshot_version) = delivery_target_metadata(&row)?;
+    if let Some(prepared) = existing_prepared_delivery(&row, body, content_type, render_version)? {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(prepared);
+    }
+    let state: String = row.try_get("state").map_err(scheduler_error)?;
+    if state != "pending" {
+      return Err(StateError::ScheduledDeliveryPayloadConflict);
+    }
+    let job_id: String = row.try_get("job_id").map_err(scheduler_error)?;
+    let target_identity_digest: String = row
+      .try_get("target_identity_digest")
+      .map_err(scheduler_error)?;
+    let target_snapshot_digest_algorithm: String = row
+      .try_get("target_snapshot_digest_algorithm")
+      .map_err(scheduler_error)?;
+    let target_snapshot_digest: String = row
+      .try_get("target_snapshot_digest")
+      .map_err(scheduler_error)?;
+    let delivery_policy_version: i64 = row
+      .try_get("delivery_policy_version")
+      .map_err(scheduler_error)?;
+    let expected_baseline_version: i64 = sqlx::query_scalar(
+      "select coalesce((select baseline_version from scheduled_delivery_baselines where job_id = ?1 and target_identity_digest = ?2 and target_snapshot_digest_algorithm = ?3 and target_snapshot_digest = ?4 and delivery_policy_version = ?5 and render_version = ?6 and hash_algorithm = ?7), 0)",
+    )
+    .bind(&job_id)
+    .bind(&target_identity_digest)
+    .bind(&target_snapshot_digest_algorithm)
+    .bind(&target_snapshot_digest)
+    .bind(delivery_policy_version)
+    .bind(i64::from(render_version))
+    .bind(DELIVERY_PAYLOAD_HASH_ALGORITHM)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let updated = sqlx::query(
+      "update scheduled_run_deliveries set state = case when ?1 then 'skipped_none' else 'pending' end, render_version = ?2, payload_schema_version = ?3, content_type = ?4, hash_algorithm = ?5, payload_digest = ?6, payload_snapshot = ?7, payload_created_at = ?10, expected_baseline_version = ?8, target_snapshot_version = ?9, provider_outcome = case when ?1 then 'skipped_none' end, updated_at = ?10 where delivery_id = ?11 and authority_kind = 'intent_v1' and state = 'pending' and payload_snapshot is null",
+    )
+    .bind(skipped_none)
+    .bind(i64::from(render_version))
+    .bind(i64::from(DELIVERY_PAYLOAD_SCHEMA_VERSION))
+    .bind(content_type)
+    .bind(DELIVERY_PAYLOAD_HASH_ALGORITHM)
+    .bind(&payload_digest)
+    .bind(body.as_bytes())
+    .bind(expected_baseline_version)
+    .bind(i64::from(target_snapshot_version))
+    .bind(now)
+    .bind(delivery_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if updated.rows_affected() != 1 {
+      return Err(StateError::ScheduledDeliveryPayloadConflict);
+    }
+    if skipped_none
+      && skipped_none_policy == SkippedNoneBaselinePolicy::Accept
+      && !advance_accepted_delivery_baseline_in_transaction(&mut transaction, delivery_id, now)
+        .await?
+    {
+      return Err(StateError::ScheduledDeliveryBaselineConflict);
+    }
+    let snapshot = DeliveryPayloadSnapshot::from_durable_parts(
+      delivery_id.to_owned(),
+      row.try_get("run_id").map_err(scheduler_error)?,
+      row.try_get("result_artifact_id").map_err(scheduler_error)?,
+      content_type.to_owned(),
+      body.to_owned(),
+      payload_digest,
+      target_identity_digest,
+      target_snapshot_digest,
+      target_snapshot_version,
+      positive_u32(delivery_policy_version)?,
+      render_version,
+      now,
+    )
+    .map_err(invalid_value)?;
+    transaction.commit().await.map_err(scheduler_error)?;
+    if skipped_none {
+      Ok(PreparedScheduledDelivery::SkippedNone(snapshot))
+    } else {
+      Ok(PreparedScheduledDelivery::Pending(snapshot))
+    }
+  }
+
+  /// Atomically claims the oldest prepared delivery and records an immutable attempt identity.
+  ///
+  /// # Errors
+  /// Returns an error for an invalid lease, exhausted counters, or storage failure.
+  pub async fn claim_next_scheduled_delivery(
+    &self,
+    lease_owner: &str,
+    now: i64,
+    lease_expires_at: i64,
+  ) -> Result<Option<ClaimedScheduledDelivery>, StateError> {
+    validate_text("scheduled delivery lease owner", lease_owner).map_err(invalid_value)?;
+    if now < 0 || lease_expires_at <= now {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled delivery lease must expire after claim time".to_owned(),
+      });
+    }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let row = sqlx::query(
+      "update scheduled_run_deliveries set state = 'sending', attempt = attempt + 1, fence = fence + 1, lease_owner = ?1, lease_expires_at = ?2, idempotency_key = 'delivery-v1:' || lower(hex(cast(delivery_id as blob))) || ':' || cast(attempt + 1 as text) || ':' || cast(fence + 1 as text) || ':' || payload_digest, expected_baseline_version = coalesce((select baseline_version from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm), 0), updated_at = ?3 where delivery_id = (select candidate.delivery_id from scheduled_run_deliveries candidate where candidate.state = 'pending' and candidate.authority_kind = 'intent_v1' and candidate.payload_snapshot is not null and candidate.attempt < 9223372036854775807 and candidate.fence < 9223372036854775807 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.job_id = candidate.job_id and active.target_identity_digest = candidate.target_identity_digest and active.target_snapshot_digest = candidate.target_snapshot_digest and active.delivery_policy_version = candidate.delivery_policy_version and active.render_version = candidate.render_version and active.hash_algorithm = candidate.hash_algorithm) order by candidate.created_at, candidate.delivery_id limit 1) and state = 'pending' returning delivery_id, run_id, result_artifact_id, content_type, payload_schema_version, hash_algorithm, payload_snapshot, payload_digest, payload_created_at, target_identity_digest, target_snapshot_digest, target_snapshot_version, delivery_policy_version, render_version, attempt, fence, lease_owner, idempotency_key",
+    )
+    .bind(lease_owner)
+    .bind(lease_expires_at)
+    .bind(now)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(row) = row else {
+      let exhausted: i64 = sqlx::query_scalar(
+        "select exists(select 1 from scheduled_run_deliveries where state = 'pending' and authority_kind = 'intent_v1' and payload_snapshot is not null and (attempt = 9223372036854775807 or fence = 9223372036854775807))",
+      )
+      .fetch_one(&mut *transaction)
+      .await
+      .map_err(scheduler_error)?;
+      transaction.commit().await.map_err(scheduler_error)?;
+      if exhausted != 0 {
+        return Err(StateError::ScheduledDeliveryCounterExhausted);
+      }
+      return Ok(None);
+    };
+    let binding = ScheduledDeliveryBinding::new(
+      row.try_get("delivery_id").map_err(scheduler_error)?,
+      row.try_get("attempt").map_err(scheduler_error)?,
+      row.try_get("fence").map_err(scheduler_error)?,
+      row.try_get("lease_owner").map_err(scheduler_error)?,
+      row.try_get("idempotency_key").map_err(scheduler_error)?,
+    );
+    let inserted = sqlx::query(
+      "insert into scheduled_delivery_attempts (delivery_id, attempt, fence, lease_owner, lease_expires_at, idempotency_key, state, started_at) values (?1, ?2, ?3, ?4, ?5, ?6, 'sending', ?7)",
+    )
+    .bind(binding.delivery_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .bind(lease_expires_at)
+    .bind(binding.idempotency_key())
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if inserted.rows_affected() != 1 {
+      return Err(StateError::ScheduledDeliveryLostLease);
+    }
+    let payload = delivery_payload_from_row(&row)?;
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(Some(ClaimedScheduledDelivery { binding, payload }))
+  }
+
+  /// Extends the current delivery attempt lease using strict owner/fence authority.
+  ///
+  /// # Errors
+  /// Returns `ScheduledDeliveryLostLease` for stale authority or a storage error.
+  pub async fn heartbeat_scheduled_delivery(
+    &self,
+    binding: &ScheduledDeliveryBinding,
+    now: i64,
+    lease_expires_at: i64,
+  ) -> Result<(), StateError> {
+    validate_delivery_binding(binding)?;
+    if lease_expires_at <= now {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled delivery heartbeat must extend its lease".to_owned(),
+      });
+    }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let delivery = sqlx::query(
+      "update scheduled_run_deliveries set lease_expires_at = ?1, updated_at = ?2 where delivery_id = ?3 and state = 'sending' and attempt = ?4 and fence = ?5 and lease_owner = ?6 and idempotency_key = ?7 and lease_expires_at > ?2",
+    )
+    .bind(lease_expires_at)
+    .bind(now)
+    .bind(binding.delivery_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .bind(binding.idempotency_key())
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let attempt = sqlx::query(
+      "update scheduled_delivery_attempts set lease_expires_at = ?1 where delivery_id = ?2 and attempt = ?3 and fence = ?4 and lease_owner = ?5 and idempotency_key = ?6 and state = 'sending' and lease_expires_at > ?7",
+    )
+    .bind(lease_expires_at)
+    .bind(binding.delivery_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .bind(binding.idempotency_key())
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if delivery.rows_affected() != 1 || attempt.rows_affected() != 1 {
+      return Err(StateError::ScheduledDeliveryLostLease);
+    }
+    transaction.commit().await.map_err(scheduler_error)
+  }
+
+  /// Commits confirmed provider success and advances the accepted baseline atomically.
+  ///
+  /// # Errors
+  /// Returns an error for stale ownership, invalid receipt, baseline conflict, or storage failure.
+  pub async fn complete_scheduled_delivery_delivered(
+    &self,
+    binding: &ScheduledDeliveryBinding,
+    provider_receipt: &str,
+    completed_at: i64,
+  ) -> Result<(), StateError> {
+    validate_delivery_binding(binding)?;
+    validate_text("scheduled delivery provider receipt", provider_receipt)
+      .map_err(invalid_value)?;
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    transition_delivery_terminal(
+      &mut transaction,
+      binding,
+      "delivered",
+      "confirmed_success",
+      Some(provider_receipt),
+      None,
+      None,
+      None,
+      completed_at,
+    )
+    .await?;
+    if !advance_accepted_delivery_baseline_in_transaction(
+      &mut transaction,
+      binding.delivery_id(),
+      completed_at,
+    )
+    .await?
+    {
+      return Err(StateError::ScheduledDeliveryBaselineConflict);
+    }
+    transaction.commit().await.map_err(scheduler_error)
+  }
+
+  /// Commits a classified provider failure without changing payload or accepted baseline.
+  ///
+  /// # Errors
+  /// Returns an error for stale ownership, invalid classification, or storage failure.
+  pub async fn complete_scheduled_delivery_failure(
+    &self,
+    binding: &ScheduledDeliveryBinding,
+    failure: &ScheduledDeliveryFailure,
+    completed_at: i64,
+  ) -> Result<(), StateError> {
+    validate_delivery_binding(binding)?;
+    let (state, outcome, error_kind, message, next_attempt_at) = match failure {
+      ScheduledDeliveryFailure::ConfirmedNoWriteRetryable {
+        error_kind,
+        redacted_message,
+        next_attempt_at,
+      } => {
+        if *next_attempt_at <= completed_at {
+          return Err(StateError::InvalidSchedulerState {
+            reason: "scheduled delivery retry must be deferred".to_owned(),
+          });
+        }
+        (
+          "failed_retryable",
+          "confirmed_no_write_retryable",
+          error_kind,
+          redacted_message.as_deref(),
+          Some(*next_attempt_at),
+        )
+      }
+      ScheduledDeliveryFailure::ConfirmedNoWriteTerminal {
+        error_kind,
+        redacted_message,
+      } => (
+        "failed_terminal",
+        "confirmed_no_write_terminal",
+        error_kind,
+        redacted_message.as_deref(),
+        None,
+      ),
+      ScheduledDeliveryFailure::AmbiguousPostWrite {
+        error_kind,
+        redacted_message,
+      } => (
+        "delivery_unknown",
+        "ambiguous_post_write",
+        error_kind,
+        redacted_message.as_deref(),
+        None,
+      ),
+    };
+    validate_delivery_error(error_kind, message)?;
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    transition_delivery_terminal(
+      &mut transaction,
+      binding,
+      state,
+      outcome,
+      None,
+      Some(error_kind),
+      message,
+      next_attempt_at,
+      completed_at,
+    )
+    .await?;
+    transaction.commit().await.map_err(scheduler_error)
+  }
+
+  /// Moves due confirmed-no-write failures back to pending for a new fenced claim.
+  ///
+  /// # Errors
+  /// Returns an error when the limit is invalid or storage fails.
+  pub async fn requeue_due_scheduled_deliveries(
+    &self,
+    now: i64,
+    limit: u32,
+  ) -> Result<u64, StateError> {
+    if limit == 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled delivery requeue limit must be positive".to_owned(),
+      });
+    }
+    sqlx::query(
+      "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, idempotency_key = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id in (select delivery_id from scheduled_run_deliveries where state = 'failed_retryable' and next_attempt_at <= ?1 order by next_attempt_at, delivery_id limit ?2)",
+    )
+    .bind(now)
+    .bind(i64::from(limit))
+    .execute(&self.pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(scheduler_error)
+  }
+
   /// Atomically accepts a live execution result, advances its execution baseline, and records
   /// immutable delivery intents derived from the materialized run snapshot.
   ///
@@ -814,7 +1170,7 @@ impl StateStore {
       let intent_key = delivery_intent_key(binding.run_id(), &target.identity_digest)?;
       let delivery_id = format!("intent:{intent_key}");
       let intent_insert = sqlx::query(
-        "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'intent', 0, 0, ?6, ?7, ?8, ?9, 'sha256-v1', ?10, ?11, 'intent_v1', ?12, ?12) returning target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest",
+        "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'pending', 0, 0, ?6, ?7, ?8, ?9, 'sha256-v1', ?10, ?11, 'intent_v1', ?12, ?12) returning target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest",
       )
       .bind(delivery_id)
       .bind(binding.run_id())
@@ -1427,21 +1783,6 @@ impl StateStore {
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(updated)
   }
-
-  /// Applies an accepted-delivery baseline CAS in its own transaction.
-  ///
-  /// # Errors
-  /// Returns an error for invalid bounded identity fields or a storage failure.
-  pub async fn compare_and_swap_accepted_delivery_baseline(
-    &self,
-    update: &UpdateAcceptedDeliveryBaseline,
-  ) -> Result<bool, StateError> {
-    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
-    let updated =
-      compare_and_swap_accepted_delivery_baseline_in_transaction(&mut transaction, update).await?;
-    transaction.commit().await.map_err(scheduler_error)?;
-    Ok(updated)
-  }
 }
 
 pub(crate) async fn compare_and_swap_execution_baseline_in_transaction(
@@ -1472,28 +1813,236 @@ pub(crate) async fn compare_and_swap_execution_baseline_in_transaction(
   Ok(result.rows_affected() == 1)
 }
 
-pub(crate) async fn compare_and_swap_accepted_delivery_baseline_in_transaction(
+fn validate_delivery_preparation(
+  delivery_id: &str,
+  content_type: &str,
+  body: &str,
+  render_version: u32,
+  now: i64,
+) -> Result<(), StateError> {
+  validate_text("scheduled delivery id", delivery_id).map_err(invalid_value)?;
+  validate_text("scheduled delivery content type", content_type).map_err(invalid_value)?;
+  if body.is_empty() || body.len() > MAX_SNAPSHOT_BYTES || render_version == 0 || now < 0 {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "invalid scheduled delivery payload preparation".to_owned(),
+    });
+  }
+  Ok(())
+}
+
+fn delivery_target_metadata(row: &SqliteRow) -> Result<(bool, u32), StateError> {
+  let target_json: String = row.try_get("target_json").map_err(scheduler_error)?;
+  let target: Value = serde_json::from_str(&target_json).map_err(invalid_json)?;
+  let target_kind = target.get("kind").and_then(Value::as_str).ok_or_else(|| {
+    StateError::InvalidSchedulerState {
+      reason: "scheduled delivery target has no kind".to_owned(),
+    }
+  })?;
+  let target_snapshot_version = target
+    .get("resolver_version")
+    .and_then(Value::as_i64)
+    .map(positive_u32)
+    .transpose()?
+    .ok_or_else(|| StateError::InvalidSchedulerState {
+      reason: "scheduled delivery target has no resolver version".to_owned(),
+    })?;
+  Ok((target_kind == "none", target_snapshot_version))
+}
+
+fn existing_prepared_delivery(
+  row: &SqliteRow,
+  body: &str,
+  content_type: &str,
+  render_version: u32,
+) -> Result<Option<PreparedScheduledDelivery>, StateError> {
+  let existing_payload: Option<Vec<u8>> =
+    row.try_get("payload_snapshot").map_err(scheduler_error)?;
+  if existing_payload.is_none() {
+    return Ok(None);
+  }
+  let snapshot = delivery_payload_from_row(row)?;
+  if snapshot.body() != body
+    || snapshot.content_type() != content_type
+    || snapshot.render_version() != render_version
+  {
+    return Err(StateError::ScheduledDeliveryPayloadConflict);
+  }
+  let state: String = row.try_get("state").map_err(scheduler_error)?;
+  match state.as_str() {
+    "pending" => Ok(Some(PreparedScheduledDelivery::Pending(snapshot))),
+    "skipped_none" => Ok(Some(PreparedScheduledDelivery::SkippedNone(snapshot))),
+    _ => Err(StateError::ScheduledDeliveryPayloadConflict),
+  }
+}
+
+fn delivery_payload_from_row(row: &SqliteRow) -> Result<DeliveryPayloadSnapshot, StateError> {
+  let payload: Vec<u8> = row.try_get("payload_snapshot").map_err(scheduler_error)?;
+  let body = String::from_utf8(payload).map_err(|_| StateError::InvalidSchedulerState {
+    reason: "scheduled delivery payload is not valid UTF-8".to_owned(),
+  })?;
+  let persisted_digest: String = row.try_get("payload_digest").map_err(scheduler_error)?;
+  if sha256_hex(body.as_bytes()) != persisted_digest {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery payload digest mismatch".to_owned(),
+    });
+  }
+  let schema_version = positive_u32(
+    row
+      .try_get::<i64, _>("payload_schema_version")
+      .map_err(scheduler_error)?,
+  )?;
+  if schema_version != DELIVERY_PAYLOAD_SCHEMA_VERSION {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "unsupported scheduled delivery payload schema".to_owned(),
+    });
+  }
+  let hash_algorithm: String = row.try_get("hash_algorithm").map_err(scheduler_error)?;
+  if hash_algorithm != DELIVERY_PAYLOAD_HASH_ALGORITHM {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "unsupported scheduled delivery payload hash algorithm".to_owned(),
+    });
+  }
+  DeliveryPayloadSnapshot::from_durable_parts(
+    row.try_get("delivery_id").map_err(scheduler_error)?,
+    row.try_get("run_id").map_err(scheduler_error)?,
+    row.try_get("result_artifact_id").map_err(scheduler_error)?,
+    row.try_get("content_type").map_err(scheduler_error)?,
+    body,
+    persisted_digest,
+    row
+      .try_get("target_identity_digest")
+      .map_err(scheduler_error)?,
+    row
+      .try_get("target_snapshot_digest")
+      .map_err(scheduler_error)?,
+    positive_u32(
+      row
+        .try_get::<i64, _>("target_snapshot_version")
+        .map_err(scheduler_error)?,
+    )?,
+    positive_u32(
+      row
+        .try_get::<i64, _>("delivery_policy_version")
+        .map_err(scheduler_error)?,
+    )?,
+    positive_u32(
+      row
+        .try_get::<i64, _>("render_version")
+        .map_err(scheduler_error)?,
+    )?,
+    row.try_get("payload_created_at").map_err(scheduler_error)?,
+  )
+  .map_err(invalid_value)
+}
+
+fn validate_delivery_binding(binding: &ScheduledDeliveryBinding) -> Result<(), StateError> {
+  validate_text("scheduled delivery id", binding.delivery_id()).map_err(invalid_value)?;
+  validate_text("scheduled delivery lease owner", binding.lease_owner()).map_err(invalid_value)?;
+  validate_text(
+    "scheduled delivery idempotency key",
+    binding.idempotency_key(),
+  )
+  .map_err(invalid_value)?;
+  if binding.attempt() <= 0 || binding.fence() <= 0 {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "invalid scheduled delivery binding counters".to_owned(),
+    });
+  }
+  Ok(())
+}
+
+fn validate_delivery_error(error_kind: &str, message: Option<&str>) -> Result<(), StateError> {
+  validate_text("scheduled delivery error kind", error_kind).map_err(invalid_value)?;
+  if message.is_some_and(|message| message.len() > MAX_DELIVERY_ERROR_MESSAGE_BYTES) {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery error message exceeds its storage bound".to_owned(),
+    });
+  }
+  Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn transition_delivery_terminal(
   transaction: &mut Transaction<'_, Sqlite>,
-  update: &UpdateAcceptedDeliveryBaseline,
+  binding: &ScheduledDeliveryBinding,
+  state: &str,
+  provider_outcome: &str,
+  provider_receipt: Option<&str>,
+  error_kind: Option<&str>,
+  error_message: Option<&str>,
+  next_attempt_at: Option<i64>,
+  completed_at: i64,
+) -> Result<(), StateError> {
+  if completed_at < 0 {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery completion timestamp must be nonnegative".to_owned(),
+    });
+  }
+  let delivery = sqlx::query(
+    "update scheduled_run_deliveries set state = ?1, next_attempt_at = ?2, lease_owner = null, lease_expires_at = null, provider_receipt = ?3, provider_outcome = ?4, error_kind = ?5, error_message = ?6, updated_at = ?7 where delivery_id = ?8 and state = 'sending' and attempt = ?9 and fence = ?10 and lease_owner = ?11 and idempotency_key = ?12 and lease_expires_at > ?7",
+  )
+  .bind(state)
+  .bind(next_attempt_at)
+  .bind(provider_receipt)
+  .bind(provider_outcome)
+  .bind(error_kind)
+  .bind(error_message)
+  .bind(completed_at)
+  .bind(binding.delivery_id())
+  .bind(binding.attempt())
+  .bind(binding.fence())
+  .bind(binding.lease_owner())
+  .bind(binding.idempotency_key())
+  .execute(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  let attempt = sqlx::query(
+    "update scheduled_delivery_attempts set state = ?1, provider_receipt = ?2, provider_outcome = ?3, error_kind = ?4, error_message = ?5, completed_at = ?6 where delivery_id = ?7 and attempt = ?8 and fence = ?9 and lease_owner = ?10 and idempotency_key = ?11 and state = 'sending' and lease_expires_at > ?6",
+  )
+  .bind(state)
+  .bind(provider_receipt)
+  .bind(provider_outcome)
+  .bind(error_kind)
+  .bind(error_message)
+  .bind(completed_at)
+  .bind(binding.delivery_id())
+  .bind(binding.attempt())
+  .bind(binding.fence())
+  .bind(binding.lease_owner())
+  .bind(binding.idempotency_key())
+  .execute(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  if delivery.rows_affected() != 1 || attempt.rows_affected() != 1 {
+    return Err(StateError::ScheduledDeliveryLostLease);
+  }
+  Ok(())
+}
+
+async fn advance_accepted_delivery_baseline_in_transaction(
+  transaction: &mut Transaction<'_, Sqlite>,
+  delivery_id: &str,
+  accepted_at: i64,
 ) -> Result<bool, StateError> {
-  validate_accepted_delivery_baseline(update)?;
+  let expected_version: i64 = sqlx::query_scalar(
+    "select expected_baseline_version from scheduled_run_deliveries where delivery_id = ?1 and authority_kind = 'intent_v1' and state in ('delivered', 'skipped_none') and payload_snapshot is not null",
+  )
+  .bind(delivery_id)
+  .fetch_optional(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?
+  .ok_or_else(|| StateError::InvalidSchedulerState {
+    reason: "scheduled delivery is not accepted terminal authority".to_owned(),
+  })?;
   let result = sqlx::query(
-      "insert into scheduled_delivery_baselines (job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_hash, accepted_at, baseline_version) select ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1 where ?11 = 0 on conflict(job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm) do update set accepted_payload_digest = excluded.accepted_payload_digest, source_delivery_id = excluded.source_delivery_id, source_run_id = excluded.source_run_id, source_result_hash = excluded.source_result_hash, accepted_at = excluded.accepted_at, baseline_version = scheduled_delivery_baselines.baseline_version + 1 where scheduled_delivery_baselines.baseline_version = ?11",
-    )
-    .bind(&update.job_id)
-    .bind(&update.target_identity_digest)
-    .bind(update.delivery_policy_version)
-    .bind(update.render_version)
-    .bind(&update.hash_algorithm)
-    .bind(&update.accepted_payload_digest)
-    .bind(&update.source_delivery_id)
-    .bind(&update.source_run_id)
-    .bind(&update.source_result_hash)
-    .bind(update.accepted_at)
-    .bind(update.expected_version)
-    .execute(&mut **transaction)
-    .await
-    .map_err(scheduler_error)?;
+    "insert into scheduled_delivery_baselines (job_id, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_id, source_result_hash, accepted_at, baseline_version) select delivery.job_id, delivery.target_identity_digest, delivery.target_snapshot_digest_algorithm, delivery.target_snapshot_digest, delivery.delivery_policy_version, delivery.render_version, delivery.hash_algorithm, delivery.payload_digest, delivery.delivery_id, delivery.run_id, delivery.result_artifact_id, artifact.result_hash, ?2, 1 from scheduled_run_deliveries delivery join scheduled_run_result_artifacts artifact on artifact.artifact_id = delivery.result_artifact_id and artifact.run_id = delivery.run_id and artifact.job_id = delivery.job_id where delivery.delivery_id = ?1 and delivery.authority_kind = 'intent_v1' and delivery.payload_snapshot is not null and (delivery.state = 'delivered' or (delivery.state = 'skipped_none' and json_extract(delivery.target_json, '$.kind') = 'none')) and (?3 = 0 or exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = delivery.job_id and baseline.target_identity_digest = delivery.target_identity_digest and baseline.target_snapshot_digest_algorithm = delivery.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = delivery.target_snapshot_digest and baseline.delivery_policy_version = delivery.delivery_policy_version and baseline.render_version = delivery.render_version and baseline.hash_algorithm = delivery.hash_algorithm and baseline.baseline_version = ?3)) on conflict(job_id, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, delivery_policy_version, render_version, hash_algorithm) do update set accepted_payload_digest = excluded.accepted_payload_digest, source_delivery_id = excluded.source_delivery_id, source_run_id = excluded.source_run_id, source_result_id = excluded.source_result_id, source_result_hash = excluded.source_result_hash, accepted_at = excluded.accepted_at, baseline_version = scheduled_delivery_baselines.baseline_version + 1 where scheduled_delivery_baselines.baseline_version = ?3",
+  )
+  .bind(delivery_id)
+  .bind(accepted_at)
+  .bind(expected_version)
+  .execute(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
   Ok(result.rows_affected() == 1)
 }
 
@@ -2562,37 +3111,6 @@ fn serialize_targets(targets: &[Value]) -> Result<String, StateError> {
   Ok(serialized)
 }
 
-fn validate_accepted_delivery_baseline(
-  update: &UpdateAcceptedDeliveryBaseline,
-) -> Result<(), StateError> {
-  for (field, value) in [
-    ("job id", update.job_id.as_str()),
-    (
-      "target identity digest",
-      update.target_identity_digest.as_str(),
-    ),
-    ("delivery hash algorithm", update.hash_algorithm.as_str()),
-    (
-      "accepted payload digest",
-      update.accepted_payload_digest.as_str(),
-    ),
-    ("source delivery id", update.source_delivery_id.as_str()),
-    ("source run id", update.source_run_id.as_str()),
-    ("source result hash", update.source_result_hash.as_str()),
-  ] {
-    validate_text(field, value).map_err(invalid_value)?;
-  }
-  if update.delivery_policy_version <= 0
-    || update.render_version <= 0
-    || update.expected_version < 0
-  {
-    return Err(StateError::InvalidSchedulerState {
-      reason: "invalid accepted delivery baseline versions".to_owned(),
-    });
-  }
-  Ok(())
-}
-
 fn validate_idempotency_request(
   operation: &str,
   request_id: &str,
@@ -2762,8 +3280,7 @@ mod tests {
     DeliveryTargetSnapshot, MAX_DELIVERY_INTENT_KEY_BYTES, MAX_DELIVERY_INTENT_RUN_ID_BYTES,
     MaterializationOutcome, PrincipalKey, ScheduleMutationAudit, ScheduleMutationIdempotency,
     ScheduleSpec, ScheduledJobDefinition, ScheduledJobMutation, StateError, StateStore,
-    TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
-    canonical_idempotency_scope, compare_and_swap_accepted_delivery_baseline_in_transaction,
+    TransactionalMutationOutcome, UpdateExecutionBaseline, canonical_idempotency_scope,
     compare_and_swap_execution_baseline_in_transaction, delivery_intent_key,
   };
 
@@ -3230,60 +3747,5 @@ mod tests {
     .await
     .expect("read committed state");
     assert_eq!(committed, ("succeeded".to_owned(), 1));
-
-    let accepted = UpdateAcceptedDeliveryBaseline {
-      job_id: "terminal-transaction".to_owned(),
-      target_identity_digest: "identity".to_owned(),
-      delivery_policy_version: 1,
-      render_version: 1,
-      hash_algorithm: "sha256-v1".to_owned(),
-      accepted_payload_digest: "payload".to_owned(),
-      source_delivery_id: "delivery-transaction".to_owned(),
-      source_run_id: run.run_id.clone(),
-      source_result_hash: "result".to_owned(),
-      accepted_at: 4,
-      expected_version: 0,
-    };
-    let mut transaction = store.pool.begin().await.expect("begin delivery rollback");
-    sqlx::query("insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values (?1, ?2, 'terminal-transaction', 'identity', '{}', 'delivered', 1, 1, 'sha256-v1', 'payload', 0, 4, 4)")
-      .bind(&accepted.source_delivery_id)
-      .bind(&run.run_id)
-      .execute(&mut *transaction)
-      .await
-      .expect("insert delivery");
-    assert!(
-      compare_and_swap_accepted_delivery_baseline_in_transaction(&mut transaction, &accepted)
-        .await
-        .expect("accepted CAS")
-    );
-    transaction.rollback().await.expect("rollback delivery");
-    let rolled_back: (i64, i64) = sqlx::query_as(
-      "select (select count(*) from scheduled_run_deliveries where delivery_id = 'delivery-transaction'), (select count(*) from scheduled_delivery_baselines where job_id = 'terminal-transaction')",
-    )
-    .fetch_one(&store.pool)
-    .await
-    .expect("read delivery rollback");
-    assert_eq!(rolled_back, (0, 0));
-
-    let mut transaction = store.pool.begin().await.expect("begin delivery commit");
-    sqlx::query("insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values (?1, ?2, 'terminal-transaction', 'identity', '{}', 'delivered', 1, 1, 'sha256-v1', 'payload', 0, 4, 4)")
-      .bind(&accepted.source_delivery_id)
-      .bind(&run.run_id)
-      .execute(&mut *transaction)
-      .await
-      .expect("insert delivery");
-    assert!(
-      compare_and_swap_accepted_delivery_baseline_in_transaction(&mut transaction, &accepted)
-        .await
-        .expect("accepted CAS")
-    );
-    transaction.commit().await.expect("commit delivery");
-    let committed: (i64, i64) = sqlx::query_as(
-      "select (select count(*) from scheduled_run_deliveries where delivery_id = 'delivery-transaction'), (select baseline_version from scheduled_delivery_baselines where job_id = 'terminal-transaction')",
-    )
-    .fetch_one(&store.pool)
-    .await
-    .expect("read committed delivery");
-    assert_eq!(committed, (1, 1));
   }
 }

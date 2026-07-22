@@ -138,6 +138,18 @@ pub enum StateError {
   #[error("scheduled run completion conflicts with durable authority")]
   ScheduledRunCompletionConflict,
 
+  #[error("scheduled delivery lease was lost")]
+  ScheduledDeliveryLostLease,
+
+  #[error("scheduled delivery attempt or fence counter is exhausted")]
+  ScheduledDeliveryCounterExhausted,
+
+  #[error("scheduled delivery baseline generation changed")]
+  ScheduledDeliveryBaselineConflict,
+
+  #[error("scheduled delivery payload conflicts with immutable authority")]
+  ScheduledDeliveryPayloadConflict,
+
   #[error("scheduled once occurrence is expired and cannot be resumed")]
   ScheduledOnceExpired,
 

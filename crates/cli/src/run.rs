@@ -832,17 +832,23 @@ fn spawn_channel_dispatch_loops(
     let shutdown = background_tasks.subscribe();
     background_tasks.spawn(async move {
       loop {
-        if *shutdown.borrow() {
-          return;
-        }
-        match run_channel_dispatch_tick_on_blocking_pool(
+        let permit = match acquire_serve_turn_before_shutdown(&turn_budget, shutdown.clone()).await
+        {
+          Ok(Some(permit)) => permit,
+          Ok(None) => return,
+          Err(error) => {
+            eprintln!("channel dispatch turn budget failed: {error}");
+            return;
+          }
+        };
+        match run_channel_dispatch_tick_on_blocking_pool_with_permit(
           state.clone(),
           backend.clone(),
           processing_streams.clone(),
           context_provider.clone(),
           context_limit,
           Some(locks.clone()),
-          turn_budget.clone(),
+          permit,
         )
         .await
         {
@@ -861,6 +867,22 @@ fn spawn_channel_dispatch_loops(
         }
       }
     });
+  }
+}
+
+async fn acquire_serve_turn_before_shutdown(
+  turn_budget: &GlobalTurnBudget,
+  shutdown: watch::Receiver<bool>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, StateError> {
+  let permit = tokio::select! {
+    biased;
+    () = wait_for_serve_shutdown(shutdown.clone()) => return Ok(None),
+    result = turn_budget.acquire() => result?,
+  };
+  if *shutdown.borrow() {
+    Ok(None)
+  } else {
+    Ok(Some(permit))
   }
 }
 
@@ -2471,6 +2493,7 @@ async fn run_slack_delivery_loop(
   }
 }
 
+#[cfg(test)]
 async fn run_channel_dispatch_tick_on_blocking_pool<B>(
   state: StateStore,
   backend: B,
@@ -2487,6 +2510,30 @@ where
     .acquire()
     .await
     .map_err(|error| -> Box<dyn Error + Send + Sync> { Box::new(error) })?;
+  run_channel_dispatch_tick_on_blocking_pool_with_permit(
+    state,
+    backend,
+    processing_streams,
+    context_provider,
+    context_limit,
+    conversation_locks,
+    permit,
+  )
+  .await
+}
+
+async fn run_channel_dispatch_tick_on_blocking_pool_with_permit<B>(
+  state: StateStore,
+  backend: B,
+  processing_streams: ServeProcessingStreamManager,
+  context_provider: ServeDispatchContextProvider,
+  context_limit: u16,
+  conversation_locks: Option<ConversationDispatchLocks>,
+  permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<bool, Box<dyn Error + Send + Sync>>
+where
+  B: codeoff_agent_contract::AgentBackend + Send + 'static,
+{
   let handle = tokio::runtime::Handle::current();
   tokio::task::spawn_blocking(move || {
     let _permit = permit;
@@ -3031,6 +3078,34 @@ mod tests {
     let stopped_at = mutations.load(Ordering::Acquire);
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(mutations.load(Ordering::Acquire), stopped_at);
+  }
+
+  #[tokio::test]
+  async fn serve_turn_waiter_cannot_acquire_after_shutdown() {
+    let budget = GlobalTurnBudget::new(1);
+    let active_turn = budget.acquire().await.expect("active turn");
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let waiting = acquire_serve_turn_before_shutdown(&budget, shutdown_rx);
+    tokio::pin!(waiting);
+    tokio::select! {
+      () = tokio::time::sleep(Duration::from_millis(10)) => {}
+      result = &mut waiting => panic!("turn waiter unexpectedly completed: {result:?}"),
+    }
+
+    shutdown.send(true).expect("request shutdown");
+    drop(active_turn);
+    assert!(
+      tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("waiter shutdown deadline")
+        .expect("waiter result")
+        .is_none()
+    );
+    let restored = tokio::time::timeout(Duration::from_secs(1), budget.acquire())
+      .await
+      .expect("turn budget restored")
+      .expect("restored turn");
+    drop(restored);
   }
 
   #[test]

@@ -16,9 +16,9 @@ mod timezone;
 pub use delivery::{
   AcceptedDeliveryBaseline, AcceptedDeliveryBaselineIdentity, ClaimedScheduledDelivery,
   DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION, DeliveryPayloadSnapshot,
-  PreparedScheduledDelivery, ScheduledDeliveryBinding, ScheduledDeliveryFailure,
-  ScheduledDeliveryRetentionReport, ScheduledDeliveryState, ScheduledDeliveryWork,
-  SkippedNoneBaselinePolicy,
+  PreparedScheduledDelivery, ScheduledDeliveryAuthority, ScheduledDeliveryBinding,
+  ScheduledDeliveryFailure, ScheduledDeliveryRetentionReport, ScheduledDeliveryState,
+  ScheduledDeliveryWork, SkippedNoneBaselinePolicy,
 };
 use timezone::BundledTimeZone;
 

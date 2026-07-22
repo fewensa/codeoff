@@ -9,12 +9,14 @@ use codeoff_state::{
   ScheduledDeliveryWork, StateError, StateStore,
 };
 use serde_json::json;
-use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 const DELIVERY_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const DELIVERY_LEASE_SECONDS: i64 = 60;
 const DELIVERY_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const DELIVERY_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+const DELIVERY_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DELIVERY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const DELIVERY_BATCH_LIMIT: u32 = 32;
 const DELIVERY_POLICY_VERSION: u32 = 1;
@@ -22,11 +24,15 @@ const MAX_DELIVERY_ATTEMPTS: i64 = 5;
 const DELIVERY_DEADLINE_SECONDS: i64 = 3_600;
 const MAX_RETRY_DELAY_SECONDS: i64 = 300;
 const MAX_RETRY_AFTER_SECONDS: i64 = 3_600;
-const DEFAULT_READINESS_RETRY: Duration = Duration::from_secs(5);
+const DEFAULT_READINESS_RETRY: Duration = Duration::from_secs(1);
 const MAX_READINESS_RETRY: Duration = Duration::from_mins(1);
 
 pub struct DeliveryProviderReadinessRequest<'a> {
+  pub delivery_id: &'a str,
   pub target_json: &'a str,
+  pub target_digest: &'a str,
+  pub payload_digest: &'a str,
+  pub binding_digest: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +124,31 @@ struct DeliveryTimeline {
   last: Arc<AtomicI64>,
 }
 
+#[derive(Default)]
+struct DeliveryWorkerState {
+  readiness_failure_streak: u32,
+}
+
+impl DeliveryWorkerState {
+  fn readiness_ready(&mut self) {
+    self.readiness_failure_streak = 0;
+  }
+
+  fn readiness_retry(&mut self, retry_after_seconds: Option<u64>) -> Duration {
+    let exponent = self.readiness_failure_streak.min(31);
+    self.readiness_failure_streak = self.readiness_failure_streak.saturating_add(1);
+    let local_seconds = DEFAULT_READINESS_RETRY
+      .as_secs()
+      .checked_shl(exponent)
+      .unwrap_or(MAX_READINESS_RETRY.as_secs())
+      .min(MAX_READINESS_RETRY.as_secs());
+    let provider_seconds = retry_after_seconds
+      .filter(|seconds| *seconds > 0)
+      .unwrap_or(0);
+    Duration::from_secs(local_seconds.max(provider_seconds))
+  }
+}
+
 impl DeliveryTimeline {
   fn new(clock: Arc<dyn DeliveryClock>) -> Self {
     Self {
@@ -172,6 +203,7 @@ pub async fn run_scheduled_delivery_worker_with_clock(
   shutdown: watch::Receiver<bool>,
 ) -> Result<(), StateError> {
   let timeline = DeliveryTimeline::new(clock);
+  let mut worker_state = DeliveryWorkerState::default();
   loop {
     if *shutdown.borrow() {
       return Ok(());
@@ -182,6 +214,7 @@ pub async fn run_scheduled_delivery_worker_with_clock(
       &lease_owner,
       timeline.clone(),
       shutdown.clone(),
+      &mut worker_state,
     )
     .await?;
     let delay = match tick {
@@ -221,12 +254,14 @@ pub async fn run_scheduled_delivery_tick_with_clock(
   clock: Arc<dyn DeliveryClock>,
   shutdown: watch::Receiver<bool>,
 ) -> Result<ScheduledDeliveryTickOutcome, StateError> {
+  let mut worker_state = DeliveryWorkerState::default();
   run_scheduled_delivery_tick_with_timeline(
     state,
     provider,
     lease_owner,
     DeliveryTimeline::new(clock),
     shutdown,
+    &mut worker_state,
   )
   .await
 }
@@ -237,7 +272,14 @@ async fn run_scheduled_delivery_tick_with_timeline(
   lease_owner: &str,
   timeline: DeliveryTimeline,
   shutdown: watch::Receiver<bool>,
+  worker_state: &mut DeliveryWorkerState,
 ) -> Result<ScheduledDeliveryTickOutcome, StateError> {
+  if *shutdown.borrow() {
+    return Ok(ScheduledDeliveryTickOutcome::Cancelled);
+  }
+  state
+    .reclaim_expired_scheduled_deliveries(timeline.fresh_now(), DELIVERY_BATCH_LIMIT)
+    .await?;
   if *shutdown.borrow() {
     return Ok(ScheduledDeliveryTickOutcome::Cancelled);
   }
@@ -245,26 +287,30 @@ async fn run_scheduled_delivery_tick_with_timeline(
     .peek_scheduled_delivery_work(timeline.fresh_now())
     .await?;
   match work {
-    ScheduledDeliveryWork::Idle => return Ok(ScheduledDeliveryTickOutcome::Idle),
-    ScheduledDeliveryWork::SkipUnchanged => {
+    ScheduledDeliveryWork::Idle => Ok(ScheduledDeliveryTickOutcome::Idle),
+    ScheduledDeliveryWork::SkipUnchanged(authority) => {
       if *shutdown.borrow() {
         return Ok(ScheduledDeliveryTickOutcome::Cancelled);
       }
-      return if state
-        .skip_next_unchanged_scheduled_delivery(timeline.fresh_now())
+      if state
+        .skip_scheduled_delivery_unchanged(&authority, timeline.fresh_now())
         .await?
       {
         Ok(ScheduledDeliveryTickOutcome::SkippedUnchanged)
       } else {
         Ok(ScheduledDeliveryTickOutcome::Idle)
-      };
+      }
     }
-    ScheduledDeliveryWork::ProviderRequired { target_json } => {
+    ScheduledDeliveryWork::ProviderRequired(authority) => {
       if *shutdown.borrow() {
         return Ok(ScheduledDeliveryTickOutcome::Cancelled);
       }
       let readiness = provider.readiness(DeliveryProviderReadinessRequest {
-        target_json: &target_json,
+        delivery_id: authority.delivery_id(),
+        target_json: authority.target_json(),
+        target_digest: authority.target_digest(),
+        payload_digest: authority.payload_digest(),
+        binding_digest: authority.binding_digest(),
       });
       tokio::pin!(readiness);
       let readiness = tokio::select! {
@@ -273,15 +319,21 @@ async fn run_scheduled_delivery_tick_with_timeline(
           return Ok(ScheduledDeliveryTickOutcome::Cancelled);
         }
         readiness = &mut readiness => readiness,
+        () = tokio::time::sleep(DELIVERY_READINESS_TIMEOUT) => {
+          DeliveryProviderReadiness::Retryable {
+            retry_after_seconds: None,
+            error_kind: "provider_readiness_timeout".to_owned(),
+          }
+        }
       };
       match readiness {
-        DeliveryProviderReadiness::Ready => {}
+        DeliveryProviderReadiness::Ready => worker_state.readiness_ready(),
         DeliveryProviderReadiness::Retryable {
           retry_after_seconds,
           error_kind: _,
         } => {
           return Ok(ScheduledDeliveryTickOutcome::ReadinessDeferred {
-            retry_after: readiness_retry_delay(retry_after_seconds),
+            retry_after: worker_state.readiness_retry(retry_after_seconds),
           });
         }
         DeliveryProviderReadiness::Permanent { error_kind: _ } => {
@@ -290,28 +342,29 @@ async fn run_scheduled_delivery_tick_with_timeline(
           });
         }
       }
+      if *shutdown.borrow() {
+        return Ok(ScheduledDeliveryTickOutcome::Cancelled);
+      }
+      let claim_time = timeline.fresh_now();
+      let lease_expires_at = checked_add(claim_time, DELIVERY_LEASE_SECONDS, "delivery lease")?;
+      let Some(claim) = state
+        .claim_scheduled_delivery(&authority, lease_owner, claim_time, lease_expires_at)
+        .await?
+      else {
+        return Ok(ScheduledDeliveryTickOutcome::Idle);
+      };
+      dispatch_claimed_delivery(state, provider, claim, timeline, shutdown).await
     }
   }
-  if *shutdown.borrow() {
-    return Ok(ScheduledDeliveryTickOutcome::Cancelled);
-  }
-  state
-    .requeue_due_scheduled_deliveries(timeline.fresh_now(), DELIVERY_BATCH_LIMIT)
-    .await?;
-  state
-    .reclaim_expired_scheduled_deliveries(timeline.fresh_now(), DELIVERY_BATCH_LIMIT)
-    .await?;
-  if *shutdown.borrow() {
-    return Ok(ScheduledDeliveryTickOutcome::Cancelled);
-  }
-  let claim_time = timeline.fresh_now();
-  let lease_expires_at = checked_add(claim_time, DELIVERY_LEASE_SECONDS, "delivery lease")?;
-  let Some(claim) = state
-    .claim_next_scheduled_delivery(lease_owner, claim_time, lease_expires_at)
-    .await?
-  else {
-    return Ok(ScheduledDeliveryTickOutcome::Idle);
-  };
+}
+
+async fn dispatch_claimed_delivery(
+  state: &StateStore,
+  provider: &dyn DeliveryProvider,
+  claim: ClaimedScheduledDelivery,
+  timeline: DeliveryTimeline,
+  shutdown: watch::Receiver<bool>,
+) -> Result<ScheduledDeliveryTickOutcome, StateError> {
   let mut heartbeat =
     DeliveryHeartbeat::start(state.clone(), claim.binding.clone(), timeline.clone());
   timeline.fresh_now();
@@ -337,7 +390,9 @@ async fn run_scheduled_delivery_tick_with_timeline(
     outcome = &mut send => match outcome {
       Ok(outcome) => outcome,
       Err(panic) => {
-        heartbeat.stop_and_join().await;
+        if let Err(error) = heartbeat.stop_and_join().await {
+          panic!("scheduled delivery provider and heartbeat cleanup failed: {error}");
+        }
         std::panic::resume_unwind(panic);
       }
     },
@@ -345,24 +400,10 @@ async fn run_scheduled_delivery_tick_with_timeline(
       error_kind: "provider_timeout".to_owned(),
     },
   };
-  if let Err(error) = refresh_lease_before_commit(state, &claim, &timeline, &mut heartbeat).await {
-    heartbeat.stop_and_join().await;
-    return if is_lost_delivery_authority(&error) {
-      Ok(ScheduledDeliveryTickOutcome::LostFence)
-    } else {
-      Err(error)
-    };
+  if let Err(error) = heartbeat.stop_and_join().await {
+    return authority_error(error);
   }
-  let completion_time = timeline.fresh_now();
-  let commit = commit_outcome(state, &claim, outcome, completion_time);
-  tokio::pin!(commit);
-  let result = tokio::select! {
-    biased;
-    heartbeat_result = &mut heartbeat.join => return heartbeat_ended(heartbeat_result),
-    result = &mut commit => result,
-  };
-  heartbeat.stop_and_join().await;
-  result
+  finalize_outcome(state, &claim, outcome, &timeline).await
 }
 
 struct CatchUnwindFuture<F> {
@@ -386,33 +427,37 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
   }
 }
 
-async fn refresh_lease_before_commit(
+async fn finalize_outcome(
   state: &StateStore,
   claim: &ClaimedScheduledDelivery,
+  outcome: DeliveryProviderOutcome,
   timeline: &DeliveryTimeline,
-  heartbeat: &mut DeliveryHeartbeat,
-) -> Result<(), StateError> {
-  let heartbeat_time = timeline.fresh_now();
-  let lease_expires_at = checked_add(
-    heartbeat_time,
-    DELIVERY_LEASE_SECONDS + 1,
-    "delivery precommit lease",
-  )?;
-  let _heartbeat_gate = heartbeat.gate.lock().await;
-  let refresh =
-    state.heartbeat_scheduled_delivery(&claim.binding, heartbeat_time, lease_expires_at);
-  tokio::pin!(refresh);
-  tokio::select! {
-    biased;
-    heartbeat_result = &mut heartbeat.join => heartbeat_ended(heartbeat_result).map(|_| ()),
-    result = &mut refresh => result,
+) -> Result<ScheduledDeliveryTickOutcome, StateError> {
+  let finalization = async {
+    let heartbeat_time = timeline.fresh_now();
+    let lease_expires_at = checked_add(
+      heartbeat_time,
+      DELIVERY_LEASE_SECONDS + 1,
+      "delivery finalization lease",
+    )?;
+    state
+      .heartbeat_scheduled_delivery(&claim.binding, heartbeat_time, lease_expires_at)
+      .await?;
+    let completion_time = timeline.fresh_now();
+    commit_outcome(state, claim, outcome, completion_time).await
+  };
+  match tokio::time::timeout(DELIVERY_FINALIZATION_TIMEOUT, finalization).await {
+    Ok(Ok(outcome)) => Ok(outcome),
+    Ok(Err(error)) => authority_error(error),
+    Err(_) => Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery finalization timed out".to_owned(),
+    }),
   }
 }
 
 struct DeliveryHeartbeat {
   stop: Option<oneshot::Sender<()>>,
   join: JoinHandle<Result<(), StateError>>,
-  gate: Arc<AsyncMutex<()>>,
 }
 
 impl DeliveryHeartbeat {
@@ -422,8 +467,6 @@ impl DeliveryHeartbeat {
     timeline: DeliveryTimeline,
   ) -> Self {
     let (stop, mut stopped) = oneshot::channel();
-    let gate = Arc::new(AsyncMutex::new(()));
-    let task_gate = Arc::clone(&gate);
     let join = tokio::spawn(async move {
       loop {
         tokio::select! {
@@ -437,7 +480,6 @@ impl DeliveryHeartbeat {
           DELIVERY_LEASE_SECONDS,
           "delivery heartbeat lease",
         )?;
-        let _heartbeat_gate = task_gate.lock().await;
         state
           .heartbeat_scheduled_delivery(&binding, heartbeat_time, lease_expires_at)
           .await?;
@@ -446,16 +488,24 @@ impl DeliveryHeartbeat {
     Self {
       stop: Some(stop),
       join,
-      gate,
     }
   }
 
-  async fn stop_and_join(&mut self) {
+  async fn stop_and_join(&mut self) -> Result<(), StateError> {
     if let Some(stop) = self.stop.take() {
       let _ = stop.send(());
     }
-    if !self.join.is_finished() {
-      let _ = (&mut self.join).await;
+    if let Ok(result) = tokio::time::timeout(DELIVERY_FINALIZATION_TIMEOUT, &mut self.join).await {
+      heartbeat_stopped(result)
+    } else {
+      self.join.abort();
+      match (&mut self.join).await {
+        Ok(Err(error)) => Err(error),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Ok(Ok(())) | Err(_) => Err(StateError::InvalidSchedulerState {
+          reason: "scheduled delivery heartbeat cleanup timed out".to_owned(),
+        }),
+      }
     }
   }
 }
@@ -484,12 +534,35 @@ fn heartbeat_ended(
   }
 }
 
+fn heartbeat_stopped(
+  result: Result<Result<(), StateError>, tokio::task::JoinError>,
+) -> Result<(), StateError> {
+  match result {
+    Ok(result) => result,
+    Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+    Err(_) => Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery heartbeat was cancelled during cleanup".to_owned(),
+    }),
+  }
+}
+
+fn authority_error(error: StateError) -> Result<ScheduledDeliveryTickOutcome, StateError> {
+  if is_lost_delivery_authority(&error) {
+    Ok(ScheduledDeliveryTickOutcome::LostFence)
+  } else {
+    Err(error)
+  }
+}
+
 async fn release_before_dispatch(
   state: &StateStore,
   claim: &ClaimedScheduledDelivery,
   timeline: &DeliveryTimeline,
   heartbeat: &mut DeliveryHeartbeat,
 ) -> Result<ScheduledDeliveryTickOutcome, StateError> {
+  if let Err(error) = heartbeat.stop_and_join().await {
+    return authority_error(error);
+  }
   let now = timeline.fresh_now();
   let next_attempt_at = checked_add(now, 1, "shutdown delivery retry")?;
   let commit = commit_failure(
@@ -503,14 +576,12 @@ async fn release_before_dispatch(
     now,
     ScheduledDeliveryTickOutcome::RetryDeferred,
   );
-  tokio::pin!(commit);
-  let result = tokio::select! {
-    biased;
-    heartbeat_result = &mut heartbeat.join => return heartbeat_ended(heartbeat_result),
-    result = &mut commit => result,
-  };
-  heartbeat.stop_and_join().await;
-  result
+  match tokio::time::timeout(DELIVERY_FINALIZATION_TIMEOUT, commit).await {
+    Ok(result) => result,
+    Err(_) => Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery pre-dispatch release timed out".to_owned(),
+    }),
+  }
 }
 
 async fn commit_outcome(
@@ -663,16 +734,30 @@ fn checked_add(value: i64, increment: i64, field: &str) -> Result<i64, StateErro
     })
 }
 
-fn readiness_retry_delay(retry_after_seconds: Option<u64>) -> Duration {
-  retry_after_seconds.map_or(DEFAULT_READINESS_RETRY, |seconds| {
-    Duration::from_secs(seconds.clamp(1, MAX_READINESS_RETRY.as_secs()))
-  })
-}
-
 async fn cancellation_requested(mut shutdown: watch::Receiver<bool>) {
   while !*shutdown.borrow() {
     if shutdown.changed().await.is_err() {
       std::future::pending::<()>().await;
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn readiness_backoff_caps_honors_retry_after_and_resets() {
+    let mut state = DeliveryWorkerState::default();
+    assert_eq!(state.readiness_retry(None), Duration::from_secs(1));
+    assert_eq!(state.readiness_retry(Some(0)), Duration::from_secs(2));
+    assert_eq!(state.readiness_retry(None), Duration::from_secs(4));
+    assert_eq!(state.readiness_retry(None), Duration::from_secs(8));
+    assert_eq!(state.readiness_retry(None), Duration::from_secs(16));
+    assert_eq!(state.readiness_retry(None), Duration::from_secs(32));
+    assert_eq!(state.readiness_retry(None), Duration::from_mins(1));
+    assert_eq!(state.readiness_retry(Some(120)), Duration::from_mins(2));
+    state.readiness_ready();
+    assert_eq!(state.readiness_retry(None), Duration::from_secs(1));
   }
 }

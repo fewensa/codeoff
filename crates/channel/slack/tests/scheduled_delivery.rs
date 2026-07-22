@@ -347,6 +347,24 @@ async fn classifies_explicit_rejection_rate_limit_and_maybe_written_failures() {
       },
     ),
     (
+      HttpStep::Response(SlackHttpResponse::new(
+        429,
+        [("Retry-After", "invalid")],
+        r#"{"ok":false,"error":"ratelimited"}"#,
+      )),
+      DeliveryProviderOutcome::ConfirmedNoWriteRetryable {
+        retry_after_seconds: None,
+        error_kind: "slack_rate_limited".to_owned(),
+      },
+    ),
+    (
+      response(429, r#"{"ok":false,"error":"ratelimited"}"#),
+      DeliveryProviderOutcome::ConfirmedNoWriteRetryable {
+        retry_after_seconds: None,
+        error_kind: "slack_rate_limited".to_owned(),
+      },
+    ),
+    (
       response(503, "private response body"),
       DeliveryProviderOutcome::AmbiguousPostWrite {
         error_kind: "slack_write_outcome_unknown".to_owned(),
@@ -467,7 +485,11 @@ async fn readiness_validates_target_before_auth_and_classifies_auth_availability
   assert_eq!(
     invalid
       .readiness(DeliveryProviderReadinessRequest {
+        delivery_id: "delivery-1",
         target_json: r#"{"provider":"email"}"#,
+        target_digest: "digest",
+        payload_digest: "digest",
+        binding_digest: "digest",
       })
       .await,
     DeliveryProviderReadiness::Permanent {
@@ -486,7 +508,11 @@ async fn readiness_validates_target_before_auth_and_classifies_auth_availability
   assert_eq!(
     transient
       .readiness(DeliveryProviderReadinessRequest {
+        delivery_id: claim.binding.delivery_id(),
         target_json: &claim.target_json,
+        target_digest: claim.payload.target_snapshot_digest(),
+        payload_digest: claim.payload.digest(),
+        binding_digest: "binding",
       })
       .await,
     DeliveryProviderReadiness::Retryable {

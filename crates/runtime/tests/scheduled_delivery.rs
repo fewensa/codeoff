@@ -102,6 +102,17 @@ struct BlockingReadinessProvider {
   sends: AtomicUsize,
 }
 
+struct ExactReadinessProvider {
+  readiness_started: Notify,
+  release_readiness: Notify,
+  readiness_delivery_ids: Mutex<Vec<String>>,
+  sends: AtomicUsize,
+}
+
+struct PendingReadinessProvider {
+  started: Notify,
+}
+
 #[async_trait]
 impl DeliveryProvider for BlockingReadinessProvider {
   async fn readiness(
@@ -116,6 +127,43 @@ impl DeliveryProvider for BlockingReadinessProvider {
   async fn send(&self, _request: DeliveryProviderRequest<'_>) -> DeliveryProviderOutcome {
     self.sends.fetch_add(1, Ordering::SeqCst);
     success()
+  }
+}
+
+#[async_trait]
+impl DeliveryProvider for ExactReadinessProvider {
+  async fn readiness(
+    &self,
+    request: DeliveryProviderReadinessRequest<'_>,
+  ) -> DeliveryProviderReadiness {
+    self
+      .readiness_delivery_ids
+      .lock()
+      .expect("readiness ids")
+      .push(request.delivery_id.to_owned());
+    self.readiness_started.notify_one();
+    self.release_readiness.notified().await;
+    DeliveryProviderReadiness::Ready
+  }
+
+  async fn send(&self, _request: DeliveryProviderRequest<'_>) -> DeliveryProviderOutcome {
+    self.sends.fetch_add(1, Ordering::SeqCst);
+    success()
+  }
+}
+
+#[async_trait]
+impl DeliveryProvider for PendingReadinessProvider {
+  async fn readiness(
+    &self,
+    _request: DeliveryProviderReadinessRequest<'_>,
+  ) -> DeliveryProviderReadiness {
+    self.started.notify_one();
+    std::future::pending().await
+  }
+
+  async fn send(&self, _request: DeliveryProviderRequest<'_>) -> DeliveryProviderOutcome {
+    panic!("timed-out readiness must not dispatch")
   }
 }
 
@@ -186,6 +234,21 @@ fn clock(now: i64) -> Arc<dyn DeliveryClock> {
 struct TokioClock {
   base: i64,
   started: tokio::time::Instant,
+}
+
+struct CountingStepClock {
+  next: AtomicI64,
+  calls: Arc<AtomicUsize>,
+  values: Arc<Mutex<Vec<i64>>>,
+}
+
+impl DeliveryClock for CountingStepClock {
+  fn now_unix_seconds(&self) -> i64 {
+    self.calls.fetch_add(1, Ordering::SeqCst);
+    let value = self.next.fetch_add(1, Ordering::SeqCst);
+    self.values.lock().expect("clock values").push(value);
+    value
+  }
 }
 
 impl TokioClock {
@@ -500,6 +563,108 @@ async fn permanent_readiness_failure_surfaces_without_delivery_mutation() {
 }
 
 #[tokio::test]
+async fn readiness_timeout_is_retryable_without_claim_or_dispatch() {
+  let (_temp, store, delivery_id, _) =
+    prepared_delivery("delivery-readiness-timeout", "body").await;
+  let provider = Arc::new(PendingReadinessProvider {
+    started: Notify::new(),
+  });
+  let task_store = store.clone();
+  let task_provider = Arc::clone(&provider);
+  let task = tokio::spawn(async move {
+    run_scheduled_delivery_tick_with_clock(
+      &task_store,
+      task_provider.as_ref(),
+      "worker",
+      Arc::new(TokioClock::new(122)),
+      shutdown(),
+    )
+    .await
+  });
+  provider.started.notified().await;
+  tokio::time::pause();
+  tokio::time::advance(Duration::from_secs(11)).await;
+  tokio::time::resume();
+  assert_eq!(
+    task.await.expect("task").expect("timeout tick"),
+    ScheduledDeliveryTickOutcome::ReadinessDeferred {
+      retry_after: Duration::from_secs(1),
+    }
+  );
+  assert_eq!(
+    store
+      .scheduled_delivery_authority_for_tests(&delivery_id)
+      .await
+      .expect("authority"),
+    ("pending".to_owned(), 0, 0, 0)
+  );
+}
+
+#[tokio::test]
+async fn provider_outage_does_not_block_expired_reclaim_or_start_a_new_attempt() {
+  for (suffix, readiness, permanent) in [
+    (
+      "transient",
+      DeliveryProviderReadiness::Retryable {
+        retry_after_seconds: None,
+        error_kind: "unavailable".to_owned(),
+      },
+      false,
+    ),
+    (
+      "permanent",
+      DeliveryProviderReadiness::Permanent {
+        error_kind: "invalid_auth".to_owned(),
+      },
+      true,
+    ),
+  ] {
+    let job_id = format!("delivery-reclaim-outage-{suffix}");
+    let (_temp, store, expired_id, _) = prepared_delivery(&job_id, "first").await;
+    let next_id = prepare_next_delivery(&store, &job_id, "second").await;
+    store
+      .claim_next_scheduled_delivery("expired-worker", 122, 125)
+      .await
+      .expect("claim expired")
+      .expect("expired claim");
+    let provider = FakeProvider::new([]).with_readiness([readiness]);
+    let result =
+      run_scheduled_delivery_tick_with_clock(&store, &provider, "worker", clock(130), shutdown())
+        .await;
+    if permanent {
+      assert!(
+        result
+          .expect_err("permanent readiness")
+          .to_string()
+          .contains("readiness failed permanently")
+      );
+    } else {
+      assert_eq!(
+        result.expect("transient readiness"),
+        ScheduledDeliveryTickOutcome::ReadinessDeferred {
+          retry_after: Duration::from_secs(1),
+        }
+      );
+    }
+    assert_eq!(
+      store
+        .scheduled_delivery_authority_for_tests(&expired_id)
+        .await
+        .expect("expired authority"),
+      ("delivery_unknown".to_owned(), 1, 1, 1)
+    );
+    assert_eq!(
+      store
+        .scheduled_delivery_authority_for_tests(&next_id)
+        .await
+        .expect("next authority"),
+      ("pending".to_owned(), 0, 0, 0)
+    );
+    assert!(provider.observed().is_empty());
+  }
+}
+
+#[tokio::test]
 async fn shutdown_observed_before_tick_never_polls_provider_or_mutates_delivery() {
   let (_temp, store, delivery_id, _) =
     prepared_delivery("delivery-shutdown-before-readiness", "body").await;
@@ -572,7 +737,7 @@ async fn shutdown_after_claim_but_before_first_send_poll_requeues_safely() {
   let gate_clock: Arc<dyn DeliveryClock> = Arc::new(GateClock {
     now: 122,
     calls: AtomicUsize::new(0),
-    gate_call: 5,
+    gate_call: 4,
     reached: Mutex::new(Some(reached_tx)),
     release: Mutex::new(release_rx),
   });
@@ -813,6 +978,76 @@ async fn heartbeat_prevents_independent_store_reclaim_during_long_send() {
 }
 
 #[tokio::test]
+async fn queued_heartbeat_finishes_before_final_refresh_without_false_lost_fence() {
+  let (temp, store, delivery_id, payload) =
+    prepared_delivery("delivery-heartbeat-finalize", "body").await;
+  let independent = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("independent state");
+  let provider = Arc::new(BlockingProvider {
+    calls: AtomicUsize::new(0),
+    started: Notify::new(),
+    release: Notify::new(),
+  });
+  let clock_calls = Arc::new(AtomicUsize::new(0));
+  let clock_values = Arc::new(Mutex::new(Vec::new()));
+  let task_store = store.clone();
+  let task_provider = Arc::clone(&provider);
+  let task_clock_calls = Arc::clone(&clock_calls);
+  let task_clock_values = Arc::clone(&clock_values);
+  let task = tokio::spawn(async move {
+    run_scheduled_delivery_tick_with_clock(
+      &task_store,
+      task_provider.as_ref(),
+      "worker",
+      Arc::new(CountingStepClock {
+        next: AtomicI64::new(122),
+        calls: task_clock_calls,
+        values: task_clock_values,
+      }),
+      shutdown(),
+    )
+    .await
+  });
+  provider.started.notified().await;
+  let lock = independent
+    .acquire_exclusive_storage_lock_for_tests()
+    .await
+    .expect("exclusive lock");
+  tokio::time::pause();
+  tokio::time::advance(Duration::from_secs(10)).await;
+  while clock_calls.load(Ordering::SeqCst) < 5 {
+    tokio::task::yield_now().await;
+  }
+  tokio::time::resume();
+  provider.release.notify_one();
+  tokio::task::yield_now().await;
+  lock.release().await.expect("release lock");
+  let outcome = task.await.expect("task").expect("tick");
+  let authority = store
+    .scheduled_delivery_authority_for_tests(&delivery_id)
+    .await
+    .expect("authority");
+  let lease = store
+    .scheduled_delivery_lease_for_tests(&delivery_id)
+    .await
+    .expect("lease");
+  assert_eq!(
+    outcome,
+    ScheduledDeliveryTickOutcome::Delivered,
+    "{authority:?} {lease:?} {:?}",
+    clock_values.lock().expect("clock values")
+  );
+  assert!(
+    store
+      .get_accepted_delivery_baseline(&baseline_identity("delivery-heartbeat-finalize", &payload,))
+      .await
+      .expect("baseline")
+      .is_some()
+  );
+}
+
+#[tokio::test]
 async fn heartbeat_contention_surfaces_storage_failure_then_reclaims_unknown() {
   let (temp, store, _delivery_id, payload) =
     prepared_delivery("delivery-heartbeat-contention", "body").await;
@@ -854,9 +1089,7 @@ async fn heartbeat_contention_surfaces_storage_failure_then_reclaims_unknown() {
     .expect("task")
     .expect_err("contention must surface storage failure");
   assert!(
-    error
-      .to_string()
-      .contains("failed to manage scheduler state"),
+    error.to_string().contains("timed out"),
     "unexpected error: {error}"
   );
   assert_eq!(
@@ -998,6 +1231,60 @@ async fn two_workers_make_one_provider_call_for_one_delivery() {
     1
   );
   assert_eq!(provider.observed().len(), 1);
+}
+
+#[tokio::test]
+async fn readiness_for_delivery_a_can_never_authorize_delivery_b() {
+  let (_temp, store, first_id, _) = prepared_delivery("delivery-exact-authority", "first").await;
+  let second_id = prepare_next_delivery(&store, "delivery-exact-authority", "second").await;
+  let blocked = Arc::new(ExactReadinessProvider {
+    readiness_started: Notify::new(),
+    release_readiness: Notify::new(),
+    readiness_delivery_ids: Mutex::new(Vec::new()),
+    sends: AtomicUsize::new(0),
+  });
+  let blocked_store = store.clone();
+  let blocked_provider = Arc::clone(&blocked);
+  let first_worker = tokio::spawn(async move {
+    run_scheduled_delivery_tick_with_clock(
+      &blocked_store,
+      blocked_provider.as_ref(),
+      "worker-a",
+      clock(130),
+      shutdown(),
+    )
+    .await
+  });
+  blocked.readiness_started.notified().await;
+  assert_eq!(
+    blocked
+      .readiness_delivery_ids
+      .lock()
+      .expect("readiness ids")
+      .as_slice(),
+    [first_id.as_str()]
+  );
+
+  let winner = FakeProvider::new([success()]);
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(&store, &winner, "worker-b", clock(130), shutdown())
+      .await
+      .expect("winner tick"),
+    ScheduledDeliveryTickOutcome::Delivered
+  );
+  blocked.release_readiness.notify_one();
+  assert_eq!(
+    first_worker.await.expect("worker-a").expect("stale tick"),
+    ScheduledDeliveryTickOutcome::Idle
+  );
+  assert_eq!(blocked.sends.load(Ordering::SeqCst), 0);
+  assert_eq!(
+    store
+      .scheduled_delivery_authority_for_tests(&second_id)
+      .await
+      .expect("second authority"),
+    ("pending".to_owned(), 0, 0, 0)
+  );
 }
 
 #[tokio::test]

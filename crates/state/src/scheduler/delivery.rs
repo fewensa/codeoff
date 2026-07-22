@@ -245,10 +245,71 @@ pub struct ClaimedScheduledDelivery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledDeliveryAuthority {
+  delivery_id: String,
+  source_state: ScheduledDeliveryState,
+  target_json: String,
+  target_digest: String,
+  payload_digest: String,
+  binding_digest: String,
+  intent_key: String,
+}
+
+impl ScheduledDeliveryAuthority {
+  pub(crate) fn new(
+    delivery_id: String,
+    source_state: ScheduledDeliveryState,
+    target_json: String,
+    target_digest: String,
+    payload_digest: String,
+    binding_digest: String,
+    intent_key: String,
+  ) -> Self {
+    Self {
+      delivery_id,
+      source_state,
+      target_json,
+      target_digest,
+      payload_digest,
+      binding_digest,
+      intent_key,
+    }
+  }
+
+  #[must_use]
+  pub fn delivery_id(&self) -> &str {
+    &self.delivery_id
+  }
+  #[must_use]
+  pub const fn source_state(&self) -> ScheduledDeliveryState {
+    self.source_state
+  }
+  #[must_use]
+  pub fn target_json(&self) -> &str {
+    &self.target_json
+  }
+  #[must_use]
+  pub fn target_digest(&self) -> &str {
+    &self.target_digest
+  }
+  #[must_use]
+  pub fn payload_digest(&self) -> &str {
+    &self.payload_digest
+  }
+  #[must_use]
+  pub fn binding_digest(&self) -> &str {
+    &self.binding_digest
+  }
+  pub(crate) fn intent_key(&self) -> &str {
+    &self.intent_key
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduledDeliveryWork {
   Idle,
-  SkipUnchanged,
-  ProviderRequired { target_json: String },
+  SkipUnchanged(ScheduledDeliveryAuthority),
+  ProviderRequired(ScheduledDeliveryAuthority),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

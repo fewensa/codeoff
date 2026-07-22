@@ -569,6 +569,7 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
     if entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
+      && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -610,6 +611,35 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
   .execute(&pool)
   .await
   .expect("insert legacy run action");
+  let legacy_force_target = resolved_slack_target("legacy-force-job", "channel", "C1", None);
+  let legacy_force_run_id = "scheduled:legacy-force-job:500";
+  let mut encoded_run_id = String::new();
+  for byte in legacy_force_run_id.as_bytes() {
+    write!(&mut encoded_run_id, "{byte:02x}").expect("encode run id");
+  }
+  let legacy_force_delivery_id = format!(
+    "intent:v1:{encoded_run_id}:{}:1",
+    legacy_force_target.identity_digest()
+  );
+  let legacy_force_evidence = json!({
+    "evidence_id": "legacy-force",
+    "evidence_version": 1,
+    "kind": "operator_force_resend",
+    "provider": "slack",
+    "target_kind": "channel",
+    "tenant": "workspace",
+  })
+  .to_string();
+  sqlx::query(
+    "insert into scheduler_operator_actions (action_id, principal_kind, principal_provider, principal_tenant, principal_subject, request_id, request_hash_algorithm, request_digest, action, target_kind, target_id, expected_attempt, expected_fence, before_state, after_state, evidence_hash_algorithm, evidence_json, evidence_digest, provider_receipt, duplicate_risk_acknowledged, effective_at, occurred_at) values ('legacy-force-action', 'service', 'codeoff', 'ops', 'operator', 'legacy-force-request', 'sha256-v1', ?1, 'force_delivery_resend', 'delivery', ?2, 1, 1, 'delivery_unknown', 'pending', 'sha256-v1', ?3, ?4, null, 1, 508, 508)",
+  )
+  .bind("9".repeat(64))
+  .bind(&legacy_force_delivery_id)
+  .bind(&legacy_force_evidence)
+  .bind(test_sha256_hex(&legacy_force_evidence))
+  .execute(&pool)
+  .await
+  .expect("insert legacy force action");
   pool.close().await;
 
   let store = StateStore::initialize(&state_dir, None)
@@ -701,6 +731,74 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
       )
       .await
       .expect("apply reason-bound upgrade retry"),
+    SchedulerOperatorMutationOutcome::Applied
+  );
+  sqlx::query(
+    "update scheduled_runs set state = 'cancelled', next_attempt_at = null, overlap_slot = null, updated_at = 121 where run_id = ?1 and state = 'pending'",
+  )
+  .bind(legacy_probe.binding.run_id())
+  .execute(&upgraded)
+  .await
+  .expect("retire reason-bound upgrade retry probe");
+  let legacy_force_probe = prepare_operator_unknown_delivery(&store, "legacy-force-job", 500).await;
+  assert_eq!(
+    legacy_force_probe.binding.delivery_id(),
+    legacy_force_delivery_id
+  );
+  assert!(
+    sqlx::query(
+      "update scheduled_run_deliveries set state = 'pending', updated_at = 508 where delivery_id = ?1 and state = 'delivery_unknown'",
+    )
+    .bind(&legacy_force_delivery_id)
+    .execute(&upgraded)
+    .await
+    .is_err(),
+    "legacy reasonless force action must remain historical and unconsumable"
+  );
+  let legacy_force_authority: (i64, i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduler_operator_actions where action_id = 'legacy-force-action'), (select reason_schema_version from scheduler_operator_actions where action_id = 'legacy-force-action'), (select count(*) from scheduler_operator_action_consumptions where action_id = 'legacy-force-action')",
+  )
+  .fetch_one(&upgraded)
+  .await
+  .expect("read legacy force authority");
+  assert_eq!(legacy_force_authority, (1, 0, 0));
+  let (force_evidence, force_evidence_digest) = operator_delivery_evidence(
+    "operator_force_resend",
+    "upgrade-force",
+    "slack",
+    "workspace",
+    "channel",
+    None,
+  );
+  let force_reason = r#"{"reason":"provider query found no write","reason_code":"upgrade_force","schema_version":1}"#;
+  let force_action = ScheduledDeliveryUnknownAction::ForceResend {
+    evidence_json: force_evidence,
+    evidence_digest: force_evidence_digest,
+    reason_json: force_reason.to_owned(),
+    reason_digest: test_sha256_hex(force_reason),
+    duplicate_risk_acknowledged: true,
+  };
+  let force_request = SchedulerOperatorRequest::for_delivery_action(
+    owner(),
+    "upgrade-valid-force",
+    legacy_force_probe.binding.delivery_id(),
+    legacy_force_probe.binding.attempt(),
+    legacy_force_probe.binding.fence(),
+    &force_action,
+    508,
+  )
+  .expect("build reason-bound force authority");
+  assert_eq!(
+    store
+      .operator_act_on_unknown_delivery(
+        &force_request,
+        legacy_force_probe.binding.delivery_id(),
+        legacy_force_probe.binding.attempt(),
+        legacy_force_probe.binding.fence(),
+        &force_action,
+      )
+      .await
+      .expect("apply reason-bound force action"),
     SchedulerOperatorMutationOutcome::Applied
   );
   assert!(
@@ -1091,6 +1189,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
           | "20260722030000_scheduler_operator_target_bounds.sql"
           | "20260722040000_scheduler_run_retry_reason.sql"
           | "20260722050000_scheduler_operator_reason_authority.sql"
+          | "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
       )
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
@@ -1415,6 +1514,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
+      && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1498,6 +1598,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
+      && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1579,6 +1680,7 @@ async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_pay
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
+      && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy issue-06 migration");
@@ -1757,6 +1859,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
+      && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2003,6 +2106,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
+      && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2076,6 +2180,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
+      && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2162,6 +2267,7 @@ async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_ident
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
+      && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");

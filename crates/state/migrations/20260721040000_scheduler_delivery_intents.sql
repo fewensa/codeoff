@@ -6,7 +6,8 @@ insert into _scheduler_target_identity_guard_040000 (invalid_count)
 select
   (select count(*)
    from scheduled_job_delivery_targets target
-   where length(target.identity_digest) != 64
+   where typeof(target.identity_digest) != 'text'
+      or length(target.identity_digest) != 64
       or target.identity_digest glob '*[^0-9a-f]*')
   +
   (select count(*)
@@ -26,7 +27,8 @@ drop table _scheduler_target_identity_guard_040000;
 
 create trigger trg_scheduled_job_target_identity_insert
 before insert on scheduled_job_delivery_targets
-when length(new.identity_digest) != 64
+when typeof(new.identity_digest) != 'text'
+  or length(new.identity_digest) != 64
   or new.identity_digest glob '*[^0-9a-f]*'
 begin
   select raise(abort, 'scheduled job target identity must be lowercase sha256');
@@ -34,7 +36,8 @@ end;
 
 create trigger trg_scheduled_job_target_identity_update
 before update of identity_digest on scheduled_job_delivery_targets
-when length(new.identity_digest) != 64
+when typeof(new.identity_digest) != 'text'
+  or length(new.identity_digest) != 64
   or new.identity_digest glob '*[^0-9a-f]*'
 begin
   select raise(abort, 'scheduled job target identity must be lowercase sha256');

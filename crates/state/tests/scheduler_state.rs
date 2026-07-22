@@ -1390,6 +1390,68 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
 }
 
 #[tokio::test]
+async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_identity() {
+  let temp = tempdir().expect("create tempdir");
+  let parent_migrations = temp.path().join("parent-migrations");
+  std::fs::create_dir(&parent_migrations).expect("create migration fixture");
+  let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+  for entry in std::fs::read_dir(source).expect("read migrations") {
+    let entry = entry.expect("migration entry");
+    if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql" {
+      std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
+        .expect("copy parent migration");
+    }
+  }
+  let state_dir = temp.path().join("state");
+  std::fs::create_dir(&state_dir).expect("create state dir");
+  let options = SqliteConnectOptions::from_str(&database_url(&state_dir))
+    .expect("database options")
+    .create_if_missing(true);
+  let pool = SqlitePoolOptions::new()
+    .max_connections(1)
+    .connect_with(options)
+    .await
+    .expect("connect parent database");
+  Migrator::new(parent_migrations)
+    .await
+    .expect("load parent migrator")
+    .run(&pool)
+    .await
+    .expect("run parent migrations");
+  sqlx::query("insert into scheduled_jobs (job_id, definition_version, definition_json, creator_kind, creator_provider, creator_tenant, creator_subject, owner_kind, owner_provider, owner_tenant, owner_subject, status, generation, capability_schema_version, capability_digest, capability_json, created_at, updated_at) values ('blob-identity-upgrade', 1, '{}', 'user', 'test', 'tenant', 'creator', 'user', 'test', 'tenant', 'owner', 'active', 0, 1, 'profile', '{}', 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed job");
+  sqlx::query("insert into scheduled_job_delivery_targets (target_id, job_id, ordinal, provider, connector, tenant, kind, address_json, resolver_version, resolver_digest, identity_digest) values ('blob-target', 'blob-identity-upgrade', 0, 'none', 'none', 'tenant', 'none', '{}', 1, 'resolver', zeroblob(64))")
+    .execute(&pool)
+    .await
+    .expect("seed blob target identity");
+  pool.close().await;
+
+  assert!(matches!(
+    StateStore::initialize(&state_dir, None).await,
+    Err(StateError::Migrate { .. })
+  ));
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("reopen rejected database");
+  let unchanged: (String, i64) = sqlx::query_as(
+    "select typeof(identity_digest), length(identity_digest) from scheduled_job_delivery_targets where target_id = 'blob-target'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled back blob identity");
+  assert_eq!(unchanged, ("blob".to_owned(), 64));
+  let migration_applied: i64 = sqlx::query_scalar(
+    "select count(*) from _sqlx_migrations where version = 20260721040000 and success = true",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read migration state");
+  assert_eq!(migration_applied, 0);
+}
+
+#[tokio::test]
 async fn test_current_schema_rejects_future_invalid_job_and_run_target_identities() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -1421,7 +1483,23 @@ async fn test_current_schema_rejects_future_invalid_job_and_run_target_identitie
     .is_err()
   );
   assert!(
+    sqlx::query(
+      "update scheduled_job_delivery_targets set identity_digest = zeroblob(64) where job_id = ?1"
+    )
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .is_err()
+  );
+  assert!(
     sqlx::query("insert into scheduled_job_delivery_targets (target_id, job_id, ordinal, provider, connector, tenant, kind, address_json, resolver_version, resolver_digest, identity_digest) values ('future-invalid-target', ?1, 1, 'none', 'none', 'tenant', 'none', '{}', 1, 'resolver', 'invalid')")
+      .bind(job_id)
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  assert!(
+    sqlx::query("insert into scheduled_job_delivery_targets (target_id, job_id, ordinal, provider, connector, tenant, kind, address_json, resolver_version, resolver_digest, identity_digest) values ('future-blob-target', ?1, 1, 'none', 'none', 'tenant', 'none', '{}', 1, 'resolver', zeroblob(64))")
       .bind(job_id)
       .execute(&pool)
       .await
@@ -1441,8 +1519,8 @@ async fn test_current_schema_rejects_future_invalid_job_and_run_target_identitie
       .await
       .is_err()
   );
-  let preserved: (String, String, i64, i64) = sqlx::query_as(
-    "select (select identity_digest from scheduled_job_delivery_targets where job_id = ?1 and ordinal = 0), (select json_extract(targets_json, '$[0].identity_digest') from scheduled_runs where run_id = ?2), (select count(*) from scheduled_job_delivery_targets where target_id = 'future-invalid-target'), (select count(*) from scheduled_runs where run_id = 'future-invalid-run')",
+  let preserved: (String, String, i64, i64, i64) = sqlx::query_as(
+    "select (select identity_digest from scheduled_job_delivery_targets where job_id = ?1 and ordinal = 0), (select json_extract(targets_json, '$[0].identity_digest') from scheduled_runs where run_id = ?2), (select count(*) from scheduled_job_delivery_targets where target_id = 'future-invalid-target'), (select count(*) from scheduled_job_delivery_targets where target_id = 'future-blob-target'), (select count(*) from scheduled_runs where run_id = 'future-invalid-run')",
   )
   .bind(job_id)
   .bind(&run.run_id)
@@ -1454,6 +1532,7 @@ async fn test_current_schema_rejects_future_invalid_job_and_run_target_identitie
     (
       NONE_TARGET_IDENTITY.to_owned(),
       NONE_TARGET_IDENTITY.to_owned(),
+      0,
       0,
       0
     )

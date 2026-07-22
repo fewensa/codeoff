@@ -8,10 +8,10 @@ use codeoff_agent_contract::{
   AgentTask, InvocationPrincipal, InvocationSource, PreviousSuccessContext, SessionMode, ToolPolicy,
 };
 use codeoff_state::{
-  AttestedExecutionProfileSnapshot, ClaimedScheduledRun, PreflightFailureDisposition,
-  RunLeaseBinding, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
-  ScheduledPrepareAuthority, ScheduledRunLateEvidenceKind, ScheduledRunResult, StateError,
-  StateStore, TransportConvergence,
+  AttestedExecutionProfileSnapshot, ClaimedScheduledRun, ExpiredRunReclaimOutcome,
+  PreflightFailureDisposition, RunLeaseBinding, ScheduledExecutionDisposition,
+  ScheduledExecutionTerminal, ScheduledPrepareAuthority, ScheduledRunLateEvidenceKind,
+  ScheduledRunResult, StateError, StateStore, TransportConvergence,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -26,6 +26,7 @@ const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const SCHEDULER_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 const SCHEDULER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 const MATERIALIZATION_BATCH_LIMIT: u32 = 32;
+const RECOVERY_BATCH_LIMIT: u32 = 32;
 const MAX_LOG_ERROR_BYTES: usize = 512;
 
 #[derive(Clone)]
@@ -231,10 +232,28 @@ async fn run_scheduled_worker_tick(
   if *shutdown.borrow() {
     return Ok(TickOutcome::Cancelled);
   }
+  let now = orchestrator.clock.now();
+  let retry_at = checked_add(
+    now,
+    orchestrator.policy.retry_delay_seconds,
+    "recovery retry",
+  )?;
+  for _ in 0..RECOVERY_BATCH_LIMIT {
+    let outcome = tokio::select! {
+      result = state.reclaim_next_expired_scheduled_run(
+        now,
+        orchestrator.policy.max_attempts,
+        retry_at,
+      ) => result?,
+      () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
+    };
+    if outcome == ExpiredRunReclaimOutcome::Idle {
+      break;
+    }
+  }
   if orchestrator.backend.readiness() != ExecutorReadiness::Ready {
     return Ok(TickOutcome::Unavailable);
   }
-  let now = orchestrator.clock.now();
   let due_jobs = tokio::select! {
     result = state.list_due_scheduled_jobs(now, MATERIALIZATION_BATCH_LIMIT) => result?,
     () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
@@ -1489,6 +1508,42 @@ mod tests {
       .expect("claim proof")
       .expect("run remained pending");
     assert_eq!(claim.binding.attempt(), 1);
+  }
+
+  #[tokio::test]
+  async fn test_unavailable_worker_reconciles_expired_run_before_readiness_gate() {
+    let (_temp, state) = fixture(&[("unavailable-recovery", 110)]).await;
+    let expired_claim = state
+      .claim_next_scheduled_run("stale-worker", 111, 120)
+      .await
+      .expect("claim stale run")
+      .expect("stale run");
+    let mut runtime = ScheduledRunOrchestrator::unavailable(
+      state.clone(),
+      GlobalTurnBudget::new(1),
+      Arc::new(BlockingGuardianRegistry::default()),
+      "runtime-test",
+    );
+    runtime.clock = Arc::new(TestClock(AtomicI64::new(121), 1));
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+
+    assert_eq!(
+      run_scheduled_worker_tick(&state, &runtime, shutdown_rx)
+        .await
+        .expect("tick"),
+      TickOutcome::Unavailable
+    );
+    let current = state
+      .claim_next_scheduled_run("current-worker", 151, 180)
+      .await
+      .expect("claim recovered run")
+      .expect("recovered run");
+    assert_eq!(current.binding.run_id(), expired_claim.binding.run_id());
+    assert_eq!(
+      current.binding.attempt(),
+      expired_claim.binding.attempt() + 1
+    );
+    assert!(current.binding.fence() > expired_claim.binding.fence());
   }
 
   #[tokio::test]

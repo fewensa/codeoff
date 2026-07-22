@@ -16,6 +16,7 @@ use codeoff_state::{
   ScheduledRunSuccessOutcome, SkippedNoneBaselinePolicy, StateError, StateStore, StateValueError,
   TransactionalMutationOutcome, TransportConvergence, UpdateScheduledJob,
 };
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::SqlitePool;
@@ -101,6 +102,48 @@ fn test_sha256_hex(value: &str) -> String {
     write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
   }
   encoded
+}
+
+fn recovery_capability_profile_json() -> String {
+  let tools = json!(["issue_read", "list_issues", "search_issues", "search_orgs"]);
+  let canonical = json!({
+    "app_server_schema_sha256": "1".repeat(64),
+    "codex_program_sha256": "2".repeat(64),
+    "codex_version": "test-codex",
+    "config_revision": "test-config-v1",
+    "config_sha256": "3".repeat(64),
+    "credential_deny_policy_revision": "test-deny-v1",
+    "credential_isolation_revision": "test-isolation-v1",
+    "credential_reference": "test-read-only-credential",
+    "github_mcp_artifact_sha256": "4".repeat(64),
+    "github_mcp_endpoint_identity": "test-github-mcp",
+    "github_mcp_version": "test-mcp",
+    "github_tools": tools,
+    "negative_test_revision": "test-negative-v1",
+    "output_schema_revision": "test-output-v1",
+    "permission_policy_revision": "test-read-only-v1",
+  });
+  let profile_sha256 = test_sha256_hex(&canonical.to_string());
+  json!({
+    "app_server_schema_sha256": "1".repeat(64),
+    "attested_at_unix_seconds": 100,
+    "codex_program_sha256": "2".repeat(64),
+    "codex_version": "test-codex",
+    "config_revision": "test-config-v1",
+    "config_sha256": "3".repeat(64),
+    "credential_deny_policy_revision": "test-deny-v1",
+    "credential_isolation_revision": "test-isolation-v1",
+    "credential_reference": "test-read-only-credential",
+    "github_mcp_artifact_sha256": "4".repeat(64),
+    "github_mcp_endpoint_identity": "test-github-mcp",
+    "github_mcp_version": "test-mcp",
+    "github_tools": ["issue_read", "list_issues", "search_issues", "search_orgs"],
+    "negative_test_revision": "test-negative-v1",
+    "output_schema_revision": "test-output-v1",
+    "permission_policy_revision": "test-read-only-v1",
+    "profile_sha256": profile_sha256,
+  })
+  .to_string()
 }
 
 fn test_intent_key(run_id: &str, target_identity_digest: &str) -> String {
@@ -2414,6 +2457,71 @@ async fn test_prepare_authority_covers_all_immutable_claim_metadata() {
 }
 
 #[tokio::test]
+async fn test_recovery_attestation_fails_closed_for_legacy_tampered_and_stale_profiles() {
+  let temp = tempdir().expect("create tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("initialize state store");
+  for (job_id, scheduled_for) in [("recovery-profile-a", 110), ("recovery-profile-b", 111)] {
+    let mut request = create_request(job_id, ScheduleSpec::once(scheduled_for), 100);
+    request.definition = ScheduledJobDefinition::new(
+      1,
+      format!(
+        r#"{{"instruction":"execute {job_id}","previous_success":{{"kind":"none"}},"schema_version":1}}"#
+      ),
+    )
+    .expect("definition");
+    store
+      .create_scheduled_job(&request)
+      .await
+      .expect("create job");
+    store
+      .materialize_due_schedule(job_id, 0, scheduled_for)
+      .await
+      .expect("materialize");
+  }
+  let first = store
+    .claim_next_scheduled_run("worker-a", 112, 150)
+    .await
+    .expect("claim first")
+    .expect("first run");
+  let second = store
+    .claim_next_scheduled_run("worker-b", 112, 150)
+    .await
+    .expect("claim second")
+    .expect("second run");
+  let first_authority =
+    ScheduledPrepareAuthority::for_claim(&first, "a".repeat(64)).expect("first authority");
+  let second_authority =
+    ScheduledPrepareAuthority::for_claim(&second, "b".repeat(64)).expect("second authority");
+  let valid = first_authority
+    .recovery_attestation_json(&recovery_capability_profile_json())
+    .expect("valid recovery profile");
+  let valid_digest = test_sha256_hex(&valid);
+  assert!(first_authority.recovery_attestation_matches(&valid, &valid_digest));
+  assert!(!second_authority.recovery_attestation_matches(&valid, &valid_digest));
+  assert!(!first_authority.recovery_attestation_matches(
+    &first_authority.attestation_json(true),
+    &test_sha256_hex(&first_authority.attestation_json(true)),
+  ));
+  assert!(!first_authority.recovery_attestation_matches(&valid, &"0".repeat(64)));
+
+  let mut tampered: serde_json::Value = serde_json::from_str(&valid).expect("profile json");
+  tampered["execution_surface"]["network_access"] = json!(true);
+  let tampered = tampered.to_string();
+  assert!(!first_authority.recovery_attestation_matches(&tampered, &test_sha256_hex(&tampered),));
+  let mut incomplete: serde_json::Value = serde_json::from_str(&valid).expect("profile json");
+  incomplete["capability_profile"]
+    .as_object_mut()
+    .expect("capability object")
+    .remove("github_tools");
+  let incomplete = incomplete.to_string();
+  assert!(
+    !first_authority.recovery_attestation_matches(&incomplete, &test_sha256_hex(&incomplete),)
+  );
+}
+
+#[tokio::test]
 async fn test_two_independent_stores_cannot_apply_equal_heartbeat_extension() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -3489,7 +3597,8 @@ async fn test_preflight_failure_never_executes_and_expired_lease_has_one_reclaim
       .iter()
       .filter(|outcome| matches!(outcome, Ok(ExpiredRunReclaimOutcome::Retried { .. })))
       .count(),
-    1
+    1,
+    "unexpected reclaim outcomes: {outcomes:?}",
   );
   for outcome in &outcomes {
     if let Err(error) = outcome {
@@ -3619,6 +3728,136 @@ async fn test_expired_executing_run_becomes_outcome_unknown_and_keeps_overlap() 
       1
     )
   );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_expired_safe_executing_run_has_one_reclaimer_and_stale_completion_is_evidence() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let first = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize first store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  let mut request = create_request("safe-executing-reclaim", ScheduleSpec::once(110), 100);
+  request.definition = ScheduledJobDefinition::new(
+    1,
+    r#"{"instruction":"check issues","previous_success":{"kind":"none"},"schema_version":1}"#,
+  )
+  .expect("execution definition");
+  first
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  first
+    .materialize_due_schedule("safe-executing-reclaim", 0, 110)
+    .await
+    .expect("materialize");
+  let stale = first
+    .claim_next_scheduled_run("worker-a", 111, 120)
+    .await
+    .expect("claim")
+    .expect("claimed run");
+  let authority = ScheduledPrepareAuthority::for_claim(&stale, "8".repeat(64)).expect("authority");
+  let attestation = authority
+    .recovery_attestation_json(&recovery_capability_profile_json())
+    .expect("complete recovery attestation");
+  assert!(authority.recovery_attestation_matches(&attestation, &test_sha256_hex(&attestation),));
+  let profile = AttestedExecutionProfileSnapshot::new(
+    2,
+    &attestation,
+    "sha256-v1",
+    test_sha256_hex(&attestation),
+  )
+  .expect("profile");
+  first
+    .mark_scheduled_run_executing(&stale.binding, &profile, 112)
+    .await
+    .expect("mark executing");
+
+  let barrier = Arc::new(Barrier::new(3));
+  let first_task = tokio::spawn(reclaim_after_barrier(first, Arc::clone(&barrier)));
+  let second_task = tokio::spawn(reclaim_after_barrier(second, Arc::clone(&barrier)));
+  barrier.wait().await;
+  let outcomes = [
+    first_task.await.expect("first reclaim task"),
+    second_task.await.expect("second reclaim task"),
+  ];
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| matches!(outcome, Ok(ExpiredRunReclaimOutcome::Retried { .. })))
+      .count(),
+    1,
+    "safe executing reclaim outcomes: {outcomes:?}",
+  );
+  for outcome in &outcomes {
+    if let Err(error) = outcome {
+      assert!(
+        error.is_transient_storage_contention()
+          || matches!(error, StateError::ScheduledRunLostLease),
+        "unexpected reclaim error: {error}"
+      );
+    }
+  }
+
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("reopen store");
+  let current = store
+    .claim_next_scheduled_run("worker-b", 130, 200)
+    .await
+    .expect("claim retry")
+    .expect("retried run");
+  assert_eq!(current.binding.attempt(), stale.binding.attempt() + 1);
+  assert!(current.binding.fence() > stale.binding.fence());
+  let result = ScheduledRunResult::new("accepted result", "context").expect("result");
+  assert_eq!(
+    store
+      .complete_scheduled_run_success(&stale.binding, &result, 140)
+      .await
+      .expect("stale completion"),
+    ScheduledRunSuccessOutcome::LateEvidence(LateEvidenceAppendOutcome::Recorded)
+  );
+  let current_authority =
+    ScheduledPrepareAuthority::for_claim(&current, "9".repeat(64)).expect("current authority");
+  let current_attestation = current_authority
+    .recovery_attestation_json(&recovery_capability_profile_json())
+    .expect("current recovery attestation");
+  store
+    .mark_scheduled_run_executing(
+      &current.binding,
+      &AttestedExecutionProfileSnapshot::new(
+        2,
+        &current_attestation,
+        "sha256-v1",
+        test_sha256_hex(&current_attestation),
+      )
+      .expect("current profile"),
+      131,
+    )
+    .await
+    .expect("mark current executing");
+  assert_eq!(
+    store
+      .complete_scheduled_run_success(&current.binding, &result, 141)
+      .await
+      .expect("complete current"),
+    ScheduledRunSuccessOutcome::Committed
+  );
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let counts: (i64, i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduled_run_result_artifacts where run_id = ?1), (select count(*) from scheduled_run_late_evidence where run_id = ?1), (select count(*) from scheduled_runs where run_id = ?1 and state = 'succeeded')",
+  )
+  .bind(current.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read outcome counts");
+  assert_eq!(counts, (1, 1, 1));
 }
 
 #[tokio::test]

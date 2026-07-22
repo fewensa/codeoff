@@ -822,6 +822,42 @@ impl ScheduledPrepareAuthority {
     .to_string()
   }
 
+  /// Builds the version-two attestation envelope used for safe execution recovery.
+  ///
+  /// The capability profile must be the canonical server-issued profile for the executor that
+  /// prepared this exact authority. The envelope records the complete enforced execution surface
+  /// rather than trusting a caller-supplied `side_effect_free` assertion.
+  ///
+  /// # Errors
+  /// Returns an error when the capability profile is not canonical or is incomplete.
+  ///
+  /// # Panics
+  /// Panics only if this privately constructed authority no longer contains valid canonical JSON.
+  pub fn recovery_attestation_json(
+    &self,
+    capability_profile_json: &str,
+  ) -> Result<String, StateValueError> {
+    let capability_profile = validate_recovery_capability_profile(capability_profile_json)?;
+    let authority: Value = serde_json::from_str(&self.canonical_json)
+      .expect("validated authority remains valid canonical JSON");
+    Ok(
+      json!({
+        "authority": authority,
+        "authority_digest": self.digest,
+        "capability_profile": capability_profile,
+        "execution_surface": {
+          "approval_policy": "never",
+          "dynamic_tools": false,
+          "network_access": false,
+          "sandbox": "read-only",
+          "web_search": "disabled",
+        },
+        "schema_version": 2,
+      })
+      .to_string(),
+    )
+  }
+
   #[must_use]
   pub fn attestation_matches(
     &self,
@@ -846,6 +882,139 @@ impl ScheduledPrepareAuthority {
     !require_side_effect_free
       || profile.get("side_effect_free").and_then(Value::as_bool) == Some(true)
   }
+
+  #[must_use]
+  pub fn recovery_attestation_matches(&self, canonical_json: &str, digest: &str) -> bool {
+    let Ok(profile) = serde_json::from_str::<Value>(canonical_json) else {
+      return false;
+    };
+    let expected_surface = json!({
+      "approval_policy": "never",
+      "dynamic_tools": false,
+      "network_access": false,
+      "sandbox": "read-only",
+      "web_search": "disabled",
+    });
+    if serde_json::to_string(&profile).ok().as_deref() != Some(canonical_json)
+      || sha256_hex(canonical_json.as_bytes()) != digest
+      || profile.get("schema_version").and_then(Value::as_u64) != Some(2)
+      || profile.get("authority_digest").and_then(Value::as_str) != Some(self.digest())
+      || profile.get("authority")
+        != serde_json::from_str::<Value>(&self.canonical_json)
+          .ok()
+          .as_ref()
+      || profile.get("execution_surface") != Some(&expected_surface)
+    {
+      return false;
+    }
+    profile
+      .get("capability_profile")
+      .is_some_and(|value| validate_recovery_capability_profile_value(value).is_ok())
+  }
+}
+
+fn validate_recovery_capability_profile(canonical_json: &str) -> Result<Value, StateValueError> {
+  validate_canonical_json("scheduled recovery capability profile", canonical_json)?;
+  let value = serde_json::from_str(canonical_json).map_err(|_| StateValueError::InvalidJson {
+    field: "scheduled recovery capability profile",
+  })?;
+  validate_recovery_capability_profile_value(&value)?;
+  Ok(value)
+}
+
+fn validate_recovery_capability_profile_value(value: &Value) -> Result<(), StateValueError> {
+  const EXPECTED_GITHUB_TOOLS: [&str; 4] =
+    ["issue_read", "list_issues", "search_issues", "search_orgs"];
+  const REQUIRED_TEXT: [&str; 15] = [
+    "app_server_schema_sha256",
+    "codex_program_sha256",
+    "codex_version",
+    "config_revision",
+    "config_sha256",
+    "credential_deny_policy_revision",
+    "credential_isolation_revision",
+    "credential_reference",
+    "github_mcp_artifact_sha256",
+    "github_mcp_endpoint_identity",
+    "github_mcp_version",
+    "negative_test_revision",
+    "output_schema_revision",
+    "permission_policy_revision",
+    "profile_sha256",
+  ];
+  let object = value.as_object().ok_or(StateValueError::InvalidJson {
+    field: "scheduled recovery capability profile",
+  })?;
+  if object.len() != REQUIRED_TEXT.len() + 2
+    || REQUIRED_TEXT.iter().any(|field| {
+      object
+        .get(*field)
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    })
+    || object
+      .get("attested_at_unix_seconds")
+      .and_then(Value::as_u64)
+      .is_none()
+  {
+    return Err(StateValueError::InvalidJson {
+      field: "scheduled recovery capability profile",
+    });
+  }
+  let Some(tools) = object.get("github_tools").and_then(Value::as_array) else {
+    return Err(StateValueError::InvalidJson {
+      field: "scheduled recovery capability profile",
+    });
+  };
+  if tools.len() != EXPECTED_GITHUB_TOOLS.len()
+    || tools
+      .iter()
+      .zip(EXPECTED_GITHUB_TOOLS)
+      .any(|(actual, expected)| actual.as_str() != Some(expected))
+  {
+    return Err(StateValueError::InvalidJson {
+      field: "scheduled recovery capability profile",
+    });
+  }
+  for field in [
+    "app_server_schema_sha256",
+    "codex_program_sha256",
+    "config_sha256",
+    "github_mcp_artifact_sha256",
+    "profile_sha256",
+  ] {
+    validate_lowercase_sha256(
+      "scheduled recovery capability profile digest",
+      object[field]
+        .as_str()
+        .expect("required string checked above"),
+    )?;
+  }
+  let canonical_profile = json!({
+    "app_server_schema_sha256": object["app_server_schema_sha256"],
+    "codex_program_sha256": object["codex_program_sha256"],
+    "codex_version": object["codex_version"],
+    "config_revision": object["config_revision"],
+    "config_sha256": object["config_sha256"],
+    "credential_deny_policy_revision": object["credential_deny_policy_revision"],
+    "credential_isolation_revision": object["credential_isolation_revision"],
+    "credential_reference": object["credential_reference"],
+    "github_mcp_artifact_sha256": object["github_mcp_artifact_sha256"],
+    "github_mcp_endpoint_identity": object["github_mcp_endpoint_identity"],
+    "github_mcp_version": object["github_mcp_version"],
+    "github_tools": object["github_tools"],
+    "negative_test_revision": object["negative_test_revision"],
+    "output_schema_revision": object["output_schema_revision"],
+    "permission_policy_revision": object["permission_policy_revision"],
+  });
+  if object["profile_sha256"].as_str()
+    != Some(&sha256_hex(canonical_profile.to_string().as_bytes()))
+  {
+    return Err(StateValueError::InvalidSha256 {
+      field: "scheduled recovery capability profile digest",
+    });
+  }
+  Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

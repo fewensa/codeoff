@@ -2046,7 +2046,7 @@ impl StateStore {
     }
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let row = sqlx::query(
-      "select run_id, job_id, attempt, fence, lease_owner, state from scheduled_runs indexed by idx_scheduled_runs_recovery where state in ('leased', 'executing') and lease_expires_at <= ?1 order by lease_expires_at, run_id limit 1",
+      "select r.run_id, r.job_id, r.attempt, r.fence, r.lease_owner, r.state, r.schedule_id, r.job_generation, r.schedule_generation, r.scheduled_for, r.coalesced_through, r.definition_version, r.definition_json, r.capability_schema_version, r.capability_digest, r.capability_json, r.targets_json, r.execution_baseline_json, a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r indexed by idx_scheduled_runs_recovery join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner and a.state = r.state where r.state in ('leased', 'executing') and r.lease_expires_at <= ?1 and a.lease_expires_at <= ?1 order by r.lease_expires_at, r.run_id limit 1",
     )
     .bind(now)
     .fetch_optional(&mut *transaction)
@@ -2062,7 +2062,23 @@ impl StateStore {
     let fence: i64 = row.try_get("fence").map_err(scheduler_error)?;
     let lease_owner: String = row.try_get("lease_owner").map_err(scheduler_error)?;
     let state: String = row.try_get("state").map_err(scheduler_error)?;
-    let transition = expired_reclaim_transition(&state, &run_id, attempt, fence, max_attempts);
+    let binding = RunLeaseBinding {
+      run_id: run_id.clone(),
+      job_id: job_id.clone(),
+      attempt,
+      fence,
+      lease_owner: lease_owner.clone(),
+    };
+    let safe_execution_retry =
+      state == "executing" && persisted_profile_allows_recovery(&binding, &row)?;
+    let transition = expired_reclaim_transition(
+      &state,
+      &run_id,
+      attempt,
+      fence,
+      max_attempts,
+      safe_execution_retry,
+    );
     let retry_at = (transition.run_state == "pending").then_some(next_attempt_at);
     let updated = sqlx::query(
       "update scheduled_runs set state = ?1, next_attempt_at = ?2, lease_owner = null, lease_expires_at = null, overlap_slot = ?3, error_kind = case when ?1 in ('failed', 'outcome_unknown') then ?4 else null end, error_message = case when ?1 in ('failed', 'outcome_unknown') then ?4 else null end, updated_at = ?5 where run_id = ?6 and job_id = ?7 and attempt = ?8 and fence = ?9 and lease_owner = ?10 and state = ?11 and lease_expires_at <= ?5",
@@ -3147,8 +3163,9 @@ fn expired_reclaim_transition(
   attempt: i64,
   fence: i64,
   max_attempts: i64,
+  safe_execution_retry: bool,
 ) -> ExpiredReclaimTransition {
-  if state == "executing" {
+  if state == "executing" && !safe_execution_retry {
     return ExpiredReclaimTransition {
       run_state: "outcome_unknown",
       attempt_state: "outcome_unknown",
@@ -3162,11 +3179,16 @@ fn expired_reclaim_transition(
     };
   }
   if attempt < max_attempts {
+    let (attempt_state, error_kind) = if state == "executing" {
+      ("lease_expired", "safe_execution_lease_expired")
+    } else {
+      ("lease_expired", "preflight_lease_expired")
+    };
     return ExpiredReclaimTransition {
       run_state: "pending",
-      attempt_state: "lease_expired",
+      attempt_state,
       overlap_slot: Some(1),
-      error_kind: "preflight_lease_expired",
+      error_kind,
       outcome: ExpiredRunReclaimOutcome::Retried {
         run_id: run_id.to_owned(),
         attempt,
@@ -3174,11 +3196,16 @@ fn expired_reclaim_transition(
       },
     };
   }
+  let (attempt_state, error_kind) = if state == "executing" {
+    ("lease_expired", "safe_execution_lease_exhausted")
+  } else {
+    ("lease_expired", "preflight_lease_exhausted")
+  };
   ExpiredReclaimTransition {
     run_state: "failed",
-    attempt_state: "lease_expired",
+    attempt_state,
     overlap_slot: None,
-    error_kind: "preflight_lease_exhausted",
+    error_kind,
     outcome: ExpiredRunReclaimOutcome::Failed {
       run_id: run_id.to_owned(),
       attempt,
@@ -4026,6 +4053,64 @@ fn persisted_profile_allows_retry(
     return Ok(false);
   };
   Ok(authority.attestation_matches(&canonical_json, &digest, true))
+}
+
+fn persisted_profile_allows_recovery(
+  binding: &RunLeaseBinding,
+  row: &sqlx::sqlite::SqliteRow,
+) -> Result<bool, StateError> {
+  let schema_version = row
+    .try_get::<Option<i64>, _>("attested_profile_schema_version")
+    .map_err(scheduler_error)?;
+  let canonical_json = row
+    .try_get::<Option<String>, _>("attested_profile_json")
+    .map_err(scheduler_error)?;
+  let hash_algorithm = row
+    .try_get::<Option<String>, _>("attested_profile_hash_algorithm")
+    .map_err(scheduler_error)?;
+  let digest = row
+    .try_get::<Option<String>, _>("attested_profile_digest")
+    .map_err(scheduler_error)?;
+  let (Some(canonical_json), Some(digest)) = (canonical_json, digest) else {
+    return Ok(false);
+  };
+  if schema_version != Some(2) || hash_algorithm.as_deref() != Some("sha256-v1") {
+    return Ok(false);
+  }
+  let profile: Value = serde_json::from_str(&canonical_json).map_err(invalid_json)?;
+  let Some(nonce) = profile.pointer("/authority/nonce").and_then(Value::as_str) else {
+    return Ok(false);
+  };
+  let claim = ClaimedScheduledRun {
+    binding: binding.clone(),
+    schedule_id: row.try_get("schedule_id").map_err(scheduler_error)?,
+    job_generation: row.try_get("job_generation").map_err(scheduler_error)?,
+    schedule_generation: row
+      .try_get("schedule_generation")
+      .map_err(scheduler_error)?,
+    scheduled_for: row.try_get("scheduled_for").map_err(scheduler_error)?,
+    coalesced_through: row.try_get("coalesced_through").map_err(scheduler_error)?,
+    definition_version: positive_u32(row.try_get("definition_version").map_err(scheduler_error)?)?,
+    definition_json: row.try_get("definition_json").map_err(scheduler_error)?,
+    capability_schema_version: positive_u32(
+      row
+        .try_get("capability_schema_version")
+        .map_err(scheduler_error)?,
+    )?,
+    capability_digest: row.try_get("capability_digest").map_err(scheduler_error)?,
+    capability_json: row.try_get("capability_json").map_err(scheduler_error)?,
+    targets_json: row.try_get("targets_json").map_err(scheduler_error)?,
+    execution_baseline_json: row
+      .try_get::<Option<String>, _>("execution_baseline_json")
+      .map_err(scheduler_error)?
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "materialized run is missing its execution baseline snapshot".to_owned(),
+      })?,
+  };
+  let Ok(authority) = super::ScheduledPrepareAuthority::for_claim(&claim, nonce) else {
+    return Ok(false);
+  };
+  Ok(authority.recovery_attestation_matches(&canonical_json, &digest))
 }
 
 #[cfg(test)]

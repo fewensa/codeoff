@@ -10,8 +10,8 @@ use codeoff_state::{
   MaterializationOutcome, OccurrenceError, PreflightFailureDisposition, PrincipalKey,
   ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryState, ScheduledExecutionDisposition,
   ScheduledExecutionTerminal, ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus,
-  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunResult,
-  ScheduledRunSuccessOutcome, StateError, StateStore, StateValueError,
+  ScheduledPrepareAuthority, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind,
+  ScheduledRunResult, ScheduledRunSuccessOutcome, StateError, StateStore, StateValueError,
   TransactionalMutationOutcome, TransportConvergence, UpdateAcceptedDeliveryBaseline,
   UpdateExecutionBaseline, UpdateScheduledJob,
 };
@@ -1825,8 +1825,14 @@ async fn test_execution_retry_requires_persisted_side_effect_free_attestation_an
     ("unsafe-retry", 111),
     ("late-retry", 112),
   ] {
+    let mut request = create_request(job, ScheduleSpec::once(scheduled_for), 100);
+    request.definition = ScheduledJobDefinition::new(
+      1,
+      format!(r#"{{"instruction":"execute {job}","previous_success":{{"kind":"none"}},"schema_version":1}}"#),
+    )
+    .expect("execution definition");
     store
-      .create_scheduled_job(&create_request(job, ScheduleSpec::once(scheduled_for), 100))
+      .create_scheduled_job(&request)
       .await
       .expect("create job");
     store
@@ -1834,20 +1840,64 @@ async fn test_execution_retry_requires_persisted_side_effect_free_attestation_an
       .await
       .expect("materialize");
   }
-  let profile_json = r#"{"schema_version":1,"side_effect_free":true}"#;
-  let profile = AttestedExecutionProfileSnapshot::new(
-    1,
-    profile_json,
-    "sha256-v1",
-    test_sha256_hex(profile_json),
-  )
-  .expect("safe profile");
-
   let safe = store
     .claim_next_scheduled_run("worker", 113, 150)
     .await
     .expect("claim safe")
     .expect("safe run");
+  let safe_authority =
+    ScheduledPrepareAuthority::for_claim(&safe, "1".repeat(64)).expect("safe authority");
+  let profile_json = safe_authority.attestation_json(true);
+  for changed in [
+    {
+      let mut changed = safe.clone();
+      changed.definition_json = changed
+        .definition_json
+        .replace("execute safe-retry", "execute changed");
+      changed
+    },
+    {
+      let mut changed = safe.clone();
+      changed.capability_json = r#"{"tools":["github.write"]}"#.to_owned();
+      changed
+    },
+    {
+      let mut changed = safe.clone();
+      changed.targets_json = changed
+        .targets_json
+        .replace(NONE_TARGET_IDENTITY, SLACK_TARGET_IDENTITY);
+      changed
+    },
+    {
+      let mut changed = safe.clone();
+      changed.execution_baseline_json = changed
+        .execution_baseline_json
+        .replace(r#""baseline_version":0"#, r#""baseline_version":1"#);
+      changed
+    },
+  ] {
+    let changed_authority =
+      ScheduledPrepareAuthority::for_claim(&changed, "1".repeat(64)).expect("changed authority");
+    assert_ne!(changed_authority.digest(), safe_authority.digest());
+    assert!(!changed_authority.attestation_matches(
+      &profile_json,
+      &test_sha256_hex(&profile_json),
+      false,
+    ));
+  }
+  assert_ne!(
+    ScheduledPrepareAuthority::for_claim(&safe, "9".repeat(64))
+      .expect("new nonce")
+      .digest(),
+    safe_authority.digest(),
+  );
+  let profile = AttestedExecutionProfileSnapshot::new(
+    1,
+    &profile_json,
+    "sha256-v1",
+    test_sha256_hex(&profile_json),
+  )
+  .expect("safe profile");
   store
     .mark_scheduled_run_executing(&safe.binding, &profile, 114)
     .await
@@ -1877,9 +1927,13 @@ async fn test_execution_retry_requires_persisted_side_effect_free_attestation_an
     .await
     .expect("claim unsafe")
     .expect("unsafe run");
-  let unsafe_profile =
-    AttestedExecutionProfileSnapshot::new(1, profile_json, "sha256-v1", "not-the-hash")
-      .expect("persistable unsafe profile");
+  let unsafe_profile = AttestedExecutionProfileSnapshot::new(
+    1,
+    &profile_json,
+    "sha256-v1",
+    test_sha256_hex(&profile_json),
+  )
+  .expect("persistable mismatched profile");
   store
     .mark_scheduled_run_executing(&unsafe_claim.binding, &unsafe_profile, 117)
     .await
@@ -1909,8 +1963,18 @@ async fn test_execution_retry_requires_persisted_side_effect_free_attestation_an
     .await
     .expect("claim late")
     .expect("late run");
+  let late_authority =
+    ScheduledPrepareAuthority::for_claim(&late, "2".repeat(64)).expect("late authority");
+  let late_profile_json = late_authority.attestation_json(true);
+  let late_profile = AttestedExecutionProfileSnapshot::new(
+    1,
+    &late_profile_json,
+    "sha256-v1",
+    test_sha256_hex(&late_profile_json),
+  )
+  .expect("late profile");
   store
-    .mark_scheduled_run_executing(&late.binding, &profile, 120)
+    .mark_scheduled_run_executing(&late.binding, &late_profile, 120)
     .await
     .expect("execute late");
   assert!(matches!(
@@ -1927,6 +1991,36 @@ async fn test_execution_retry_requires_persisted_side_effect_free_attestation_an
     ScheduledRunExecutionOutcome::LateEvidence(LateEvidenceAppendOutcome::Recorded)
   ));
 
+  let replay = store
+    .claim_next_scheduled_run("worker", 131, 150)
+    .await
+    .expect("claim retry for replay")
+    .expect("safe run retry");
+  assert_eq!(replay.binding.attempt(), 2);
+  store
+    .mark_scheduled_run_executing(&replay.binding, &profile, 132)
+    .await
+    .expect("persist stale-attempt attestation");
+  assert_eq!(
+    store
+      .record_scheduled_run_execution_outcome(
+        &replay.binding,
+        ScheduledExecutionDisposition::RetryAt {
+          retry_at: 140,
+          deadline_at: 145,
+          max_attempts: 3,
+          transport: TransportConvergence::Converged,
+          exhausted: ScheduledExecutionTerminal::Failed,
+        },
+        "interrupted",
+        "replayed nonce and attempt authority",
+        133,
+      )
+      .await
+      .expect("reject replayed authority"),
+    ScheduledRunExecutionOutcome::Terminal(ScheduledExecutionTerminal::OutcomeUnknown)
+  );
+
   let pool = SqlitePool::connect(&database_url(&state_dir))
     .await
     .expect("connect database");
@@ -1940,7 +2034,11 @@ async fn test_execution_retry_requires_persisted_side_effect_free_attestation_an
     states,
     vec![
       ("late-retry".to_owned(), "executing".to_owned(), Some(1)),
-      ("safe-retry".to_owned(), "pending".to_owned(), Some(1)),
+      (
+        "safe-retry".to_owned(),
+        "outcome_unknown".to_owned(),
+        Some(1),
+      ),
       (
         "unsafe-retry".to_owned(),
         "outcome_unknown".to_owned(),

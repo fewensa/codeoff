@@ -26,6 +26,26 @@ const MAX_DELIVERY_INTENT_KEY_BYTES: usize = 70 + (MAX_DELIVERY_INTENT_RUN_ID_BY
 const MAX_DELIVERY_INTENT_ID_BYTES: usize = "intent:".len() + MAX_DELIVERY_INTENT_KEY_BYTES;
 
 impl StateStore {
+  /// Reads scheduler authority counts for cross-pool lifecycle tests.
+  ///
+  /// # Errors
+  /// Returns an error when `SQLite` cannot read the test authority rows.
+  #[cfg(any(test, feature = "test-support"))]
+  pub async fn scheduled_execution_authority_counts_for_tests(
+    &self,
+    run_id: &str,
+    job_id: &str,
+  ) -> Result<(i64, i64, i64, i64), StateError> {
+    sqlx::query_as(
+      "select (select count(*) from scheduled_run_result_artifacts where run_id = ?1), (select count(*) from scheduled_run_deliveries where run_id = ?1), (select baseline_version from scheduled_execution_baselines where job_id = ?2), (select count(*) from scheduled_run_late_evidence where run_id = ?1)",
+    )
+    .bind(run_id)
+    .bind(job_id)
+    .fetch_one(&self.pool)
+    .await
+    .map_err(scheduler_error)
+  }
+
   /// Creates a job, current schedule, resolved targets, and empty execution baseline atomically.
   ///
   /// # Errors
@@ -1041,7 +1061,7 @@ impl StateStore {
     );
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let row = sqlx::query(
-      "select a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner where r.run_id = ?1 and r.job_id = ?2 and r.attempt = ?3 and r.fence = ?4 and r.lease_owner = ?5 and r.state = 'executing' and a.state = 'executing' and r.lease_expires_at > ?6 and a.lease_expires_at > ?6",
+      "select r.schedule_id, r.job_generation, r.schedule_generation, r.scheduled_for, r.coalesced_through, r.definition_version, r.definition_json, r.capability_schema_version, r.capability_digest, r.capability_json, r.targets_json, r.execution_baseline_json, a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner where r.run_id = ?1 and r.job_id = ?2 and r.attempt = ?3 and r.fence = ?4 and r.lease_owner = ?5 and r.state = 'executing' and a.state = 'executing' and r.lease_expires_at > ?6 and a.lease_expires_at > ?6",
     )
     .bind(binding.run_id())
     .bind(binding.job_id())
@@ -2644,7 +2664,7 @@ fn execution_outcome_transition(
       transport: super::TransportConvergence::Converged,
       exhausted,
     } => {
-      if !persisted_profile_allows_retry(row)? {
+      if !persisted_profile_allows_retry(binding, row)? {
         ScheduledExecutionTerminal::OutcomeUnknown
       } else if binding.attempt() >= max_attempts || now >= deadline_at || retry_at > deadline_at {
         exhausted
@@ -2675,7 +2695,10 @@ fn execution_outcome_transition(
   })
 }
 
-fn persisted_profile_allows_retry(row: &sqlx::sqlite::SqliteRow) -> Result<bool, StateError> {
+fn persisted_profile_allows_retry(
+  binding: &RunLeaseBinding,
+  row: &sqlx::sqlite::SqliteRow,
+) -> Result<bool, StateError> {
   let schema_version = row
     .try_get::<Option<i64>, _>("attested_profile_schema_version")
     .map_err(scheduler_error)?;
@@ -2691,17 +2714,43 @@ fn persisted_profile_allows_retry(row: &sqlx::sqlite::SqliteRow) -> Result<bool,
   let (Some(canonical_json), Some(digest)) = (canonical_json, digest) else {
     return Ok(false);
   };
-  if schema_version != Some(1)
-    || hash_algorithm.as_deref() != Some("sha256-v1")
-    || sha256_hex(canonical_json.as_bytes()) != digest
-  {
+  if schema_version != Some(1) || hash_algorithm.as_deref() != Some("sha256-v1") {
     return Ok(false);
   }
   let profile: Value = serde_json::from_str(&canonical_json).map_err(invalid_json)?;
-  Ok(
-    profile.get("schema_version").and_then(Value::as_u64) == Some(1)
-      && profile.get("side_effect_free").and_then(Value::as_bool) == Some(true),
-  )
+  let Some(nonce) = profile.pointer("/authority/nonce").and_then(Value::as_str) else {
+    return Ok(false);
+  };
+  let claim = ClaimedScheduledRun {
+    binding: binding.clone(),
+    schedule_id: row.try_get("schedule_id").map_err(scheduler_error)?,
+    job_generation: row.try_get("job_generation").map_err(scheduler_error)?,
+    schedule_generation: row
+      .try_get("schedule_generation")
+      .map_err(scheduler_error)?,
+    scheduled_for: row.try_get("scheduled_for").map_err(scheduler_error)?,
+    coalesced_through: row.try_get("coalesced_through").map_err(scheduler_error)?,
+    definition_version: positive_u32(row.try_get("definition_version").map_err(scheduler_error)?)?,
+    definition_json: row.try_get("definition_json").map_err(scheduler_error)?,
+    capability_schema_version: positive_u32(
+      row
+        .try_get("capability_schema_version")
+        .map_err(scheduler_error)?,
+    )?,
+    capability_digest: row.try_get("capability_digest").map_err(scheduler_error)?,
+    capability_json: row.try_get("capability_json").map_err(scheduler_error)?,
+    targets_json: row.try_get("targets_json").map_err(scheduler_error)?,
+    execution_baseline_json: row
+      .try_get::<Option<String>, _>("execution_baseline_json")
+      .map_err(scheduler_error)?
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "materialized run is missing its execution baseline snapshot".to_owned(),
+      })?,
+  };
+  let Ok(authority) = super::ScheduledPrepareAuthority::for_claim(&claim, nonce) else {
+    return Ok(false);
+  };
+  Ok(authority.attestation_matches(&canonical_json, &digest, true))
 }
 
 #[cfg(test)]

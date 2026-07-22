@@ -1,8 +1,10 @@
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use croner::parser::CronParser;
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::StateError;
@@ -23,6 +25,7 @@ type ScheduleStorageParts = (
 
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_PREVIOUS_SUCCESS_BYTES: usize = 16 * 1024;
 const MAX_DELIVERY_TARGETS: usize = 32;
 const DEFAULT_OCCURRENCE_STEPS: u32 = 100_000;
 const MAX_CRON_HORIZON_SECONDS: i64 = 366 * 24 * 60 * 60 * 10;
@@ -610,6 +613,222 @@ pub struct ClaimedScheduledRun {
   pub capability_json: String,
   pub targets_json: String,
   pub execution_baseline_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledPrepareAuthority {
+  nonce: String,
+  canonical_json: String,
+  digest: String,
+  instruction: String,
+  previous_success: Option<String>,
+  previous_success_was_truncated: bool,
+}
+
+impl ScheduledPrepareAuthority {
+  /// Builds the version-one execution authority over a complete immutable run snapshot.
+  ///
+  /// # Errors
+  /// Returns an error when the nonce or any persisted snapshot is invalid.
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps the canonical authority field order and digest inputs auditable in one owner"
+  )]
+  pub fn for_claim(
+    claim: &ClaimedScheduledRun,
+    nonce: impl Into<String>,
+  ) -> Result<Self, StateValueError> {
+    let nonce = nonce.into();
+    validate_lowercase_sha256("scheduled prepare nonce", &nonce)?;
+    validate_canonical_snapshot(
+      claim.definition_version,
+      "scheduled definition",
+      &claim.definition_json,
+    )?;
+    validate_canonical_snapshot(
+      claim.capability_schema_version,
+      "scheduled capability",
+      &claim.capability_json,
+    )?;
+    validate_canonical_json("scheduled targets", &claim.targets_json)?;
+    validate_canonical_json(
+      "scheduled execution baseline",
+      &claim.execution_baseline_json,
+    )?;
+    let definition: Value =
+      serde_json::from_str(&claim.definition_json).map_err(|_| StateValueError::InvalidJson {
+        field: "scheduled definition",
+      })?;
+    let instruction = definition
+      .get("instruction")
+      .and_then(Value::as_str)
+      .filter(|value| !value.trim().is_empty())
+      .ok_or(StateValueError::InvalidJson {
+        field: "scheduled definition",
+      })?
+      .to_owned();
+    let baseline: Value = serde_json::from_str(&claim.execution_baseline_json).map_err(|_| {
+      StateValueError::InvalidJson {
+        field: "scheduled execution baseline",
+      }
+    })?;
+    let include_previous = definition
+      .pointer("/previous_success/kind")
+      .and_then(Value::as_str)
+      == Some("latest_success");
+    let previous = include_previous
+      .then(|| {
+        baseline
+          .get("previous_success_context")
+          .and_then(Value::as_str)
+      })
+      .flatten();
+    let (previous_success, previous_success_was_truncated) =
+      previous.map_or((None, false), |value| {
+        let boundary = bounded_utf8_boundary(value, MAX_PREVIOUS_SUCCESS_BYTES);
+        (Some(value[..boundary].to_owned()), boundary < value.len())
+      });
+    let instruction_digest = framed_sha256("scheduled-instruction-v1", &[instruction.as_bytes()]);
+    let definition_digest = framed_sha256(
+      "scheduled-definition-v1",
+      &[claim.definition_json.as_bytes()],
+    );
+    let capability_digest = framed_sha256(
+      "scheduled-capability-v1",
+      &[claim.capability_json.as_bytes()],
+    );
+    let targets_digest = framed_sha256("scheduled-targets-v1", &[claim.targets_json.as_bytes()]);
+    let baseline_digest = framed_sha256(
+      "scheduled-baseline-v1",
+      &[claim.execution_baseline_json.as_bytes()],
+    );
+    let task_json = json!({
+      "channel": null,
+      "feedback_target": null,
+      "instruction": instruction,
+      "previous_success": previous_success.as_ref().map(|content| json!({
+        "content": content,
+        "was_truncated": previous_success_was_truncated,
+      })),
+      "principal": {"kind": "service", "service": "codeoff-scheduler"},
+      "session": "fresh",
+      "source": {
+        "job_id": claim.binding.job_id(),
+        "kind": "scheduled_run",
+        "run_id": claim.binding.run_id(),
+        "scheduled_for": claim.scheduled_for.to_string(),
+      },
+      "task_id": format!("scheduled:{}:{}:{}", claim.binding.run_id(), claim.binding.attempt(), claim.binding.fence()),
+      "tool_policy": "none",
+    })
+    .to_string();
+    let task_digest = framed_sha256("scheduled-agent-task-v1", &[task_json.as_bytes()]);
+    let authority_json = json!({
+      "binding": {
+        "attempt": claim.binding.attempt(),
+        "fence": claim.binding.fence(),
+        "job_id": claim.binding.job_id(),
+        "lease_owner": claim.binding.lease_owner(),
+        "run_id": claim.binding.run_id(),
+      },
+      "capability_identity_digest": claim.capability_digest,
+      "digests": {
+        "baseline": baseline_digest,
+        "capability": capability_digest,
+        "definition": definition_digest,
+        "instruction": instruction_digest,
+        "targets": targets_digest,
+        "task": task_digest,
+      },
+      "nonce": nonce,
+      "schema_version": 1,
+    })
+    .to_string();
+    let digest = framed_sha256(
+      "scheduled-prepare-authority-v1",
+      &[authority_json.as_bytes()],
+    );
+    Ok(Self {
+      nonce,
+      canonical_json: authority_json,
+      digest,
+      instruction,
+      previous_success,
+      previous_success_was_truncated,
+    })
+  }
+
+  #[must_use]
+  pub fn nonce(&self) -> &str {
+    &self.nonce
+  }
+
+  #[must_use]
+  pub fn canonical_json(&self) -> &str {
+    &self.canonical_json
+  }
+
+  #[must_use]
+  pub fn digest(&self) -> &str {
+    &self.digest
+  }
+
+  #[must_use]
+  pub fn instruction(&self) -> &str {
+    &self.instruction
+  }
+
+  #[must_use]
+  pub fn previous_success(&self) -> Option<&str> {
+    self.previous_success.as_deref()
+  }
+
+  #[must_use]
+  pub const fn previous_success_was_truncated(&self) -> bool {
+    self.previous_success_was_truncated
+  }
+
+  #[must_use]
+  /// Builds the canonical attestation envelope for this authority.
+  ///
+  /// # Panics
+  /// Panics only if this privately constructed authority no longer contains valid canonical JSON.
+  pub fn attestation_json(&self, side_effect_free: bool) -> String {
+    let authority: Value = serde_json::from_str(&self.canonical_json)
+      .expect("validated authority remains valid canonical JSON");
+    json!({
+      "authority": authority,
+      "authority_digest": self.digest,
+      "schema_version": 1,
+      "side_effect_free": side_effect_free,
+    })
+    .to_string()
+  }
+
+  #[must_use]
+  pub fn attestation_matches(
+    &self,
+    canonical_json: &str,
+    digest: &str,
+    require_side_effect_free: bool,
+  ) -> bool {
+    let Ok(profile) = serde_json::from_str::<Value>(canonical_json) else {
+      return false;
+    };
+    if serde_json::to_string(&profile).ok().as_deref() != Some(canonical_json)
+      || sha256_hex(canonical_json.as_bytes()) != digest
+      || profile.get("schema_version").and_then(Value::as_u64) != Some(1)
+      || profile.get("authority_digest").and_then(Value::as_str) != Some(self.digest())
+      || profile.get("authority")
+        != serde_json::from_str::<Value>(&self.canonical_json)
+          .ok()
+          .as_ref()
+    {
+      return false;
+    }
+    !require_side_effect_free
+      || profile.get("side_effect_free").and_then(Value::as_bool) == Some(true)
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1206,6 +1425,56 @@ fn validate_canonical_snapshot(
     return Err(StateValueError::NonCanonicalJson { field });
   }
   Ok(())
+}
+
+fn validate_canonical_json(field: &'static str, json: &str) -> Result<(), StateValueError> {
+  if json.len() > MAX_SNAPSHOT_BYTES {
+    return Err(StateValueError::TooLarge { field });
+  }
+  let value =
+    serde_json::from_str::<Value>(json).map_err(|_| StateValueError::InvalidJson { field })?;
+  if serde_json::to_string(&value).ok().as_deref() != Some(json) {
+    return Err(StateValueError::NonCanonicalJson { field });
+  }
+  Ok(())
+}
+
+fn bounded_utf8_boundary(value: &str, maximum: usize) -> usize {
+  if value.len() <= maximum {
+    return value.len();
+  }
+  value
+    .char_indices()
+    .map(|(index, _)| index)
+    .take_while(|index| *index <= maximum)
+    .last()
+    .unwrap_or(0)
+}
+
+fn framed_sha256(domain: &str, values: &[&[u8]]) -> String {
+  let mut digest = Sha256::new();
+  for value in std::iter::once(domain.as_bytes()).chain(values.iter().copied()) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value);
+  }
+  let bytes = digest.finalize();
+  encode_sha256(&bytes)
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+  let mut digest = Sha256::new();
+  digest.update(value);
+  let bytes = digest.finalize();
+  encode_sha256(&bytes)
+}
+
+fn encode_sha256(value: &[u8]) -> String {
+  value
+    .iter()
+    .fold(String::with_capacity(64), |mut encoded, byte| {
+      write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+      encoded
+    })
 }
 
 fn contains_forbidden_durable_key(value: &Value) -> bool {

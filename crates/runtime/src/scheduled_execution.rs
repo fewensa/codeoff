@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -10,7 +10,8 @@ use codeoff_agent_contract::{
 use codeoff_state::{
   AttestedExecutionProfileSnapshot, ClaimedScheduledRun, PreflightFailureDisposition,
   RunLeaseBinding, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
-  ScheduledRunLateEvidenceKind, ScheduledRunResult, StateError, StateStore, TransportConvergence,
+  ScheduledPrepareAuthority, ScheduledRunLateEvidenceKind, ScheduledRunResult, StateError,
+  StateStore, TransportConvergence,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,7 +21,7 @@ use tokio::task::JoinHandle;
 use crate::channel_tools::CHANNEL_DYNAMIC_TOOL_NAMES;
 use crate::schedule_tools::SCHEDULE_DYNAMIC_TOOL_NAMES;
 
-const MAX_PREVIOUS_SUCCESS_BYTES: usize = 16 * 1024;
+static PREPARE_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutorReadiness {
@@ -37,11 +38,20 @@ enum TickOutcome {
   LostLease,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatStop {
+  LostLease,
+  HardDeadline,
+}
+
 #[derive(Debug, Clone)]
 struct ExecutionPolicy {
   lease_seconds: i64,
   heartbeat_interval: Duration,
+  total_timeout: Duration,
+  prepare_grace: Duration,
   cancellation_grace: Duration,
+  finalization_grace: Duration,
   retry_delay_seconds: i64,
   run_deadline_seconds: i64,
   max_attempts: i64,
@@ -52,7 +62,10 @@ impl Default for ExecutionPolicy {
     Self {
       lease_seconds: 60,
       heartbeat_interval: Duration::from_secs(15),
+      total_timeout: Duration::from_mins(30),
+      prepare_grace: Duration::from_secs(5),
       cancellation_grace: Duration::from_secs(5),
+      finalization_grace: Duration::from_secs(5),
       retry_delay_seconds: 30,
       run_deadline_seconds: 3_600,
       max_attempts: 3,
@@ -85,6 +98,7 @@ impl SchedulerClock for SystemClock {
 
 struct PrepareInput {
   task: AgentTask,
+  authority: ScheduledPrepareAuthority,
   definition_json: String,
   capability_json: String,
   capability_digest: String,
@@ -93,6 +107,8 @@ struct PrepareInput {
 }
 
 struct BackendPrepared {
+  authority: ScheduledPrepareAuthority,
+  authority_digest: String,
   attested_profile_json: String,
   attested_profile_digest: String,
   execution: Box<dyn PreparedExecution>,
@@ -120,27 +136,27 @@ impl ScheduledExecutionBackend for UnavailableScheduledExecutionBackend {
 }
 
 struct PreparedRun {
-  run_id: String,
-  job_id: String,
-  attempt: i64,
-  fence: i64,
-  lease_owner: String,
+  authority: ScheduledPrepareAuthority,
   attested_profile: AttestedExecutionProfileSnapshot,
   execution: Box<dyn PreparedExecution>,
 }
 
 impl PreparedRun {
   fn from_backend(
-    binding: &RunLeaseBinding,
+    expected_authority: &ScheduledPrepareAuthority,
     prepared: BackendPrepared,
   ) -> Result<Self, PrepareFailure> {
     let profile: Value = serde_json::from_str(&prepared.attested_profile_json)
       .map_err(|error| PrepareFailure::fatal(error.to_string()))?;
     let canonical_profile =
       serde_json::to_string(&profile).map_err(|error| PrepareFailure::fatal(error.to_string()))?;
-    if canonical_profile != prepared.attested_profile_json
-      || sha256_hex(canonical_profile.as_bytes()) != prepared.attested_profile_digest
-      || profile.get("schema_version").and_then(Value::as_u64) != Some(1)
+    if prepared.authority != *expected_authority
+      || prepared.authority_digest != expected_authority.digest()
+      || !expected_authority.attestation_matches(
+        &canonical_profile,
+        &prepared.attested_profile_digest,
+        false,
+      )
     {
       return Err(PrepareFailure::fatal(
         "scheduled_attested_profile_authority_mismatch",
@@ -154,22 +170,14 @@ impl PreparedRun {
     )
     .map_err(|error| PrepareFailure::fatal(error.to_string()))?;
     Ok(Self {
-      run_id: binding.run_id().to_owned(),
-      job_id: binding.job_id().to_owned(),
-      attempt: binding.attempt(),
-      fence: binding.fence(),
-      lease_owner: binding.lease_owner().to_owned(),
+      authority: prepared.authority,
       attested_profile,
       execution: prepared.execution,
     })
   }
 
-  fn matches(&self, binding: &RunLeaseBinding) -> bool {
-    self.run_id == binding.run_id()
-      && self.job_id == binding.job_id()
-      && self.attempt == binding.attempt()
-      && self.fence == binding.fence()
-      && self.lease_owner == binding.lease_owner()
+  fn matches(&self, authority: &ScheduledPrepareAuthority) -> bool {
+    self.authority == *authority
   }
 
   fn execute(self, cancellation: Arc<AtomicBool>) -> ExecutionResult {
@@ -205,6 +213,7 @@ enum ExecutionResult {
   Empty,
 }
 
+#[derive(Clone)]
 struct ScheduledRunOrchestrator {
   state: StateStore,
   backend: Arc<dyn ScheduledExecutionBackend>,
@@ -227,6 +236,13 @@ impl ScheduledRunOrchestrator {
   }
 
   async fn run_once(&self) -> Result<TickOutcome, StateError> {
+    let supervisor = self.clone();
+    tokio::spawn(async move { supervisor.run_supervised().await })
+      .await
+      .map_err(join_error)?
+  }
+
+  async fn run_supervised(self) -> Result<TickOutcome, StateError> {
     let mut permit = Some(
       Arc::clone(&self.semaphore)
         .acquire_owned()
@@ -238,6 +254,22 @@ impl ScheduledRunOrchestrator {
     if self.backend.readiness() != ExecutorReadiness::Ready {
       return Ok(TickOutcome::Unavailable);
     }
+    let total_deadline = tokio::time::Instant::now()
+      .checked_add(self.policy.total_timeout)
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "scheduled total deadline overflow".to_owned(),
+      })?;
+    let terminal_commit_deadline = total_deadline
+      .checked_add(self.policy.prepare_grace)
+      .and_then(|deadline| deadline.checked_add(self.policy.cancellation_grace))
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "scheduled terminal commit deadline overflow".to_owned(),
+      })?;
+    let heartbeat_stop_deadline = terminal_commit_deadline
+      .checked_add(self.policy.finalization_grace)
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "scheduled heartbeat stop deadline overflow".to_owned(),
+      })?;
     let now = self.clock.now();
     let lease_expires_at = checked_add(now, self.policy.lease_seconds, "lease expiry")?;
     let Some(claim) = self
@@ -249,17 +281,30 @@ impl ScheduledRunOrchestrator {
     };
 
     let cancellation = Arc::new(AtomicBool::new(false));
-    let (heartbeat, mut lost_lease) = self.start_heartbeat(&claim, Arc::clone(&cancellation));
-    let task = match task_from_claim(&claim) {
+    let (mut heartbeat, mut heartbeat_stop) =
+      self.start_heartbeat(&claim, Arc::clone(&cancellation), heartbeat_stop_deadline);
+    let authority =
+      match ScheduledPrepareAuthority::for_claim(&claim, prepare_nonce(&claim.binding)) {
+        Ok(authority) => authority,
+        Err(error) => {
+          let outcome = self
+            .record_preflight_failure(&claim, PrepareFailure::fatal(error.to_string()))
+            .await;
+          stop_heartbeat(&mut heartbeat).await;
+          return outcome;
+        }
+      };
+    let task = match task_from_claim(&claim, &authority) {
       Ok(task) => task,
       Err(failure) => {
         let outcome = self.record_preflight_failure(&claim, failure).await;
-        heartbeat.abort();
+        stop_heartbeat(&mut heartbeat).await;
         return outcome;
       }
     };
     let input = PrepareInput {
       task,
+      authority: authority.clone(),
       definition_json: claim.definition_json.clone(),
       capability_json: claim.capability_json.clone(),
       capability_digest: claim.capability_digest.clone(),
@@ -270,48 +315,84 @@ impl ScheduledRunOrchestrator {
     let mut prepare = tokio::task::spawn_blocking(move || backend.prepare(input));
     let prepared = tokio::select! {
       biased;
-      _ = &mut lost_lease => {
+      stop = &mut heartbeat_stop => {
         cancellation.store(true, Ordering::Release);
-        if tokio::time::timeout(self.policy.cancellation_grace, &mut prepare).await.is_err() {
+        if tokio::time::timeout(self.policy.prepare_grace, &mut prepare).await.is_err() {
           let retained_permit = permit.take().expect("scheduled execution permit is held");
           tokio::spawn(async move {
             let _ = prepare.await;
             drop(retained_permit);
           });
         }
-        heartbeat.abort();
-        self.append_late_preflight(&claim).await?;
-        return Ok(TickOutcome::LostLease);
+        let outcome = if matches!(stop, Ok(HeartbeatStop::LostLease)) {
+          self.append_late_preflight(&claim).await?;
+          Ok(TickOutcome::LostLease)
+        } else {
+          self.record_preflight_failure(&claim, PrepareFailure::fatal("prepare_hard_deadline")).await
+        };
+        stop_heartbeat(&mut heartbeat).await;
+        return outcome;
+      },
+      () = tokio::time::sleep_until(total_deadline) => {
+        cancellation.store(true, Ordering::Release);
+        if tokio::time::timeout(self.policy.prepare_grace, &mut prepare).await.is_err() {
+          let retained_permit = permit.take().expect("scheduled execution permit is held");
+          tokio::spawn(async move {
+            let _ = prepare.await;
+            drop(retained_permit);
+          });
+        }
+        let outcome = self.record_preflight_failure(
+          &claim,
+          PrepareFailure::fatal("prepare_total_deadline"),
+        ).await;
+        stop_heartbeat(&mut heartbeat).await;
+        return outcome;
       },
       result = &mut prepare => result.map_err(join_error)?,
     };
     let prepared =
-      match prepared.and_then(|prepared| PreparedRun::from_backend(&claim.binding, prepared)) {
-        Ok(prepared) if prepared.matches(&claim.binding) => prepared,
+      match prepared.and_then(|prepared| PreparedRun::from_backend(&authority, prepared)) {
+        Ok(prepared) if prepared.matches(&authority) => prepared,
         Ok(_) => {
-          heartbeat.abort();
-          return self
+          let outcome = self
             .record_preflight_failure(&claim, PrepareFailure::fatal("prepared_authority_mismatch"))
             .await;
+          stop_heartbeat(&mut heartbeat).await;
+          return outcome;
         }
         Err(failure) => {
           let outcome = self.record_preflight_failure(&claim, failure).await;
-          heartbeat.abort();
+          stop_heartbeat(&mut heartbeat).await;
           return outcome;
         }
       };
 
-    if let Err(error) = self
-      .state
-      .mark_scheduled_run_executing(&claim.binding, &prepared.attested_profile, self.clock.now())
-      .await
-    {
+    let mark_executing = tokio::time::timeout_at(
+      total_deadline,
+      self.state.mark_scheduled_run_executing(
+        &claim.binding,
+        &prepared.attested_profile,
+        self.clock.now(),
+      ),
+    )
+    .await;
+    let Ok(mark_executing) = mark_executing else {
       cancellation.store(true, Ordering::Release);
-      heartbeat.abort();
+      let outcome = self
+        .record_preflight_failure(&claim, PrepareFailure::fatal("preflight_commit_deadline"))
+        .await;
+      stop_heartbeat(&mut heartbeat).await;
+      return outcome;
+    };
+    if let Err(error) = mark_executing {
+      cancellation.store(true, Ordering::Release);
       if matches!(error, StateError::ScheduledRunLostLease) {
         self.append_late_preflight(&claim).await?;
+        stop_heartbeat(&mut heartbeat).await;
         return Ok(TickOutcome::LostLease);
       }
+      stop_heartbeat(&mut heartbeat).await;
       return Err(error);
     }
 
@@ -320,7 +401,7 @@ impl ScheduledRunOrchestrator {
       tokio::task::spawn_blocking(move || prepared.execute(execution_cancellation));
     let result = tokio::select! {
       biased;
-      _ = &mut lost_lease => {
+      stop = &mut heartbeat_stop => {
         cancellation.store(true, Ordering::Release);
         if tokio::time::timeout(self.policy.cancellation_grace, &mut execution).await.is_err() {
           let retained_permit = permit.take().expect("scheduled execution permit is held");
@@ -329,14 +410,61 @@ impl ScheduledRunOrchestrator {
             drop(retained_permit);
           });
         }
-        heartbeat.abort();
-        self.append_late_execution(&claim).await?;
-        return Ok(TickOutcome::LostLease);
+        let outcome = if matches!(stop, Ok(HeartbeatStop::LostLease)) {
+          self.append_late_execution(&claim).await?;
+          Ok(TickOutcome::LostLease)
+        } else {
+          self.commit_execution_result_bounded(
+            &claim,
+            ExecutionResult::TransportLost {
+              message: "heartbeat hard deadline".to_owned(),
+            },
+            terminal_commit_deadline,
+            heartbeat_stop_deadline,
+          ).await
+        };
+        stop_heartbeat(&mut heartbeat).await;
+        return outcome;
+      },
+      () = tokio::time::sleep_until(total_deadline) => {
+        cancellation.store(true, Ordering::Release);
+        let result = if let Ok(result) = tokio::time::timeout(
+          self.policy.cancellation_grace,
+          &mut execution,
+        ).await {
+          result.map_err(join_error)?
+        } else {
+          let retained_permit = permit.take().expect("scheduled execution permit is held");
+          tokio::spawn(async move {
+            let _ = execution.await;
+            drop(retained_permit);
+          });
+          ExecutionResult::TransportLost {
+            message: "execution cancellation did not converge".to_owned(),
+          }
+        };
+        let outcome = self
+          .commit_execution_result_bounded(
+            &claim,
+            result,
+            terminal_commit_deadline,
+            heartbeat_stop_deadline,
+          )
+          .await;
+        stop_heartbeat(&mut heartbeat).await;
+        return outcome;
       },
       result = &mut execution => result.map_err(join_error)?,
     };
-    let outcome = self.commit_execution_result(&claim, result).await;
-    heartbeat.abort();
+    let outcome = self
+      .commit_execution_result_bounded(
+        &claim,
+        result,
+        terminal_commit_deadline,
+        heartbeat_stop_deadline,
+      )
+      .await;
+    stop_heartbeat(&mut heartbeat).await;
     outcome
   }
 
@@ -344,7 +472,8 @@ impl ScheduledRunOrchestrator {
     &self,
     claim: &ClaimedScheduledRun,
     cancellation: Arc<AtomicBool>,
-  ) -> (JoinHandle<()>, oneshot::Receiver<()>) {
+    hard_stop_deadline: tokio::time::Instant,
+  ) -> (JoinHandle<()>, oneshot::Receiver<HeartbeatStop>) {
     let state = self.state.clone();
     let binding = claim.binding.clone();
     let clock = Arc::clone(&self.clock);
@@ -353,11 +482,19 @@ impl ScheduledRunOrchestrator {
     let (lost_tx, lost_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
       loop {
-        clock.sleep(interval).await;
+        tokio::select! {
+          biased;
+          () = tokio::time::sleep_until(hard_stop_deadline) => {
+            cancellation.store(true, Ordering::Release);
+            let _ = lost_tx.send(HeartbeatStop::HardDeadline);
+            return;
+          }
+          () = clock.sleep(interval) => {}
+        }
         let now = clock.now();
         let Some(expires_at) = now.checked_add(lease_seconds) else {
           cancellation.store(true, Ordering::Release);
-          let _ = lost_tx.send(());
+          let _ = lost_tx.send(HeartbeatStop::LostLease);
           return;
         };
         if state
@@ -366,7 +503,7 @@ impl ScheduledRunOrchestrator {
           .is_err()
         {
           cancellation.store(true, Ordering::Release);
-          let _ = lost_tx.send(());
+          let _ = lost_tx.send(HeartbeatStop::LostLease);
           return;
         }
       }
@@ -476,23 +613,61 @@ impl ScheduledRunOrchestrator {
         _ => TickOutcome::Failed,
       })
   }
+
+  async fn commit_execution_result_bounded(
+    &self,
+    claim: &ClaimedScheduledRun,
+    result: ExecutionResult,
+    terminal_deadline: tokio::time::Instant,
+    hard_stop_deadline: tokio::time::Instant,
+  ) -> Result<TickOutcome, StateError> {
+    loop {
+      match tokio::time::timeout_at(
+        terminal_deadline,
+        self.commit_execution_result(claim, result.clone()),
+      )
+      .await
+      {
+        Ok(Err(error)) if error.is_transient_storage_contention() => {
+          if tokio::time::Instant::now() >= terminal_deadline {
+            break;
+          }
+          tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        Ok(outcome) => return outcome,
+        Err(_) => break,
+      }
+    }
+    let fallback = self.state.record_scheduled_run_execution_outcome(
+      &claim.binding,
+      ScheduledExecutionDisposition::Terminal(ScheduledExecutionTerminal::OutcomeUnknown),
+      "terminal_commit_deadline",
+      "scheduled terminal commit exceeded its bounded database window",
+      self.clock.now(),
+    );
+    match tokio::time::timeout_at(hard_stop_deadline, fallback).await {
+      Ok(Ok(codeoff_state::ScheduledRunExecutionOutcome::LateEvidence(_))) => {
+        Ok(TickOutcome::LostLease)
+      }
+      Ok(Ok(_)) => Ok(TickOutcome::Failed),
+      Ok(Err(StateError::ScheduledRunLostLease)) | Err(_) => Ok(TickOutcome::LostLease),
+      Ok(Err(error)) if error.is_transient_storage_contention() => Ok(TickOutcome::LostLease),
+      Ok(Err(error)) => Err(error),
+    }
+  }
 }
 
-fn task_from_claim(claim: &ClaimedScheduledRun) -> Result<AgentTask, PrepareFailure> {
+fn task_from_claim(
+  claim: &ClaimedScheduledRun,
+  authority: &ScheduledPrepareAuthority,
+) -> Result<AgentTask, PrepareFailure> {
   reject_dynamic_tool_exposure(&claim.capability_json)?;
-  let definition: Value = serde_json::from_str(&claim.definition_json)
-    .map_err(|error| PrepareFailure::fatal(error.to_string()))?;
-  let instruction = definition
-    .get("instruction")
-    .and_then(Value::as_str)
-    .filter(|value| !value.trim().is_empty())
-    .ok_or_else(|| PrepareFailure::fatal("scheduled_definition_missing_instruction"))?
-    .to_owned();
-  let include_previous_success = definition
-    .pointer("/previous_success/kind")
-    .and_then(Value::as_str)
-    == Some("latest_success");
-  let previous_success = previous_success_from_claim(claim, include_previous_success)?;
+  let previous_success = authority
+    .previous_success()
+    .map(|content| PreviousSuccessContext {
+      content: content.to_owned(),
+      was_truncated: authority.previous_success_was_truncated(),
+    });
   let task = AgentTask {
     task_id: format!(
       "scheduled:{}:{}:{}",
@@ -500,7 +675,7 @@ fn task_from_claim(claim: &ClaimedScheduledRun) -> Result<AgentTask, PrepareFail
       claim.binding.attempt(),
       claim.binding.fence()
     ),
-    instruction,
+    instruction: authority.instruction().to_owned(),
     source: InvocationSource::ScheduledRun {
       job_id: claim.binding.job_id().to_owned(),
       run_id: claim.binding.run_id().to_owned(),
@@ -515,38 +690,6 @@ fn task_from_claim(claim: &ClaimedScheduledRun) -> Result<AgentTask, PrepareFail
   };
   task.validate().map_err(PrepareFailure::fatal)?;
   Ok(task)
-}
-
-fn previous_success_from_claim(
-  claim: &ClaimedScheduledRun,
-  enabled: bool,
-) -> Result<Option<PreviousSuccessContext>, PrepareFailure> {
-  if !enabled {
-    return Ok(None);
-  }
-  let baseline: Value = serde_json::from_str(&claim.execution_baseline_json)
-    .map_err(|error| PrepareFailure::fatal(error.to_string()))?;
-  let Some(content) = baseline
-    .get("previous_success_context")
-    .and_then(Value::as_str)
-  else {
-    return Ok(None);
-  };
-  let boundary = content
-    .char_indices()
-    .map(|(index, _)| index)
-    .take_while(|index| *index <= MAX_PREVIOUS_SUCCESS_BYTES)
-    .last()
-    .unwrap_or(0);
-  let was_truncated = content.len() > MAX_PREVIOUS_SUCCESS_BYTES;
-  Ok(Some(PreviousSuccessContext {
-    content: if was_truncated {
-      content[..boundary].to_owned()
-    } else {
-      content.to_owned()
-    },
-    was_truncated,
-  }))
 }
 
 fn reject_dynamic_tool_exposure(capability_json: &str) -> Result<(), PrepareFailure> {
@@ -646,10 +789,33 @@ fn checked_add(value: i64, delta: i64, field: &str) -> Result<i64, StateError> {
     })
 }
 
+fn prepare_nonce(binding: &RunLeaseBinding) -> String {
+  let sequence = PREPARE_NONCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+  let timestamp = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map_or(0, |duration| duration.as_nanos());
+  sha256_hex(
+    format!(
+      "scheduled-prepare-nonce-v1\n{}\n{}\n{}\n{}\n{}\n{timestamp}\n{sequence}",
+      std::process::id(),
+      binding.run_id(),
+      binding.job_id(),
+      binding.attempt(),
+      binding.fence(),
+    )
+    .as_bytes(),
+  )
+}
+
 fn join_error(error: tokio::task::JoinError) -> StateError {
   StateError::InvalidSchedulerState {
     reason: format!("scheduled blocking task failed: {error}"),
   }
+}
+
+async fn stop_heartbeat(heartbeat: &mut JoinHandle<()>) {
+  heartbeat.abort();
+  let _ = heartbeat.await;
 }
 
 fn sha256_hex(value: &[u8]) -> String {
@@ -666,13 +832,15 @@ fn sha256_hex(value: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+  use std::sync::Barrier;
   use std::sync::Mutex;
   use std::sync::atomic::{AtomicI64, AtomicUsize};
 
   use codeoff_agent_contract::{InvocationPrincipalRef, InvocationSource};
   use codeoff_state::{
-    CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot, MaterializationOutcome,
-    PrincipalKey, ScheduleSpec, ScheduledJobDefinition,
+    CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot,
+    ExpiredRunReclaimOutcome, MaterializationOutcome, PrincipalKey, ScheduleSpec,
+    ScheduledJobDefinition,
   };
   use tempfile::{TempDir, tempdir};
 
@@ -698,7 +866,9 @@ mod tests {
   struct FakeBackend {
     seen: Arc<Mutex<Vec<AgentTask>>>,
     result: ExecutionResult,
+    prepare_delay: Duration,
     execution_delay: Duration,
+    honor_execution_cancellation: bool,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
   }
@@ -708,7 +878,9 @@ mod tests {
       Self {
         seen: Arc::new(Mutex::new(Vec::new())),
         result,
+        prepare_delay: Duration::ZERO,
         execution_delay: Duration::ZERO,
+        honor_execution_cancellation: true,
         active: Arc::new(AtomicUsize::new(0)),
         max_active: Arc::new(AtomicUsize::new(0)),
       }
@@ -721,19 +893,24 @@ mod tests {
     }
 
     fn prepare(&self, input: PrepareInput) -> Result<BackendPrepared, PrepareFailure> {
-      assert!(!input.cancellation.load(Ordering::Acquire));
+      if !self.prepare_delay.is_zero() {
+        std::thread::sleep(self.prepare_delay);
+      }
       assert!(!input.definition_json.is_empty());
       assert_eq!(input.capability_json, "{}");
       assert_eq!(input.capability_digest, "profile");
       assert!(input.targets_json.contains(TARGET_IDENTITY));
       self.seen.lock().expect("seen tasks").push(input.task);
-      let profile = r#"{"schema_version":1,"side_effect_free":true}"#;
+      let profile = input.authority.attestation_json(true);
       Ok(BackendPrepared {
-        attested_profile_json: profile.to_owned(),
+        authority_digest: input.authority.digest().to_owned(),
+        authority: input.authority,
+        attested_profile_json: profile.clone(),
         attested_profile_digest: sha256_hex(profile.as_bytes()),
         execution: Box::new(FakePrepared {
           result: self.result.clone(),
           execution_delay: self.execution_delay,
+          honor_cancellation: self.honor_execution_cancellation,
           active: Arc::clone(&self.active),
           max_active: Arc::clone(&self.max_active),
         }),
@@ -744,8 +921,57 @@ mod tests {
   struct FakePrepared {
     result: ExecutionResult,
     execution_delay: Duration,
+    honor_cancellation: bool,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
+  }
+
+  struct SwappingBackend {
+    barrier: Arc<Barrier>,
+    authorities: Arc<Mutex<Vec<ScheduledPrepareAuthority>>>,
+    executions: Arc<AtomicUsize>,
+  }
+
+  impl ScheduledExecutionBackend for SwappingBackend {
+    fn readiness(&self) -> ExecutorReadiness {
+      ExecutorReadiness::Ready
+    }
+
+    fn prepare(&self, input: PrepareInput) -> Result<BackendPrepared, PrepareFailure> {
+      self
+        .authorities
+        .lock()
+        .expect("swap authorities")
+        .push(input.authority.clone());
+      self.barrier.wait();
+      let swapped = self
+        .authorities
+        .lock()
+        .expect("swap authorities")
+        .iter()
+        .find(|authority| authority.digest() != input.authority.digest())
+        .expect("other authority")
+        .clone();
+      let profile = swapped.attestation_json(true);
+      Ok(BackendPrepared {
+        authority_digest: swapped.digest().to_owned(),
+        authority: swapped,
+        attested_profile_json: profile.clone(),
+        attested_profile_digest: sha256_hex(profile.as_bytes()),
+        execution: Box::new(CountingPrepared(Arc::clone(&self.executions))),
+      })
+    }
+  }
+
+  struct CountingPrepared(Arc<AtomicUsize>);
+
+  impl PreparedExecution for CountingPrepared {
+    fn execute(self: Box<Self>, _cancellation: Arc<AtomicBool>) -> ExecutionResult {
+      self.0.fetch_add(1, Ordering::AcqRel);
+      ExecutionResult::Completed {
+        summary: "must not execute".to_owned(),
+      }
+    }
   }
 
   impl PreparedExecution for FakePrepared {
@@ -753,7 +979,9 @@ mod tests {
       let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
       self.max_active.fetch_max(active, Ordering::AcqRel);
       let started = std::time::Instant::now();
-      while started.elapsed() < self.execution_delay && !cancellation.load(Ordering::Acquire) {
+      while started.elapsed() < self.execution_delay
+        && (!self.honor_cancellation || !cancellation.load(Ordering::Acquire))
+      {
         std::thread::sleep(Duration::from_millis(1));
       }
       self.active.fetch_sub(1, Ordering::AcqRel);
@@ -825,7 +1053,10 @@ mod tests {
       policy: ExecutionPolicy {
         lease_seconds: 20,
         heartbeat_interval: Duration::from_mins(1),
+        total_timeout: Duration::from_secs(10),
+        prepare_grace: Duration::from_millis(20),
         cancellation_grace: Duration::from_millis(20),
+        finalization_grace: Duration::from_millis(20),
         retry_delay_seconds: 5,
         run_deadline_seconds: 100,
         max_attempts: 3,
@@ -1092,6 +1323,258 @@ mod tests {
         content: "first accepted summary".to_owned(),
         was_truncated: false,
       })
+    );
+  }
+
+  #[tokio::test]
+  async fn test_concurrent_runs_cannot_swap_prepared_authority_or_attestation() {
+    let (_temp, state) = fixture(&[("swap-first", 110), ("swap-second", 111)]).await;
+    let executions = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(SwappingBackend {
+      barrier: Arc::new(Barrier::new(2)),
+      authorities: Arc::new(Mutex::new(Vec::new())),
+      executions: Arc::clone(&executions),
+    });
+    let runtime = Arc::new(orchestrator(
+      state,
+      backend,
+      Arc::new(TestClock(AtomicI64::new(112), 1)),
+      2,
+    ));
+    let first = {
+      let runtime = Arc::clone(&runtime);
+      tokio::spawn(async move { runtime.run_once().await })
+    };
+    let second = {
+      let runtime = Arc::clone(&runtime);
+      tokio::spawn(async move { runtime.run_once().await })
+    };
+    assert_eq!(
+      first.await.expect("first task").expect("first tick"),
+      TickOutcome::Failed
+    );
+    assert_eq!(
+      second.await.expect("second task").expect("second tick"),
+      TickOutcome::Failed
+    );
+    assert_eq!(executions.load(Ordering::Acquire), 0);
+  }
+
+  #[tokio::test]
+  async fn test_aborting_run_once_caller_does_not_abort_owned_supervisor() {
+    let (_temp, state) = fixture(&[("caller-abort", 110)]).await;
+    let mut backend = FakeBackend::new(ExecutionResult::Completed {
+      summary: "survived caller abort".to_owned(),
+    });
+    backend.execution_delay = Duration::from_millis(40);
+    let backend = Arc::new(backend);
+    let runtime = Arc::new(orchestrator(
+      state.clone(),
+      backend.clone(),
+      Arc::new(TestClock(AtomicI64::new(111), 1)),
+      1,
+    ));
+    let caller = {
+      let runtime = Arc::clone(&runtime);
+      tokio::spawn(async move { runtime.run_once().await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+      while backend.active.load(Ordering::Acquire) == 0 {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("execution started");
+    caller.abort();
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    assert_eq!(backend.active.load(Ordering::Acquire), 0);
+    assert!(
+      state
+        .claim_next_scheduled_run("proof", 112, 140)
+        .await
+        .expect("claim proof")
+        .is_none(),
+      "the detached caller receiver must not abandon claimed authority"
+    );
+  }
+
+  #[tokio::test]
+  async fn test_hung_prepare_fails_preflight_but_guardian_retains_permit_until_exit() {
+    let (_temp, state) = fixture(&[("hung-prepare", 110)]).await;
+    let mut backend = FakeBackend::new(ExecutionResult::Completed {
+      summary: "must not execute".to_owned(),
+    });
+    backend.prepare_delay = Duration::from_millis(150);
+    let mut runtime = orchestrator(
+      state,
+      Arc::new(backend),
+      Arc::new(TestClock(AtomicI64::new(111), 1)),
+      1,
+    );
+    runtime.policy.total_timeout = Duration::from_millis(50);
+    runtime.policy.prepare_grace = Duration::from_millis(5);
+    assert_eq!(runtime.run_once().await.expect("tick"), TickOutcome::Failed);
+    assert_eq!(runtime.semaphore.available_permits(), 0);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(runtime.semaphore.available_permits(), 1);
+  }
+
+  #[tokio::test]
+  async fn test_hung_execute_becomes_outcome_unknown_and_guardian_retains_permit() {
+    let (_temp, state) = fixture(&[("hung-execute", 110)]).await;
+    let mut backend = FakeBackend::new(ExecutionResult::Completed {
+      summary: "late completion must not win".to_owned(),
+    });
+    backend.execution_delay = Duration::from_millis(80);
+    backend.honor_execution_cancellation = false;
+    let mut runtime = orchestrator(
+      state.clone(),
+      Arc::new(backend),
+      Arc::new(TestClock(AtomicI64::new(111), 1)),
+      1,
+    );
+    runtime.policy.total_timeout = Duration::from_millis(50);
+    runtime.policy.cancellation_grace = Duration::from_millis(5);
+    assert_eq!(runtime.run_once().await.expect("tick"), TickOutcome::Failed);
+    assert_eq!(runtime.semaphore.available_permits(), 0);
+    assert!(
+      state
+        .claim_next_scheduled_run("proof", 112, 140)
+        .await
+        .expect("claim proof")
+        .is_none(),
+      "unknown execution must not be retried"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(runtime.semaphore.available_permits(), 1);
+  }
+
+  #[tokio::test]
+  async fn test_heartbeat_stops_and_joins_after_terminal_commit() {
+    let (_temp, state) = fixture(&[("heartbeat-stop", 110)]).await;
+    let mut backend = FakeBackend::new(ExecutionResult::Completed {
+      summary: "done".to_owned(),
+    });
+    backend.execution_delay = Duration::from_millis(10);
+    let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
+    let mut runtime = orchestrator(state, Arc::new(backend), clock.clone(), 1);
+    runtime.policy.heartbeat_interval = Duration::from_millis(1);
+    assert_eq!(
+      runtime.run_once().await.expect("tick"),
+      TickOutcome::Completed
+    );
+    let stopped_at = clock.now();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(clock.now(), stopped_at);
+  }
+
+  #[tokio::test]
+  async fn test_terminal_commit_waits_for_cross_pool_lock_released_within_reserve() {
+    let (_temp, state) = fixture(&[("commit-unlocked", 110)]).await;
+    let mut backend = FakeBackend::new(ExecutionResult::Completed {
+      summary: "committed after contention".to_owned(),
+    });
+    backend.execution_delay = Duration::from_millis(30);
+    let backend = Arc::new(backend);
+    let runtime = Arc::new(orchestrator(
+      state.clone(),
+      backend.clone(),
+      Arc::new(TestClock(AtomicI64::new(111), 1)),
+      1,
+    ));
+    let caller = {
+      let runtime = Arc::clone(&runtime);
+      tokio::spawn(async move { runtime.run_once().await })
+    };
+    while backend.active.load(Ordering::Acquire) == 0 {
+      tokio::task::yield_now().await;
+    }
+    let lock = state
+      .acquire_exclusive_storage_lock_for_tests()
+      .await
+      .expect("exclusive lock");
+    while backend.active.load(Ordering::Acquire) != 0 {
+      tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    lock.release().await.expect("release lock");
+    assert_eq!(
+      caller.await.expect("caller task").expect("tick"),
+      TickOutcome::Completed
+    );
+    let (run_id, job_id) = {
+      let seen = backend.seen.lock().expect("seen tasks");
+      let InvocationSource::ScheduledRun { run_id, job_id, .. } = &seen[0].source else {
+        panic!("scheduled source");
+      };
+      (run_id.clone(), job_id.clone())
+    };
+    assert_eq!(
+      state
+        .scheduled_execution_authority_counts_for_tests(&run_id, &job_id)
+        .await
+        .expect("authority counts"),
+      (1, 1, 1, 0)
+    );
+  }
+
+  #[tokio::test]
+  async fn test_terminal_commit_contention_past_reserve_stops_heartbeat_and_reclaims_unknown() {
+    let (_temp, state) = fixture(&[("commit-blocked", 110)]).await;
+    let mut backend = FakeBackend::new(ExecutionResult::Completed {
+      summary: "must roll back".to_owned(),
+    });
+    backend.execution_delay = Duration::from_millis(15);
+    let backend = Arc::new(backend);
+    let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
+    let mut configured = orchestrator(state.clone(), backend.clone(), clock.clone(), 1);
+    configured.policy.total_timeout = Duration::from_millis(50);
+    configured.policy.prepare_grace = Duration::from_millis(5);
+    configured.policy.cancellation_grace = Duration::from_millis(5);
+    configured.policy.finalization_grace = Duration::from_millis(20);
+    configured.policy.heartbeat_interval = Duration::from_millis(5);
+    let runtime = Arc::new(configured);
+    let caller = {
+      let runtime = Arc::clone(&runtime);
+      tokio::spawn(async move { runtime.run_once().await })
+    };
+    while backend.active.load(Ordering::Acquire) == 0 {
+      tokio::task::yield_now().await;
+    }
+    let lock = state
+      .acquire_exclusive_storage_lock_for_tests()
+      .await
+      .expect("exclusive lock");
+    let outcome = tokio::time::timeout(Duration::from_millis(150), caller)
+      .await
+      .expect("supervisor hard stop")
+      .expect("caller task")
+      .expect("tick");
+    assert_eq!(outcome, TickOutcome::LostLease);
+    let heartbeat_stopped_at = clock.now();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(clock.now(), heartbeat_stopped_at);
+    lock.release().await.expect("release lock");
+    assert!(matches!(
+      state
+        .reclaim_next_expired_scheduled_run(200, 3, 210)
+        .await
+        .expect("reclaim"),
+      ExpiredRunReclaimOutcome::OutcomeUnknown { .. }
+    ));
+    let (run_id, job_id) = {
+      let seen = backend.seen.lock().expect("seen tasks");
+      let InvocationSource::ScheduledRun { run_id, job_id, .. } = &seen[0].source else {
+        panic!("scheduled source");
+      };
+      (run_id.clone(), job_id.clone())
+    };
+    assert_eq!(
+      state
+        .scheduled_execution_authority_counts_for_tests(&run_id, &job_id)
+        .await
+        .expect("authority counts"),
+      (0, 0, 0, 0)
     );
   }
 }

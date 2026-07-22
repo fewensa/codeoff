@@ -190,14 +190,20 @@ impl CodeoffConfig {
   ///
   /// Returns an error when required values are empty or the server bind address is invalid.
   pub fn validate(&self) -> Result<(), ConfigError> {
-    self
-      .server
-      .bind
-      .parse::<SocketAddr>()
-      .map_err(|source| ConfigError::InvalidBind {
+    let server_bind =
+      self
+        .server
+        .bind
+        .parse::<SocketAddr>()
+        .map_err(|source| ConfigError::InvalidBind {
+          value: self.server.bind.clone(),
+          source,
+        })?;
+    if !server_bind.ip().is_loopback() && !self.server.allow_non_loopback {
+      return Err(ConfigError::NonLoopbackServerBind {
         value: self.server.bind.clone(),
-        source,
-      })?;
+      });
+    }
 
     if self.state.dir.as_os_str().is_empty() {
       return Err(ConfigError::EmptyStateDir);
@@ -326,12 +332,14 @@ impl SchedulerRuntimeConfig {
 #[serde(default)]
 pub struct ServerConfig {
   pub bind: String,
+  pub allow_non_loopback: bool,
 }
 
 impl Default for ServerConfig {
   fn default() -> Self {
     Self {
       bind: "127.0.0.1:7788".to_owned(),
+      allow_non_loopback: false,
     }
   }
 }

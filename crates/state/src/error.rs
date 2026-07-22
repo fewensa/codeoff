@@ -38,6 +38,12 @@ pub enum StateError {
   #[error("failed to connect state database")]
   Connect,
 
+  #[error("failed to read state database for readiness: {source}")]
+  Readiness {
+    #[source]
+    source: sqlx::Error,
+  },
+
   #[error("failed to run state database migrations: {source}")]
   Migrate {
     #[source]

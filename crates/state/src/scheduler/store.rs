@@ -22,10 +22,10 @@ use super::{
   ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
   ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
   ScheduledRunReconcileCandidate, ScheduledRunReconcileOutcome, ScheduledRunResult,
-  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerOperatorActionSummary,
-  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
-  StateError, TransactionalMutationOutcome, UpdateExecutionBaseline, UpdateScheduledJob, Value,
-  invalid_json, invalid_occurrence, invalid_value, materialized_run,
+  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerObservabilitySnapshot,
+  SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
+  SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome, UpdateExecutionBaseline,
+  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
   operator_action_request_digest, operator_delivery_evidence_binding, positive_u32,
   scheduler_error, validate_lowercase_sha256, validate_text,
 };
@@ -38,8 +38,142 @@ const MAX_DELIVERY_INTENT_ID_BYTES: usize = "intent:".len() + MAX_DELIVERY_INTEN
 const MAX_DELIVERY_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
 const READINESS_REJECTION_MESSAGE: &str =
   "provider rejected exact delivery target during readiness";
+const MAX_OBSERVABILITY_COUNT_CAP: u64 = 1_000_000;
+const MAX_OBSERVABILITY_AGE_CAP_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+const SCHEDULER_OBSERVABILITY_QUERY: &str = r"
+select
+  (select count(*) from (
+    select 1 from schedules indexed by idx_schedules_due
+    join scheduled_jobs on scheduled_jobs.job_id = schedules.job_id
+    where schedules.next_run_at is not null
+      and schedules.next_run_at <= ?1
+      and scheduled_jobs.status = 'active'
+      and not exists (
+        select 1 from scheduled_runs
+        where scheduled_runs.job_id = schedules.job_id
+          and scheduled_runs.overlap_slot = 1
+      )
+    limit ?2
+  )) as due_jobs,
+  (select count(*) from (
+    select 1 from scheduled_runs indexed by idx_scheduled_runs_observability
+    where state = 'pending' limit ?2
+  )) as pending_runs,
+  (select count(*) from (
+    select 1 from scheduled_runs indexed by idx_scheduled_runs_observability
+    where state = 'leased' limit ?2
+  )) as leased_runs,
+  (select count(*) from (
+    select 1 from scheduled_runs indexed by idx_scheduled_runs_observability
+    where state = 'executing' limit ?2
+  )) as executing_runs,
+  (select count(*) from (
+    select 1 from scheduled_runs indexed by idx_scheduled_runs_observability
+    where state = 'outcome_unknown' limit ?2
+  )) as unknown_runs,
+  (select count(*) from (
+    select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability
+    where state = 'pending' limit ?2
+  )) as pending_deliveries,
+  (select count(*) from (
+    select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability
+    where state = 'sending' limit ?2
+  )) as sending_deliveries,
+  (select count(*) from (
+    select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability
+    where state = 'failed_retryable' limit ?2
+  )) as retryable_deliveries,
+  (select count(*) from (
+    select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability
+    where state = 'delivery_unknown' limit ?2
+  )) as unknown_deliveries,
+  (select scheduled_for from scheduled_runs indexed by idx_scheduled_runs_observability
+    where state = 'pending' order by scheduled_for limit 1) as oldest_pending_run,
+  (select created_at from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability
+    where state = 'pending' order by created_at limit 1) as oldest_pending_delivery
+";
+
+fn age_seconds(now: i64, created_at: i64, cap: u64) -> (u64, bool) {
+  let age = now.saturating_sub(created_at);
+  let age = u64::try_from(age).unwrap_or(0);
+  (age.min(cap), age > cap)
+}
+
+fn observability_snapshot_from_row(
+  row: &SqliteRow,
+  now: i64,
+  count_cap: u64,
+  age_cap_seconds: u64,
+) -> Result<SchedulerObservabilitySnapshot, StateError> {
+  let count_columns = [
+    "due_jobs",
+    "pending_runs",
+    "leased_runs",
+    "executing_runs",
+    "unknown_runs",
+    "pending_deliveries",
+    "sending_deliveries",
+    "retryable_deliveries",
+    "unknown_deliveries",
+  ];
+  let mut counts = [0_u64; 9];
+  for (index, column) in count_columns.into_iter().enumerate() {
+    let value = row.try_get::<i64, _>(column).map_err(scheduler_error)?;
+    counts[index] = u64::try_from(value).unwrap_or(0);
+  }
+  let bounded = counts.map(|value| value.min(count_cap));
+  let oldest_run = row
+    .try_get::<Option<i64>, _>("oldest_pending_run")
+    .map_err(scheduler_error)?;
+  let oldest_delivery = row
+    .try_get::<Option<i64>, _>("oldest_pending_delivery")
+    .map_err(scheduler_error)?;
+  let run_age = oldest_run.map(|created_at| age_seconds(now, created_at, age_cap_seconds));
+  let delivery_age =
+    oldest_delivery.map(|created_at| age_seconds(now, created_at, age_cap_seconds));
+  Ok(SchedulerObservabilitySnapshot {
+    due_jobs: bounded[0],
+    pending_runs: bounded[1],
+    leased_runs: bounded[2],
+    executing_runs: bounded[3],
+    unknown_runs: bounded[4],
+    pending_deliveries: bounded[5],
+    sending_deliveries: bounded[6],
+    retryable_deliveries: bounded[7],
+    unknown_deliveries: bounded[8],
+    oldest_pending_run_age_seconds: run_age.map(|(age, _)| age),
+    oldest_pending_delivery_age_seconds: delivery_age.map(|(age, _)| age),
+    counts_saturated: counts.into_iter().any(|value| value > count_cap),
+    ages_saturated: run_age.is_some_and(|(_, saturated)| saturated)
+      || delivery_age.is_some_and(|(_, saturated)| saturated),
+  })
+}
 
 impl StateStore {
+  /// Reads a bounded, identifier-free scheduler telemetry snapshot.
+  ///
+  /// Counts stop after `count_cap + 1` indexed active-state rows so callers can distinguish an
+  /// exact count from a saturated value. Pending ages are capped independently.
+  ///
+  /// # Errors
+  /// Returns an error when `SQLite` cannot read the scheduler tables.
+  pub async fn scheduler_observability_snapshot(
+    &self,
+    now: i64,
+    count_cap: u64,
+    age_cap_seconds: u64,
+  ) -> Result<SchedulerObservabilitySnapshot, StateError> {
+    let count_cap = count_cap.clamp(1, MAX_OBSERVABILITY_COUNT_CAP);
+    let age_cap_seconds = age_cap_seconds.clamp(1, MAX_OBSERVABILITY_AGE_CAP_SECONDS);
+    let row = sqlx::query(SCHEDULER_OBSERVABILITY_QUERY)
+      .bind(now)
+      .bind(i64::try_from(count_cap.saturating_add(1)).unwrap_or(i64::MAX))
+      .fetch_one(&self.pool)
+      .await
+      .map_err(scheduler_error)?;
+    observability_snapshot_from_row(&row, now, count_cap, age_cap_seconds)
+  }
+
   /// Reads delivery authority for runtime lifecycle tests.
   ///
   /// # Errors

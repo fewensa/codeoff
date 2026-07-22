@@ -911,6 +911,23 @@ pub enum ScheduledRunState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerObservabilitySnapshot {
+  pub due_jobs: u64,
+  pub pending_runs: u64,
+  pub leased_runs: u64,
+  pub executing_runs: u64,
+  pub unknown_runs: u64,
+  pub pending_deliveries: u64,
+  pub sending_deliveries: u64,
+  pub retryable_deliveries: u64,
+  pub unknown_deliveries: u64,
+  pub oldest_pending_run_age_seconds: Option<u64>,
+  pub oldest_pending_delivery_age_seconds: Option<u64>,
+  pub counts_saturated: bool,
+  pub ages_saturated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunLeaseBinding {
   run_id: String,
   job_id: String,

@@ -28,12 +28,17 @@ pedantic = "warn"
 
 [workspace.dependencies]
 assert_cmd = "2"
+bytes = "1.12.1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 croner = "3.0.1"
+http-body-util = "0.1.3"
+hyper = { version = "1.10.1", features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["server", "service", "tokio"] }
 jiff = { version = "=0.2.34", default-features = false, features = ["std", "tzdb-bundle-always"] }
 jiff-tzdb = "=0.1.8"
 nix = { version = "=0.31.3", default-features = false, features = ["signal", "process"] }
+prometheus-client = { version = "0.25.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -41,3 +46,5 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 toml = "0.9"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json"] }

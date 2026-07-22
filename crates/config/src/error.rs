@@ -25,6 +25,9 @@ pub enum ConfigError {
     source: std::net::AddrParseError,
   },
 
+  #[error("server bind address must be loopback unless allow_non_loopback is true: {value:?}")]
+  NonLoopbackServerBind { value: String },
+
   #[error("MCP TCP bind address must be loopback: {value:?}")]
   NonLoopbackMcpBind { value: String },
 

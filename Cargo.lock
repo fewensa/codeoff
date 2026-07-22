@@ -332,6 +332,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
+ "bytes",
  "chrono",
  "clap",
  "codeoff-agent-codex",
@@ -342,13 +343,19 @@ dependencies = [
  "codeoff-mcp",
  "codeoff-runtime",
  "codeoff-state",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "predicates",
+ "prometheus-client",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -393,6 +400,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -670,6 +678,12 @@ name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+
+[[package]]
+name = "dtoa"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
 
 [[package]]
 name = "either"
@@ -998,6 +1012,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1019,6 +1039,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -1281,6 +1302,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazy_static"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1513,6 +1540,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prometheus-client"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba70bf887030e45213b4a95c9b08d5a450b157f87c1d63661ed0847a12fa2aad"
+dependencies = [
+ "dtoa",
+ "itoa",
+ "parking_lot",
+ "prometheus-client-derive-encode",
+]
+
+[[package]]
+name = "prometheus-client-derive-encode"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9adf1691c04c0a5ff46ff8f262b58beb07b0dbb61f96f9f54f6cbd82106ed87f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1921,6 +1971,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sharded-slab"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2260,6 +2319,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thread_local"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2475,6 +2543,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+ "valuable",
+]
+
+[[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-subscriber"
+version = "0.3.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sharded-slab",
+ "thread_local",
+ "tracing-core",
+ "tracing-serde",
 ]
 
 [[package]]
@@ -2570,6 +2663,12 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "valuable"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"

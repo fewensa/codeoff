@@ -432,6 +432,19 @@ impl StateStore {
     })
   }
 
+  /// Confirms that the current `SQLite` connection can execute a minimal read.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when `SQLite` cannot execute the readiness probe.
+  pub async fn check_readable(&self) -> Result<(), StateError> {
+    sqlx::query_scalar::<_, i64>("select 1")
+      .fetch_one(&self.pool)
+      .await
+      .map(|_| ())
+      .map_err(|source| StateError::Readiness { source })
+  }
+
   /// Claims an idempotency key.
   ///
   /// Returns `true` when the key was inserted and `false` when it already existed.

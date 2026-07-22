@@ -5556,6 +5556,136 @@ async fn test_due_query_uses_due_index_and_overlap_index_is_enforced() {
 }
 
 #[tokio::test]
+async fn test_scheduler_observability_is_bounded_indexed_and_ignores_terminal_history() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  store.check_readable().await.expect("readiness read");
+
+  for ordinal in 0..12 {
+    let job_id = format!("observability-{ordinal}");
+    store
+      .create_scheduled_job(&create_request(
+        &job_id,
+        ScheduleSpec::fixed_interval(100, 60).expect("interval"),
+        90,
+      ))
+      .await
+      .expect("create observed job");
+    store
+      .materialize_due_schedule(&job_id, 0, 100)
+      .await
+      .expect("materialize observed run");
+  }
+
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  insert_observability_terminal_history(&pool).await;
+
+  let snapshot = store
+    .scheduler_observability_snapshot(1_000, 10, 50)
+    .await
+    .expect("observability snapshot");
+  assert_eq!(snapshot.pending_runs, 10);
+  assert_eq!(snapshot.leased_runs, 0);
+  assert_eq!(snapshot.executing_runs, 0);
+  assert_eq!(snapshot.unknown_runs, 0);
+  assert_eq!(snapshot.due_jobs, 0, "active overlap suppresses due work");
+  assert_eq!(snapshot.oldest_pending_run_age_seconds, Some(50));
+  assert!(snapshot.counts_saturated);
+  assert!(snapshot.ages_saturated);
+  assert_observability_query_plans(&pool).await;
+}
+
+async fn insert_observability_terminal_history(pool: &SqlitePool) {
+  sqlx::query(
+    r"
+with recursive sequence(value) as (
+  select 1
+  union all
+  select value + 1 from sequence where value < 500
+)
+insert into scheduled_runs (
+  run_id,
+  job_id,
+  schedule_id,
+  job_generation,
+  schedule_generation,
+  scheduled_for,
+  coalesced_through,
+  definition_version,
+  definition_json,
+  capability_schema_version,
+  capability_digest,
+  capability_json,
+  targets_json,
+  state,
+  attempt,
+  fence,
+  overlap_slot,
+  created_at,
+  updated_at
+)
+select
+  printf('observability-history-%04d', sequence.value),
+  template.job_id,
+  template.schedule_id,
+  template.job_generation,
+  template.schedule_generation,
+  template.scheduled_for + sequence.value,
+  template.coalesced_through + sequence.value,
+  template.definition_version,
+  template.definition_json,
+  template.capability_schema_version,
+  template.capability_digest,
+  template.capability_json,
+  template.targets_json,
+  'succeeded',
+  1,
+  1,
+  null,
+  template.created_at,
+  template.updated_at
+from scheduled_runs template
+cross join sequence
+where template.run_id = 'run:observability-0:100'
+",
+  )
+  .execute(pool)
+  .await
+  .expect("insert terminal history volume");
+}
+
+async fn assert_observability_query_plans(pool: &SqlitePool) {
+  for (query, expected_index) in [
+    (
+      "explain query plan select 1 from scheduled_runs indexed by idx_scheduled_runs_observability where state = 'pending' limit 11",
+      "idx_scheduled_runs_observability",
+    ),
+    (
+      "explain query plan select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability where state = 'pending' limit 11",
+      "idx_scheduled_deliveries_observability",
+    ),
+  ] {
+    let plan = sqlx::query(query)
+      .fetch_all(pool)
+      .await
+      .expect("observability query plan");
+    assert!(
+      plan.iter().any(|row| {
+        row
+          .try_get::<String, _>("detail")
+          .is_ok_and(|detail| detail.contains(expected_index))
+      }),
+      "expected observability query plan to use {expected_index}"
+    );
+  }
+}
+
+#[tokio::test]
 async fn test_owner_list_isolated_cursor_bounded_and_uses_owner_status_index() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");

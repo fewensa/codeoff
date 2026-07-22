@@ -17,6 +17,7 @@ codeoff-state = { path = "../state" }
 serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
 
 [dev-dependencies]
 codeoff-state = { path = "../state", features = ["test-support"] }

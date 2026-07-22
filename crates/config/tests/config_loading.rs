@@ -81,6 +81,25 @@ url = "sqlite://./.codeoff/codeoff.db"
 }
 
 #[test]
+fn test_server_bind_requires_explicit_non_loopback_exposure() {
+  let mut config = CodeoffConfig::default();
+  config.server.bind = "0.0.0.0:7788".to_owned();
+
+  let error = config
+    .validate()
+    .expect_err("non-loopback server bind must fail closed");
+  assert!(matches!(
+    error,
+    ConfigError::NonLoopbackServerBind { value } if value == "0.0.0.0:7788"
+  ));
+
+  config.server.allow_non_loopback = true;
+  config
+    .validate()
+    .expect("explicit non-loopback exposure is valid");
+}
+
+#[test]
 fn test_database_driver_defaults_to_sqlite_and_loads_from_toml() {
   let defaults_dir = tempdir().expect("create tempdir");
   let defaults = CodeoffConfig::load(

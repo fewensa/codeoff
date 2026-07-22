@@ -326,6 +326,28 @@ pub enum PreparedScheduledDelivery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledDeliveryRenderInput {
+  delivery_id: String,
+  body: String,
+}
+
+impl ScheduledDeliveryRenderInput {
+  pub(crate) fn new(delivery_id: String, body: String) -> Self {
+    Self { delivery_id, body }
+  }
+
+  #[must_use]
+  pub fn delivery_id(&self) -> &str {
+    &self.delivery_id
+  }
+
+  #[must_use]
+  pub fn body(&self) -> &str {
+    &self.body
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduledDeliveryFailure {
   ConfirmedNoWriteRetryable {
     error_kind: String,

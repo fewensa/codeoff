@@ -5,8 +5,9 @@ use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, task::Context, task
 
 use async_trait::async_trait;
 use codeoff_state::{
-  ClaimedScheduledDelivery, DeliveryPayloadSnapshot, ScheduledDeliveryFailure,
-  ScheduledDeliveryWork, StateError, StateStore,
+  ClaimedScheduledDelivery, DeliveryPayloadSnapshot, PreparedScheduledDelivery,
+  ScheduledDeliveryFailure, ScheduledDeliveryWork, SkippedNoneBaselinePolicy, StateError,
+  StateStore,
 };
 use serde_json::json;
 use tokio::sync::{oneshot, watch};
@@ -20,6 +21,8 @@ const DELIVERY_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DELIVERY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const DELIVERY_BATCH_LIMIT: u32 = 32;
 const DELIVERY_POLICY_VERSION: u32 = 1;
+const DELIVERY_RENDER_VERSION: u32 = 1;
+const DELIVERY_CONTENT_TYPE: &str = "text/markdown; charset=utf-8";
 const MAX_DELIVERY_ATTEMPTS: i64 = 5;
 const DELIVERY_DEADLINE_SECONDS: i64 = 3_600;
 const MAX_RETRY_DELAY_SECONDS: i64 = 300;
@@ -173,6 +176,7 @@ impl DeliveryTimeline {
 pub enum ScheduledDeliveryTickOutcome {
   Idle,
   Cancelled,
+  SkippedNone,
   SkippedUnchanged,
   ReadinessDeferred { retry_after: Duration },
   Delivered,
@@ -180,6 +184,90 @@ pub enum ScheduledDeliveryTickOutcome {
   FailedTerminal,
   DeliveryUnknown,
   LostFence,
+}
+
+/// Freezes accepted scheduled results into exact delivery payloads without provider access.
+///
+/// This worker is used when provider delivery is disabled so `none` targets still complete and
+/// non-provider payload authority remains restart-safe.
+///
+/// # Errors
+/// Returns an error when durable result or delivery authority is invalid or storage fails.
+pub async fn run_scheduled_delivery_preparation_worker(
+  state: StateStore,
+  shutdown: watch::Receiver<bool>,
+) -> Result<(), StateError> {
+  let timeline = DeliveryTimeline::new(Arc::new(SystemDeliveryClock));
+  loop {
+    if *shutdown.borrow() {
+      return Ok(());
+    }
+    let preparation = tokio::select! {
+      biased;
+      () = cancellation_requested(shutdown.clone()) => return Ok(()),
+      preparation = prepare_next_scheduled_delivery(&state, timeline.fresh_now()) => preparation,
+    };
+    let preparation = match preparation {
+      Ok(preparation) => preparation,
+      Err(error) if error.is_transient_storage_contention() => {
+        tokio::select! {
+          biased;
+          () = cancellation_requested(shutdown.clone()) => return Ok(()),
+          () = tokio::time::sleep(DELIVERY_TICK_INTERVAL) => {}
+        }
+        continue;
+      }
+      Err(error) => return Err(error),
+    };
+    let delay = if preparation.is_some() {
+      Duration::ZERO
+    } else {
+      DELIVERY_TICK_INTERVAL
+    };
+    tokio::select! {
+      biased;
+      () = cancellation_requested(shutdown.clone()) => return Ok(()),
+      () = tokio::time::sleep(delay) => {}
+    }
+  }
+}
+
+/// Freezes one accepted result into the immutable payload for its next pending delivery intent.
+///
+/// # Errors
+/// Returns an error when durable result or delivery authority is invalid or storage fails.
+pub async fn prepare_next_scheduled_delivery(
+  state: &StateStore,
+  now: i64,
+) -> Result<Option<PreparedScheduledDelivery>, StateError> {
+  let Some(input) = state.next_scheduled_delivery_render_input().await? else {
+    return Ok(None);
+  };
+  let prepared = state
+    .prepare_scheduled_delivery(
+      input.delivery_id(),
+      DELIVERY_CONTENT_TYPE,
+      input.body(),
+      DELIVERY_RENDER_VERSION,
+      now,
+      SkippedNoneBaselinePolicy::Accept,
+    )
+    .await;
+  match prepared {
+    Ok(prepared) => Ok(Some(prepared)),
+    Err(StateError::ScheduledDeliveryPayloadConflict) => state
+      .prepare_scheduled_delivery(
+        input.delivery_id(),
+        DELIVERY_CONTENT_TYPE,
+        input.body(),
+        DELIVERY_RENDER_VERSION,
+        now,
+        SkippedNoneBaselinePolicy::Accept,
+      )
+      .await
+      .map(Some),
+    Err(error) => Err(error),
+  }
 }
 
 pub async fn run_scheduled_delivery_worker(
@@ -219,7 +307,19 @@ pub async fn run_scheduled_delivery_worker_with_clock(
       shutdown.clone(),
       &mut worker_state,
     )
-    .await?;
+    .await;
+    let tick = match tick {
+      Ok(tick) => tick,
+      Err(error) if error.is_transient_storage_contention() => {
+        tokio::select! {
+          biased;
+          () = cancellation_requested(shutdown.clone()) => return Ok(()),
+          () = tokio::time::sleep(DELIVERY_TICK_INTERVAL) => {}
+        }
+        continue;
+      }
+      Err(error) => return Err(error),
+    };
     let delay = match tick {
       ScheduledDeliveryTickOutcome::Cancelled => return Ok(()),
       ScheduledDeliveryTickOutcome::Idle => DELIVERY_TICK_INTERVAL,
@@ -285,6 +385,22 @@ async fn run_scheduled_delivery_tick_with_timeline(
     .await?;
   if *shutdown.borrow() {
     return Ok(ScheduledDeliveryTickOutcome::Cancelled);
+  }
+  let preparation = tokio::select! {
+    biased;
+    () = cancellation_requested(shutdown.clone()) => {
+      return Ok(ScheduledDeliveryTickOutcome::Cancelled);
+    }
+    preparation = prepare_next_scheduled_delivery(state, timeline.fresh_now()) => preparation?,
+  };
+  if matches!(preparation, Some(PreparedScheduledDelivery::SkippedNone(_))) {
+    return Ok(ScheduledDeliveryTickOutcome::SkippedNone);
+  }
+  if matches!(
+    preparation,
+    Some(PreparedScheduledDelivery::SkippedUnchanged(_))
+  ) {
+    return Ok(ScheduledDeliveryTickOutcome::SkippedUnchanged);
   }
   let work = state
     .peek_scheduled_delivery_work(timeline.fresh_now())

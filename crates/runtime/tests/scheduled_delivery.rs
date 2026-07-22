@@ -9,18 +9,23 @@ use async_trait::async_trait;
 use codeoff_runtime::scheduled_delivery::{
   DeliveryClock, DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderReadiness,
   DeliveryProviderReadinessRequest, DeliveryProviderRequest, ProviderMessageIdentity,
-  ScheduledDeliveryTickOutcome, run_scheduled_delivery_tick_with_clock,
-  run_scheduled_delivery_worker_with_clock,
+  ScheduledDeliveryTickOutcome, prepare_next_scheduled_delivery,
+  run_scheduled_delivery_tick_with_clock, run_scheduled_delivery_worker_with_clock,
 };
 use codeoff_state::{
   AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
   CreateScheduledJob, DeliveryTargetSnapshot, PreparedScheduledDelivery, PrincipalKey,
   ScheduleSpec, ScheduledJobDefinition, ScheduledRunResult, SkippedNoneBaselinePolicy, StateStore,
 };
+use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 use tokio::sync::{Notify, watch};
 
+const NONE_TARGET_IDENTITY: &str =
+  "0000000000000000000000000000000000000000000000000000000000000001";
 const TARGET_IDENTITY: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+const SECOND_TARGET_IDENTITY: &str =
+  "0000000000000000000000000000000000000000000000000000000000000003";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedSend {
@@ -309,18 +314,47 @@ fn owner() -> PrincipalKey {
 }
 
 fn target(job_id: &str) -> DeliveryTargetSnapshot {
+  slack_target(job_id, TARGET_IDENTITY, "C1")
+}
+
+fn slack_target(job_id: &str, identity: &str, channel_id: &str) -> DeliveryTargetSnapshot {
   DeliveryTargetSnapshot::new(
-    format!("target-{job_id}"),
+    format!("target-{job_id}-{identity}"),
     "slack",
     "slack-default",
     "T1",
     "channel",
-    r#"{"channel_id":"C1"}"#,
+    format!(r#"{{"channel_id":"{channel_id}"}}"#),
     1,
     "test-resolver-v1",
-    TARGET_IDENTITY,
+    identity,
   )
   .expect("target")
+}
+
+fn none_target(job_id: &str) -> DeliveryTargetSnapshot {
+  DeliveryTargetSnapshot::new(
+    format!("target-{job_id}-none"),
+    "none",
+    "none",
+    "none",
+    "none",
+    "{}",
+    1,
+    "none-v1",
+    NONE_TARGET_IDENTITY,
+  )
+  .expect("none target")
+}
+
+fn sha256_hex(value: &str) -> String {
+  let mut digest = Sha256::new();
+  digest.update(value.as_bytes());
+  let mut encoded = String::with_capacity(64);
+  for byte in digest.finalize() {
+    write!(&mut encoded, "{byte:02x}").expect("write digest");
+  }
+  encoded
 }
 
 async fn prepared_delivery(
@@ -332,6 +366,25 @@ async fn prepared_delivery(
   String,
   codeoff_state::DeliveryPayloadSnapshot,
 ) {
+  let (temp, store, delivery_id) = completed_delivery_intent(job_id, body).await;
+  let PreparedScheduledDelivery::Pending(payload) = store
+    .prepare_scheduled_delivery(
+      &delivery_id,
+      "text/markdown; charset=utf-8",
+      body,
+      1,
+      121,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare")
+  else {
+    panic!("Slack target must remain pending");
+  };
+  (temp, store, delivery_id, payload)
+}
+
+async fn completed_delivery_intent(job_id: &str, body: &str) -> (TempDir, StateStore, String) {
   let temp = tempdir().expect("tempdir");
   let state_dir = temp.path().join("state");
   let store = StateStore::initialize(&state_dir, None)
@@ -375,21 +428,7 @@ async fn prepared_delivery(
     .await
     .expect("complete run");
   let delivery_id = delivery_id(run.binding.run_id(), TARGET_IDENTITY);
-  let PreparedScheduledDelivery::Pending(payload) = store
-    .prepare_scheduled_delivery(
-      &delivery_id,
-      "text/markdown; charset=utf-8",
-      body,
-      1,
-      121,
-      SkippedNoneBaselinePolicy::DoNotAdvance,
-    )
-    .await
-    .expect("prepare")
-  else {
-    panic!("Slack target must remain pending");
-  };
-  (temp, store, delivery_id, payload)
+  (temp, store, delivery_id)
 }
 
 async fn prepare_next_delivery(store: &StateStore, job_id: &str, body: &str) -> String {
@@ -496,6 +535,274 @@ async fn confirmed_success_persists_identity_and_advances_baseline() {
       .expect("accepted")
       .accepted_payload_digest,
     payload.digest()
+  );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn committed_multi_target_result_survives_restart_and_delivers_independently() {
+  let temp = tempdir().expect("tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("state");
+  let job_id = "delivery-multi-restart";
+  let body = "exact UTF-8: 測試 e\u{0301}  \n";
+  store
+    .create_scheduled_job(&CreateScheduledJob {
+      job_id: job_id.to_owned(),
+      schedule_id: format!("schedule-{job_id}"),
+      definition: ScheduledJobDefinition::new(1, r#"{"prompt":"check"}"#).expect("definition"),
+      creator: owner(),
+      owner: owner(),
+      capability: CapabilityProfileSnapshot::new(1, "none", "{}").expect("capability"),
+      targets: vec![
+        slack_target(job_id, TARGET_IDENTITY, "C1"),
+        slack_target(job_id, SECOND_TARGET_IDENTITY, "C2"),
+      ],
+      schedule: ScheduleSpec::fixed_interval(110, 10).expect("interval"),
+      now: 100,
+    })
+    .await
+    .expect("create");
+  store
+    .materialize_due_schedule(job_id, 0, 110)
+    .await
+    .expect("materialize");
+  let run = store
+    .claim_next_scheduled_run("run-worker", 111, 200)
+    .await
+    .expect("claim run")
+    .expect("run");
+  let first_run_id = run.binding.run_id().to_owned();
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&run.binding, &profile, 112)
+    .await
+    .expect("executing");
+  store
+    .complete_scheduled_run_success(
+      &run.binding,
+      &ScheduledRunResult::new(body, "accepted context").expect("result"),
+      120,
+    )
+    .await
+    .expect("complete run");
+  drop(store);
+
+  let restarted = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("restart state");
+  let agent_invocations = AtomicUsize::new(1);
+  let provider = FakeProvider::new([
+    success(),
+    DeliveryProviderOutcome::AmbiguousPostWrite {
+      error_kind: "write_then_disconnect".to_owned(),
+    },
+    success(),
+  ]);
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(
+      &restarted,
+      &provider,
+      "delivery-worker-a",
+      clock(122),
+      shutdown(),
+    )
+    .await
+    .expect("first target"),
+    ScheduledDeliveryTickOutcome::Delivered
+  );
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(
+      &restarted,
+      &provider,
+      "delivery-worker-b",
+      clock(123),
+      shutdown(),
+    )
+    .await
+    .expect("second target"),
+    ScheduledDeliveryTickOutcome::DeliveryUnknown
+  );
+  assert_eq!(
+    restarted
+      .scheduled_run_state_for_tests(&first_run_id)
+      .await
+      .expect("run state"),
+    "succeeded"
+  );
+  assert_eq!(agent_invocations.load(Ordering::SeqCst), 1);
+
+  let first_delivery_id = delivery_id(&first_run_id, TARGET_IDENTITY);
+  let second_delivery_id = delivery_id(&first_run_id, SECOND_TARGET_IDENTITY);
+  assert_eq!(
+    restarted
+      .scheduled_delivery_authority_for_tests(&first_delivery_id)
+      .await
+      .expect("first authority"),
+    ("delivered".to_owned(), 1, 1, 1)
+  );
+  assert_eq!(
+    restarted
+      .scheduled_delivery_authority_for_tests(&second_delivery_id)
+      .await
+      .expect("second authority"),
+    ("delivery_unknown".to_owned(), 1, 1, 1)
+  );
+  let observed = provider.observed();
+  assert_eq!(observed.len(), 2);
+  assert_eq!(observed[0].body.as_bytes(), body.as_bytes());
+  assert_eq!(observed[1].body.as_bytes(), body.as_bytes());
+  assert!(observed[0].target_json.contains(TARGET_IDENTITY));
+  assert!(observed[1].target_json.contains(SECOND_TARGET_IDENTITY));
+  let delivered_identity = AcceptedDeliveryBaselineIdentity {
+    job_id: job_id.to_owned(),
+    target_identity_digest: TARGET_IDENTITY.to_owned(),
+    target_snapshot_digest_algorithm: "sha256-v1".to_owned(),
+    target_snapshot_digest: sha256_hex(&observed[0].target_json),
+    delivery_policy_version: 1,
+    render_version: 1,
+    hash_algorithm: "sha256-utf8-exact-v1".to_owned(),
+  };
+  let unknown_identity = AcceptedDeliveryBaselineIdentity {
+    target_identity_digest: SECOND_TARGET_IDENTITY.to_owned(),
+    target_snapshot_digest: sha256_hex(&observed[1].target_json),
+    ..delivered_identity.clone()
+  };
+  assert!(
+    restarted
+      .get_accepted_delivery_baseline(&delivered_identity)
+      .await
+      .expect("delivered baseline")
+      .is_some()
+  );
+  assert!(
+    restarted
+      .get_accepted_delivery_baseline(&unknown_identity)
+      .await
+      .expect("unknown baseline")
+      .is_none()
+  );
+
+  restarted
+    .materialize_due_schedule(job_id, 0, 120)
+    .await
+    .expect("next occurrence");
+  let next_run = restarted
+    .claim_next_scheduled_run("next-run-worker", 124, 200)
+    .await
+    .expect("claim next run")
+    .expect("next run");
+  restarted
+    .mark_scheduled_run_executing(&next_run.binding, &profile, 125)
+    .await
+    .expect("execute next run");
+  restarted
+    .complete_scheduled_run_success(
+      &next_run.binding,
+      &ScheduledRunResult::new(body, "next context").expect("next result"),
+      126,
+    )
+    .await
+    .expect("complete next run");
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(
+      &restarted,
+      &provider,
+      "delivery-worker-c",
+      clock(127),
+      shutdown(),
+    )
+    .await
+    .expect("unchanged delivered target"),
+    ScheduledDeliveryTickOutcome::SkippedUnchanged
+  );
+  assert_eq!(provider.observed().len(), 2);
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(
+      &restarted,
+      &provider,
+      "delivery-worker-d",
+      clock(128),
+      shutdown(),
+    )
+    .await
+    .expect("unknown target remains sendable"),
+    ScheduledDeliveryTickOutcome::Delivered
+  );
+  assert_eq!(provider.observed().len(), 3);
+  assert_eq!(agent_invocations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn none_target_prepares_without_provider_and_advances_accepted_baseline() {
+  let temp = tempdir().expect("tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("state");
+  let job_id = "delivery-none-only";
+  let body = "none-only exact result  \n";
+  store
+    .create_scheduled_job(&CreateScheduledJob {
+      job_id: job_id.to_owned(),
+      schedule_id: format!("schedule-{job_id}"),
+      definition: ScheduledJobDefinition::new(1, "{}").expect("definition"),
+      creator: owner(),
+      owner: owner(),
+      capability: CapabilityProfileSnapshot::new(1, "none", "{}").expect("capability"),
+      targets: vec![none_target(job_id)],
+      schedule: ScheduleSpec::once(110),
+      now: 100,
+    })
+    .await
+    .expect("create");
+  store
+    .materialize_due_schedule(job_id, 0, 110)
+    .await
+    .expect("materialize");
+  let run = store
+    .claim_next_scheduled_run("run-worker", 111, 200)
+    .await
+    .expect("claim run")
+    .expect("run");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&run.binding, &profile, 112)
+    .await
+    .expect("executing");
+  store
+    .complete_scheduled_run_success(
+      &run.binding,
+      &ScheduledRunResult::new(body, "").expect("result"),
+      120,
+    )
+    .await
+    .expect("complete");
+
+  let Some(PreparedScheduledDelivery::SkippedNone(payload)) =
+    prepare_next_scheduled_delivery(&store, 121)
+      .await
+      .expect("prepare none")
+  else {
+    panic!("none target must complete locally")
+  };
+  assert_eq!(payload.body().as_bytes(), body.as_bytes());
+  assert_eq!(
+    store
+      .scheduled_delivery_authority_for_tests(payload.delivery_id())
+      .await
+      .expect("none authority"),
+    ("skipped_none".to_owned(), 0, 0, 0)
+  );
+  assert!(
+    store
+      .get_accepted_delivery_baseline(&baseline_identity(job_id, &payload))
+      .await
+      .expect("none baseline")
+      .is_some()
   );
 }
 
@@ -819,7 +1126,7 @@ async fn retry_reuses_exact_payload_target_and_idempotency_without_agent_work() 
   let agent_invocations = AtomicUsize::new(1);
   let provider = FakeProvider::new([
     DeliveryProviderOutcome::ConfirmedNoWriteRetryable {
-      retry_after_seconds: Some(10),
+      retry_after_seconds: Some(1),
       error_kind: "rate_limited".to_owned(),
     },
     success(),
@@ -831,7 +1138,7 @@ async fn retry_reuses_exact_payload_target_and_idempotency_without_agent_work() 
     ScheduledDeliveryTickOutcome::RetryDeferred
   );
   assert_eq!(
-    run_scheduled_delivery_tick_with_clock(&store, &provider, "worker-b", clock(132), shutdown())
+    run_scheduled_delivery_tick_with_clock(&store, &provider, "worker-b", clock(127), shutdown())
       .await
       .expect("retry tick"),
     ScheduledDeliveryTickOutcome::Delivered
@@ -841,6 +1148,28 @@ async fn retry_reuses_exact_payload_target_and_idempotency_without_agent_work() 
   assert_eq!(observed[0], observed[1]);
   assert_eq!(agent_invocations.load(Ordering::SeqCst), 1);
   assert_eq!(observed[0].body, payload.body());
+}
+
+#[tokio::test]
+async fn retry_after_at_delivery_deadline_becomes_terminal_without_retry() {
+  let (_temp, store, _, _) = prepared_delivery("delivery-retry-deadline", "body").await;
+  let provider = FakeProvider::new([DeliveryProviderOutcome::ConfirmedNoWriteRetryable {
+    retry_after_seconds: Some(3_600),
+    error_kind: "rate_limited".to_owned(),
+  }]);
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(&store, &provider, "worker", clock(122), shutdown())
+      .await
+      .expect("deadline tick"),
+    ScheduledDeliveryTickOutcome::FailedTerminal
+  );
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(&store, &provider, "worker", clock(3_721), shutdown())
+      .await
+      .expect("no retry"),
+    ScheduledDeliveryTickOutcome::Idle
+  );
+  assert_eq!(provider.observed().len(), 1);
 }
 
 #[tokio::test]
@@ -1271,6 +1600,61 @@ async fn two_workers_make_one_provider_call_for_one_delivery() {
     1
   );
   assert_eq!(provider.observed().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_restarted_workers_prepare_once_and_make_one_provider_call() {
+  let (temp, first_store, delivery_id) =
+    completed_delivery_intent("delivery-unprepared-race", "body").await;
+  let second_store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("second store");
+  let provider = Arc::new(FakeProvider::new([success()]));
+  let (first_shutdown, first_shutdown_rx) = watch::channel(false);
+  let (second_shutdown, second_shutdown_rx) = watch::channel(false);
+  let first_provider: Arc<dyn DeliveryProvider> = provider.clone();
+  let first = tokio::spawn(run_scheduled_delivery_worker_with_clock(
+    first_store,
+    first_provider,
+    "worker-a".to_owned(),
+    clock(122),
+    first_shutdown_rx,
+  ));
+  let second_provider: Arc<dyn DeliveryProvider> = provider.clone();
+  let second = tokio::spawn(run_scheduled_delivery_worker_with_clock(
+    second_store,
+    second_provider,
+    "worker-b".to_owned(),
+    clock(122),
+    second_shutdown_rx,
+  ));
+  tokio::time::timeout(Duration::from_secs(2), async {
+    while provider.observed().is_empty() {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("delivery deadline");
+  first_shutdown.send(true).expect("first shutdown");
+  second_shutdown.send(true).expect("second shutdown");
+  first
+    .await
+    .expect("first task")
+    .expect("first worker result");
+  second
+    .await
+    .expect("second task")
+    .expect("second worker result");
+  assert_eq!(provider.observed().len(), 1);
+  assert_eq!(
+    StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("reopen")
+      .scheduled_delivery_authority_for_tests(&delivery_id)
+      .await
+      .expect("authority"),
+    ("delivered".to_owned(), 1, 1, 1)
+  );
 }
 
 #[tokio::test]

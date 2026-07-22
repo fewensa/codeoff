@@ -49,7 +49,8 @@ use codeoff_runtime::{
   schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler},
   scheduled_delivery::{
     DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderReadiness,
-    DeliveryProviderReadinessRequest, DeliveryProviderRequest, run_scheduled_delivery_worker,
+    DeliveryProviderReadinessRequest, DeliveryProviderRequest,
+    run_scheduled_delivery_preparation_worker, run_scheduled_delivery_worker,
   },
   scheduled_execution::{
     GlobalTurnBudget, ScheduledWorkerConfig, ScheduledWorkerHandle, ScheduledWorkerShutdown,
@@ -747,6 +748,8 @@ impl ServeLifecycle {
     };
     if let Some(provider) = scheduled_delivery {
       lifecycle.spawn_scheduled_delivery_worker(state, provider);
+    } else {
+      lifecycle.spawn_scheduled_delivery_preparation_worker(state);
     }
     if let Some(server) = mcp_server {
       lifecycle.spawn_mcp_server(server);
@@ -765,6 +768,18 @@ impl ServeLifecycle {
       .background_tasks
       .spawn("scheduled delivery", async move {
         run_scheduled_delivery_worker(state, provider, lease_owner, shutdown)
+          .await
+          .map_err(|error| Box::new(error) as ServeTaskError)?;
+        Ok(ServeTaskExit::Cancelled)
+      });
+  }
+
+  fn spawn_scheduled_delivery_preparation_worker(&mut self, state: StateStore) {
+    let shutdown = self.background_tasks.subscribe();
+    self
+      .background_tasks
+      .spawn("scheduled delivery preparation", async move {
+        run_scheduled_delivery_preparation_worker(state, shutdown)
           .await
           .map_err(|error| Box::new(error) as ServeTaskError)?;
         Ok(ServeTaskExit::Cancelled)
@@ -3290,6 +3305,102 @@ mod tests {
     .await
     .expect("serve shutdown deadline")
     .expect("clean serve shutdown");
+  }
+
+  #[tokio::test]
+  async fn delivery_disabled_serve_completes_none_target_without_slack() {
+    use codeoff_state::{
+      AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot, CreateScheduledJob,
+      DeliveryTargetSnapshot, PrincipalKey, ScheduleSpec, ScheduledJobDefinition,
+      ScheduledRunResult,
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    let owner = PrincipalKey::new("service", "local", "local", "scheduler").expect("owner");
+    state
+      .create_scheduled_job(&CreateScheduledJob {
+        job_id: "serve-none-only".to_owned(),
+        schedule_id: "schedule-serve-none-only".to_owned(),
+        definition: ScheduledJobDefinition::new(1, "{}").expect("definition"),
+        creator: owner.clone(),
+        owner,
+        capability: CapabilityProfileSnapshot::new(1, "none", "{}").expect("capability"),
+        targets: vec![
+          DeliveryTargetSnapshot::new(
+            "serve-none-target",
+            "none",
+            "none",
+            "none",
+            "none",
+            "{}",
+            1,
+            "none-v1",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+          )
+          .expect("target"),
+        ],
+        schedule: ScheduleSpec::once(110),
+        now: 100,
+      })
+      .await
+      .expect("create");
+    state
+      .materialize_due_schedule("serve-none-only", 0, 110)
+      .await
+      .expect("materialize");
+    let run = state
+      .claim_next_scheduled_run("run-worker", 111, 200)
+      .await
+      .expect("claim")
+      .expect("run");
+    let profile =
+      AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+    state
+      .mark_scheduled_run_executing(&run.binding, &profile, 112)
+      .await
+      .expect("executing");
+    state
+      .complete_scheduled_run_success(
+        &run.binding,
+        &ScheduledRunResult::new("none result", "").expect("result"),
+        120,
+      )
+      .await
+      .expect("complete");
+    assert!(
+      state
+        .next_scheduled_delivery_render_input()
+        .await
+        .expect("render input")
+        .is_some()
+    );
+    let observer = state.clone();
+    let mut config = CodeoffConfig::default();
+    config.scheduler.run_claims_enabled = false;
+    config.data_retention.enabled = false;
+    assert!(!config.scheduler.delivery_enabled);
+
+    tokio::time::timeout(
+      Duration::from_secs(2),
+      run_serve_loops_until(config, state, None, async move {
+        loop {
+          if observer
+            .next_scheduled_delivery_render_input()
+            .await
+            .is_ok_and(|input| input.is_none())
+          {
+            return Ok(());
+          }
+          tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+      }),
+    )
+    .await
+    .expect("serve deadline")
+    .expect("clean none-only serve shutdown");
   }
 
   #[tokio::test]

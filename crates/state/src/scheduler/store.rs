@@ -15,13 +15,14 @@ use super::{
   MaterializationOutcome, PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey,
   RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency,
   ScheduleSpec, ScheduledDeliveryAuthority, ScheduledDeliveryBinding, ScheduledDeliveryFailure,
-  ScheduledDeliveryRetentionReport, ScheduledDeliveryState, ScheduledDeliveryWork,
-  ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition,
-  ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus, ScheduledRunExecutionOutcome,
-  ScheduledRunLateEvidenceKind, ScheduledRunResult, ScheduledRunSuccessOutcome,
-  SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome, UpdateExecutionBaseline,
-  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
-  positive_u32, scheduler_error, validate_lowercase_sha256, validate_text,
+  ScheduledDeliveryRenderInput, ScheduledDeliveryRetentionReport, ScheduledDeliveryState,
+  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob,
+  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
+  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunResult,
+  ScheduledRunSuccessOutcome, SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome,
+  UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
+  invalid_value, materialized_run, positive_u32, scheduler_error, validate_lowercase_sha256,
+  validate_text,
 };
 use crate::StateStore;
 
@@ -43,6 +44,37 @@ impl StateStore {
   ) -> Result<(String, i64, i64, i64), StateError> {
     sqlx::query_as(
       "select state, attempt, fence, (select count(*) from scheduled_delivery_attempts where delivery_id = ?1) from scheduled_run_deliveries where delivery_id = ?1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&self.pool)
+    .await
+    .map_err(scheduler_error)
+  }
+
+  /// Reads run state for runtime lifecycle tests.
+  ///
+  /// # Errors
+  /// Returns an error when `SQLite` cannot read the run.
+  #[cfg(any(test, feature = "test-support"))]
+  pub async fn scheduled_run_state_for_tests(&self, run_id: &str) -> Result<String, StateError> {
+    sqlx::query_scalar("select state from scheduled_runs where run_id = ?1")
+      .bind(run_id)
+      .fetch_one(&self.pool)
+      .await
+      .map_err(scheduler_error)
+  }
+
+  /// Reads the provider receipt for runtime lifecycle tests.
+  ///
+  /// # Errors
+  /// Returns an error when `SQLite` cannot read the delivery.
+  #[cfg(any(test, feature = "test-support"))]
+  pub async fn scheduled_delivery_receipt_for_tests(
+    &self,
+    delivery_id: &str,
+  ) -> Result<Option<String>, StateError> {
+    sqlx::query_scalar(
+      "select provider_receipt from scheduled_run_deliveries where delivery_id = ?1",
     )
     .bind(delivery_id)
     .fetch_one(&self.pool)
@@ -700,6 +732,33 @@ impl StateStore {
         .map_err(scheduler_error)?,
     )?;
     Ok(target_json)
+  }
+
+  /// Reads the next accepted result that still needs its exact delivery payload frozen.
+  ///
+  /// This is a read-only recovery boundary. Concurrent preparers may observe the same input;
+  /// `prepare_scheduled_delivery` provides the idempotent immutable compare-and-set authority.
+  ///
+  /// # Errors
+  /// Returns an error when persisted result authority is invalid or storage fails.
+  pub async fn next_scheduled_delivery_render_input(
+    &self,
+  ) -> Result<Option<ScheduledDeliveryRenderInput>, StateError> {
+    let row = sqlx::query(
+      "select delivery.delivery_id, artifact.result_json from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id join scheduled_run_result_artifacts artifact on artifact.artifact_id = delivery.result_artifact_id and artifact.run_id = delivery.run_id and artifact.job_id = delivery.job_id and artifact.accepted_attempt = delivery.result_attempt and artifact.accepted_fence = delivery.result_fence where delivery.state = 'pending' and delivery.authority_kind = 'intent_v1' and delivery.payload_snapshot is null and run.state = 'succeeded' and run.result_artifact_id = delivery.result_artifact_id order by delivery.created_at, delivery.delivery_id limit 1",
+    )
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(row) = row else {
+      return Ok(None);
+    };
+    let delivery_id: String = row.try_get("delivery_id").map_err(scheduler_error)?;
+    let result_json: String = row.try_get("result_json").map_err(scheduler_error)?;
+    Ok(Some(ScheduledDeliveryRenderInput::new(
+      delivery_id,
+      delivery_body_from_result_json(&result_json)?,
+    )))
   }
 
   /// Freezes the exact UTF-8 payload for an issue-06 delivery intent.
@@ -2432,6 +2491,31 @@ fn delivery_payload_from_row(row: &SqliteRow) -> Result<DeliveryPayloadSnapshot,
     row.try_get("payload_created_at").map_err(scheduler_error)?,
   )
   .map_err(invalid_value)
+}
+
+fn delivery_body_from_result_json(result_json: &str) -> Result<String, StateError> {
+  let Value::Object(mut result) = serde_json::from_str(result_json).map_err(invalid_json)? else {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled result artifact is not an object".to_owned(),
+    });
+  };
+  if result.len() != 2
+    || result
+      .remove("schema_version")
+      .and_then(|value| value.as_u64())
+      != Some(1)
+  {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled result artifact has an unsupported schema".to_owned(),
+    });
+  }
+  let Some(Value::String(body)) = result.remove("summary") else {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled result artifact has no summary".to_owned(),
+    });
+  };
+  validate_text("scheduled result summary", &body).map_err(invalid_value)?;
+  Ok(body)
 }
 
 fn validate_delivery_binding(binding: &ScheduledDeliveryBinding) -> Result<(), StateError> {

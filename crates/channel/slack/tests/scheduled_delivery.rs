@@ -10,14 +10,17 @@ use codeoff_channel_slack::{
 use codeoff_config::SlackConfig;
 use codeoff_runtime::scheduled_delivery::{
   DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderReadiness,
-  DeliveryProviderReadinessRequest, DeliveryProviderRequest,
+  DeliveryProviderReadinessRequest, DeliveryProviderRequest, ScheduledDeliveryTickOutcome,
+  run_scheduled_delivery_tick,
 };
 use codeoff_state::{
-  AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot, ClaimedScheduledDelivery,
-  CreateScheduledJob, DeliveryTargetSnapshot, PreparedScheduledDelivery, PrincipalKey,
-  ScheduleSpec, ScheduledJobDefinition, ScheduledRunResult, SkippedNoneBaselinePolicy, StateStore,
+  AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
+  ClaimedScheduledDelivery, CreateScheduledJob, DeliveryTargetSnapshot, PreparedScheduledDelivery,
+  PrincipalKey, ScheduleSpec, ScheduledJobDefinition, ScheduledRunResult,
+  SkippedNoneBaselinePolicy, StateStore,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
 enum HttpStep {
@@ -80,11 +83,49 @@ fn target_identity(kind: &str) -> String {
   }
 }
 
+fn sha256_hex(value: &str) -> String {
+  let mut digest = Sha256::new();
+  digest.update(value.as_bytes());
+  let mut encoded = String::with_capacity(64);
+  for byte in digest.finalize() {
+    write!(&mut encoded, "{byte:02x}").expect("write digest");
+  }
+  encoded
+}
+
 async fn claimed_delivery(
   kind: &str,
   channel_id: &str,
   thread_ts: Option<&str>,
 ) -> (TempDir, StateStore, ClaimedScheduledDelivery) {
+  let (temp, store, delivery_id) = completed_delivery_intent(kind, channel_id, thread_ts).await;
+  assert!(matches!(
+    store
+      .prepare_scheduled_delivery(
+        &delivery_id,
+        "text/markdown; charset=utf-8",
+        "exact UTF-8: 測試  \n",
+        1,
+        121,
+        SkippedNoneBaselinePolicy::DoNotAdvance,
+      )
+      .await
+      .expect("prepare"),
+    PreparedScheduledDelivery::Pending(_)
+  ));
+  let claim = store
+    .claim_next_scheduled_delivery("delivery-worker", 122, 200)
+    .await
+    .expect("claim delivery")
+    .expect("delivery");
+  (temp, store, claim)
+}
+
+async fn completed_delivery_intent(
+  kind: &str,
+  channel_id: &str,
+  thread_ts: Option<&str>,
+) -> (TempDir, StateStore, String) {
   let temp = tempdir().expect("tempdir");
   let store = StateStore::initialize(&temp.path().join("state"), None)
     .await
@@ -130,7 +171,7 @@ async fn claimed_delivery(
       owner: owner(),
       capability: CapabilityProfileSnapshot::new(1, "none", "{}").expect("capability"),
       targets: vec![target],
-      schedule: ScheduleSpec::once(110),
+      schedule: ScheduleSpec::fixed_interval(110, 10).expect("interval"),
       now: 100,
     })
     .await
@@ -159,26 +200,7 @@ async fn claimed_delivery(
     .await
     .expect("complete");
   let delivery_id = delivery_id(run.binding.run_id(), &identity);
-  assert!(matches!(
-    store
-      .prepare_scheduled_delivery(
-        &delivery_id,
-        "text/markdown; charset=utf-8",
-        "exact UTF-8: 測試  \n",
-        1,
-        121,
-        SkippedNoneBaselinePolicy::DoNotAdvance,
-      )
-      .await
-      .expect("prepare"),
-    PreparedScheduledDelivery::Pending(_)
-  ));
-  let claim = store
-    .claim_next_scheduled_delivery("delivery-worker", 122, 200)
-    .await
-    .expect("claim delivery")
-    .expect("delivery");
-  (temp, store, claim)
+  (temp, store, delivery_id)
 }
 
 fn delivery_id(run_id: &str, identity: &str) -> String {
@@ -258,6 +280,177 @@ async fn sends_exact_channel_thread_and_dm_routes_and_returns_provider_identity(
     };
     assert_eq!(requests[0].json_keys(), Some(expected_keys));
   }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn runtime_delivers_slack_result_skips_exact_repeat_and_sends_utf8_change() {
+  let (_temp, store, first_delivery_id) = completed_delivery_intent("channel", "C123", None).await;
+  let target_json = store
+    .load_scheduled_delivery_intent_target_snapshot(&first_delivery_id)
+    .await
+    .expect("target snapshot");
+  let provider = SlackScheduledDeliveryProvider::new(SlackWebApiClient::new(
+    FakeHttp::new([
+      response(
+        200,
+        r#"{"ok":true,"team_id":"T00000000","enterprise_id":"E00000000","user_id":"U123","bot_id":"B123"}"#,
+      ),
+      response(
+        200,
+        r#"{"ok":true,"channel":"C123","ts":"200.000001","team_id":"T00000000","message":{"ts":"200.000001"}}"#,
+      ),
+      response(
+        200,
+        r#"{"ok":true,"team_id":"T00000000","enterprise_id":"E00000000","user_id":"U123","bot_id":"B123"}"#,
+      ),
+      response(
+        200,
+        r#"{"ok":true,"channel":"C123","ts":"201.000001","team_id":"T00000000","message":{"ts":"201.000001"}}"#,
+      ),
+    ]),
+    "slack-default",
+    "xoxb-secret",
+    SlackConfig::default(),
+    100,
+  ));
+  assert_eq!(
+    run_scheduled_delivery_tick(
+      &store,
+      &provider,
+      "delivery-worker-a",
+      tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .expect("first delivery"),
+    ScheduledDeliveryTickOutcome::Delivered
+  );
+  assert_eq!(
+    store
+      .scheduled_delivery_authority_for_tests(&first_delivery_id)
+      .await
+      .expect("first authority"),
+    ("delivered".to_owned(), 1, 1, 1)
+  );
+  let receipt: Value = serde_json::from_str(
+    &store
+      .scheduled_delivery_receipt_for_tests(&first_delivery_id)
+      .await
+      .expect("receipt")
+      .expect("provider receipt"),
+  )
+  .expect("receipt json");
+  assert_eq!(
+    receipt,
+    json!({
+      "provider": "slack",
+      "tenant": "T00000000",
+      "conversation_id": "C123",
+      "thread_id": null,
+      "message_id": "200.000001",
+    })
+  );
+  let baseline_identity = AcceptedDeliveryBaselineIdentity {
+    job_id: "slack-channel-C123".to_owned(),
+    target_identity_digest: target_identity("channel"),
+    target_snapshot_digest_algorithm: "sha256-v1".to_owned(),
+    target_snapshot_digest: sha256_hex(&target_json),
+    delivery_policy_version: 1,
+    render_version: 1,
+    hash_algorithm: "sha256-utf8-exact-v1".to_owned(),
+  };
+  let first_baseline = store
+    .get_accepted_delivery_baseline(&baseline_identity)
+    .await
+    .expect("baseline")
+    .expect("accepted baseline");
+  assert_eq!(first_baseline.source_delivery_id, first_delivery_id);
+
+  store
+    .materialize_due_schedule("slack-channel-C123", 0, 120)
+    .await
+    .expect("repeat occurrence");
+  let repeat_run = store
+    .claim_next_scheduled_run("repeat-run-worker", 121, 300)
+    .await
+    .expect("claim repeat")
+    .expect("repeat run");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&repeat_run.binding, &profile, 122)
+    .await
+    .expect("execute repeat");
+  store
+    .complete_scheduled_run_success(
+      &repeat_run.binding,
+      &ScheduledRunResult::new("exact UTF-8: 測試  \n", "").expect("repeat result"),
+      123,
+    )
+    .await
+    .expect("complete repeat");
+  assert_eq!(
+    run_scheduled_delivery_tick(
+      &store,
+      &provider,
+      "delivery-worker-b",
+      tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .expect("repeat delivery"),
+    ScheduledDeliveryTickOutcome::SkippedUnchanged
+  );
+  assert_eq!(provider.http_client().requests().len(), 2);
+
+  let changed_body = "exact UTF-8: 測試 e\u{0301}  \n";
+  store
+    .materialize_due_schedule("slack-channel-C123", 0, 130)
+    .await
+    .expect("changed occurrence");
+  let changed_run = store
+    .claim_next_scheduled_run("changed-run-worker", 131, 400)
+    .await
+    .expect("claim changed")
+    .expect("changed run");
+  store
+    .mark_scheduled_run_executing(&changed_run.binding, &profile, 132)
+    .await
+    .expect("execute changed");
+  store
+    .complete_scheduled_run_success(
+      &changed_run.binding,
+      &ScheduledRunResult::new(changed_body, "").expect("changed result"),
+      133,
+    )
+    .await
+    .expect("complete changed");
+  assert_eq!(
+    run_scheduled_delivery_tick(
+      &store,
+      &provider,
+      "delivery-worker-c",
+      tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .expect("changed delivery"),
+    ScheduledDeliveryTickOutcome::Delivered
+  );
+  let requests = provider.http_client().requests();
+  assert_eq!(requests.len(), 4);
+  assert_eq!(requests[3].path(), "chat.postMessage");
+  assert_eq!(
+    requests[3].json_value("text").as_deref(),
+    Some(changed_body)
+  );
+  assert_eq!(
+    store
+      .get_accepted_delivery_baseline(&baseline_identity)
+      .await
+      .expect("changed baseline")
+      .expect("updated baseline")
+      .baseline_version,
+    2
+  );
 }
 
 #[tokio::test]

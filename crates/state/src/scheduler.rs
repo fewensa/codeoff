@@ -237,6 +237,201 @@ pub struct DeliveryTargetSnapshot {
   identity_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryTargetRoute {
+  provider: String,
+  tenant: String,
+  kind: String,
+  conversation_id: String,
+  thread_id: Option<String>,
+}
+
+impl DeliveryTargetRoute {
+  /// Parses one canonical resolver-produced target envelope into provider-neutral routing
+  /// coordinates.
+  ///
+  /// # Errors
+  /// Returns an error for legacy, unknown, non-canonical, or kind-inconsistent route shapes.
+  pub fn from_canonical_target_json(target_json: &str) -> Result<Self, StateValueError> {
+    let target: Value =
+      serde_json::from_str(target_json).map_err(|_| StateValueError::InvalidJson {
+        field: "delivery target route",
+      })?;
+    if serde_json::to_string(&target).map_err(|_| StateValueError::InvalidJson {
+      field: "delivery target route",
+    })?
+      != target_json
+    {
+      return Err(StateValueError::NonCanonicalJson {
+        field: "delivery target route",
+      });
+    }
+    let target = target.as_object().ok_or(StateValueError::InvalidJson {
+      field: "delivery target route",
+    })?;
+    let target_keys = [
+      "address",
+      "connector",
+      "identity_digest",
+      "kind",
+      "provider",
+      "resolver_digest",
+      "resolver_version",
+      "tenant",
+    ];
+    if target.len() != target_keys.len()
+      || target_keys.iter().any(|key| !target.contains_key(*key))
+      || target.get("resolver_version").and_then(Value::as_u64) != Some(1)
+    {
+      return Err(StateValueError::InvalidJson {
+        field: "delivery target route",
+      });
+    }
+    let provider =
+      target
+        .get("provider")
+        .and_then(Value::as_str)
+        .ok_or(StateValueError::InvalidJson {
+          field: "delivery target route",
+        })?;
+    let tenant =
+      target
+        .get("tenant")
+        .and_then(Value::as_str)
+        .ok_or(StateValueError::InvalidJson {
+          field: "delivery target route",
+        })?;
+    let kind = target
+      .get("kind")
+      .and_then(Value::as_str)
+      .ok_or(StateValueError::InvalidJson {
+        field: "delivery target route",
+      })?;
+    for value in [provider, tenant, kind] {
+      validate_text("delivery target route identity", value)?;
+    }
+    if !matches!(kind, "channel" | "direct_message" | "thread") {
+      return Err(StateValueError::InvalidJson {
+        field: "delivery target route",
+      });
+    }
+    let address = target.get("address").ok_or(StateValueError::InvalidJson {
+      field: "delivery target route",
+    })?;
+    let (conversation_id, thread_id) = parse_delivery_target_route_address(address, tenant, kind)?;
+    Ok(Self {
+      provider: provider.to_owned(),
+      tenant: tenant.to_owned(),
+      kind: kind.to_owned(),
+      conversation_id,
+      thread_id,
+    })
+  }
+
+  #[must_use]
+  pub fn provider(&self) -> &str {
+    &self.provider
+  }
+
+  #[must_use]
+  pub fn tenant(&self) -> &str {
+    &self.tenant
+  }
+
+  #[must_use]
+  pub fn kind(&self) -> &str {
+    &self.kind
+  }
+
+  #[must_use]
+  pub fn conversation_id(&self) -> &str {
+    &self.conversation_id
+  }
+
+  #[must_use]
+  pub fn thread_id(&self) -> Option<&str> {
+    self.thread_id.as_deref()
+  }
+}
+
+fn parse_delivery_target_route_address(
+  address: &Value,
+  tenant: &str,
+  kind: &str,
+) -> Result<(String, Option<String>), StateValueError> {
+  let address = address.as_object().ok_or(StateValueError::InvalidJson {
+    field: "delivery target route",
+  })?;
+  let address_keys = [
+    "authorization_evidence",
+    "coordinates",
+    "created_at",
+    "requested_identity_digest",
+    "routing_authority",
+    "schema_version",
+    "workspace_id",
+  ];
+  if address.len() != address_keys.len()
+    || address_keys.iter().any(|key| !address.contains_key(*key))
+    || address.get("schema_version").and_then(Value::as_u64) != Some(1)
+    || address.get("workspace_id").and_then(Value::as_str) != Some(tenant)
+    || !address
+      .get("authorization_evidence")
+      .is_some_and(Value::is_object)
+    || !address
+      .get("routing_authority")
+      .is_some_and(Value::is_object)
+    || address.get("created_at").and_then(Value::as_i64).is_none()
+  {
+    return Err(StateValueError::InvalidJson {
+      field: "delivery target route",
+    });
+  }
+  validate_lowercase_sha256(
+    "delivery target requested identity digest",
+    address
+      .get("requested_identity_digest")
+      .and_then(Value::as_str)
+      .ok_or(StateValueError::InvalidJson {
+        field: "delivery target route",
+      })?,
+  )?;
+  let coordinates = address
+    .get("coordinates")
+    .and_then(Value::as_object)
+    .ok_or(StateValueError::InvalidJson {
+      field: "delivery target route",
+    })?;
+  let expected_coordinate_count = usize::from(kind == "thread") + 1;
+  if coordinates.len() != expected_coordinate_count
+    || !coordinates.contains_key("channel_id")
+    || (kind == "thread") != coordinates.contains_key("thread_ts")
+  {
+    return Err(StateValueError::InvalidJson {
+      field: "delivery target route",
+    });
+  }
+  let conversation_id = coordinates
+    .get("channel_id")
+    .and_then(Value::as_str)
+    .ok_or(StateValueError::InvalidJson {
+      field: "delivery target route",
+    })?;
+  validate_text("delivery target route conversation", conversation_id)?;
+  let thread_id = coordinates
+    .get("thread_ts")
+    .map(|value| {
+      value.as_str().ok_or(StateValueError::InvalidJson {
+        field: "delivery target route",
+      })
+    })
+    .transpose()?;
+  if let Some(thread_id) = thread_id {
+    validate_text("delivery target route thread", thread_id)?;
+  }
+  Ok((conversation_id.to_owned(), thread_id.map(str::to_owned)))
+}
+
 impl DeliveryTargetSnapshot {
   /// Builds a resolved, versioned delivery target snapshot.
   ///
@@ -319,6 +514,30 @@ impl DeliveryTargetSnapshot {
   #[must_use]
   pub fn resolver_digest(&self) -> &str {
     &self.resolver_digest
+  }
+
+  /// Returns provider-neutral routing coordinates from this resolver-produced target.
+  ///
+  /// # Errors
+  /// Returns an error when the address does not use the recognized versioned route schema.
+  pub fn delivery_route(&self) -> Result<DeliveryTargetRoute, StateValueError> {
+    let address: Value =
+      serde_json::from_str(&self.address_json).map_err(|_| StateValueError::InvalidJson {
+        field: "delivery target route",
+      })?;
+    DeliveryTargetRoute::from_canonical_target_json(
+      &json!({
+        "address": address,
+        "connector": self.connector,
+        "identity_digest": self.identity_digest,
+        "kind": self.kind,
+        "provider": self.provider,
+        "resolver_digest": self.resolver_digest,
+        "resolver_version": self.resolver_version,
+        "tenant": self.tenant,
+      })
+      .to_string(),
+    )
   }
 
   /// Replaces the storage identity while preserving the resolved target snapshot.

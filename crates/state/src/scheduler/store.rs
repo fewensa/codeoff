@@ -10,22 +10,23 @@ use super::{
   AcceptedDeliveryBaseline, AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot,
   CapabilityProfileSnapshot, ClaimedScheduledDelivery, ClaimedScheduledRun, CreateScheduledJob,
   DEFAULT_OCCURRENCE_STEPS, DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION,
-  DeliveryPayloadSnapshot, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome, IdempotencyDecision,
-  LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES, MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES,
-  MaterializationOutcome, PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey,
-  RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency,
-  ScheduleSpec, ScheduledDeliveryAuthority, ScheduledDeliveryBinding, ScheduledDeliveryFailure,
-  ScheduledDeliveryOperatorProjection, ScheduledDeliveryRenderInput,
-  ScheduledDeliveryRetentionReport, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
-  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob,
-  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
-  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
-  ScheduledRunResult, ScheduledRunSuccessOutcome, SchedulerOperatorActionSummary,
-  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
-  StateError, TransactionalMutationOutcome, UpdateExecutionBaseline, UpdateScheduledJob, Value,
-  invalid_json, invalid_occurrence, invalid_value, materialized_run,
-  operator_action_request_digest, operator_delivery_evidence_binding, positive_u32,
-  scheduler_error, validate_lowercase_sha256, validate_text,
+  DeliveryPayloadSnapshot, DeliveryTargetRoute, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome,
+  IdempotencyDecision, LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES, MAX_DELIVERY_TARGETS,
+  MAX_SNAPSHOT_BYTES, MaterializationOutcome, PreflightFailureDisposition,
+  PreparedScheduledDelivery, PrincipalKey, RunLeaseBinding, ScheduleAuditSummary,
+  ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryAuthority,
+  ScheduledDeliveryBinding, ScheduledDeliveryFailure, ScheduledDeliveryOperatorProjection,
+  ScheduledDeliveryRenderInput, ScheduledDeliveryRetentionReport, ScheduledDeliveryState,
+  ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
+  ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
+  ScheduledJobMutation, ScheduledJobStatus, ScheduledRunExecutionOutcome,
+  ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection, ScheduledRunResult,
+  ScheduledRunSuccessOutcome, SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome,
+  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome,
+  UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
+  invalid_value, materialized_run, operator_action_request_digest,
+  operator_delivery_evidence_binding, positive_u32, scheduler_error, validate_lowercase_sha256,
+  validate_text,
 };
 use crate::StateStore;
 
@@ -4574,34 +4575,13 @@ fn validate_operator_delivery_target_binding(
   target_json: &str,
   action: &ScheduledDeliveryUnknownAction,
 ) -> Result<(), StateError> {
-  let target: Value = serde_json::from_str(target_json).map_err(invalid_json)?;
-  let target = target
-    .as_object()
-    .ok_or_else(|| StateError::InvalidSchedulerState {
-      reason: "operator delivery target snapshot must be an object".to_owned(),
-    })?;
-  let target_provider = target
-    .get("provider")
-    .and_then(Value::as_str)
-    .ok_or_else(|| StateError::InvalidSchedulerState {
-      reason: "operator delivery target snapshot has no provider".to_owned(),
-    })?;
-  let target_tenant = target
-    .get("tenant")
-    .and_then(Value::as_str)
-    .ok_or_else(|| StateError::InvalidSchedulerState {
-      reason: "operator delivery target snapshot has no tenant".to_owned(),
-    })?;
-  let target_kind = target.get("kind").and_then(Value::as_str).ok_or_else(|| {
-    StateError::InvalidSchedulerState {
-      reason: "operator delivery target snapshot has no kind".to_owned(),
-    }
-  })?;
+  let route =
+    DeliveryTargetRoute::from_canonical_target_json(target_json).map_err(invalid_value)?;
   let (evidence_provider, evidence_tenant, evidence_target_kind) =
     operator_delivery_evidence_binding(action).map_err(invalid_value)?;
-  if evidence_provider != target_provider
-    || evidence_tenant != target_tenant
-    || evidence_target_kind != target_kind
+  if evidence_provider != route.provider()
+    || evidence_tenant != route.tenant()
+    || evidence_target_kind != route.kind()
   {
     return Err(StateError::InvalidSchedulerState {
       reason: "operator delivery evidence does not bind the immutable target snapshot".to_owned(),
@@ -4619,28 +4599,23 @@ fn validate_operator_delivery_target_binding(
     .ok_or_else(|| StateError::InvalidSchedulerState {
       reason: "operator provider receipt must be an object".to_owned(),
     })?;
-  if receipt.get("provider").and_then(Value::as_str) != Some(target_provider)
-    || receipt.get("tenant").and_then(Value::as_str) != Some(target_tenant)
-    || receipt.get("target_kind").and_then(Value::as_str) != Some(target_kind)
+  if receipt.get("provider").and_then(Value::as_str) != Some(route.provider())
+    || receipt.get("tenant").and_then(Value::as_str) != Some(route.tenant())
+    || receipt.get("target_kind").and_then(Value::as_str) != Some(route.kind())
   {
     return Err(StateError::InvalidSchedulerState {
       reason: "operator provider receipt does not bind the immutable target snapshot".to_owned(),
     });
   }
-  let expected_conversation = target
-    .get("address")
-    .and_then(Value::as_object)
-    .and_then(|address| {
-      address
-        .get("conversation_id")
-        .or_else(|| address.get("channel_id"))
-    })
-    .and_then(Value::as_str);
-  if expected_conversation.is_some()
-    && receipt.get("conversation_id").and_then(Value::as_str) != expected_conversation
-  {
+  if receipt.get("conversation_id").and_then(Value::as_str) != Some(route.conversation_id()) {
     return Err(StateError::InvalidSchedulerState {
       reason: "operator provider receipt conversation does not bind the target address".to_owned(),
+    });
+  }
+  let receipt_thread = receipt.get("thread_id").and_then(Value::as_str);
+  if receipt_thread != route.thread_id() {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "operator provider receipt thread does not bind the target address".to_owned(),
     });
   }
   Ok(())

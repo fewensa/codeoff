@@ -96,6 +96,47 @@ fn second_target(job: &str) -> DeliveryTargetSnapshot {
   .expect("second target")
 }
 
+fn resolved_slack_target(
+  job: &str,
+  kind: &str,
+  channel_id: &str,
+  thread_ts: Option<&str>,
+) -> DeliveryTargetSnapshot {
+  let coordinates = thread_ts.map_or_else(
+    || json!({"channel_id": channel_id}),
+    |thread_ts| json!({"channel_id": channel_id, "thread_ts": thread_ts}),
+  );
+  DeliveryTargetSnapshot::new(
+    format!("target-{job}-resolved"),
+    "slack",
+    "slack-default",
+    "workspace",
+    kind,
+    json!({
+      "authorization_evidence": {"digest": "evidence", "version": 2},
+      "coordinates": coordinates,
+      "created_at": 100,
+      "requested_identity_digest": test_sha256_hex(job),
+      "routing_authority": {
+        "context_team_id": "workspace",
+        "conversation_host_id": "workspace",
+        "enterprise_id": null,
+        "team_id": "workspace",
+      },
+      "schema_version": 1,
+      "workspace_id": "workspace",
+    })
+    .to_string(),
+    1,
+    "slack-web-api-v2",
+    test_sha256_hex(&format!(
+      "{job}:{kind}:{channel_id}:{}",
+      thread_ts.unwrap_or("")
+    )),
+  )
+  .expect("resolved Slack target")
+}
+
 fn test_sha256_hex(value: &str) -> String {
   let mut digest = Sha256::new();
   digest.update(value.as_bytes());
@@ -113,6 +154,24 @@ fn operator_provider_receipt(
   conversation_id: &str,
   message_id: &str,
 ) -> String {
+  operator_provider_receipt_with_thread(
+    provider,
+    tenant,
+    target_kind,
+    conversation_id,
+    None,
+    message_id,
+  )
+}
+
+fn operator_provider_receipt_with_thread(
+  provider: &str,
+  tenant: &str,
+  target_kind: &str,
+  conversation_id: &str,
+  thread_id: Option<&str>,
+  message_id: &str,
+) -> String {
   json!({
     "conversation_id": conversation_id,
     "message_id": message_id,
@@ -120,7 +179,7 @@ fn operator_provider_receipt(
     "receipt_version": 1,
     "target_kind": target_kind,
     "tenant": tenant,
-    "thread_id": null,
+    "thread_id": thread_id,
   })
   .to_string()
 }
@@ -6535,13 +6594,14 @@ async fn test_ambiguous_post_write_becomes_unknown_without_retry_or_baseline() {
   assert_eq!(claim.payload.digest(), payload.digest());
 }
 
-async fn prepare_operator_unknown_delivery(
+async fn prepare_operator_unknown_delivery_with_target(
   store: &StateStore,
   job_id: &str,
   scheduled_for: i64,
+  target: DeliveryTargetSnapshot,
 ) -> ClaimedScheduledDelivery {
   let mut request = create_request(job_id, ScheduleSpec::once(scheduled_for), 100);
-  request.targets = vec![second_target(job_id)];
+  request.targets = vec![target];
   store
     .create_scheduled_job(&request)
     .await
@@ -6616,6 +6676,20 @@ async fn prepare_operator_unknown_delivery(
     .await
     .expect("record ambiguity");
   claim
+}
+
+async fn prepare_operator_unknown_delivery(
+  store: &StateStore,
+  job_id: &str,
+  scheduled_for: i64,
+) -> ClaimedScheduledDelivery {
+  prepare_operator_unknown_delivery_with_target(
+    store,
+    job_id,
+    scheduled_for,
+    resolved_slack_target(job_id, "channel", "C1", None),
+  )
+  .await
 }
 
 #[tokio::test]
@@ -6796,6 +6870,213 @@ async fn test_operator_delivery_evidence_is_canonical_versioned_and_target_bound
       Err(StateError::InvalidSchedulerState { .. })
     ));
   }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_operator_delivered_receipt_binds_resolved_channel_dm_and_thread_routes() {
+  let temp = tempdir().expect("create tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("initialize store");
+  for (index, kind, conversation_id, thread_id) in [
+    (0_i64, "channel", "C1", None),
+    (1, "direct_message", "D1", None),
+    (2, "thread", "C2", Some("100.000000")),
+  ] {
+    let job_id = format!("operator-resolved-{kind}");
+    let unknown = prepare_operator_unknown_delivery_with_target(
+      &store,
+      &job_id,
+      200 + index * 20,
+      resolved_slack_target(&job_id, kind, conversation_id, thread_id),
+    )
+    .await;
+    let receipt = operator_provider_receipt_with_thread(
+      "slack",
+      "workspace",
+      kind,
+      conversation_id,
+      thread_id,
+      &format!("message-{kind}"),
+    );
+    let (evidence_json, evidence_digest) = operator_delivery_evidence(
+      "provider_confirmed_delivered",
+      &format!("provider-case-{kind}"),
+      "slack",
+      "workspace",
+      kind,
+      Some(&receipt),
+    );
+    let action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+      provider_receipt: receipt,
+      evidence_json,
+      evidence_digest,
+    };
+    let request = SchedulerOperatorRequest::for_delivery_action(
+      owner(),
+      format!("confirm-{kind}"),
+      unknown.binding.delivery_id(),
+      unknown.binding.attempt(),
+      unknown.binding.fence(),
+      &action,
+      300 + index,
+    )
+    .expect("operator request");
+    assert_eq!(
+      store
+        .operator_act_on_unknown_delivery(
+          &request,
+          unknown.binding.delivery_id(),
+          unknown.binding.attempt(),
+          unknown.binding.fence(),
+          &action,
+        )
+        .await
+        .expect("confirm resolved route"),
+      SchedulerOperatorMutationOutcome::Applied
+    );
+  }
+  let pool = SqlitePool::connect(&database_url(&temp.path().join("state")))
+    .await
+    .expect("connect database");
+  let baselines: i64 = sqlx::query_scalar(
+    "select count(*) from scheduled_delivery_baselines where job_id like 'operator-resolved-%'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("resolved route baselines");
+  assert_eq!(baselines, 3);
+
+  for (index, job_id, kind, conversation_id, target_thread, receipt_thread) in [
+    (
+      0_i64,
+      "operator-thread-missing",
+      "thread",
+      "C3",
+      Some("300.000000"),
+      None,
+    ),
+    (
+      1,
+      "operator-thread-wrong",
+      "thread",
+      "C4",
+      Some("400.000000"),
+      Some("401.000000"),
+    ),
+    (
+      2,
+      "operator-channel-unexpected-thread",
+      "channel",
+      "C5",
+      None,
+      Some("500.000000"),
+    ),
+    (
+      3,
+      "operator-dm-unexpected-thread",
+      "direct_message",
+      "D2",
+      None,
+      Some("600.000000"),
+    ),
+  ] {
+    let unknown = prepare_operator_unknown_delivery_with_target(
+      &store,
+      job_id,
+      400 + index * 20,
+      resolved_slack_target(job_id, kind, conversation_id, target_thread),
+    )
+    .await;
+    let receipt = operator_provider_receipt_with_thread(
+      "slack",
+      "workspace",
+      kind,
+      conversation_id,
+      receipt_thread,
+      "wrong-thread-message",
+    );
+    let (evidence_json, evidence_digest) = operator_delivery_evidence(
+      "provider_confirmed_delivered",
+      job_id,
+      "slack",
+      "workspace",
+      kind,
+      Some(&receipt),
+    );
+    let action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+      provider_receipt: receipt,
+      evidence_json,
+      evidence_digest,
+    };
+    let request = SchedulerOperatorRequest::for_delivery_action(
+      owner(),
+      job_id,
+      unknown.binding.delivery_id(),
+      unknown.binding.attempt(),
+      unknown.binding.fence(),
+      &action,
+      500 + index,
+    )
+    .expect("well-formed mismatched thread request");
+    assert!(matches!(
+      store
+        .operator_act_on_unknown_delivery(
+          &request,
+          unknown.binding.delivery_id(),
+          unknown.binding.attempt(),
+          unknown.binding.fence(),
+          &action,
+        )
+        .await,
+      Err(StateError::InvalidSchedulerState { .. })
+    ));
+  }
+
+  let legacy = prepare_operator_unknown_delivery_with_target(
+    &store,
+    "operator-legacy-route",
+    500,
+    second_target("operator-legacy-route"),
+  )
+  .await;
+  let receipt = operator_provider_receipt("slack", "workspace", "channel", "C1", "legacy-message");
+  let (evidence_json, evidence_digest) = operator_delivery_evidence(
+    "provider_confirmed_delivered",
+    "legacy-route",
+    "slack",
+    "workspace",
+    "channel",
+    Some(&receipt),
+  );
+  let action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+    provider_receipt: receipt,
+    evidence_json,
+    evidence_digest,
+  };
+  let request = SchedulerOperatorRequest::for_delivery_action(
+    owner(),
+    "legacy-route",
+    legacy.binding.delivery_id(),
+    legacy.binding.attempt(),
+    legacy.binding.fence(),
+    &action,
+    510,
+  )
+  .expect("legacy route request");
+  assert!(matches!(
+    store
+      .operator_act_on_unknown_delivery(
+        &request,
+        legacy.binding.delivery_id(),
+        legacy.binding.attempt(),
+        legacy.binding.fence(),
+        &action,
+      )
+      .await,
+    Err(StateError::InvalidSchedulerState { .. })
+  ));
 }
 
 async fn operator_delivery_action_after_barrier(

@@ -579,7 +579,12 @@ mod tests {
     VerifiedSlackTargetResolver,
   };
   use codeoff_runtime::schedule_tools::ScheduleDynamicToolHandler;
-  use codeoff_state::PrincipalKey;
+  use codeoff_state::{
+    AttestedExecutionProfileSnapshot, PreparedScheduledDelivery, PrincipalKey,
+    ScheduledDeliveryFailure, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
+    ScheduledRunResult, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
+    SkippedNoneBaselinePolicy,
+  };
   use std::io::Cursor;
   use std::sync::atomic::{AtomicUsize, Ordering};
   use std::sync::{Arc, Mutex};
@@ -1288,6 +1293,143 @@ kind = "none"
         })
       );
       assert_eq!(target.kind(), expected_kind);
+      let route = target.delivery_route().expect("provider-neutral route");
+      assert_eq!(route.provider(), "slack");
+      assert_eq!(route.tenant(), "T00000000");
+      assert_eq!(route.kind(), expected_kind);
+      assert_eq!(route.conversation_id(), channel_id);
+      assert_eq!(route.thread_id(), thread_ts);
+      inspection
+        .materialize_due_schedule(job_id, 0, 500)
+        .await
+        .expect("materialize real resolver schedule");
+      let run = inspection
+        .claim_next_scheduled_run("real-resolver-run", 501, 600)
+        .await
+        .expect("claim real resolver run")
+        .expect("real resolver run");
+      let profile = AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile")
+        .expect("execution profile");
+      inspection
+        .mark_scheduled_run_executing(&run.binding, &profile, 502)
+        .await
+        .expect("execute real resolver run");
+      inspection
+        .complete_scheduled_run_success(
+          &run.binding,
+          &ScheduledRunResult::new("resolved result", "").expect("result"),
+          503,
+        )
+        .await
+        .expect("complete real resolver run");
+      let delivery_id = inspection
+        .list_scheduled_delivery_operator_projections(None, 10)
+        .await
+        .expect("list real resolver delivery")
+        .remove(0)
+        .delivery_id;
+      assert!(matches!(
+        inspection
+          .prepare_scheduled_delivery(
+            &delivery_id,
+            "text/plain; charset=utf-8",
+            "resolved payload",
+            1,
+            504,
+            SkippedNoneBaselinePolicy::DoNotAdvance,
+          )
+          .await
+          .expect("prepare real resolver delivery"),
+        PreparedScheduledDelivery::Pending(_)
+      ));
+      let delivery = inspection
+        .claim_next_scheduled_delivery("real-resolver-delivery", 505, 600)
+        .await
+        .expect("claim real resolver delivery")
+        .expect("real resolver delivery");
+      inspection
+        .complete_scheduled_delivery_failure(
+          &delivery.binding,
+          &ScheduledDeliveryFailure::AmbiguousPostWrite {
+            error_kind: "provider_response_lost".to_owned(),
+            redacted_message: None,
+          },
+          506,
+        )
+        .await
+        .expect("record real resolver ambiguity");
+      let (receipt_digest, operator_evidence_digest) = match expected_kind {
+        "channel" => (
+          "e56ebe0615616be029fe6affbf10eae04563718f089002c65794756a4762f535",
+          "bac34051ce5ed63dcc66dc15c17ea73c3050b5a05b3f3e04deeb75c1466d1112",
+        ),
+        "direct_message" => (
+          "55258902520189aede7485035ced4b0e63a48a144479006cc457b1f80d87424c",
+          "522b9e4fc386aec5958c5d5a91bbe77aba68e6dc9bb8d157897d3a10b09c2eff",
+        ),
+        "thread" => (
+          "f62298ae6787508f5e0ae7e9908d4a2e7c1344572100a22db98831e93b03a46f",
+          "1380f082082a6101d1a2a7e6b3a6ca0a229a747dc23b9aea00975c8a8a0a2c1c",
+        ),
+        _ => unreachable!(),
+      };
+      let receipt = json!({
+        "conversation_id": channel_id,
+        "message_id": format!("operator-{expected_kind}-message"),
+        "provider": "slack",
+        "receipt_version": 1,
+        "target_kind": expected_kind,
+        "tenant": "T00000000",
+        "thread_id": thread_ts,
+      })
+      .to_string();
+      let operator_evidence = json!({
+        "evidence_id": format!("real-resolver-{expected_kind}"),
+        "evidence_version": 1,
+        "kind": "provider_confirmed_delivered",
+        "provider": "slack",
+        "receipt_digest": receipt_digest,
+        "target_kind": expected_kind,
+        "tenant": "T00000000",
+      })
+      .to_string();
+      let action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+        provider_receipt: receipt,
+        evidence_json: operator_evidence,
+        evidence_digest: operator_evidence_digest.to_owned(),
+      };
+      let operator_request = SchedulerOperatorRequest::for_delivery_action(
+        PrincipalKey::new("operator", "local", "ops", "reviewer").expect("operator"),
+        format!("real-resolver-{expected_kind}"),
+        delivery.binding.delivery_id(),
+        delivery.binding.attempt(),
+        delivery.binding.fence(),
+        &action,
+        507,
+      )
+      .expect("real resolver operator request");
+      assert_eq!(
+        inspection
+          .operator_act_on_unknown_delivery(
+            &operator_request,
+            delivery.binding.delivery_id(),
+            delivery.binding.attempt(),
+            delivery.binding.fence(),
+            &action,
+          )
+          .await
+          .expect("confirm real resolver delivery"),
+        SchedulerOperatorMutationOutcome::Applied
+      );
+      assert_eq!(
+        inspection
+          .list_scheduled_delivery_operator_projections(None, 10)
+          .await
+          .expect("read confirmed delivery")
+          .remove(0)
+          .state,
+        ScheduledDeliveryState::Delivered
+      );
       for forbidden in [
         "Ev-must-not-persist",
         "dedupe-must-not-persist",

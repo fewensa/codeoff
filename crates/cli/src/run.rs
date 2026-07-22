@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::future::Future;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -45,9 +46,14 @@ use codeoff_runtime::{
     VerifiedSlackTargetResolver,
   },
   schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler},
-  scheduled_execution::{GlobalTurnBudget, ScheduledWorkerConfig, spawn_scheduled_worker},
+  scheduled_execution::{
+    GlobalTurnBudget, ScheduledWorkerConfig, ScheduledWorkerHandle, ScheduledWorkerShutdown,
+    spawn_scheduled_worker,
+  },
 };
 use codeoff_state::{RetentionPolicy, StateError, StateStore};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::command::{Cli, Command, ConfigCommand, SchedulerCommand, WorkerCommand};
 use crate::scheduler::{SchedulerCommandError, SchedulerOperatorConfig, execute_scheduler_command};
@@ -405,18 +411,32 @@ impl ChannelContextProvider for ServeDispatchContextProvider {
 }
 
 async fn run_serve_loops(config: CodeoffConfig, state: StateStore) -> Result<(), Box<dyn Error>> {
+  run_serve_loops_until(config, state, shutdown_signal()).await
+}
+
+async fn run_serve_loops_until<F>(
+  config: CodeoffConfig,
+  state: StateStore,
+  shutdown_signal: F,
+) -> Result<(), Box<dyn Error>>
+where
+  F: Future<Output = io::Result<()>>,
+{
   let tick_limit = serve_tick_limit();
   let turn_budget = GlobalTurnBudget::new(config.agent.codex_app_server.max_parallel_turns);
-  let scheduled_worker = spawn_scheduled_worker(
-    state.clone(),
-    turn_budget.clone(),
-    ScheduledWorkerConfig {
-      run_claims_enabled: config.scheduler.run_claims_enabled,
-    },
-  );
+  let mut lifecycle = ServeLifecycle {
+    scheduled_worker: spawn_scheduled_worker(
+      state.clone(),
+      turn_budget.clone(),
+      ScheduledWorkerConfig {
+        run_claims_enabled: config.scheduler.run_claims_enabled,
+      },
+    ),
+    background_tasks: ServeTaskGroup::new(),
+  };
   if tick_limit.is_none() {
-    maybe_spawn_slack_intake_loop(&config, state.clone());
-    maybe_spawn_retention_cleanup_loop(&config, state.clone());
+    maybe_spawn_slack_intake_loop(&config, state.clone(), &mut lifecycle.background_tasks);
+    maybe_spawn_retention_cleanup_loop(&config, state.clone(), &mut lifecycle.background_tasks);
   }
   let assistant_status = build_assistant_status_controller(&config);
   let slack_streams = build_slack_codex_stream_controller(&config, assistant_status.clone());
@@ -436,22 +456,19 @@ async fn run_serve_loops(config: CodeoffConfig, state: StateStore) -> Result<(),
   );
   let processing_streams = build_processing_stream_manager(&config, state.clone());
   let delivery = build_slack_delivery_queue(&config, state.clone());
+  tokio::pin!(shutdown_signal);
 
   if should_spawn_background_dispatch_loop(tick_limit, backend.is_some()) {
-    if backend.is_some() {
-      spawn_channel_dispatch_loops(
-        config.clone(),
-        state.clone(),
-        processing_streams,
-        channel_dispatch_worker_count(&config),
-        turn_budget,
-      );
-    }
-    let result = run_slack_delivery_loop(delivery.as_ref()).await;
-    if let Some(worker) = scheduled_worker {
-      worker.shutdown().await;
-    }
-    return result;
+    return run_background_serve_loops(
+      &config,
+      state,
+      processing_streams,
+      turn_budget,
+      delivery.as_ref(),
+      &mut shutdown_signal,
+      &mut lifecycle,
+    )
+    .await;
   }
 
   let result: Result<(), Box<dyn Error>> = async {
@@ -464,36 +481,188 @@ async fn run_serve_loops(config: CodeoffConfig, state: StateStore) -> Result<(),
         }
       }
       ticks = ticks.saturating_add(1);
-      let dispatched = match backend.as_ref() {
-        Some(backend) => {
-          let _permit = turn_budget.acquire().await?;
-          run_channel_dispatch_tick(
-            &state,
-            backend,
-            &processing_streams,
-            &dispatch_context_provider,
-            config.slack.recent_message_limit,
-            None,
-          )
-          .await?
+      let tick = async {
+        let dispatched = match backend.as_ref() {
+          Some(backend) => {
+            let _permit = turn_budget.acquire().await?;
+            run_channel_dispatch_tick(
+              &state,
+              backend,
+              &processing_streams,
+              &dispatch_context_provider,
+              config.slack.recent_message_limit,
+              None,
+            )
+            .await?
+          }
+          None => false,
+        };
+        let delivered = match delivery.as_ref() {
+          Some(delivery) => run_slack_delivery_tick(delivery).await?,
+          None => false,
+        };
+        if !dispatched && !delivered {
+          tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        None => false,
+        Ok::<(), Box<dyn Error>>(())
       };
-      let delivered = match delivery.as_ref() {
-        Some(delivery) => run_slack_delivery_tick(delivery).await?,
-        None => false,
-      };
-      if !dispatched && !delivered {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+      if tick_limit.is_none() {
+        tokio::select! {
+          biased;
+          signal = &mut shutdown_signal => {
+            signal.map_err(|error| Box::new(error) as Box<dyn Error>)?;
+            break;
+          }
+          result = tick => result?,
+        }
+      } else {
+        tick.await?;
       }
     }
     Ok(())
   }
   .await;
-  if let Some(worker) = scheduled_worker {
-    worker.shutdown().await;
+  lifecycle.finish(result).await
+}
+
+async fn run_background_serve_loops<F>(
+  config: &CodeoffConfig,
+  state: StateStore,
+  processing_streams: ServeProcessingStreamManager,
+  turn_budget: GlobalTurnBudget,
+  delivery: Option<&SlackDeliveryQueue<SlackReqwestWebApiClient>>,
+  shutdown_signal: &mut std::pin::Pin<&mut F>,
+  lifecycle: &mut ServeLifecycle,
+) -> Result<(), Box<dyn Error>>
+where
+  F: Future<Output = io::Result<()>>,
+{
+  spawn_channel_dispatch_loops(
+    config.clone(),
+    state,
+    processing_streams,
+    channel_dispatch_worker_count(config),
+    turn_budget,
+    &mut lifecycle.background_tasks,
+  );
+  let delivery_loop = run_slack_delivery_loop(delivery, lifecycle.background_tasks.subscribe());
+  tokio::pin!(delivery_loop);
+  let (mut result, delivery_finished) = tokio::select! {
+    biased;
+    signal = shutdown_signal => (
+      signal.map_err(|error| Box::new(error) as Box<dyn Error>),
+      false,
+    ),
+    result = &mut delivery_loop => (result, true),
+  };
+  lifecycle.request_shutdown();
+  if !delivery_finished {
+    record_serve_error(&mut result, delivery_loop.await);
   }
-  result
+  lifecycle.finish(result).await
+}
+
+struct ServeLifecycle {
+  scheduled_worker: Option<ScheduledWorkerHandle>,
+  background_tasks: ServeTaskGroup,
+}
+
+impl ServeLifecycle {
+  fn request_shutdown(&self) {
+    self.background_tasks.request_shutdown();
+    if let Some(worker) = &self.scheduled_worker {
+      worker.request_shutdown();
+    }
+  }
+
+  async fn finish(&mut self, mut result: Result<(), Box<dyn Error>>) -> Result<(), Box<dyn Error>> {
+    self.request_shutdown();
+    if let Some(worker) = &mut self.scheduled_worker {
+      if worker.shutdown().await == ScheduledWorkerShutdown::NonClean {
+        record_serve_error(
+          &mut result,
+          Err(Box::new(io::Error::other(
+            "scheduled worker did not converge before the shutdown deadline",
+          ))),
+        );
+      }
+    }
+    record_serve_error(&mut result, self.background_tasks.join().await);
+    result
+  }
+}
+
+fn record_serve_error(
+  result: &mut Result<(), Box<dyn Error>>,
+  candidate: Result<(), Box<dyn Error>>,
+) {
+  if result.is_ok() {
+    *result = candidate;
+  }
+}
+
+struct ServeTaskGroup {
+  shutdown: watch::Sender<bool>,
+  joins: Vec<JoinHandle<()>>,
+}
+
+impl ServeTaskGroup {
+  fn new() -> Self {
+    let (shutdown, _) = watch::channel(false);
+    Self {
+      shutdown,
+      joins: Vec::new(),
+    }
+  }
+
+  fn subscribe(&self) -> watch::Receiver<bool> {
+    self.shutdown.subscribe()
+  }
+
+  fn spawn(&mut self, task: impl Future<Output = ()> + Send + 'static) {
+    self.joins.push(tokio::spawn(task));
+  }
+
+  fn request_shutdown(&self) {
+    let _ = self.shutdown.send(true);
+  }
+
+  async fn join(&mut self) -> Result<(), Box<dyn Error>> {
+    let mut result = Ok(());
+    for join in self.joins.drain(..) {
+      if let Err(error) = join.await {
+        record_serve_error(&mut result, Err(Box::new(error)));
+      }
+    }
+    result
+  }
+}
+
+async fn wait_for_serve_shutdown(mut shutdown: watch::Receiver<bool>) {
+  while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
+}
+
+async fn sleep_until_serve_shutdown(duration: Duration, shutdown: watch::Receiver<bool>) -> bool {
+  tokio::select! {
+    biased;
+    () = wait_for_serve_shutdown(shutdown) => true,
+    () = tokio::time::sleep(duration) => false,
+  }
+}
+
+async fn shutdown_signal() -> io::Result<()> {
+  #[cfg(unix)]
+  {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+      result = tokio::signal::ctrl_c() => result,
+      _ = terminate.recv() => Ok(()),
+    }
+  }
+  #[cfg(not(unix))]
+  {
+    tokio::signal::ctrl_c().await
+  }
 }
 
 fn should_spawn_background_dispatch_loop(tick_limit: Option<u64>, has_backend: bool) -> bool {
@@ -512,7 +681,11 @@ fn serve_tick_limit() -> Option<u64> {
 
 const SLACK_INTAKE_RESTART_MAX_DELAY_SECS: u64 = 30;
 
-fn maybe_spawn_slack_intake_loop(config: &CodeoffConfig, state: StateStore) {
+fn maybe_spawn_slack_intake_loop(
+  config: &CodeoffConfig,
+  state: StateStore,
+  background_tasks: &mut ServeTaskGroup,
+) {
   if check_slack_worker(&config.slack).is_err() {
     return;
   }
@@ -520,12 +693,16 @@ fn maybe_spawn_slack_intake_loop(config: &CodeoffConfig, state: StateStore) {
     return;
   };
   let slack = config.slack.clone();
-  tokio::spawn(async move {
+  let shutdown = background_tasks.subscribe();
+  background_tasks.spawn(async move {
     let intake = SlackIntake::with_slack_config(state, "slack-default", &slack);
     let mut restart_count = 0_u32;
     loop {
+      if *shutdown.borrow() {
+        return;
+      }
       let mut transport = SlackSocketClient::new();
-      let result = run_socket_worker(
+      let worker = run_socket_worker(
         &mut transport,
         &app_token,
         SocketWorkerOptions::default(),
@@ -547,8 +724,13 @@ fn maybe_spawn_slack_intake_loop(config: &CodeoffConfig, state: StateStore) {
             }
           }
         },
-      )
-      .await;
+      );
+      tokio::pin!(worker);
+      let result = tokio::select! {
+        biased;
+        () = wait_for_serve_shutdown(shutdown.clone()) => return,
+        result = &mut worker => result,
+      };
       match result {
         Ok(_) => return,
         Err(error) => {
@@ -558,7 +740,9 @@ fn maybe_spawn_slack_intake_loop(config: &CodeoffConfig, state: StateStore) {
             "Slack Socket Mode intake loop stopped: {error}; restarting in {}s",
             delay.as_secs()
           );
-          tokio::time::sleep(delay).await;
+          if sleep_until_serve_shutdown(delay, shutdown.clone()).await {
+            return;
+          }
         }
       }
     }
@@ -572,21 +756,31 @@ fn slack_intake_restart_delay(restart_count: u32) -> Duration {
   Duration::from_secs(delay.min(SLACK_INTAKE_RESTART_MAX_DELAY_SECS))
 }
 
-fn maybe_spawn_retention_cleanup_loop(config: &CodeoffConfig, state: StateStore) {
+fn maybe_spawn_retention_cleanup_loop(
+  config: &CodeoffConfig,
+  state: StateStore,
+  background_tasks: &mut ServeTaskGroup,
+) {
   let policy = retention_policy_from_config(config);
   if !policy.enabled {
     return;
   }
   let workspace_id = config.slack.workspace_id.clone();
-  tokio::spawn(async move {
+  let shutdown = background_tasks.subscribe();
+  background_tasks.spawn(async move {
     loop {
+      if *shutdown.borrow() {
+        return;
+      }
       if let Err(error) = state
         .cleanup_retained_data(Some(&workspace_id), now_unix_seconds(), &policy)
         .await
       {
         eprintln!("retention cleanup failed: {error}");
       }
-      tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+      if sleep_until_serve_shutdown(Duration::from_secs(24 * 60 * 60), shutdown.clone()).await {
+        return;
+      }
     }
   });
 }
@@ -608,6 +802,7 @@ fn spawn_channel_dispatch_loops(
   processing_streams: ServeProcessingStreamManager,
   worker_count: usize,
   turn_budget: GlobalTurnBudget,
+  background_tasks: &mut ServeTaskGroup,
 ) {
   let locks = ConversationDispatchLocks::default();
   for _ in 0..worker_count.max(1) {
@@ -634,8 +829,12 @@ fn spawn_channel_dispatch_loops(
       slack_streams.clone(),
     );
     let context_limit = config.slack.recent_message_limit;
-    tokio::spawn(async move {
+    let shutdown = background_tasks.subscribe();
+    background_tasks.spawn(async move {
       loop {
+        if *shutdown.borrow() {
+          return;
+        }
         match run_channel_dispatch_tick_on_blocking_pool(
           state.clone(),
           backend.clone(),
@@ -648,10 +847,16 @@ fn spawn_channel_dispatch_loops(
         .await
         {
           Ok(true) => {}
-          Ok(false) => tokio::time::sleep(Duration::from_millis(250)).await,
+          Ok(false) => {
+            if sleep_until_serve_shutdown(Duration::from_millis(250), shutdown.clone()).await {
+              return;
+            }
+          }
           Err(error) => {
             eprintln!("channel dispatch tick failed: {error}");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            if sleep_until_serve_shutdown(Duration::from_secs(1), shutdown.clone()).await {
+              return;
+            }
           }
         }
       }
@@ -2241,14 +2446,27 @@ fn build_slack_delivery_queue(
 
 async fn run_slack_delivery_loop(
   delivery: Option<&SlackDeliveryQueue<SlackReqwestWebApiClient>>,
+  shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn Error>> {
   loop {
-    let delivered = match delivery {
-      Some(delivery) => run_slack_delivery_tick(delivery).await?,
-      None => false,
+    if *shutdown.borrow() {
+      return Ok(());
+    }
+    let tick = async {
+      match delivery {
+        Some(delivery) => run_slack_delivery_tick(delivery).await,
+        None => Ok(false),
+      }
+    };
+    let delivered = tokio::select! {
+      biased;
+      () = wait_for_serve_shutdown(shutdown.clone()) => return Ok(()),
+      result = tick => result?,
     };
     if !delivered {
-      tokio::time::sleep(Duration::from_millis(250)).await;
+      if sleep_until_serve_shutdown(Duration::from_millis(250), shutdown.clone()).await {
+        return Ok(());
+      }
     }
   }
 }
@@ -2514,7 +2732,7 @@ mod tests {
   use super::*;
   use std::sync::{
     Arc, Barrier,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
   };
 
   #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2759,6 +2977,60 @@ mod tests {
     assert!(should_spawn_background_dispatch_loop(None, true));
     assert!(!should_spawn_background_dispatch_loop(None, false));
     assert!(!should_spawn_background_dispatch_loop(Some(1), true));
+  }
+
+  #[tokio::test]
+  async fn production_serve_accepts_injected_shutdown_and_drains() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    let mut config = CodeoffConfig::default();
+    config.scheduler.run_claims_enabled = false;
+    config.data_retention.enabled = false;
+
+    tokio::time::timeout(
+      Duration::from_secs(1),
+      run_serve_loops_until(config, state, async { Ok(()) }),
+    )
+    .await
+    .expect("serve shutdown deadline")
+    .expect("clean serve shutdown");
+  }
+
+  #[tokio::test]
+  async fn serve_task_group_joins_without_post_shutdown_mutation() {
+    let mutations = Arc::new(AtomicUsize::new(0));
+    let mut tasks = ServeTaskGroup::new();
+    let shutdown = tasks.subscribe();
+    let task_mutations = Arc::clone(&mutations);
+    tasks.spawn(async move {
+      loop {
+        if *shutdown.borrow() {
+          return;
+        }
+        task_mutations.fetch_add(1, Ordering::AcqRel);
+        if sleep_until_serve_shutdown(Duration::from_millis(1), shutdown.clone()).await {
+          return;
+        }
+      }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+      while mutations.load(Ordering::Acquire) == 0 {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("background task started");
+
+    tasks.request_shutdown();
+    tokio::time::timeout(Duration::from_secs(1), tasks.join())
+      .await
+      .expect("task group drain deadline")
+      .expect("task group drain");
+    let stopped_at = mutations.load(Ordering::Acquire);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(mutations.load(Ordering::Acquire), stopped_at);
   }
 
   #[test]

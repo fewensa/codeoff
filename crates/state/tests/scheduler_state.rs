@@ -48,6 +48,11 @@ type DeliveryIntentAuthorityRow = (
   String,
 );
 
+const NONE_TARGET_IDENTITY: &str =
+  "0000000000000000000000000000000000000000000000000000000000000001";
+const SLACK_TARGET_IDENTITY: &str =
+  "0000000000000000000000000000000000000000000000000000000000000002";
+
 fn database_url(state_dir: &Path) -> String {
   format!("sqlite://{}", state_dir.join("codeoff.db").display())
 }
@@ -62,7 +67,7 @@ fn target(job: &str) -> DeliveryTargetSnapshot {
     "{}",
     1,
     "resolver-v1",
-    "none-v1",
+    NONE_TARGET_IDENTITY,
   )
   .expect("target")
 }
@@ -77,7 +82,7 @@ fn second_target(job: &str) -> DeliveryTargetSnapshot {
     r#"{"channel_id":"C1"}"#,
     1,
     "resolver-v1",
-    "slack-channel-v1",
+    SLACK_TARGET_IDENTITY,
   )
   .expect("second target")
 }
@@ -90,6 +95,16 @@ fn test_sha256_hex(value: &str) -> String {
     write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
   }
   encoded
+}
+
+fn test_intent_key(run_id: &str, target_identity_digest: &str) -> String {
+  let mut key = String::with_capacity(70 + (run_id.len() * 2));
+  key.push_str("v1:");
+  for byte in run_id.as_bytes() {
+    write!(&mut key, "{byte:02x}").expect("writing to String cannot fail");
+  }
+  write!(&mut key, ":{target_identity_digest}:1").expect("writing to String cannot fail");
+  key
 }
 
 fn owner() -> PrincipalKey {
@@ -1619,16 +1634,17 @@ async fn test_complete_success_atomically_persists_result_baseline_and_exact_del
   let store = StateStore::initialize(&state_dir, None)
     .await
     .expect("initialize store");
-  let mut request = create_request("complete-success", ScheduleSpec::once(110), 100);
+  let job_id = "complete:成功";
+  let mut request = create_request(job_id, ScheduleSpec::once(110), 100);
   request.definition =
     ScheduledJobDefinition::new(2, r#"{"prompt":"check","schema_version":2}"#).expect("definition");
-  request.targets.push(second_target("complete-success"));
+  request.targets.push(second_target(job_id));
   store
     .create_scheduled_job(&request)
     .await
     .expect("create job");
   store
-    .materialize_due_schedule("complete-success", 0, 110)
+    .materialize_due_schedule(job_id, 0, 110)
     .await
     .expect("materialize");
   let claim = store
@@ -1645,7 +1661,8 @@ async fn test_complete_success_atomically_persists_result_baseline_and_exact_del
   let pool = SqlitePool::connect(&database_url(&state_dir))
     .await
     .expect("connect mutable job database");
-  sqlx::query("update scheduled_job_delivery_targets set identity_digest = 'mutated-' || ordinal, address_json = '{\"mutated\":true}' where job_id = 'complete-success'")
+  sqlx::query("update scheduled_job_delivery_targets set identity_digest = 'mutated-' || ordinal, address_json = '{\"mutated\":true}' where job_id = ?1")
+    .bind(job_id)
     .execute(&pool)
     .await
     .expect("mutate current job targets after materialization");
@@ -1682,8 +1699,8 @@ async fn test_complete_success_atomically_persists_result_baseline_and_exact_del
   .await
   .expect("read intents");
   assert_eq!(intents.len(), 2);
-  assert_eq!(intents[0].2, "none-v1");
-  assert_eq!(intents[1].2, "slack-channel-v1");
+  assert_eq!(intents[0].2, NONE_TARGET_IDENTITY);
+  assert_eq!(intents[1].2, SLACK_TARGET_IDENTITY);
   for intent in intents {
     assert_eq!(intent.0, "intent");
     assert_eq!(intent.1, "intent_v1");
@@ -1827,8 +1844,8 @@ async fn test_direct_delivery_intents_require_database_verifiable_authority() {
   .fetch_one(&pool)
   .await
   .expect("read target snapshot");
-  let identity = "none-v1";
-  let natural_key = format!("v1:{}:{identity}:1", claim.binding.run_id());
+  let identity = NONE_TARGET_IDENTITY;
+  let natural_key = test_intent_key(claim.binding.run_id(), identity);
   let natural_delivery_id = format!("intent:{natural_key}");
   let mut foreign_target: serde_json::Value =
     serde_json::from_str(&target_json).expect("parse target");
@@ -1840,8 +1857,14 @@ async fn test_direct_delivery_intents_require_database_verifiable_authority() {
       2,
       identity,
       target_json.as_str(),
-      format!("v1:{}:{identity}:2", claim.binding.run_id()),
-      format!("intent:v1:{}:{identity}:2", claim.binding.run_id()),
+      format!(
+        "{}:2",
+        test_intent_key(claim.binding.run_id(), identity).trim_end_matches(":1")
+      ),
+      format!(
+        "intent:{}:2",
+        test_intent_key(claim.binding.run_id(), identity).trim_end_matches(":1")
+      ),
     ),
     (
       "empty-target",
@@ -1862,10 +1885,13 @@ async fn test_direct_delivery_intents_require_database_verifiable_authority() {
     (
       "identity-mismatch",
       1,
-      "other-identity",
+      SLACK_TARGET_IDENTITY,
       target_json.as_str(),
-      format!("v1:{}:other-identity:1", claim.binding.run_id()),
-      format!("intent:v1:{}:other-identity:1", claim.binding.run_id()),
+      test_intent_key(claim.binding.run_id(), SLACK_TARGET_IDENTITY),
+      format!(
+        "intent:{}",
+        test_intent_key(claim.binding.run_id(), SLACK_TARGET_IDENTITY)
+      ),
     ),
     (
       "key-mismatch",
@@ -1927,6 +1953,54 @@ async fn test_direct_delivery_intents_require_database_verifiable_authority() {
     Err(StateError::InvalidSchedulerState { reason })
       if reason == "scheduled delivery intent target snapshot digest mismatch"
   ));
+  let legacy_delivery_id = "legacy-update-collision";
+  sqlx::query(
+    "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, payload_snapshot, expected_baseline_version, created_at, updated_at) values (?1, ?2, ?3, 'legacy-identity', '{}', 'pending', 1, 1, 'sha256-v1', 'legacy-payload', ?4, 0, 115, 115)",
+  )
+  .bind(legacy_delivery_id)
+  .bind(claim.binding.run_id())
+  .bind(job_id)
+  .bind(b"legacy payload".as_slice())
+  .execute(&pool)
+  .await
+  .expect("insert legacy update source");
+  let collision_updates = [
+    (
+      "delivery id",
+      "update or replace scheduled_run_deliveries set delivery_id = ?1 where delivery_id = ?2",
+      natural_delivery_id.as_str(),
+    ),
+    (
+      "intent key",
+      "update or replace scheduled_run_deliveries set intent_key = ?1 where delivery_id = ?2",
+      natural_key.as_str(),
+    ),
+    (
+      "natural tuple",
+      "update or replace scheduled_run_deliveries set target_identity_digest = ?1 where delivery_id = ?2",
+      identity,
+    ),
+  ];
+  for (collision, statement, value) in collision_updates {
+    assert!(
+      sqlx::query(statement)
+        .bind(value)
+        .bind(legacy_delivery_id)
+        .execute(&pool)
+        .await
+        .is_err(),
+      "UPDATE OR REPLACE {collision} collision must be rejected"
+    );
+    let preserved: (i64, String) = sqlx::query_as(
+      "select count(*), (select target_identity_digest from scheduled_run_deliveries where delivery_id = ?1) from scheduled_run_deliveries where delivery_id in (?1, ?2)",
+    )
+    .bind(legacy_delivery_id)
+    .bind(&natural_delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read preserved collision rows");
+    assert_eq!(preserved, (2, "legacy-identity".to_owned()));
+  }
   assert!(
     sqlx::query(
       "insert or replace into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, payload_snapshot, expected_baseline_version, created_at, updated_at) values (?1, ?2, ?3, 'legacy-replacement', '{}', 'pending', 1, 1, 'sha256-v1', 'replacement', ?4, 0, 115, 115)"
@@ -1940,6 +2014,65 @@ async fn test_direct_delivery_intents_require_database_verifiable_authority() {
     .is_err(),
     "OR REPLACE cannot remove intent authority even while its run remains executing"
   );
+}
+
+#[tokio::test]
+async fn test_delivery_intent_run_id_byte_bound_accepts_generated_schema_maximum() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let job_id = "😀".repeat(255);
+  let scheduled_for = 1_000_000_000_000_000_000;
+  let mut request = create_request(
+    &job_id,
+    ScheduleSpec::once(scheduled_for),
+    scheduled_for - 1,
+  );
+  request.schedule_id = "schedule-run-id-bound".to_owned();
+  request.targets = vec![target("run-id-bound")];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create maximum-width job id");
+  store
+    .materialize_due_schedule(&job_id, 0, scheduled_for)
+    .await
+    .expect("materialize maximum-width run id");
+  let claim = store
+    .claim_next_scheduled_run("worker", scheduled_for, scheduled_for + 100)
+    .await
+    .expect("claim")
+    .expect("claimed maximum-width run");
+  assert_eq!(claim.binding.run_id().len(), 1050);
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&claim.binding, &profile, scheduled_for + 1)
+    .await
+    .expect("mark executing");
+  let result = ScheduledRunResult::new("bounded run id", "context").expect("result");
+  assert_eq!(
+    store
+      .complete_scheduled_run_success(&claim.binding, &result, scheduled_for + 2)
+      .await
+      .expect("complete schema-maximum run id"),
+    ScheduledRunSuccessOutcome::Committed
+  );
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let delivery_id: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(claim.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("read maximum-bound delivery intent");
+  store
+    .load_scheduled_delivery_intent_target_snapshot(&delivery_id)
+    .await
+    .expect("load maximum-bound intent snapshot");
 }
 
 #[tokio::test]
@@ -2005,7 +2138,7 @@ async fn test_complete_success_baseline_and_insert_conflicts_roll_back_all_autho
         let target: serde_json::Value =
           serde_json::from_str(&target_json).expect("parse target snapshot");
         let identity = target["identity_digest"].as_str().expect("identity digest");
-        let intent_key = format!("v1:{}:{identity}:1", claim.binding.run_id());
+        let intent_key = test_intent_key(claim.binding.run_id(), identity);
         sqlx::query("insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, expected_baseline_version, created_at, updated_at) values (?1, ?2, ?3, 'collision', '{}', 'pending', 1, 1, 'sha256-v1', 'collision', 0, 119, 119)")
           .bind(format!("intent:{intent_key}"))
           .bind(claim.binding.run_id())

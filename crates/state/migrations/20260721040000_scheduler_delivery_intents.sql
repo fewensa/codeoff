@@ -94,10 +94,11 @@ create table scheduled_run_deliveries (
       and target_snapshot_digest_algorithm = 'sha256-v1'
       and length(target_snapshot_digest) = 64
       and target_snapshot_digest not glob '*[^0-9a-f]*'
-      and length(run_id) between 1 and 65536
-      and length(target_identity_digest) between 1 and 65536
-      and length(intent_key) between 8 and 131080
-      and intent_key = 'v1:' || run_id || ':' || target_identity_digest || ':1'
+      and length(cast(run_id as blob)) between 1 and 1050
+      and length(target_identity_digest) = 64
+      and target_identity_digest not glob '*[^0-9a-f]*'
+      and length(intent_key) between 72 and 2170
+      and intent_key = 'v1:' || lower(hex(cast(run_id as blob))) || ':' || target_identity_digest || ':1'
       and delivery_id = 'intent:' || intent_key)
   ),
   check (
@@ -275,6 +276,27 @@ when old.authority_kind = 'intent_v1' and not (
 )
 begin
   select raise(abort, 'scheduled delivery intent only permits one complete enrichment');
+end;
+
+create trigger trg_scheduled_delivery_intent_update_collision
+before update on scheduled_run_deliveries
+when exists (
+  select 1
+  from scheduled_run_deliveries existing
+  where existing.authority_kind = 'intent_v1'
+    and existing.rowid != old.rowid
+    and (
+      existing.delivery_id = new.delivery_id
+      or (new.intent_key is not null and existing.intent_key = new.intent_key)
+      or (
+        existing.run_id = new.run_id
+        and existing.target_identity_digest = new.target_identity_digest
+        and existing.delivery_policy_version = new.delivery_policy_version
+      )
+    )
+)
+begin
+  select raise(abort, 'scheduled delivery update conflicts with intent authority');
 end;
 
 create trigger trg_scheduled_delivery_intent_promotion_forbidden

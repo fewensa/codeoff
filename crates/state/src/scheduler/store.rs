@@ -20,6 +20,9 @@ use super::{
 use crate::StateStore;
 
 const DELIVERY_POLICY_VERSION_V1: i64 = 1;
+const MAX_DELIVERY_INTENT_RUN_ID_BYTES: usize = 1050;
+const MAX_DELIVERY_INTENT_KEY_BYTES: usize = 70 + (MAX_DELIVERY_INTENT_RUN_ID_BYTES * 2);
+const MAX_DELIVERY_INTENT_ID_BYTES: usize = "intent:".len() + MAX_DELIVERY_INTENT_KEY_BYTES;
 
 impl StateStore {
   /// Creates a job, current schedule, resolved targets, and empty execution baseline atomically.
@@ -600,9 +603,13 @@ impl StateStore {
     &self,
     delivery_id: &str,
   ) -> Result<String, StateError> {
-    validate_text("scheduled delivery id", delivery_id).map_err(invalid_value)?;
+    if delivery_id.is_empty() || delivery_id.len() > MAX_DELIVERY_INTENT_ID_BYTES {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled delivery intent id exceeds its dedicated bound".to_owned(),
+      });
+    }
     let row = sqlx::query(
-      "select target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest from scheduled_run_deliveries where delivery_id = ?1 and authority_kind = 'intent_v1'",
+      "select run_id, target_json, target_identity_digest, delivery_policy_version, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key from scheduled_run_deliveries where delivery_id = ?1 and authority_kind = 'intent_v1'",
     )
     .bind(delivery_id)
     .fetch_optional(&self.pool)
@@ -611,12 +618,29 @@ impl StateStore {
     .ok_or_else(|| StateError::InvalidSchedulerState {
       reason: "scheduled delivery intent does not exist".to_owned(),
     })?;
+    let run_id: String = row.try_get("run_id").map_err(scheduler_error)?;
     let target_json: String = row.try_get("target_json").map_err(scheduler_error)?;
+    let target_identity_digest: String = row
+      .try_get("target_identity_digest")
+      .map_err(scheduler_error)?;
+    let delivery_policy_version: i64 = row
+      .try_get("delivery_policy_version")
+      .map_err(scheduler_error)?;
+    if delivery_policy_version != DELIVERY_POLICY_VERSION_V1 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled delivery intent has an unsupported policy version".to_owned(),
+      });
+    }
+    let expected_key = delivery_intent_key(&run_id, &target_identity_digest)?;
+    let intent_key: String = row.try_get("intent_key").map_err(scheduler_error)?;
+    if intent_key != expected_key || delivery_id != format!("intent:{expected_key}") {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled delivery intent natural identity mismatch".to_owned(),
+      });
+    }
     validate_delivery_intent_target_snapshot(
       &target_json,
-      row
-        .try_get("target_identity_digest")
-        .map_err(scheduler_error)?,
+      &target_identity_digest,
       row
         .try_get("target_snapshot_digest_algorithm")
         .map_err(scheduler_error)?,
@@ -766,11 +790,7 @@ impl StateStore {
     }
 
     for target in targets {
-      let intent_key = format!(
-        "v1:{}:{}:{delivery_policy_version}",
-        binding.run_id(),
-        target.identity_digest
-      );
+      let intent_key = delivery_intent_key(binding.run_id(), &target.identity_digest)?;
       let delivery_id = format!("intent:{intent_key}");
       let intent_insert = sqlx::query(
         "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'intent', 0, 0, ?6, ?7, ?8, ?9, 'sha256-v1', ?10, ?11, 'intent_v1', ?12, ?12) returning target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest",
@@ -1509,6 +1529,33 @@ fn validate_delivery_intent_target_snapshot(
     });
   }
   Ok(())
+}
+
+fn delivery_intent_key(run_id: &str, target_identity_digest: &str) -> Result<String, StateError> {
+  if run_id.is_empty() || run_id.len() > MAX_DELIVERY_INTENT_RUN_ID_BYTES {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery intent run id exceeds its dedicated bound".to_owned(),
+    });
+  }
+  if target_identity_digest.len() != 64
+    || !target_identity_digest
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+  {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery intent target identity must be lowercase sha256".to_owned(),
+    });
+  }
+  let mut key = String::with_capacity(70 + (run_id.len() * 2));
+  key.push_str("v1:");
+  for byte in run_id.as_bytes() {
+    write!(&mut key, "{byte:02x}").expect("writing to String cannot fail");
+  }
+  key.push(':');
+  key.push_str(target_identity_digest);
+  key.push_str(":1");
+  debug_assert!(key.len() <= MAX_DELIVERY_INTENT_KEY_BYTES);
+  Ok(key)
 }
 
 fn execution_baseline_version(snapshot_json: &str) -> Result<i64, StateError> {
@@ -2466,13 +2513,43 @@ mod tests {
 
   use super::{
     AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot, CreateScheduledJob,
-    DeliveryTargetSnapshot, MaterializationOutcome, PrincipalKey, ScheduleMutationAudit,
-    ScheduleMutationIdempotency, ScheduleSpec, ScheduledJobDefinition, ScheduledJobMutation,
-    StateError, StateStore, TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline,
-    UpdateExecutionBaseline, canonical_idempotency_scope,
-    compare_and_swap_accepted_delivery_baseline_in_transaction,
-    compare_and_swap_execution_baseline_in_transaction,
+    DeliveryTargetSnapshot, MAX_DELIVERY_INTENT_KEY_BYTES, MAX_DELIVERY_INTENT_RUN_ID_BYTES,
+    MaterializationOutcome, PrincipalKey, ScheduleMutationAudit, ScheduleMutationIdempotency,
+    ScheduleSpec, ScheduledJobDefinition, ScheduledJobMutation, StateError, StateStore,
+    TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
+    canonical_idempotency_scope, compare_and_swap_accepted_delivery_baseline_in_transaction,
+    compare_and_swap_execution_baseline_in_transaction, delivery_intent_key,
   };
+
+  #[test]
+  fn test_delivery_intent_key_is_unambiguous_and_enforces_its_byte_bound() {
+    let first_identity = "1".repeat(64);
+    let second_identity = "2".repeat(64);
+    let unicode = delivery_intent_key("scheduled:作业:110", &first_identity)
+      .expect("encode colon and Unicode run id");
+    assert!(unicode.starts_with("v1:7363686564756c65643a"));
+    assert_eq!(
+      unicode,
+      delivery_intent_key("scheduled:作业:110", &first_identity).expect("stable key")
+    );
+    assert_ne!(
+      delivery_intent_key("scheduled:a:b:110", &first_identity).expect("first pair"),
+      delivery_intent_key("scheduled:a:110", &second_identity).expect("second pair")
+    );
+
+    let maximum_run_id = "r".repeat(MAX_DELIVERY_INTENT_RUN_ID_BYTES);
+    let maximum_key =
+      delivery_intent_key(&maximum_run_id, &first_identity).expect("maximum run id");
+    assert_eq!(maximum_key.len(), MAX_DELIVERY_INTENT_KEY_BYTES);
+    assert!(matches!(
+      delivery_intent_key(
+        &"r".repeat(MAX_DELIVERY_INTENT_RUN_ID_BYTES + 1),
+        &first_identity
+      ),
+      Err(StateError::InvalidSchedulerState { reason })
+        if reason == "scheduled delivery intent run id exceeds its dedicated bound"
+    ));
+  }
 
   fn audited_create_fixture(
     job_id: &str,

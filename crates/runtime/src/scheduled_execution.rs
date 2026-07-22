@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use codeoff_agent_contract::{
@@ -20,6 +20,11 @@ use tokio::task::JoinHandle;
 
 use crate::channel_tools::CHANNEL_DYNAMIC_TOOL_NAMES;
 use crate::schedule_tools::SCHEDULE_DYNAMIC_TOOL_NAMES;
+use crate::scheduler_observability::{
+  NoopSchedulerTelemetry, SchedulerLoopGuard, SchedulerOperation, SchedulerOperationStatus,
+  SchedulerTelemetry, SchedulerTelemetryErrorKind, SchedulerTelemetryEvent, SchedulerWorker,
+  record_scheduler_event,
+};
 
 static PREPARE_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SCHEDULER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -154,6 +159,7 @@ pub fn spawn_scheduled_worker(
   state: StateStore,
   budget: GlobalTurnBudget,
   config: ScheduledWorkerConfig,
+  telemetry: Arc<dyn SchedulerTelemetry>,
 ) -> Option<ScheduledWorkerHandle> {
   if !config.enabled {
     return None;
@@ -168,7 +174,13 @@ pub fn spawn_scheduled_worker(
   );
   orchestrator.run_claims_enabled = config.run_claims_enabled;
   orchestrator.policy = ExecutionPolicy::from_config(config);
-  let join = tokio::spawn(run_scheduled_worker(state, orchestrator, shutdown_rx));
+  orchestrator.telemetry = telemetry.clone();
+  let join = tokio::spawn(run_scheduled_worker(
+    state,
+    orchestrator,
+    shutdown_rx,
+    telemetry,
+  ));
   Some(ScheduledWorkerHandle {
     shutdown,
     join: Some(join),
@@ -239,12 +251,30 @@ async fn run_scheduled_worker(
   state: StateStore,
   orchestrator: ScheduledRunOrchestrator,
   shutdown: watch::Receiver<bool>,
+  telemetry: Arc<dyn SchedulerTelemetry>,
 ) {
+  let loop_guard = SchedulerLoopGuard::start(telemetry.clone(), SchedulerWorker::Execution);
   loop {
     if *shutdown.borrow() {
-      return;
+      break;
     }
+    let started_at = Instant::now();
     let tick = run_scheduled_worker_tick(&state, &orchestrator, shutdown.clone()).await;
+    let (status, error_kind) = match &tick {
+      Ok(outcome) => (execution_tick_status(*outcome), None),
+      Err(_) => (
+        SchedulerOperationStatus::Failed,
+        Some(SchedulerTelemetryErrorKind::State),
+      ),
+    };
+    record_execution_event(
+      telemetry.as_ref(),
+      SchedulerOperation::Tick,
+      status,
+      error_kind,
+      started_at.elapsed(),
+      None,
+    );
     let delay = if let Err(error) = &tick {
       eprintln!("scheduled worker tick failed: {}", bounded_log_error(error));
       orchestrator.policy.error_backoff
@@ -252,10 +282,32 @@ async fn run_scheduled_worker(
       orchestrator.policy.tick_interval
     };
     tokio::select! {
-      () = cancellation_requested(shutdown.clone()) => return,
+      () = cancellation_requested(shutdown.clone()) => break,
       () = tokio::time::sleep(delay) => {}
     }
   }
+  loop_guard.finish(SchedulerOperationStatus::Stopped, None);
+}
+
+fn record_execution_event(
+  telemetry: &dyn SchedulerTelemetry,
+  operation: SchedulerOperation,
+  status: SchedulerOperationStatus,
+  error_kind: Option<SchedulerTelemetryErrorKind>,
+  duration: Duration,
+  attempt: Option<u32>,
+) {
+  record_scheduler_event(
+    telemetry,
+    SchedulerTelemetryEvent {
+      worker: SchedulerWorker::Execution,
+      operation,
+      status,
+      error_kind,
+      duration,
+      attempt,
+    },
+  );
 }
 
 async fn run_scheduled_worker_tick(
@@ -364,6 +416,17 @@ enum TickOutcome {
   Completed,
   Failed,
   LostLease,
+}
+
+const fn execution_tick_status(outcome: TickOutcome) -> SchedulerOperationStatus {
+  match outcome {
+    TickOutcome::Cancelled => SchedulerOperationStatus::Cancelled,
+    TickOutcome::Unavailable => SchedulerOperationStatus::Unavailable,
+    TickOutcome::Idle => SchedulerOperationStatus::Idle,
+    TickOutcome::Completed => SchedulerOperationStatus::Completed,
+    TickOutcome::Failed => SchedulerOperationStatus::Failed,
+    TickOutcome::LostLease => SchedulerOperationStatus::LostAuthority,
+  }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -587,6 +650,7 @@ struct ScheduledRunOrchestrator {
   lease_owner: String,
   run_claims_enabled: bool,
   policy: ExecutionPolicy,
+  telemetry: Arc<dyn SchedulerTelemetry>,
 }
 
 impl ScheduledRunOrchestrator {
@@ -605,6 +669,7 @@ impl ScheduledRunOrchestrator {
       lease_owner: lease_owner.into(),
       run_claims_enabled: true,
       policy: ExecutionPolicy::default(),
+      telemetry: Arc::new(NoopSchedulerTelemetry),
     }
   }
 
@@ -627,6 +692,36 @@ impl ScheduledRunOrchestrator {
   async fn run_supervised(
     self,
     shutdown: watch::Receiver<bool>,
+  ) -> Result<TickOutcome, StateError> {
+    let telemetry = self.telemetry.clone();
+    let attempt = AtomicU64::new(0);
+    let started_at = Instant::now();
+    let result = self.run_supervised_inner(shutdown, &attempt).await;
+    let attempt = attempt.load(Ordering::Acquire);
+    if attempt > 0 {
+      let attempt = u32::try_from(attempt).unwrap_or(u32::MAX);
+      record_execution_event(
+        telemetry.as_ref(),
+        SchedulerOperation::Attempt,
+        match &result {
+          Ok(outcome) => execution_tick_status(*outcome),
+          Err(_) => SchedulerOperationStatus::Failed,
+        },
+        result
+          .as_ref()
+          .err()
+          .map(|_| SchedulerTelemetryErrorKind::State),
+        started_at.elapsed(),
+        Some(attempt),
+      );
+    }
+    result
+  }
+
+  async fn run_supervised_inner(
+    self,
+    shutdown: watch::Receiver<bool>,
+    observed_attempt: &AtomicU64,
   ) -> Result<TickOutcome, StateError> {
     let mut permit = Some(tokio::select! {
       result = self.budget.acquire() => result?,
@@ -668,6 +763,10 @@ impl ScheduledRunOrchestrator {
     let Some(claim) = claim else {
       return Ok(TickOutcome::Idle);
     };
+    observed_attempt.store(
+      u64::try_from(claim.binding.attempt()).unwrap_or(u64::MAX),
+      Ordering::Release,
+    );
 
     let cancellation = Arc::new(AtomicBool::new(false));
     let (mut heartbeat, mut heartbeat_stop) =
@@ -1329,6 +1428,37 @@ mod tests {
 
   use super::*;
 
+  #[derive(Default)]
+  struct RecordingTelemetry {
+    events: Mutex<Vec<SchedulerTelemetryEvent>>,
+  }
+
+  impl SchedulerTelemetry for RecordingTelemetry {
+    fn record(&self, event: SchedulerTelemetryEvent) {
+      self.events.lock().expect("telemetry events").push(event);
+    }
+  }
+
+  #[test]
+  fn test_execution_tick_telemetry_uses_fixed_outcomes() {
+    for (outcome, expected) in [
+      (TickOutcome::Cancelled, SchedulerOperationStatus::Cancelled),
+      (
+        TickOutcome::Unavailable,
+        SchedulerOperationStatus::Unavailable,
+      ),
+      (TickOutcome::Idle, SchedulerOperationStatus::Idle),
+      (TickOutcome::Completed, SchedulerOperationStatus::Completed),
+      (TickOutcome::Failed, SchedulerOperationStatus::Failed),
+      (
+        TickOutcome::LostLease,
+        SchedulerOperationStatus::LostAuthority,
+      ),
+    ] {
+      assert_eq!(execution_tick_status(outcome), expected);
+    }
+  }
+
   const TARGET_IDENTITY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
   struct TestClock(AtomicI64, i64);
@@ -1558,7 +1688,31 @@ mod tests {
         max_attempts: 3,
         ..ExecutionPolicy::default()
       },
+      telemetry: Arc::new(NoopSchedulerTelemetry),
     }
+  }
+
+  #[tokio::test]
+  async fn test_completed_execution_emits_numeric_authoritative_attempt() {
+    let (_temp, state) = fixture(&[("telemetry-attempt", 110)]).await;
+    let backend = Arc::new(FakeBackend::new(ExecutionResult::Completed {
+      summary: "done".to_owned(),
+    }));
+    let telemetry = Arc::new(RecordingTelemetry::default());
+    let mut runtime = orchestrator(state, backend, Arc::new(TestClock(111.into(), 1)), 1);
+    runtime.telemetry = telemetry.clone();
+
+    assert_eq!(
+      runtime.run_once().await.expect("execution tick"),
+      TickOutcome::Completed
+    );
+    let events = telemetry.events.lock().expect("telemetry events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].worker, SchedulerWorker::Execution);
+    assert_eq!(events[0].operation, SchedulerOperation::Attempt);
+    assert_eq!(events[0].status, SchedulerOperationStatus::Completed);
+    assert_eq!(events[0].attempt, Some(1));
+    assert_eq!(events[0].error_kind, None);
   }
 
   #[tokio::test]
@@ -1641,6 +1795,7 @@ mod tests {
         state.clone(),
         GlobalTurnBudget::new(1),
         ScheduledWorkerConfig::default(),
+        Arc::new(NoopSchedulerTelemetry),
       )
       .is_none()
     );
@@ -1652,6 +1807,7 @@ mod tests {
         run_claims_enabled: true,
         ..ScheduledWorkerConfig::default()
       },
+      Arc::new(NoopSchedulerTelemetry),
     )
     .expect("enabled worker");
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1696,7 +1852,12 @@ mod tests {
       1,
     );
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let worker = tokio::spawn(run_scheduled_worker(state, runtime, shutdown_rx));
+    let worker = tokio::spawn(run_scheduled_worker(
+      state,
+      runtime,
+      shutdown_rx,
+      Arc::new(NoopSchedulerTelemetry),
+    ));
 
     tokio::time::timeout(Duration::from_secs(1), async {
       while backend.seen.lock().expect("seen tasks").is_empty() {
@@ -1736,7 +1897,12 @@ mod tests {
       1,
     );
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let worker = tokio::spawn(run_scheduled_worker(state.clone(), runtime, shutdown_rx));
+    let worker = tokio::spawn(run_scheduled_worker(
+      state.clone(),
+      runtime,
+      shutdown_rx,
+      Arc::new(NoopSchedulerTelemetry),
+    ));
     tokio::time::timeout(Duration::from_secs(1), async {
       while backend.active.load(Ordering::Acquire) == 0 {
         tokio::task::yield_now().await;
@@ -1780,7 +1946,12 @@ mod tests {
     runtime.policy.heartbeat_interval = Duration::from_millis(1);
     runtime.policy.cancellation_grace = Duration::from_millis(5);
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let join = tokio::spawn(run_scheduled_worker(state, runtime, shutdown_rx));
+    let join = tokio::spawn(run_scheduled_worker(
+      state,
+      runtime,
+      shutdown_rx,
+      Arc::new(NoopSchedulerTelemetry),
+    ));
     let mut worker = ScheduledWorkerHandle {
       shutdown,
       join: Some(join),
@@ -1860,6 +2031,7 @@ mod tests {
       lease_owner: "runtime-test".to_owned(),
       run_claims_enabled: true,
       policy: ExecutionPolicy::default(),
+      telemetry: Arc::new(NoopSchedulerTelemetry),
     });
     let scheduled = {
       let runtime = runtime.clone();

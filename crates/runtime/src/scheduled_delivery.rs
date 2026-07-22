@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, task::Context, task::Poll};
 
 use async_trait::async_trait;
@@ -12,6 +12,12 @@ use codeoff_state::{
 use serde_json::json;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
+
+use crate::scheduler_observability::{
+  NoopSchedulerTelemetry, SchedulerLoopGuard, SchedulerOperation, SchedulerOperationStatus,
+  SchedulerTelemetry, SchedulerTelemetryErrorKind, SchedulerTelemetryEvent, SchedulerWorker,
+  record_scheduler_event,
+};
 
 const DELIVERY_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const DELIVERY_LEASE_SECONDS: i64 = 60;
@@ -199,17 +205,57 @@ pub enum ScheduledDeliveryTickOutcome {
 pub async fn run_scheduled_delivery_preparation_worker(
   state: StateStore,
   shutdown: watch::Receiver<bool>,
+  telemetry: Arc<dyn SchedulerTelemetry>,
+) -> Result<(), StateError> {
+  let loop_guard =
+    SchedulerLoopGuard::start(telemetry.clone(), SchedulerWorker::DeliveryPreparation);
+  let result = run_scheduled_delivery_preparation_worker_inner(state, shutdown, &telemetry).await;
+  loop_guard.finish(
+    if result.is_ok() {
+      SchedulerOperationStatus::Stopped
+    } else {
+      SchedulerOperationStatus::Failed
+    },
+    result
+      .as_ref()
+      .err()
+      .map(|_| SchedulerTelemetryErrorKind::State),
+  );
+  result
+}
+
+async fn run_scheduled_delivery_preparation_worker_inner(
+  state: StateStore,
+  shutdown: watch::Receiver<bool>,
+  telemetry: &Arc<dyn SchedulerTelemetry>,
 ) -> Result<(), StateError> {
   let timeline = DeliveryTimeline::new(Arc::new(SystemDeliveryClock));
   loop {
     if *shutdown.borrow() {
       return Ok(());
     }
+    let started_at = Instant::now();
     let preparation = tokio::select! {
       biased;
       () = cancellation_requested(shutdown.clone()) => return Ok(()),
       preparation = prepare_next_scheduled_delivery(&state, timeline.fresh_now()) => preparation,
     };
+    record_delivery_event(
+      telemetry.as_ref(),
+      SchedulerWorker::DeliveryPreparation,
+      SchedulerOperation::Tick,
+      match &preparation {
+        Ok(Some(_)) => SchedulerOperationStatus::Completed,
+        Ok(None) => SchedulerOperationStatus::Idle,
+        Err(_) => SchedulerOperationStatus::Failed,
+      },
+      preparation
+        .as_ref()
+        .err()
+        .map(|_| SchedulerTelemetryErrorKind::State),
+      started_at.elapsed(),
+      None,
+    );
     let preparation = match preparation {
       Ok(preparation) => preparation,
       Err(error) if error.is_transient_storage_contention() => {
@@ -278,6 +324,7 @@ pub async fn run_scheduled_delivery_worker(
   provider: Arc<dyn DeliveryProvider>,
   lease_owner: String,
   shutdown: watch::Receiver<bool>,
+  telemetry: Arc<dyn SchedulerTelemetry>,
 ) -> Result<(), StateError> {
   run_scheduled_delivery_worker_with_clock(
     state,
@@ -285,6 +332,7 @@ pub async fn run_scheduled_delivery_worker(
     lease_owner,
     Arc::new(SystemDeliveryClock),
     shutdown,
+    telemetry,
   )
   .await
 }
@@ -295,6 +343,33 @@ pub async fn run_scheduled_delivery_worker_with_clock(
   lease_owner: String,
   clock: Arc<dyn DeliveryClock>,
   shutdown: watch::Receiver<bool>,
+  telemetry: Arc<dyn SchedulerTelemetry>,
+) -> Result<(), StateError> {
+  let loop_guard = SchedulerLoopGuard::start(telemetry.clone(), SchedulerWorker::Delivery);
+  let result =
+    run_scheduled_delivery_worker_inner(state, provider, lease_owner, clock, shutdown, &telemetry)
+      .await;
+  loop_guard.finish(
+    if result.is_ok() {
+      SchedulerOperationStatus::Stopped
+    } else {
+      SchedulerOperationStatus::Failed
+    },
+    result
+      .as_ref()
+      .err()
+      .map(|_| SchedulerTelemetryErrorKind::State),
+  );
+  result
+}
+
+async fn run_scheduled_delivery_worker_inner(
+  state: StateStore,
+  provider: Arc<dyn DeliveryProvider>,
+  lease_owner: String,
+  clock: Arc<dyn DeliveryClock>,
+  shutdown: watch::Receiver<bool>,
+  telemetry: &Arc<dyn SchedulerTelemetry>,
 ) -> Result<(), StateError> {
   let timeline = DeliveryTimeline::new(clock);
   let mut worker_state = DeliveryWorkerState::default();
@@ -302,6 +377,7 @@ pub async fn run_scheduled_delivery_worker_with_clock(
     if *shutdown.borrow() {
       return Ok(());
     }
+    let started_at = Instant::now();
     let tick = run_scheduled_delivery_tick_with_timeline(
       &state,
       provider.as_ref(),
@@ -309,8 +385,24 @@ pub async fn run_scheduled_delivery_worker_with_clock(
       timeline.clone(),
       shutdown.clone(),
       &mut worker_state,
+      telemetry.as_ref(),
     )
     .await;
+    record_delivery_event(
+      telemetry.as_ref(),
+      SchedulerWorker::Delivery,
+      SchedulerOperation::Tick,
+      match &tick {
+        Ok(outcome) => delivery_tick_status(*outcome),
+        Err(_) => SchedulerOperationStatus::Failed,
+      },
+      tick
+        .as_ref()
+        .err()
+        .map(|_| SchedulerTelemetryErrorKind::State),
+      started_at.elapsed(),
+      None,
+    );
     let tick = match tick {
       Ok(tick) => tick,
       Err(error) if error.is_transient_storage_contention() => {
@@ -334,6 +426,44 @@ pub async fn run_scheduled_delivery_worker_with_clock(
       () = cancellation_requested(shutdown.clone()) => return Ok(()),
       () = tokio::time::sleep(delay) => {}
     }
+  }
+}
+
+fn record_delivery_event(
+  telemetry: &dyn SchedulerTelemetry,
+  worker: SchedulerWorker,
+  operation: SchedulerOperation,
+  status: SchedulerOperationStatus,
+  error_kind: Option<SchedulerTelemetryErrorKind>,
+  duration: Duration,
+  attempt: Option<u32>,
+) {
+  record_scheduler_event(
+    telemetry,
+    SchedulerTelemetryEvent {
+      worker,
+      operation,
+      status,
+      error_kind,
+      duration,
+      attempt,
+    },
+  );
+}
+
+const fn delivery_tick_status(outcome: ScheduledDeliveryTickOutcome) -> SchedulerOperationStatus {
+  match outcome {
+    ScheduledDeliveryTickOutcome::Idle => SchedulerOperationStatus::Idle,
+    ScheduledDeliveryTickOutcome::Cancelled => SchedulerOperationStatus::Cancelled,
+    ScheduledDeliveryTickOutcome::SkippedNone | ScheduledDeliveryTickOutcome::SkippedUnchanged => {
+      SchedulerOperationStatus::Skipped
+    }
+    ScheduledDeliveryTickOutcome::ReadinessDeferred { .. }
+    | ScheduledDeliveryTickOutcome::RetryDeferred => SchedulerOperationStatus::Deferred,
+    ScheduledDeliveryTickOutcome::Delivered => SchedulerOperationStatus::Completed,
+    ScheduledDeliveryTickOutcome::FailedTerminal => SchedulerOperationStatus::Failed,
+    ScheduledDeliveryTickOutcome::DeliveryUnknown => SchedulerOperationStatus::Unknown,
+    ScheduledDeliveryTickOutcome::LostFence => SchedulerOperationStatus::LostAuthority,
   }
 }
 
@@ -361,6 +491,7 @@ pub async fn run_scheduled_delivery_tick_with_clock(
   shutdown: watch::Receiver<bool>,
 ) -> Result<ScheduledDeliveryTickOutcome, StateError> {
   let mut worker_state = DeliveryWorkerState::default();
+  let telemetry = NoopSchedulerTelemetry;
   run_scheduled_delivery_tick_with_timeline(
     state,
     provider,
@@ -368,6 +499,7 @@ pub async fn run_scheduled_delivery_tick_with_clock(
     DeliveryTimeline::new(clock),
     shutdown,
     &mut worker_state,
+    &telemetry,
   )
   .await
 }
@@ -379,6 +511,7 @@ async fn run_scheduled_delivery_tick_with_timeline(
   timeline: DeliveryTimeline,
   shutdown: watch::Receiver<bool>,
   worker_state: &mut DeliveryWorkerState,
+  telemetry: &dyn SchedulerTelemetry,
 ) -> Result<ScheduledDeliveryTickOutcome, StateError> {
   if *shutdown.borrow() {
     return Ok(ScheduledDeliveryTickOutcome::Cancelled);
@@ -484,12 +617,41 @@ async fn run_scheduled_delivery_tick_with_timeline(
       else {
         return Ok(ScheduledDeliveryTickOutcome::Idle);
       };
-      dispatch_claimed_delivery(state, provider, claim, timeline, shutdown).await
+      dispatch_claimed_delivery(state, provider, claim, timeline, shutdown, telemetry).await
     }
   }
 }
 
 async fn dispatch_claimed_delivery(
+  state: &StateStore,
+  provider: &dyn DeliveryProvider,
+  claim: ClaimedScheduledDelivery,
+  timeline: DeliveryTimeline,
+  shutdown: watch::Receiver<bool>,
+  telemetry: &dyn SchedulerTelemetry,
+) -> Result<ScheduledDeliveryTickOutcome, StateError> {
+  let started_at = Instant::now();
+  let attempt = u32::try_from(claim.binding.attempt()).unwrap_or(u32::MAX);
+  let result = dispatch_claimed_delivery_inner(state, provider, claim, timeline, shutdown).await;
+  record_delivery_event(
+    telemetry,
+    SchedulerWorker::Delivery,
+    SchedulerOperation::Attempt,
+    match &result {
+      Ok(outcome) => delivery_tick_status(*outcome),
+      Err(_) => SchedulerOperationStatus::Failed,
+    },
+    result
+      .as_ref()
+      .err()
+      .map(|_| SchedulerTelemetryErrorKind::State),
+    started_at.elapsed(),
+    Some(attempt),
+  );
+  result
+}
+
+async fn dispatch_claimed_delivery_inner(
   state: &StateStore,
   provider: &dyn DeliveryProvider,
   claim: ClaimedScheduledDelivery,
@@ -886,6 +1048,73 @@ async fn cancellation_requested(mut shutdown: watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::sync::Mutex;
+  use tempfile::tempdir;
+
+  #[derive(Default)]
+  struct RecordingTelemetry {
+    events: Mutex<Vec<SchedulerTelemetryEvent>>,
+  }
+
+  impl SchedulerTelemetry for RecordingTelemetry {
+    fn record(&self, event: SchedulerTelemetryEvent) {
+      self.events.lock().expect("telemetry events").push(event);
+    }
+  }
+
+  #[tokio::test]
+  async fn preparation_worker_emits_one_normal_loop_terminal_event() {
+    let temp = tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    let (shutdown, shutdown_rx) = watch::channel(true);
+    let telemetry = Arc::new(RecordingTelemetry::default());
+
+    run_scheduled_delivery_preparation_worker(state, shutdown_rx, telemetry.clone())
+      .await
+      .expect("worker exit");
+    drop(shutdown);
+    let events = telemetry.events.lock().expect("telemetry events");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].status, SchedulerOperationStatus::Started);
+    assert_eq!(events[1].status, SchedulerOperationStatus::Stopped);
+    assert_eq!(events[1].worker, SchedulerWorker::DeliveryPreparation);
+  }
+
+  #[test]
+  fn delivery_tick_telemetry_uses_fixed_outcomes() {
+    for (outcome, expected) in [
+      (
+        ScheduledDeliveryTickOutcome::Cancelled,
+        SchedulerOperationStatus::Cancelled,
+      ),
+      (
+        ScheduledDeliveryTickOutcome::SkippedNone,
+        SchedulerOperationStatus::Skipped,
+      ),
+      (
+        ScheduledDeliveryTickOutcome::ReadinessDeferred {
+          retry_after: Duration::from_secs(1),
+        },
+        SchedulerOperationStatus::Deferred,
+      ),
+      (
+        ScheduledDeliveryTickOutcome::Delivered,
+        SchedulerOperationStatus::Completed,
+      ),
+      (
+        ScheduledDeliveryTickOutcome::DeliveryUnknown,
+        SchedulerOperationStatus::Unknown,
+      ),
+      (
+        ScheduledDeliveryTickOutcome::LostFence,
+        SchedulerOperationStatus::LostAuthority,
+      ),
+    ] {
+      assert_eq!(delivery_tick_status(outcome), expected);
+    }
+  }
 
   #[test]
   fn readiness_backoff_caps_local_and_provider_delays_and_resets() {

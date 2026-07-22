@@ -12,6 +12,10 @@ use codeoff_runtime::scheduled_delivery::{
   ScheduledDeliveryTickOutcome, prepare_next_scheduled_delivery,
   run_scheduled_delivery_tick_with_clock, run_scheduled_delivery_worker_with_clock,
 };
+use codeoff_runtime::scheduler_observability::{
+  NoopSchedulerTelemetry, SchedulerOperation, SchedulerOperationStatus, SchedulerTelemetry,
+  SchedulerTelemetryEvent, SchedulerWorker,
+};
 use codeoff_state::{
   AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
   CreateScheduledJob, DeliveryTargetSnapshot, PreparedScheduledDelivery, PrincipalKey,
@@ -39,6 +43,17 @@ struct FakeProvider {
   readiness_calls: AtomicUsize,
   outcomes: Mutex<VecDeque<DeliveryProviderOutcome>>,
   observed: Mutex<Vec<ObservedSend>>,
+}
+
+#[derive(Default)]
+struct RecordingTelemetry {
+  events: Mutex<Vec<SchedulerTelemetryEvent>>,
+}
+
+impl SchedulerTelemetry for RecordingTelemetry {
+  fn record(&self, event: SchedulerTelemetryEvent) {
+    self.events.lock().expect("telemetry events").push(event);
+  }
 }
 
 impl FakeProvider {
@@ -1679,6 +1694,7 @@ async fn two_restarted_workers_prepare_once_and_make_one_provider_call() {
     "worker-a".to_owned(),
     clock(122),
     first_shutdown_rx,
+    Arc::new(NoopSchedulerTelemetry),
   ));
   let second_provider: Arc<dyn DeliveryProvider> = provider.clone();
   let second = tokio::spawn(run_scheduled_delivery_worker_with_clock(
@@ -1687,6 +1703,7 @@ async fn two_restarted_workers_prepare_once_and_make_one_provider_call() {
     "worker-b".to_owned(),
     clock(122),
     second_shutdown_rx,
+    Arc::new(NoopSchedulerTelemetry),
   ));
   tokio::time::timeout(Duration::from_secs(2), async {
     while provider.observed().is_empty() {
@@ -1815,12 +1832,14 @@ async fn worker_shutdown_joins_in_flight_send_without_new_claims() {
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
   let task_store = store.clone();
   let task_provider: Arc<dyn DeliveryProvider> = provider.clone();
+  let telemetry = Arc::new(RecordingTelemetry::default());
   let task = tokio::spawn(run_scheduled_delivery_worker_with_clock(
     task_store,
     task_provider,
     "worker".to_owned(),
     clock(122),
     shutdown_rx,
+    telemetry.clone(),
   ));
   provider.started.notified().await;
   shutdown_tx.send(true).expect("shutdown");
@@ -1830,6 +1849,16 @@ async fn worker_shutdown_joins_in_flight_send_without_new_claims() {
     .expect("worker task")
     .expect("worker result");
   assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+  {
+    let events = telemetry.events.lock().expect("telemetry events");
+    let attempt = events
+      .iter()
+      .find(|event| event.operation == SchedulerOperation::Attempt)
+      .expect("delivery attempt telemetry");
+    assert_eq!(attempt.worker, SchedulerWorker::Delivery);
+    assert_eq!(attempt.status, SchedulerOperationStatus::Unknown);
+    assert_eq!(attempt.attempt, Some(1));
+  }
   assert_eq!(
     store
       .scheduled_delivery_authority_for_tests(&second_delivery_id)

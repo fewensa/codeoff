@@ -56,6 +56,7 @@ use codeoff_runtime::{
     GlobalTurnBudget, ScheduledWorkerConfig, ScheduledWorkerHandle, ScheduledWorkerShutdown,
     spawn_scheduled_worker,
   },
+  scheduler_observability::NoopSchedulerTelemetry,
 };
 use codeoff_state::{RetentionPolicy, StateError, StateStore};
 use tokio::sync::OnceCell;
@@ -687,6 +688,7 @@ impl ServeLifecycle {
         state.clone(),
         turn_budget,
         scheduled_worker_config(scheduler),
+        Arc::new(NoopSchedulerTelemetry),
       ),
       background_tasks: ServeTaskGroup::new(),
     };
@@ -713,9 +715,15 @@ impl ServeLifecycle {
     self
       .background_tasks
       .spawn("scheduled delivery", async move {
-        run_scheduled_delivery_worker(state, provider, lease_owner, shutdown)
-          .await
-          .map_err(|error| Box::new(error) as ServeTaskError)?;
+        run_scheduled_delivery_worker(
+          state,
+          provider,
+          lease_owner,
+          shutdown,
+          Arc::new(NoopSchedulerTelemetry),
+        )
+        .await
+        .map_err(|error| Box::new(error) as ServeTaskError)?;
         Ok(ServeTaskExit::Cancelled)
       });
   }
@@ -725,9 +733,13 @@ impl ServeLifecycle {
     self
       .background_tasks
       .spawn("scheduled delivery preparation", async move {
-        run_scheduled_delivery_preparation_worker(state, shutdown)
-          .await
-          .map_err(|error| Box::new(error) as ServeTaskError)?;
+        run_scheduled_delivery_preparation_worker(
+          state,
+          shutdown,
+          Arc::new(NoopSchedulerTelemetry),
+        )
+        .await
+        .map_err(|error| Box::new(error) as ServeTaskError)?;
         Ok(ServeTaskExit::Cancelled)
       });
   }

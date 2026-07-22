@@ -13,15 +13,18 @@ use codeoff_agent_codex::{
 use codeoff_config::ScheduledCodexConfig;
 use codeoff_runtime::scheduled_execution::{
   BackendAuthorization, BackendPrepared, ExecutionResult, ExecutorReadiness, PrepareFailure,
-  PrepareInput, PreparedExecution, ScheduledExecutionBackend, ScheduledWorkerConfig,
+  PrepareInput, PreparedExecution, RefreshedExecutorAdmission, ScheduledExecutionBackend,
+  ScheduledWorkerConfig,
 };
 use codeoff_state::{
-  ConsumeScheduledExecutionPermit, ScheduledExecutorEpochAuthority, StateError, StateStore,
+  ConsumeScheduledExecutionPermit, ScheduledExecutorAdmission, ScheduledExecutorEpochAuthority,
+  StateError, StateStore,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 const CLAIM_MIN_REMAINING_SECONDS: i64 = 30;
+const ADMISSION_OPERATION_SECONDS: i64 = 5;
 
 type AuthoritySource =
   dyn Fn() -> Result<ScheduledDeploymentAuthority, ScheduledFailure> + Send + Sync;
@@ -82,6 +85,31 @@ impl ScheduledAuthorityManager {
       .ok()
       .filter(|authority| authority_is_claimable(authority, now))
       .map(|authority| authority.clone())
+  }
+
+  fn admission(&self) -> Option<ScheduledExecutorAdmission> {
+    let now = (self.clock)()?;
+    let authority = self
+      .cached
+      .read()
+      .ok()
+      .filter(|authority| authority_is_claimable(authority, now))?
+      .clone();
+    let signed_not_after = i64::try_from(authority.expires_at_unix_seconds).ok()?;
+    let operation_deadline = now
+      .checked_add(ADMISSION_OPERATION_SECONDS)?
+      .min(signed_not_after.saturating_sub(1));
+    if operation_deadline <= now {
+      return None;
+    }
+    Some(ScheduledExecutorAdmission {
+      schema_version: authority.schema_version,
+      deployment_epoch: authority.deployment_epoch,
+      attestation_id: authority.attestation_id,
+      profile_digest: authority.profile_digest,
+      signed_not_after,
+      operation_deadline,
+    })
   }
 
   async fn refresh(&self) -> ExecutorReadiness {
@@ -192,6 +220,16 @@ impl ScheduledExecutionBackend for CodexScheduledExecutionBackend {
 
   async fn refresh_readiness(&self) -> ExecutorReadiness {
     self.authority.refresh().await
+  }
+
+  async fn refresh_admission(&self) -> RefreshedExecutorAdmission {
+    if self.authority.refresh().await != ExecutorReadiness::Ready {
+      return RefreshedExecutorAdmission::Unavailable;
+    }
+    self.authority.admission().map_or(
+      RefreshedExecutorAdmission::Unavailable,
+      RefreshedExecutorAdmission::Authority,
+    )
   }
 
   async fn authorize(&self, input: &PrepareInput) -> Result<BackendAuthorization, PrepareFailure> {

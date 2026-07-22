@@ -20,16 +20,17 @@ use super::{
   ScheduledDeliveryReconcileOutcome, ScheduledDeliveryRenderInput,
   ScheduledDeliveryRetentionReport, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
   ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
-  ScheduledExecutorEpochAuthority, ScheduledExecutorEpochRegistration, ScheduledJob,
-  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
-  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
-  ScheduledRunReconcileCandidate, ScheduledRunReconcileOutcome, ScheduledRunResult,
-  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerObservabilitySnapshot,
-  SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
-  SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome, UpdateExecutionBaseline,
-  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
-  operator_action_request_digest, operator_delivery_evidence_binding, positive_u32,
-  scheduler_error, validate_lowercase_sha256, validate_text,
+  ScheduledExecutorAdmission, ScheduledExecutorEpochAuthority, ScheduledExecutorEpochRegistration,
+  ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation,
+  ScheduledJobStatus, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind,
+  ScheduledRunOperatorProjection, ScheduledRunReconcileCandidate, ScheduledRunReconcileOutcome,
+  ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  SchedulerObservabilitySnapshot, SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome,
+  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome,
+  UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
+  invalid_value, materialized_run, operator_action_request_digest,
+  operator_delivery_evidence_binding, positive_u32, scheduler_error, validate_lowercase_sha256,
+  validate_text,
 };
 use crate::StateStore;
 
@@ -800,6 +801,37 @@ impl StateStore {
     now: i64,
     lease_expires_at: i64,
   ) -> Result<Option<ClaimedScheduledRun>, StateError> {
+    self
+      .claim_next_scheduled_run_inner(lease_owner, now, lease_expires_at, None, &|| now)
+      .await
+  }
+
+  /// Claims only while the exact signed executor admission remains current through commit.
+  ///
+  /// # Errors
+  /// Returns an admission error without incrementing attempt or fence when authority expires,
+  /// rotates, or its bounded deadline is exhausted while waiting for the write transaction.
+  pub async fn claim_next_scheduled_run_with_admission(
+    &self,
+    lease_owner: &str,
+    now: i64,
+    lease_expires_at: i64,
+    admission: &ScheduledExecutorAdmission,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+  ) -> Result<Option<ClaimedScheduledRun>, StateError> {
+    self
+      .claim_next_scheduled_run_inner(lease_owner, now, lease_expires_at, Some(admission), clock)
+      .await
+  }
+
+  async fn claim_next_scheduled_run_inner(
+    &self,
+    lease_owner: &str,
+    now: i64,
+    lease_expires_at: i64,
+    admission: Option<&ScheduledExecutorAdmission>,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+  ) -> Result<Option<ClaimedScheduledRun>, StateError> {
     validate_text("scheduled run lease owner", lease_owner).map_err(invalid_value)?;
     if lease_expires_at <= now {
       return Err(StateError::InvalidSchedulerState {
@@ -807,6 +839,7 @@ impl StateStore {
       });
     }
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    acquire_and_validate_executor_admission(&mut transaction, admission, clock).await?;
     let row = sqlx::query(
       "update scheduled_runs set state = 'leased', attempt = attempt + 1, fence = fence + 1, next_attempt_at = null, lease_owner = ?1, lease_expires_at = ?2, updated_at = ?3 where run_id = (select run_id from scheduled_runs indexed by idx_scheduled_runs_claim where state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 order by scheduled_for, run_id limit 1) and state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 returning run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, attempt, fence",
     )
@@ -827,6 +860,7 @@ impl StateStore {
       if exhausted != 0 {
         return Err(StateError::ScheduledRunCounterExhausted);
       }
+      revalidate_executor_admission(&mut transaction, admission, clock).await?;
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(None);
     };
@@ -882,6 +916,7 @@ impl StateStore {
       targets_json: row.try_get("targets_json").map_err(scheduler_error)?,
       execution_baseline_json,
     };
+    revalidate_executor_admission(&mut transaction, admission, clock).await?;
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(Some(claimed))
   }
@@ -3930,7 +3965,43 @@ where run.run_id = ?2
     expected_generation: i64,
     now: i64,
   ) -> Result<MaterializationOutcome, StateError> {
+    self
+      .materialize_due_schedule_inner(job_id, expected_generation, now, None, &|| now)
+      .await
+  }
+
+  /// Materializes only while exact signed executor admission remains current through commit.
+  ///
+  /// # Errors
+  /// Returns an admission error and rolls back all schedule/run changes when authority expires,
+  /// rotates, or its bounded deadline is exhausted.
+  pub async fn materialize_due_schedule_with_admission(
+    &self,
+    job_id: &str,
+    expected_generation: i64,
+    now: i64,
+    admission: &ScheduledExecutorAdmission,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+  ) -> Result<MaterializationOutcome, StateError> {
+    self
+      .materialize_due_schedule_inner(job_id, expected_generation, now, Some(admission), clock)
+      .await
+  }
+
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps materialization and its before-commit executor admission in one transaction"
+  )]
+  async fn materialize_due_schedule_inner(
+    &self,
+    job_id: &str,
+    expected_generation: i64,
+    now: i64,
+    admission: Option<&ScheduledExecutorAdmission>,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+  ) -> Result<MaterializationOutcome, StateError> {
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    acquire_and_validate_executor_admission(&mut transaction, admission, clock).await?;
     let row = sqlx::query(
       "select j.definition_version, j.definition_json, j.capability_schema_version, j.capability_digest, j.capability_json, j.status, j.generation, s.schedule_id, s.generation as schedule_generation, s.kind, s.canonical_spec, s.timezone, s.once_at, s.anchor_at, s.interval_seconds, s.next_run_at from scheduled_jobs j join schedules s on s.job_id = j.job_id where j.job_id = ?1",
     )
@@ -4025,6 +4096,7 @@ where run.run_id = ?2
       .await
       .map_err(scheduler_error)?;
     }
+    revalidate_executor_admission(&mut transaction, admission, clock).await?;
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(materialized_run(run_id, job_id, window))
   }
@@ -4074,6 +4146,57 @@ pub(crate) async fn compare_and_swap_execution_baseline_in_transaction(
     .await
     .map_err(scheduler_error)?;
   Ok(result.rows_affected() == 1)
+}
+
+async fn acquire_and_validate_executor_admission(
+  transaction: &mut Transaction<'_, Sqlite>,
+  admission: Option<&ScheduledExecutorAdmission>,
+  clock: &(dyn Fn() -> i64 + Send + Sync),
+) -> Result<(), StateError> {
+  let Some(admission) = admission else {
+    return Ok(());
+  };
+  admission.validate().map_err(invalid_value)?;
+  let locked = sqlx::query(
+    "update scheduled_executor_epochs set registered_at = registered_at where authority_key = 'scheduled-codex-v1'",
+  )
+  .execute(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  if locked.rows_affected() != 1 {
+    return Err(StateError::ScheduledExecutorAdmissionUnavailable);
+  }
+  revalidate_executor_admission(transaction, Some(admission), clock).await
+}
+
+async fn revalidate_executor_admission(
+  transaction: &mut Transaction<'_, Sqlite>,
+  admission: Option<&ScheduledExecutorAdmission>,
+  clock: &(dyn Fn() -> i64 + Send + Sync),
+) -> Result<(), StateError> {
+  let Some(admission) = admission else {
+    return Ok(());
+  };
+  let now = clock();
+  if now <= 0 || now >= admission.operation_deadline || now >= admission.signed_not_after {
+    return Err(StateError::ScheduledExecutorAdmissionUnavailable);
+  }
+  let exact: i64 = sqlx::query_scalar(
+    "select exists(select 1 from scheduled_executor_epochs where authority_key = 'scheduled-codex-v1' and schema_version = ?1 and deployment_epoch = ?2 and attestation_id = ?3 and profile_digest = ?4 and expires_at = ?5 and expires_at > ?6)",
+  )
+  .bind(i64::from(admission.schema_version))
+  .bind(admission.deployment_epoch)
+  .bind(&admission.attestation_id)
+  .bind(&admission.profile_digest)
+  .bind(admission.signed_not_after)
+  .bind(now)
+  .fetch_one(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  if exact != 1 {
+    return Err(StateError::ScheduledExecutorAdmissionUnavailable);
+  }
+  Ok(())
 }
 
 fn validate_delivery_preparation(

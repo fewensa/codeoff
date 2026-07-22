@@ -961,6 +961,36 @@ pub struct ScheduledExecutorEpochAuthority {
   pub expires_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledExecutorAdmission {
+  pub schema_version: u32,
+  pub deployment_epoch: i64,
+  pub attestation_id: String,
+  pub profile_digest: String,
+  pub signed_not_after: i64,
+  pub operation_deadline: i64,
+}
+
+impl ScheduledExecutorAdmission {
+  /// Validates the exact deployment identity and bounded operation window.
+  ///
+  /// # Errors
+  /// Returns an error when the admission cannot safely authorize a state mutation.
+  pub fn validate(&self) -> Result<(), StateValueError> {
+    if self.schema_version != 1
+      || self.deployment_epoch <= 0
+      || self.operation_deadline <= 0
+      || self.operation_deadline >= self.signed_not_after
+    {
+      return Err(StateValueError::InvalidValue {
+        field: "scheduled executor admission",
+      });
+    }
+    validate_lowercase_sha256("scheduled executor admission id", &self.attestation_id)?;
+    validate_lowercase_sha256("scheduled executor admission profile", &self.profile_digest)
+  }
+}
+
 impl ScheduledExecutorEpochAuthority {
   /// Validates the durable deployment epoch authority before registration.
   ///

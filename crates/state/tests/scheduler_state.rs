@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use codeoff_state::{
@@ -12,13 +13,14 @@ use codeoff_state::{
   PreparedScheduledDelivery, PrincipalKey, RetentionPolicy, ScheduleMutationIdempotency,
   ScheduleSpec, ScheduledDeliveryFailure, ScheduledDeliveryReconcileOutcome,
   ScheduledDeliveryState, ScheduledDeliveryUnknownAction, ScheduledDeliveryWork,
-  ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledExecutorEpochAuthority,
-  ScheduledExecutorEpochRegistration, ScheduledJobDefinition, ScheduledJobMutation,
-  ScheduledJobStatus, ScheduledPrepareAuthority, ScheduledRunExecutionOutcome,
-  ScheduledRunLateEvidenceKind, ScheduledRunReconcileOutcome, ScheduledRunResult,
-  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerOperatorMutationOutcome,
-  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, StateStore, StateValueError,
-  TransactionalMutationOutcome, TransportConvergence, UpdateScheduledJob,
+  ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledExecutorAdmission,
+  ScheduledExecutorEpochAuthority, ScheduledExecutorEpochRegistration, ScheduledJobDefinition,
+  ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
+  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunReconcileOutcome,
+  ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
+  StateError, StateStore, StateValueError, TransactionalMutationOutcome, TransportConvergence,
+  UpdateScheduledJob,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -88,6 +90,20 @@ fn execution_permit_for(
     nonce: format!("{ordinal:064x}"),
     permit_id: format!("{:064x}", ordinal.saturating_add(1_000)),
     consumed_at,
+  }
+}
+
+fn executor_admission(
+  authority: &ScheduledExecutorEpochAuthority,
+  deadline: i64,
+) -> ScheduledExecutorAdmission {
+  ScheduledExecutorAdmission {
+    schema_version: authority.schema_version,
+    deployment_epoch: authority.deployment_epoch,
+    attestation_id: authority.attestation_id.clone(),
+    profile_digest: authority.profile_digest.clone(),
+    signed_not_after: authority.expires_at,
+    operation_deadline: deadline,
   }
 }
 
@@ -344,6 +360,99 @@ async fn scheduled_execution_permit_retention_is_bounded_and_preserves_authority
       .await
       .is_err()
   );
+}
+
+#[tokio::test]
+async fn scheduled_executor_admission_rolls_back_clock_jump_and_rotation_without_deltas() {
+  let temp = tempdir().expect("tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("state");
+  let job_id = "atomic-executor-admission";
+  store
+    .create_scheduled_job(&create_request(job_id, ScheduleSpec::once(110), 100))
+    .await
+    .expect("create job");
+  let epoch_one = executor_epoch(1, 'a');
+  store
+    .register_scheduled_executor_epoch(&epoch_one, 110)
+    .await
+    .expect("epoch one");
+  let admission_one = executor_admission(&epoch_one, 150);
+  let calls = AtomicUsize::new(0);
+  let jumping_clock = || {
+    if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+      120
+    } else {
+      150
+    }
+  };
+  assert!(matches!(
+    store
+      .materialize_due_schedule_with_admission(job_id, 0, 120, &admission_one, &jumping_clock)
+      .await,
+    Err(StateError::ScheduledExecutorAdmissionUnavailable)
+  ));
+  let snapshot = store
+    .scheduler_observability_snapshot(120, 10, 100)
+    .await
+    .expect("post-jump snapshot");
+  assert_eq!(snapshot.due_jobs.value, 1);
+  assert_eq!(snapshot.pending_runs.value, 0);
+
+  let epoch_two = executor_epoch(2, '4');
+  store
+    .register_scheduled_executor_epoch(&epoch_two, 121)
+    .await
+    .expect("epoch two");
+  assert!(matches!(
+    store
+      .materialize_due_schedule_with_admission(job_id, 0, 121, &admission_one, &|| 121)
+      .await,
+    Err(StateError::ScheduledExecutorAdmissionUnavailable)
+  ));
+  let admission_two = executor_admission(&epoch_two, 160);
+  assert!(matches!(
+    store
+      .materialize_due_schedule_with_admission(job_id, 0, 122, &admission_two, &|| 122)
+      .await
+      .expect("recovered materialization"),
+    MaterializationOutcome::Created(_)
+  ));
+
+  let claim_calls = AtomicUsize::new(0);
+  let claim_clock = || {
+    if claim_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+      123
+    } else {
+      160
+    }
+  };
+  assert!(matches!(
+    store
+      .claim_next_scheduled_run_with_admission(
+        "atomic-admission",
+        123,
+        140,
+        &admission_two,
+        &claim_clock,
+      )
+      .await,
+    Err(StateError::ScheduledExecutorAdmissionUnavailable)
+  ));
+  let claim = store
+    .claim_next_scheduled_run_with_admission(
+      "atomic-admission",
+      124,
+      141,
+      &executor_admission(&epoch_two, 170),
+      &|| 124,
+    )
+    .await
+    .expect("recovered claim")
+    .expect("pending run");
+  assert_eq!(claim.binding.attempt(), 1);
+  assert_eq!(claim.binding.fence(), 1);
 }
 type LegacyDeliveryRow = (
   String,

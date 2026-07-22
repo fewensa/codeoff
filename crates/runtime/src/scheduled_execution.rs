@@ -11,8 +11,8 @@ use codeoff_agent_contract::{
 use codeoff_state::{
   AttestedExecutionProfileSnapshot, ClaimedScheduledRun, ExpiredRunReclaimOutcome,
   PreflightFailureDisposition, RunLeaseBinding, ScheduledExecutionDisposition,
-  ScheduledExecutionTerminal, ScheduledPrepareAuthority, ScheduledRunLateEvidenceKind,
-  ScheduledRunResult, StateError, StateStore, TransportConvergence,
+  ScheduledExecutionTerminal, ScheduledExecutorAdmission, ScheduledPrepareAuthority,
+  ScheduledRunLateEvidenceKind, ScheduledRunResult, StateError, StateStore, TransportConvergence,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -30,6 +30,7 @@ use crate::scheduler_observability::{
 static PREPARE_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SCHEDULER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_LOG_ERROR_BYTES: usize = 512;
+const ADMISSION_OPERATION_MAX_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct GlobalTurnBudget {
@@ -371,7 +372,7 @@ async fn run_scheduled_worker_tick(
   if !orchestrator.run_claims_enabled {
     return Ok(TickOutcome::Unavailable);
   }
-  if orchestrator.backend.refresh_readiness().await != ExecutorReadiness::Ready {
+  if orchestrator.backend.refresh_admission().await == RefreshedExecutorAdmission::Unavailable {
     return Ok(TickOutcome::Unavailable);
   }
   let due_jobs = tokio::select! {
@@ -389,11 +390,49 @@ async fn run_scheduled_worker_tick(
     let Some(job) = job else {
       continue;
     };
-    tokio::select! {
-      result = state.materialize_due_schedule(&job_id, job.generation, now) => {
-        result?;
+    let admission = orchestrator.backend.refresh_admission().await;
+    if admission == RefreshedExecutorAdmission::Unavailable {
+      return Ok(TickOutcome::Unavailable);
+    }
+    let clock = Arc::clone(&orchestrator.clock);
+    let clock_read = || clock.now();
+    let materialization = match &admission {
+      RefreshedExecutorAdmission::Unavailable => unreachable!(),
+      RefreshedExecutorAdmission::Ready => tokio::select! {
+        result = state.materialize_due_schedule(&job_id, job.generation, now) => result,
+        () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
       },
-      () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
+      RefreshedExecutorAdmission::Authority(authority) => {
+        let Some(timeout) = admission_operation_timeout(authority, clock.now()) else {
+          return Ok(TickOutcome::Unavailable);
+        };
+        let operation = tokio::time::timeout(
+          timeout,
+          state.materialize_due_schedule_with_admission(
+            &job_id,
+            job.generation,
+            now,
+            authority,
+            &clock_read,
+          ),
+        );
+        match tokio::select! {
+          result = operation => result,
+          () = cancellation_requested(shutdown.clone()) => {
+            return Ok(TickOutcome::Cancelled);
+          }
+        } {
+          Ok(result) => result,
+          Err(_) => return Ok(TickOutcome::Unavailable),
+        }
+      }
+    };
+    match materialization {
+      Ok(_) => {}
+      Err(StateError::ScheduledExecutorAdmissionUnavailable) => {
+        return Ok(TickOutcome::Unavailable);
+      }
+      Err(error) => return Err(error),
     }
   }
   if *shutdown.borrow() {
@@ -431,6 +470,18 @@ fn bounded_log_error(error: &StateError) -> String {
     end -= 1;
   }
   format!("{}…", &message[..end])
+}
+
+fn admission_operation_timeout(
+  admission: &ScheduledExecutorAdmission,
+  now: i64,
+) -> Option<Duration> {
+  let remaining = admission.operation_deadline.checked_sub(now)?;
+  let seconds = u64::try_from(remaining).ok()?;
+  if seconds == 0 || admission.operation_deadline >= admission.signed_not_after {
+    return None;
+  }
+  Some(ADMISSION_OPERATION_MAX_DURATION.min(Duration::from_secs(seconds)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,6 +669,12 @@ pub trait ScheduledExecutionBackend: Send + Sync {
   async fn refresh_readiness(&self) -> ExecutorReadiness {
     self.readiness()
   }
+  async fn refresh_admission(&self) -> RefreshedExecutorAdmission {
+    match self.refresh_readiness().await {
+      ExecutorReadiness::Ready => RefreshedExecutorAdmission::Ready,
+      ExecutorReadiness::Unavailable => RefreshedExecutorAdmission::Unavailable,
+    }
+  }
   async fn authorize(&self, _input: &PrepareInput) -> Result<BackendAuthorization, PrepareFailure> {
     Ok(BackendAuthorization::new(()))
   }
@@ -626,6 +683,13 @@ pub trait ScheduledExecutionBackend: Send + Sync {
     input: PrepareInput,
     authorization: BackendAuthorization,
   ) -> Result<BackendPrepared, PrepareFailure>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshedExecutorAdmission {
+  Unavailable,
+  Ready,
+  Authority(ScheduledExecutorAdmission),
 }
 
 struct UnavailableScheduledExecutionBackend;
@@ -849,7 +913,8 @@ impl ScheduledRunOrchestrator {
     if !self.run_claims_enabled {
       return Ok(TickOutcome::Unavailable);
     }
-    if self.backend.refresh_readiness().await != ExecutorReadiness::Ready {
+    let admission = self.backend.refresh_admission().await;
+    if admission == RefreshedExecutorAdmission::Unavailable {
       return Ok(TickOutcome::Unavailable);
     }
     if *shutdown.borrow() {
@@ -873,9 +938,45 @@ impl ScheduledRunOrchestrator {
       })?;
     let now = self.clock.now();
     let lease_expires_at = checked_add(now, self.policy.lease_seconds, "lease expiry")?;
+    let clock = Arc::clone(&self.clock);
+    let clock_read = || clock.now();
+    let claim_future = async {
+      match &admission {
+        RefreshedExecutorAdmission::Unavailable => Ok(None),
+        RefreshedExecutorAdmission::Ready => {
+          self
+            .state
+            .claim_next_scheduled_run(&self.lease_owner, now, lease_expires_at)
+            .await
+        }
+        RefreshedExecutorAdmission::Authority(authority) => {
+          let Some(timeout) = admission_operation_timeout(authority, clock.now()) else {
+            return Err(StateError::ScheduledExecutorAdmissionUnavailable);
+          };
+          tokio::time::timeout(
+            timeout,
+            self.state.claim_next_scheduled_run_with_admission(
+              &self.lease_owner,
+              now,
+              lease_expires_at,
+              authority,
+              &clock_read,
+            ),
+          )
+          .await
+          .map_err(|_| StateError::ScheduledExecutorAdmissionUnavailable)?
+        }
+      }
+    };
     let claim = tokio::select! {
-      result = self.state.claim_next_scheduled_run(&self.lease_owner, now, lease_expires_at) => {
-        result?
+      result = claim_future => {
+        match result {
+          Ok(claim) => claim,
+          Err(StateError::ScheduledExecutorAdmissionUnavailable) => {
+            return Ok(TickOutcome::Unavailable);
+          }
+          Err(error) => return Err(error),
+        }
       },
       () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
     };
@@ -1585,7 +1686,7 @@ mod tests {
   use codeoff_state::{
     CapabilityProfileSnapshot, CreateScheduledJob, DeliveryTargetSnapshot,
     ExpiredRunReclaimOutcome, MaterializationOutcome, PrincipalKey, ScheduleSpec,
-    ScheduledJobDefinition,
+    ScheduledExecutorEpochAuthority, ScheduledJobDefinition,
   };
   use tempfile::{TempDir, tempdir};
 
@@ -1704,6 +1805,56 @@ mod tests {
   struct SwitchableBackend {
     available: Arc<AtomicBool>,
     inner: FakeBackend,
+  }
+
+  struct AdmissionBackend {
+    admission: Arc<Mutex<RefreshedExecutorAdmission>>,
+    inner: FakeBackend,
+  }
+
+  #[async_trait]
+  impl ScheduledExecutionBackend for AdmissionBackend {
+    fn readiness(&self) -> ExecutorReadiness {
+      ExecutorReadiness::Ready
+    }
+
+    async fn refresh_admission(&self) -> RefreshedExecutorAdmission {
+      self.admission.lock().expect("executor admission").clone()
+    }
+
+    fn prepare(
+      &self,
+      input: PrepareInput,
+      authorization: BackendAuthorization,
+    ) -> Result<BackendPrepared, PrepareFailure> {
+      self.inner.prepare(input, authorization)
+    }
+  }
+
+  fn test_executor_authority(epoch: i64, marker: char) -> ScheduledExecutorEpochAuthority {
+    ScheduledExecutorEpochAuthority {
+      schema_version: 1,
+      deployment_epoch: epoch,
+      attestation_id: marker.to_string().repeat(64),
+      attestation_digest: "b".repeat(64),
+      profile_digest: "c".repeat(64),
+      issued_at: 100,
+      expires_at: 200,
+    }
+  }
+
+  fn test_executor_admission(
+    authority: &ScheduledExecutorEpochAuthority,
+    deadline: i64,
+  ) -> ScheduledExecutorAdmission {
+    ScheduledExecutorAdmission {
+      schema_version: authority.schema_version,
+      deployment_epoch: authority.deployment_epoch,
+      attestation_id: authority.attestation_id.clone(),
+      profile_digest: authority.profile_digest.clone(),
+      signed_not_after: authority.expires_at,
+      operation_deadline: deadline,
+    }
   }
 
   #[async_trait]
@@ -1980,6 +2131,111 @@ mod tests {
       run_scheduled_worker_tick(&state, &runtime, shutdown_rx)
         .await
         .expect("recovery tick"),
+      TickOutcome::Completed
+    );
+  }
+
+  #[tokio::test]
+  async fn test_executor_admission_deadline_bounds_claim_lock_wait_without_counter_delta() {
+    let (_temp, state) = fixture(&[("admission-lock", 110)]).await;
+    let authority = test_executor_authority(1, 'a');
+    state
+      .register_scheduled_executor_epoch(&authority, 110)
+      .await
+      .expect("register authority");
+    let admission = Arc::new(Mutex::new(RefreshedExecutorAdmission::Authority(
+      test_executor_admission(&authority, 116),
+    )));
+    let runtime = orchestrator(
+      state.clone(),
+      Arc::new(AdmissionBackend {
+        admission,
+        inner: FakeBackend::new(ExecutionResult::Completed {
+          summary: "must not execute under contention".to_owned(),
+        }),
+      }),
+      Arc::new(TestClock(AtomicI64::new(111), 1)),
+      1,
+    );
+    let lock = state
+      .acquire_exclusive_storage_lock_for_tests()
+      .await
+      .expect("exclusive lock");
+    tokio::time::pause();
+
+    assert_eq!(
+      runtime.run_once().await.expect("bounded claim"),
+      TickOutcome::Unavailable
+    );
+    drop(lock);
+    tokio::time::resume();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let claim = state
+      .claim_next_scheduled_run("proof", 112, 140)
+      .await
+      .expect("claim proof")
+      .expect("run remains pending");
+    assert_eq!(claim.binding.attempt(), 1);
+    assert_eq!(claim.binding.fence(), 1);
+  }
+
+  #[tokio::test]
+  async fn test_rotated_admission_cannot_materialize_and_per_item_refresh_recovers() {
+    let temp = tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    create_job(&state, "admission-rotation", 110).await;
+    let epoch_one = test_executor_authority(1, 'a');
+    let epoch_two = test_executor_authority(2, 'd');
+    state
+      .register_scheduled_executor_epoch(&epoch_one, 105)
+      .await
+      .expect("epoch one");
+    state
+      .register_scheduled_executor_epoch(&epoch_two, 106)
+      .await
+      .expect("epoch two");
+    let admission = Arc::new(Mutex::new(RefreshedExecutorAdmission::Authority(
+      test_executor_admission(&epoch_one, 150),
+    )));
+    let runtime = orchestrator(
+      state.clone(),
+      Arc::new(AdmissionBackend {
+        admission: Arc::clone(&admission),
+        inner: FakeBackend::new(ExecutionResult::Completed {
+          summary: "recovered".to_owned(),
+        }),
+      }),
+      Arc::new(TestClock(AtomicI64::new(111), 1)),
+      1,
+    );
+    let before = state
+      .scheduler_observability_snapshot(111, 10, 100)
+      .await
+      .expect("before rotation");
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+
+    assert_eq!(
+      run_scheduled_worker_tick(&state, &runtime, shutdown_rx.clone())
+        .await
+        .expect("stale admission tick"),
+      TickOutcome::Unavailable
+    );
+    assert_eq!(
+      state
+        .scheduler_observability_snapshot(111, 10, 100)
+        .await
+        .expect("after rejected rotation"),
+      before
+    );
+
+    *admission.lock().expect("executor admission") =
+      RefreshedExecutorAdmission::Authority(test_executor_admission(&epoch_two, 150));
+    assert_eq!(
+      run_scheduled_worker_tick(&state, &runtime, shutdown_rx)
+        .await
+        .expect("rotated admission tick"),
       TickOutcome::Completed
     );
   }

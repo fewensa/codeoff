@@ -18,14 +18,15 @@ pub use scheduler::{
   ScheduledDeliveryOperatorProjection, ScheduledDeliveryReconcileOutcome,
   ScheduledDeliveryRenderInput, ScheduledDeliveryRetentionReport, ScheduledDeliveryState,
   ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
-  ScheduledExecutionTerminal, ScheduledExecutorEpochAuthority, ScheduledExecutorEpochRegistration,
-  ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation,
-  ScheduledJobStatus, ScheduledPrepareAuthority, ScheduledRun, ScheduledRunExecutionOutcome,
-  ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection, ScheduledRunReconcileCandidate,
-  ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
-  SchedulerObservabilitySnapshot, SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome,
-  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateValueError,
-  TransactionalMutationOutcome, TransportConvergence, UpdateExecutionBaseline, UpdateScheduledJob,
+  ScheduledExecutionTerminal, ScheduledExecutorAdmission, ScheduledExecutorEpochAuthority,
+  ScheduledExecutorEpochRegistration, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
+  ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority, ScheduledRun,
+  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
+  ScheduledRunReconcileCandidate, ScheduledRunReconcileOutcome, ScheduledRunResult,
+  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerObservabilitySnapshot,
+  SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
+  SkippedNoneBaselinePolicy, StateValueError, TransactionalMutationOutcome, TransportConvergence,
+  UpdateExecutionBaseline, UpdateScheduledJob,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::StateStoreTestLock;

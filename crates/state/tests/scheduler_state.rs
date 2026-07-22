@@ -1541,6 +1541,13 @@ async fn test_delivery_retention_completion_migration_backfills_one_time_ledger(
     "drop trigger trg_scheduled_delivery_retention_audit_update",
     "drop trigger trg_scheduled_delivery_retention_ledger_update",
     "drop trigger trg_scheduled_delivery_retention_ledger_delete",
+    "drop trigger trg_scheduled_delivery_retention_ledger_insert",
+    "drop trigger trg_scheduled_delivery_retention_delete_guard",
+    "drop trigger trg_scheduled_delivery_attempt_retention_delete_guard",
+    "drop trigger trg_scheduled_run_result_artifacts_retention_delete_guard",
+    "drop trigger trg_scheduled_run_late_evidence_retention_delete_guard",
+    "drop trigger trg_scheduled_run_attempt_retention_delete_guard",
+    "drop trigger trg_scheduled_run_retention_delete_guard",
   ] {
     sqlx::query(statement)
       .execute(&pool)
@@ -1610,6 +1617,19 @@ async fn test_delivery_retention_completion_migration_backfills_one_time_ledger(
   .execute(&pool)
   .await
   .expect("restore historical update trigger name");
+  for statement in [
+    "create trigger trg_scheduled_delivery_retention_delete_guard before delete on scheduled_run_deliveries when 0 begin select 1; end",
+    "create trigger trg_scheduled_delivery_attempt_retention_delete_guard before delete on scheduled_delivery_attempts when 0 begin select 1; end",
+    "create trigger trg_scheduled_run_result_artifacts_retention_delete_guard before delete on scheduled_run_result_artifacts when 0 begin select 1; end",
+    "create trigger trg_scheduled_run_late_evidence_retention_delete_guard before delete on scheduled_run_late_evidence when 0 begin select 1; end",
+    "create trigger trg_scheduled_run_attempt_retention_delete_guard before delete on scheduled_run_attempts when 0 begin select 1; end",
+    "create trigger trg_scheduled_run_retention_delete_guard before delete on scheduled_runs when 0 begin select 1; end",
+  ] {
+    sqlx::query(statement)
+      .execute(&pool)
+      .await
+      .expect("restore historical retention guard name");
+  }
   pool.close().await;
 
   let upgraded = StateStore::initialize(&state_dir, None)
@@ -1657,6 +1677,14 @@ async fn test_delivery_retention_completion_migration_backfills_one_time_ledger(
     .await
     .is_err(),
     "one open historical audit must keep the delivery ledger open"
+  );
+  assert!(
+    sqlx::query("delete from scheduled_delivery_attempts where delivery_id = ?1")
+      .bind(open_delivery)
+      .execute(&pool)
+      .await
+      .is_err(),
+    "an unchosen open historical audit must not authorize deletion"
   );
   for (operation_id, run_id) in [
     ("post-upgrade-completed-replay", &completed_run),
@@ -4322,21 +4350,12 @@ async fn prepare_succeeded_retention_candidate(
   )
 }
 
-async fn insert_open_delivery_retention_authority(
+async fn insert_open_delivery_retention_audit(
   connection: &mut SqliteConnection,
   operation_id: &str,
   delivery_id: &str,
   authorized_at: i64,
 ) {
-  sqlx::query(
-    "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) select delivery_id, ?1, run_id, job_id, ?2 from scheduled_run_deliveries where delivery_id = ?3",
-  )
-  .bind(operation_id)
-  .bind(authorized_at)
-  .bind(delivery_id)
-  .execute(&mut *connection)
-  .await
-  .expect("claim test retention ledger");
   sqlx::query(
     "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at, expected_deliveries_deleted, expected_delivery_attempts_deleted, expected_run_attempts_deleted, expected_late_evidence_deleted, expected_result_artifacts_deleted, expected_runs_deleted) select ?1, delivery.delivery_id, delivery.run_id, delivery.job_id, delivery.state, delivery.payload_digest, ?2, run.job_generation, run.schedule_generation, attempt.completed_at, ?2, ?2, (select count(*) from scheduled_run_deliveries item where item.run_id = run.run_id), (select count(*) from scheduled_delivery_attempts item where item.delivery_id in (select target.delivery_id from scheduled_run_deliveries target where target.run_id = run.run_id)), (select count(*) from scheduled_run_attempts item where item.run_id = run.run_id), (select count(*) from scheduled_run_late_evidence item where item.run_id = run.run_id), (select count(*) from scheduled_run_result_artifacts item where item.run_id = run.run_id), 1 from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id join scheduled_run_attempts attempt on attempt.run_id = run.run_id and attempt.job_id = run.job_id and attempt.attempt = run.attempt and attempt.fence = run.fence where delivery.delivery_id = ?3",
   )
@@ -4346,6 +4365,24 @@ async fn insert_open_delivery_retention_authority(
   .execute(&mut *connection)
   .await
   .expect("insert test retention audit");
+}
+
+async fn insert_open_delivery_retention_authority(
+  connection: &mut SqliteConnection,
+  operation_id: &str,
+  delivery_id: &str,
+  authorized_at: i64,
+) {
+  insert_open_delivery_retention_audit(connection, operation_id, delivery_id, authorized_at).await;
+  sqlx::query(
+    "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) select delivery_id, ?1, run_id, job_id, ?2 from scheduled_run_deliveries where delivery_id = ?3",
+  )
+  .bind(operation_id)
+  .bind(authorized_at)
+  .bind(delivery_id)
+  .execute(&mut *connection)
+  .await
+  .expect("claim test retention ledger");
 }
 
 async fn fail_due_run(store: &StateStore, job_id: &str, due_at: i64, completed_at: i64) -> String {
@@ -7659,6 +7696,7 @@ async fn test_succeeded_automatic_retention_preserves_delivery_baseline_and_audi
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_delivery_retention_completion_requires_deleted_graph_and_exact_counts() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -7685,6 +7723,16 @@ async fn test_delivery_retention_completion_requires_deleted_graph_and_exact_cou
     140,
   )
   .await;
+  assert!(
+    sqlx::query(
+      "update scheduled_delivery_retention_ledger set completed_at = 141 where operation_id = 'premature-completion' and delivery_id = ?1",
+    )
+    .bind(delivery_id)
+    .execute(&mut *transaction)
+    .await
+    .is_err(),
+    "ledger completion must fail before its exact audit and graph completion"
+  );
   assert!(
     sqlx::query(
       "update scheduled_delivery_retention_audit set attempts_deleted = expected_delivery_attempts_deleted, deliveries_deleted = expected_deliveries_deleted, run_attempts_deleted = expected_run_attempts_deleted, late_evidence_deleted = expected_late_evidence_deleted, result_artifacts_deleted = expected_result_artifacts_deleted, runs_deleted = expected_runs_deleted, completed_at = 141 where operation_id = 'premature-completion' and delivery_id = ?1",
@@ -7743,6 +7791,30 @@ async fn test_delivery_retention_completion_requires_deleted_graph_and_exact_cou
     .is_err(),
     "completion must reject forged deletion counts"
   );
+  sqlx::query(
+    "update scheduled_delivery_retention_audit set attempts_deleted = expected_delivery_attempts_deleted, deliveries_deleted = expected_deliveries_deleted, run_attempts_deleted = expected_run_attempts_deleted, late_evidence_deleted = expected_late_evidence_deleted, result_artifacts_deleted = expected_result_artifacts_deleted, runs_deleted = expected_runs_deleted, completed_at = 141 where operation_id = 'forged-completion' and delivery_id = ?1",
+  )
+  .bind(delivery_id)
+  .execute(&mut *transaction)
+  .await
+  .expect("complete exact audit after graph deletion");
+  assert!(
+    sqlx::query(
+      "update scheduled_delivery_retention_ledger set completed_at = 142 where operation_id = 'forged-completion' and delivery_id = ?1",
+    )
+    .bind(delivery_id)
+    .execute(&mut *transaction)
+    .await
+    .is_err(),
+    "ledger completion time must exactly match its completed audit"
+  );
+  sqlx::query(
+    "update scheduled_delivery_retention_ledger set completed_at = 141 where operation_id = 'forged-completion' and delivery_id = ?1",
+  )
+  .bind(delivery_id)
+  .execute(&mut *transaction)
+  .await
+  .expect("complete ledger at exact audit time");
   transaction
     .rollback()
     .await
@@ -7778,15 +7850,51 @@ async fn test_delivery_retention_replay_conflict_rolls_back_prior_target_claims(
   )
   .await;
   let blocked_delivery = deliveries.last().expect("second ordered delivery");
-  sqlx::query(
-    "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) values (?1, 'historical-operation', ?2, ?3, 140)",
+  assert!(
+    sqlx::query(
+      "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) values (?1, 'ledger-without-audit', ?2, ?3, 140)",
+    )
+    .bind(blocked_delivery)
+    .bind(&run_id)
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .is_err(),
+    "an arbitrary ledger row without canonical audit authority must be rejected"
+  );
+  let mut transaction = pool.begin().await.expect("begin completed insert probe");
+  insert_open_delivery_retention_audit(
+    &mut transaction,
+    "completed-ledger-insert",
+    blocked_delivery,
+    140,
   )
-  .bind(blocked_delivery)
-  .bind(&run_id)
-  .bind(job_id)
-  .execute(&pool)
-  .await
-  .expect("insert historical delivery claim");
+  .await;
+  assert!(
+    sqlx::query(
+      "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at, completed_at) values (?1, 'completed-ledger-insert', ?2, ?3, 140, 140)",
+    )
+    .bind(blocked_delivery)
+    .bind(&run_id)
+    .bind(job_id)
+    .execute(&mut *transaction)
+    .await
+    .is_err(),
+    "a new ledger claim must start open even with canonical audit authority"
+  );
+  transaction
+    .rollback()
+    .await
+    .expect("rollback completed insert probe");
+  let mut connection = pool.acquire().await.expect("acquire competing connection");
+  insert_open_delivery_retention_authority(
+    &mut connection,
+    "historical-operation",
+    blocked_delivery,
+    140,
+  )
+  .await;
+  drop(connection);
 
   for operation_id in ["replay-operation-one", "replay-operation-two"] {
     assert!(matches!(
@@ -7803,7 +7911,7 @@ async fn test_delivery_retention_replay_conflict_rolls_back_prior_target_claims(
   .fetch_one(&pool)
   .await
   .expect("read replay-protected graph");
-  assert_eq!(persisted, (1, 2, 1, 1, 1, 0, 1));
+  assert_eq!(persisted, (1, 2, 1, 1, 1, 1, 1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8402,19 +8510,19 @@ async fn test_retention_guards_reject_dynamic_nonterminal_and_latest_source_dele
     .expect("complete first dynamic delivery");
   let _second_dynamic_run = complete_due_run(&store, dynamic_job, 220, 230).await;
   sqlx::query(
-    "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) select delivery_id, 'dynamic-authority', run_id, job_id, 231 from scheduled_run_deliveries where delivery_id = ?1",
-  )
-  .bind(&first_dynamic_delivery)
-  .execute(&pool)
-  .await
-  .expect("claim dynamic retention ledger");
-  sqlx::query(
     "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at, expected_deliveries_deleted, expected_delivery_attempts_deleted, expected_run_attempts_deleted, expected_late_evidence_deleted, expected_result_artifacts_deleted, expected_runs_deleted) select 'dynamic-authority', delivery.delivery_id, delivery.run_id, delivery.job_id, delivery.state, delivery.payload_digest, 231, run.job_generation, run.schedule_generation, attempt.completed_at, 231, 231, (select count(*) from scheduled_run_deliveries item where item.run_id = run.run_id), (select count(*) from scheduled_delivery_attempts item where item.delivery_id in (select target.delivery_id from scheduled_run_deliveries target where target.run_id = run.run_id)), (select count(*) from scheduled_run_attempts item where item.run_id = run.run_id), (select count(*) from scheduled_run_late_evidence item where item.run_id = run.run_id), (select count(*) from scheduled_run_result_artifacts item where item.run_id = run.run_id), 1 from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id join scheduled_run_attempts attempt on attempt.run_id = run.run_id and attempt.attempt = run.attempt and attempt.fence = run.fence where delivery.delivery_id = ?1",
   )
   .bind(&first_dynamic_delivery)
   .execute(&pool)
   .await
   .expect("mint authority while first run is not execution baseline source");
+  sqlx::query(
+    "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) select delivery_id, 'dynamic-authority', run_id, job_id, 231 from scheduled_run_deliveries where delivery_id = ?1",
+  )
+  .bind(&first_dynamic_delivery)
+  .execute(&pool)
+  .await
+  .expect("claim dynamic retention ledger");
   sqlx::query(
     "update scheduled_execution_baselines set hash_algorithm = artifact.hash_algorithm, result_hash = artifact.result_hash, previous_success_context = artifact.previous_success_context, source_run_id = artifact.run_id, completed_at = artifact.completed_at from scheduled_run_result_artifacts artifact where scheduled_execution_baselines.job_id = ?1 and artifact.run_id = ?2 and artifact.job_id = scheduled_execution_baselines.job_id",
   )

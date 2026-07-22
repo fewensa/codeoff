@@ -1872,20 +1872,6 @@ order by delivery.delivery_id
       let job_id = row
         .try_get::<String, _>("job_id")
         .map_err(scheduler_error)?;
-      let ledger = sqlx::query(
-        "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) values (?1, ?2, ?3, ?4, ?5) on conflict(delivery_id) do nothing",
-      )
-      .bind(&delivery_id)
-      .bind(operation_id)
-      .bind(run_id)
-      .bind(&job_id)
-      .bind(now)
-      .execute(&mut *transaction)
-      .await
-      .map_err(scheduler_error)?;
-      if ledger.rows_affected() != 1 {
-        return Err(StateError::ScheduledDeliveryRetentionConflict);
-      }
       sqlx::query(
         "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at, expected_deliveries_deleted, expected_delivery_attempts_deleted, expected_run_attempts_deleted, expected_late_evidence_deleted, expected_result_artifacts_deleted, expected_runs_deleted) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
       )
@@ -1914,6 +1900,20 @@ order by delivery.delivery_id
       .execute(&mut *transaction)
       .await
       .map_err(scheduler_error)?;
+      let ledger = sqlx::query(
+        "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) values (?1, ?2, ?3, ?4, ?5) on conflict(delivery_id) do nothing",
+      )
+      .bind(&delivery_id)
+      .bind(operation_id)
+      .bind(run_id)
+      .bind(&job_id)
+      .bind(now)
+      .execute(&mut *transaction)
+      .await
+      .map_err(scheduler_error)?;
+      if ledger.rows_affected() != 1 {
+        return Err(StateError::ScheduledDeliveryRetentionConflict);
+      }
     }
     let delivery_attempts = sqlx::query(
       "delete from scheduled_delivery_attempts where delivery_id in (select delivery_id from scheduled_run_deliveries where run_id = ?1)",

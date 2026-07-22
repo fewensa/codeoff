@@ -33,11 +33,28 @@ when not (
   and new.run_id is old.run_id
   and new.job_id is old.job_id
   and new.claimed_at is old.claimed_at
+  and 1 = (
+    select count(*) from scheduled_delivery_retention_audit audit
+    where audit.delivery_id = old.delivery_id
+      and audit.operation_id = old.operation_id
+      and audit.run_id = old.run_id
+      and audit.job_id = old.job_id
+      and audit.completed_at = new.completed_at
+  )
   and not exists (
     select 1 from scheduled_delivery_retention_audit audit
-    where audit.delivery_id = old.delivery_id
-      and (audit.completed_at is null or audit.completed_at > new.completed_at)
+    where audit.delivery_id = old.delivery_id and audit.completed_at is null
   )
+  and not exists (select 1 from scheduled_runs run where run.run_id = old.run_id)
+  and not exists (select 1 from scheduled_run_deliveries delivery where delivery.run_id = old.run_id)
+  and not exists (
+    select 1 from scheduled_delivery_attempts attempt
+    join scheduled_delivery_retention_ledger ledger on ledger.delivery_id = attempt.delivery_id
+    where ledger.run_id = old.run_id
+  )
+  and not exists (select 1 from scheduled_run_attempts attempt where attempt.run_id = old.run_id)
+  and not exists (select 1 from scheduled_run_late_evidence evidence where evidence.run_id = old.run_id)
+  and not exists (select 1 from scheduled_run_result_artifacts artifact where artifact.run_id = old.run_id)
 )
 begin
   select raise(abort, 'scheduled delivery retention ledger is immutable');
@@ -94,11 +111,6 @@ when new.completed_at is not null
       on artifact.artifact_id = run.result_artifact_id
       and artifact.run_id = run.run_id and artifact.job_id = run.job_id
       and artifact.accepted_attempt = run.attempt and artifact.accepted_fence = run.fence
-    join scheduled_delivery_retention_ledger ledger
-      on ledger.delivery_id = delivery.delivery_id
-      and ledger.operation_id = new.operation_id
-      and ledger.run_id = run.run_id and ledger.job_id = run.job_id
-      and ledger.completed_at is null
     where delivery.delivery_id = new.delivery_id
       and delivery.run_id = new.run_id
       and delivery.job_id = new.job_id
@@ -159,6 +171,23 @@ begin
   select raise(abort, 'scheduled delivery retention authority mismatch');
 end;
 
+create trigger trg_scheduled_delivery_retention_ledger_insert
+before insert on scheduled_delivery_retention_ledger
+when new.completed_at is not null
+  or 1 != (
+  select count(*)
+  from scheduled_delivery_retention_audit audit
+  where audit.delivery_id = new.delivery_id
+    and audit.operation_id = new.operation_id
+    and audit.run_id = new.run_id
+    and audit.job_id = new.job_id
+    and audit.authorized_at = new.claimed_at
+    and audit.completed_at is null
+)
+begin
+  select raise(abort, 'scheduled delivery retention ledger requires canonical audit authority');
+end;
+
 drop trigger trg_scheduled_delivery_retention_audit_update;
 
 create trigger trg_scheduled_delivery_retention_audit_update
@@ -204,4 +233,273 @@ when not (
 )
 begin
   select raise(abort, 'scheduled delivery retention audit is immutable');
+end;
+
+drop trigger trg_scheduled_delivery_retention_delete_guard;
+
+create trigger trg_scheduled_delivery_retention_delete_guard
+before delete on scheduled_run_deliveries
+when not exists (
+  select 1
+  from scheduled_delivery_retention_audit audit
+  join scheduled_delivery_retention_ledger ledger
+    on ledger.delivery_id = audit.delivery_id
+    and ledger.operation_id = audit.operation_id
+    and ledger.run_id = audit.run_id
+    and ledger.job_id = audit.job_id
+  where audit.delivery_id = old.delivery_id
+    and audit.run_id = old.run_id
+    and audit.job_id = old.job_id
+    and audit.delivery_state = old.state
+    and audit.payload_digest = old.payload_digest
+    and audit.completed_at is null
+    and ledger.completed_at is null
+    and not exists (
+      select 1 from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id and baseline.job_id = old.job_id
+    )
+)
+begin
+  select raise(abort, 'scheduled delivery deletion requires retention authority');
+end;
+
+drop trigger trg_scheduled_delivery_attempt_retention_delete_guard;
+
+create trigger trg_scheduled_delivery_attempt_retention_delete_guard
+before delete on scheduled_delivery_attempts
+when not exists (
+  select 1
+  from scheduled_run_deliveries delivery
+  join scheduled_delivery_retention_audit audit
+    on audit.delivery_id = delivery.delivery_id
+    and audit.run_id = delivery.run_id
+    and audit.job_id = delivery.job_id
+    and audit.delivery_state = delivery.state
+    and audit.payload_digest = delivery.payload_digest
+  join scheduled_delivery_retention_ledger ledger
+    on ledger.delivery_id = audit.delivery_id
+    and ledger.operation_id = audit.operation_id
+    and ledger.run_id = audit.run_id
+    and ledger.job_id = audit.job_id
+  where delivery.delivery_id = old.delivery_id
+    and audit.completed_at is null
+    and ledger.completed_at is null
+    and not exists (
+      select 1 from scheduled_execution_baselines baseline
+      where baseline.source_run_id = delivery.run_id and baseline.job_id = delivery.job_id
+    )
+)
+begin
+  select raise(abort, 'scheduled delivery attempt deletion requires retention authority');
+end;
+
+drop trigger trg_scheduled_run_result_artifacts_retention_delete_guard;
+
+create trigger trg_scheduled_run_result_artifacts_retention_delete_guard
+before delete on scheduled_run_result_artifacts
+when not exists (
+  select 1
+  from scheduled_runs run
+  join scheduled_delivery_retention_ledger ledger
+    on ledger.run_id = run.run_id and ledger.job_id = run.job_id
+  join scheduled_delivery_retention_audit audit
+    on audit.delivery_id = ledger.delivery_id
+    and audit.operation_id = ledger.operation_id
+    and audit.run_id = ledger.run_id
+    and audit.job_id = ledger.job_id
+  where run.run_id = old.run_id
+    and run.job_id = old.job_id
+    and run.state = 'succeeded'
+    and run.result_artifact_id = old.artifact_id
+    and audit.completed_at is null
+    and ledger.completed_at is null
+    and audit.expected_deliveries_deleted = (
+      select count(*) from scheduled_delivery_retention_ledger item where item.run_id = run.run_id
+    )
+    and not exists (
+      select 1 from scheduled_delivery_retention_ledger item
+      where item.run_id = run.run_id
+        and not exists (
+          select 1 from scheduled_delivery_retention_audit authority
+          where authority.delivery_id = item.delivery_id
+            and authority.operation_id = item.operation_id
+            and authority.run_id = item.run_id
+            and authority.job_id = item.job_id
+            and authority.completed_at is null
+        )
+    )
+    and not exists (
+      select 1 from scheduled_execution_baselines baseline
+      where baseline.source_run_id = run.run_id and baseline.job_id = run.job_id
+    )
+)
+begin
+  select raise(abort, 'scheduled result deletion requires retention authority');
+end;
+
+drop trigger trg_scheduled_run_late_evidence_retention_delete_guard;
+
+create trigger trg_scheduled_run_late_evidence_retention_delete_guard
+before delete on scheduled_run_late_evidence
+when not exists (
+  select 1
+  from scheduled_run_attempts attempt
+  join scheduled_delivery_retention_ledger ledger
+    on ledger.run_id = attempt.run_id and ledger.job_id = attempt.job_id
+  join scheduled_delivery_retention_audit audit
+    on audit.delivery_id = ledger.delivery_id
+    and audit.operation_id = ledger.operation_id
+    and audit.run_id = ledger.run_id
+    and audit.job_id = ledger.job_id
+  where attempt.run_id = old.run_id
+    and attempt.attempt = old.attempt
+    and attempt.fence = old.fence
+    and audit.completed_at is null
+    and ledger.completed_at is null
+    and audit.expected_deliveries_deleted = (
+      select count(*) from scheduled_delivery_retention_ledger item where item.run_id = attempt.run_id
+    )
+    and not exists (
+      select 1 from scheduled_delivery_retention_ledger item
+      where item.run_id = attempt.run_id
+        and not exists (
+          select 1 from scheduled_delivery_retention_audit authority
+          where authority.delivery_id = item.delivery_id
+            and authority.operation_id = item.operation_id
+            and authority.run_id = item.run_id
+            and authority.job_id = item.job_id
+            and authority.completed_at is null
+        )
+    )
+    and not exists (
+      select 1 from scheduled_execution_baselines baseline
+      where baseline.source_run_id = attempt.run_id and baseline.job_id = attempt.job_id
+    )
+)
+and not exists (
+  select 1
+  from scheduled_run_attempts attempt
+  join scheduled_run_retention_audit audit
+    on audit.run_id = attempt.run_id and audit.job_id = attempt.job_id
+  join scheduled_runs run on run.run_id = attempt.run_id and run.job_id = attempt.job_id
+  where attempt.run_id = old.run_id
+    and attempt.attempt = old.attempt
+    and attempt.fence = old.fence
+    and audit.completed_at is null
+    and audit.run_state = run.state
+    and audit.job_generation = run.job_generation
+    and audit.schedule_generation = run.schedule_generation
+)
+begin
+  select raise(abort, 'scheduled late evidence deletion requires retention authority');
+end;
+
+drop trigger trg_scheduled_run_attempt_retention_delete_guard;
+
+create trigger trg_scheduled_run_attempt_retention_delete_guard
+before delete on scheduled_run_attempts
+when not exists (
+  select 1
+  from scheduled_delivery_retention_ledger ledger
+  join scheduled_delivery_retention_audit audit
+    on audit.delivery_id = ledger.delivery_id
+    and audit.operation_id = ledger.operation_id
+    and audit.run_id = ledger.run_id
+    and audit.job_id = ledger.job_id
+  where ledger.run_id = old.run_id
+    and ledger.job_id = old.job_id
+    and audit.completed_at is null
+    and ledger.completed_at is null
+    and audit.expected_deliveries_deleted = (
+      select count(*) from scheduled_delivery_retention_ledger item where item.run_id = old.run_id
+    )
+    and not exists (
+      select 1 from scheduled_delivery_retention_ledger item
+      where item.run_id = old.run_id
+        and not exists (
+          select 1 from scheduled_delivery_retention_audit authority
+          where authority.delivery_id = item.delivery_id
+            and authority.operation_id = item.operation_id
+            and authority.run_id = item.run_id
+            and authority.job_id = item.job_id
+            and authority.completed_at is null
+        )
+    )
+    and not exists (
+      select 1 from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id and baseline.job_id = old.job_id
+    )
+)
+and not exists (
+  select 1
+  from scheduled_run_retention_audit audit
+  join scheduled_runs run on run.run_id = old.run_id and run.job_id = old.job_id
+  where audit.run_id = old.run_id
+    and audit.job_id = old.job_id
+    and audit.completed_at is null
+    and audit.run_state = run.state
+    and audit.job_generation = run.job_generation
+    and audit.schedule_generation = run.schedule_generation
+)
+begin
+  select raise(abort, 'scheduled run attempt deletion requires retention authority');
+end;
+
+drop trigger trg_scheduled_run_retention_delete_guard;
+
+create trigger trg_scheduled_run_retention_delete_guard
+before delete on scheduled_runs
+when not exists (
+  select 1
+  from scheduled_delivery_retention_ledger ledger
+  join scheduled_delivery_retention_audit audit
+    on audit.delivery_id = ledger.delivery_id
+    and audit.operation_id = ledger.operation_id
+    and audit.run_id = ledger.run_id
+    and audit.job_id = ledger.job_id
+  where ledger.run_id = old.run_id
+    and ledger.job_id = old.job_id
+    and old.state = 'succeeded'
+    and audit.completed_at is null
+    and ledger.completed_at is null
+    and audit.expected_deliveries_deleted = (
+      select count(*) from scheduled_delivery_retention_ledger item where item.run_id = old.run_id
+    )
+    and not exists (
+      select 1 from scheduled_delivery_retention_ledger item
+      where item.run_id = old.run_id
+        and not exists (
+          select 1 from scheduled_delivery_retention_audit authority
+          where authority.delivery_id = item.delivery_id
+            and authority.operation_id = item.operation_id
+            and authority.run_id = item.run_id
+            and authority.job_id = item.job_id
+            and authority.completed_at is null
+        )
+    )
+    and not exists (
+      select 1 from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id and baseline.job_id = old.job_id
+    )
+)
+and not exists (
+  select 1
+  from scheduled_run_retention_audit audit
+  where audit.run_id = old.run_id
+    and audit.job_id = old.job_id
+    and audit.completed_at is null
+    and audit.run_state = old.state
+    and audit.job_generation = old.job_generation
+    and audit.schedule_generation = old.schedule_generation
+    and old.state in ('failed', 'timed_out', 'cancelled')
+    and not exists (
+      select 1 from scheduled_run_deliveries delivery where delivery.run_id = old.run_id
+    )
+    and not exists (
+      select 1 from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id and baseline.job_id = old.job_id
+    )
+)
+begin
+  select raise(abort, 'scheduled run deletion requires retention authority');
 end;

@@ -560,11 +560,15 @@ pub(crate) fn validate_resolved_targets(
       InvocationPrincipalRef::ChannelActor { workspace_id, .. } => target.tenant() == workspace_id,
       InvocationPrincipalRef::Service { .. } => true,
     };
-    let identity_address = identity_address(&address)?;
-    let expected_identity = digest_json(&json!({
-      "provider": target.provider(), "connector": target.connector(), "tenant": target.tenant(),
-      "kind": target.kind(), "address": identity_address,
-    }))?;
+    let none_identity_matches = if matches!(requested, DeliveryTargetRequest::None) {
+      let expected_identity = digest_json(&json!({
+        "provider": target.provider(), "connector": target.connector(), "tenant": target.tenant(),
+        "kind": target.kind(), "address": address,
+      }))?;
+      target.identity_digest() == expected_identity
+    } else {
+      true
+    };
     if authority.provider != expected_provider
       || target.provider() != authority.provider
       || target.connector() != authority.connector
@@ -572,7 +576,7 @@ pub(crate) fn validate_resolved_targets(
       || !kind_matches
       || target.resolver_version() != authority.resolver_version
       || target.resolver_digest() != authority.resolver_digest
-      || target.identity_digest() != expected_identity
+      || !none_identity_matches
     {
       return Err(ScheduleServiceError::ResolverUnavailable);
     }
@@ -799,56 +803,9 @@ fn validate_address_against_request(
       .then_some(())
       .ok_or(ScheduleServiceError::ResolverUnavailable);
   }
-  let object = address
-    .as_object()
-    .ok_or(ScheduleServiceError::ResolverUnavailable)?;
-  if object.len() != 7
-    || object.get("schema_version").and_then(Value::as_u64) != Some(u64::from(SNAPSHOT_VERSION))
-    || object.get("workspace_id").and_then(Value::as_str) != Some(target.tenant())
-    || object
-      .get("routing_authority")
-      .and_then(Value::as_object)
-      .is_none_or(|authority| {
-        authority.len() != 4
-          || authority.get("team_id").and_then(Value::as_str) != Some(target.tenant())
-          || authority.get("context_team_id").and_then(Value::as_str) != Some(target.tenant())
-          || authority
-            .get("conversation_host_id")
-            .and_then(Value::as_str)
-            .is_none_or(|host| !(host.starts_with('T') || host.starts_with('E')))
-          || authority.get("enterprise_id").is_none_or(|value| {
-            !value.is_null()
-              && value
-                .as_str()
-                .is_none_or(|enterprise_id| !enterprise_id.starts_with('E'))
-          })
-      })
-    || object
-      .get("created_at")
-      .and_then(Value::as_i64)
-      .is_none_or(|value| value < 0)
-    || object
-      .get("authorization_evidence")
-      .and_then(Value::as_object)
-      .is_none_or(|evidence| {
-        evidence.len() != 2
-          || evidence
-            .get("version")
-            .and_then(Value::as_u64)
-            .is_none_or(|value| value == 0)
-          || evidence
-            .get("digest")
-            .and_then(Value::as_str)
-            .is_none_or(|digest| {
-              digest.len() != 64
-                || !digest
-                  .bytes()
-                  .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            })
-      })
-  {
-    return Err(ScheduleServiceError::ResolverUnavailable);
-  }
+  let route = target
+    .delivery_route()
+    .map_err(|_| ScheduleServiceError::ResolverUnavailable)?;
   let resolution_request = match requested {
     DeliveryTargetRequest::Origin => origin_resolution_request(
       invocation
@@ -874,14 +831,35 @@ fn validate_address_against_request(
     DeliveryTargetRequest::None => unreachable!("handled above"),
   };
   let expected_request_digest = digest_json(&resolution_request_json(&resolution_request))?;
-  if object
-    .get("requested_identity_digest")
-    .and_then(Value::as_str)
-    != Some(expected_request_digest.as_str())
-  {
+  if route.requested_identity_digest() != expected_request_digest {
     return Err(ScheduleServiceError::ResolverUnavailable);
   }
-  Ok(())
+  let route_matches = match resolution_request {
+    SlackTargetResolutionRequest::Channel { channel_id } => {
+      route.kind() == "channel"
+        && route.conversation_id() == channel_id
+        && route.thread_id().is_none()
+    }
+    SlackTargetResolutionRequest::DirectMessageUser { .. } => {
+      route.kind() == "direct_message" && route.thread_id().is_none()
+    }
+    SlackTargetResolutionRequest::DirectMessageConversation { channel_id } => {
+      route.kind() == "direct_message"
+        && route.conversation_id() == channel_id
+        && route.thread_id().is_none()
+    }
+    SlackTargetResolutionRequest::Thread {
+      channel_id,
+      thread_ts,
+    } => {
+      route.kind() == "thread"
+        && route.conversation_id() == channel_id
+        && route.thread_id() == Some(thread_ts.as_str())
+    }
+  };
+  route_matches
+    .then_some(())
+    .ok_or(ScheduleServiceError::ResolverUnavailable)
 }
 
 fn target_kind(target: &DeliveryTargetRequest) -> &'static str {
@@ -912,7 +890,7 @@ fn build_target_snapshot(
     "kind": kind,
     "address": identity_address,
   }))?;
-  DeliveryTargetSnapshot::new(
+  let snapshot = DeliveryTargetSnapshot::new(
     format!("target_{}", &identity_digest[..32]),
     provider,
     connector,
@@ -923,5 +901,9 @@ fn build_target_snapshot(
     resolver_digest,
     identity_digest,
   )
-  .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))
+  .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?;
+  snapshot
+    .delivery_route()
+    .map_err(|_| ScheduleServiceError::ResolverUnavailable)?;
+  Ok(snapshot)
 }

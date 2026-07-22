@@ -18,7 +18,7 @@ use codeoff_state::{
   StateError, StateStore, StateValueError, TransactionalMutationOutcome, TransportConvergence,
   UpdateScheduledJob,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::SqlitePool;
@@ -106,33 +106,48 @@ fn resolved_slack_target(
     || json!({"channel_id": channel_id}),
     |thread_ts| json!({"channel_id": channel_id, "thread_ts": thread_ts}),
   );
+  let routing_authority = json!({
+    "context_team_id": "workspace",
+    "conversation_host_id": "workspace",
+    "enterprise_id": null,
+    "team_id": "workspace",
+  });
+  let address = json!({
+    "authorization_evidence": {
+      "digest": test_sha256_hex("authorization-evidence"),
+      "version": 2,
+    },
+    "coordinates": coordinates,
+    "created_at": 100,
+    "requested_identity_digest": test_sha256_hex(job),
+    "routing_authority": routing_authority,
+    "schema_version": 1,
+    "workspace_id": "workspace",
+  });
+  let identity_digest = test_sha256_hex(
+    &json!({
+      "address": {
+        "coordinates": address["coordinates"].clone(),
+        "routing_authority": address["routing_authority"].clone(),
+        "workspace_id": "workspace",
+      },
+      "connector": "slack-default",
+      "kind": kind,
+      "provider": "slack",
+      "tenant": "workspace",
+    })
+    .to_string(),
+  );
   DeliveryTargetSnapshot::new(
     format!("target-{job}-resolved"),
     "slack",
     "slack-default",
     "workspace",
     kind,
-    json!({
-      "authorization_evidence": {"digest": "evidence", "version": 2},
-      "coordinates": coordinates,
-      "created_at": 100,
-      "requested_identity_digest": test_sha256_hex(job),
-      "routing_authority": {
-        "context_team_id": "workspace",
-        "conversation_host_id": "workspace",
-        "enterprise_id": null,
-        "team_id": "workspace",
-      },
-      "schema_version": 1,
-      "workspace_id": "workspace",
-    })
-    .to_string(),
+    address.to_string(),
     1,
     "slack-web-api-v2",
-    test_sha256_hex(&format!(
-      "{job}:{kind}:{channel_id}:{}",
-      thread_ts.unwrap_or("")
-    )),
+    identity_digest,
   )
   .expect("resolved Slack target")
 }
@@ -7077,6 +7092,240 @@ async fn test_operator_delivered_receipt_binds_resolved_channel_dm_and_thread_ro
       .await,
     Err(StateError::InvalidSchedulerState { .. })
   ));
+}
+
+fn mutate_persisted_delivery_route(target: &mut Value, mutation: &str) {
+  let object = target.as_object_mut().expect("target object");
+  match mutation {
+    "evidence_malformed" => object["address"]["authorization_evidence"] = json!("invalid"),
+    "evidence_missing" => {
+      object["address"]["authorization_evidence"]
+        .as_object_mut()
+        .expect("evidence object")
+        .remove("digest");
+    }
+    "evidence_extra" => object["address"]["authorization_evidence"]["extra"] = json!(true),
+    "evidence_zero_version" => {
+      object["address"]["authorization_evidence"]["version"] = json!(0);
+    }
+    "evidence_invalid_digest" => {
+      object["address"]["authorization_evidence"]["digest"] = json!("not-a-digest");
+    }
+    "authority_malformed" => object["address"]["routing_authority"] = json!("invalid"),
+    "authority_missing" => {
+      object["address"]["routing_authority"]
+        .as_object_mut()
+        .expect("authority object")
+        .remove("team_id");
+    }
+    "authority_extra" => object["address"]["routing_authority"]["extra"] = json!(true),
+    "authority_team_mismatch" => {
+      object["address"]["routing_authority"]["team_id"] = json!("other-workspace");
+    }
+    "authority_context_mismatch" => {
+      object["address"]["routing_authority"]["context_team_id"] = json!("other-workspace");
+    }
+    "authority_host_missing" => {
+      object["address"]["routing_authority"]
+        .as_object_mut()
+        .expect("authority object")
+        .remove("conversation_host_id");
+    }
+    "authority_host_empty" => {
+      object["address"]["routing_authority"]["conversation_host_id"] = json!("");
+    }
+    "authority_enterprise_type" => {
+      object["address"]["routing_authority"]["enterprise_id"] = json!(7);
+    }
+    "authority_enterprise_empty" => {
+      object["address"]["routing_authority"]["enterprise_id"] = json!("");
+    }
+    "outer_identity_invalid" => object["identity_digest"] = json!("not-a-digest"),
+    "outer_identity_mismatch" => object["identity_digest"] = json!("f".repeat(64)),
+    "outer_missing" => {
+      object.remove("identity_digest");
+    }
+    "outer_extra" => {
+      object.insert("extra".to_owned(), json!(true));
+    }
+    "outer_connector_empty" => object["connector"] = json!(""),
+    "outer_provider_empty" => object["provider"] = json!(""),
+    "outer_tenant_empty" => object["tenant"] = json!(""),
+    "outer_kind_unknown" => object["kind"] = json!("unknown"),
+    "outer_resolver_digest_empty" => object["resolver_digest"] = json!(""),
+    "outer_resolver_version_zero" => object["resolver_version"] = json!(0),
+    "address_created_at_negative" => object["address"]["created_at"] = json!(-1),
+    "address_workspace_mismatch" => {
+      object["address"]["workspace_id"] = json!("other-workspace");
+    }
+    "address_schema_version_zero" => object["address"]["schema_version"] = json!(0),
+    "address_requested_digest_missing" => {
+      object["address"]
+        .as_object_mut()
+        .expect("address object")
+        .remove("requested_identity_digest");
+    }
+    "address_requested_digest_invalid" => {
+      object["address"]["requested_identity_digest"] = json!("not-a-digest");
+    }
+    "address_missing" => {
+      object["address"]
+        .as_object_mut()
+        .expect("address object")
+        .remove("created_at");
+    }
+    "address_extra" => object["address"]["extra"] = json!(true),
+    "coordinates_missing_channel" => {
+      object["address"]["coordinates"]
+        .as_object_mut()
+        .expect("coordinates object")
+        .remove("channel_id");
+    }
+    "coordinates_extra" => object["address"]["coordinates"]["extra"] = json!(true),
+    "coordinates_channel_type" => object["address"]["coordinates"]["channel_id"] = json!(7),
+    "coordinates_unexpected_thread" => {
+      object["address"]["coordinates"]["thread_ts"] = json!("100.000000");
+    }
+    "coordinates_thread_missing" => object["kind"] = json!("thread"),
+    _ => panic!("unknown route mutation: {mutation}"),
+  }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_operator_rejects_invalid_persisted_route_without_mutating_authority() {
+  let temp = tempdir().expect("create tempdir");
+  let state_path = temp.path().join("state");
+  let store = StateStore::initialize(&state_path, None)
+    .await
+    .expect("initialize store");
+  let mutations = [
+    "evidence_malformed",
+    "evidence_missing",
+    "evidence_extra",
+    "evidence_zero_version",
+    "evidence_invalid_digest",
+    "authority_malformed",
+    "authority_missing",
+    "authority_extra",
+    "authority_team_mismatch",
+    "authority_context_mismatch",
+    "authority_host_missing",
+    "authority_host_empty",
+    "authority_enterprise_type",
+    "authority_enterprise_empty",
+    "outer_identity_invalid",
+    "outer_identity_mismatch",
+    "outer_missing",
+    "outer_extra",
+    "outer_connector_empty",
+    "outer_provider_empty",
+    "outer_tenant_empty",
+    "outer_kind_unknown",
+    "outer_resolver_digest_empty",
+    "outer_resolver_version_zero",
+    "address_created_at_negative",
+    "address_workspace_mismatch",
+    "address_schema_version_zero",
+    "address_requested_digest_missing",
+    "address_requested_digest_invalid",
+    "address_missing",
+    "address_extra",
+    "coordinates_missing_channel",
+    "coordinates_extra",
+    "coordinates_channel_type",
+    "coordinates_unexpected_thread",
+    "coordinates_thread_missing",
+  ];
+  let mut unknowns = Vec::with_capacity(mutations.len());
+  for (index, _) in mutations.iter().enumerate() {
+    let job_id = format!("operator-route-{index}");
+    let scheduled_for = 600 + i64::try_from(index).expect("bounded mutation index") * 20;
+    unknowns.push(prepare_operator_unknown_delivery(&store, &job_id, scheduled_for).await);
+  }
+  let pool = SqlitePool::connect(&database_url(&state_path))
+    .await
+    .expect("connect database");
+  sqlx::query("drop trigger trg_scheduled_delivery_identity_immutable")
+    .execute(&pool)
+    .await
+    .expect("allow corruption fixture to replace immutable target");
+
+  for ((index, mutation), unknown) in mutations.into_iter().enumerate().zip(unknowns) {
+    let scheduled_for = 600 + i64::try_from(index).expect("bounded mutation index") * 20;
+    let target_json: String =
+      sqlx::query_scalar("select target_json from scheduled_run_deliveries where delivery_id = ?1")
+        .bind(unknown.binding.delivery_id())
+        .fetch_one(&pool)
+        .await
+        .expect("read immutable target");
+    let mut target: Value = serde_json::from_str(&target_json).expect("canonical target");
+    mutate_persisted_delivery_route(&mut target, mutation);
+    sqlx::query("update scheduled_run_deliveries set target_json = ?1 where delivery_id = ?2")
+      .bind(target.to_string())
+      .bind(unknown.binding.delivery_id())
+      .execute(&pool)
+      .await
+      .unwrap_or_else(|error| panic!("persist corruption fixture {mutation}: {error}"));
+
+    let receipt = operator_provider_receipt("slack", "workspace", "channel", "C1", "message-1");
+    let (evidence_json, evidence_digest) = operator_delivery_evidence(
+      "provider_confirmed_delivered",
+      mutation,
+      "slack",
+      "workspace",
+      "channel",
+      Some(&receipt),
+    );
+    let action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+      provider_receipt: receipt,
+      evidence_json,
+      evidence_digest,
+    };
+    let request = SchedulerOperatorRequest::for_delivery_action(
+      owner(),
+      mutation,
+      unknown.binding.delivery_id(),
+      unknown.binding.attempt(),
+      unknown.binding.fence(),
+      &action,
+      scheduled_for + 10,
+    )
+    .expect("operator request");
+    assert!(
+      matches!(
+        store
+          .operator_act_on_unknown_delivery(
+            &request,
+            unknown.binding.delivery_id(),
+            unknown.binding.attempt(),
+            unknown.binding.fence(),
+            &action,
+          )
+          .await,
+        Err(StateError::InvalidSchedulerState { .. })
+      ),
+      "mutation {mutation} must fail closed"
+    );
+    let authority: (String, String, i64, i64, i64) = sqlx::query_as(
+      "select delivery.state, attempt.state, (select count(*) from scheduler_operator_actions where target_id = delivery.delivery_id), (select count(*) from scheduler_operator_action_consumptions where target_id = delivery.delivery_id), (select count(*) from scheduled_delivery_baselines where job_id = delivery.job_id) from scheduled_run_deliveries delivery join scheduled_delivery_attempts attempt on attempt.delivery_id = delivery.delivery_id and attempt.attempt = delivery.attempt where delivery.delivery_id = ?1",
+    )
+    .bind(unknown.binding.delivery_id())
+    .fetch_one(&pool)
+    .await
+    .expect("read operator transaction authority");
+    assert_eq!(
+      authority,
+      (
+        "delivery_unknown".to_owned(),
+        "delivery_unknown".to_owned(),
+        0,
+        0,
+        0
+      ),
+      "mutation {mutation} changed authority"
+    );
+  }
 }
 
 async fn operator_delivery_action_after_barrier(

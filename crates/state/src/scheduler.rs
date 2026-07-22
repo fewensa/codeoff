@@ -244,6 +244,7 @@ pub struct DeliveryTargetRoute {
   kind: String,
   conversation_id: String,
   thread_id: Option<String>,
+  requested_identity_digest: String,
 }
 
 impl DeliveryTargetRoute {
@@ -281,35 +282,35 @@ impl DeliveryTargetRoute {
     ];
     if target.len() != target_keys.len()
       || target_keys.iter().any(|key| !target.contains_key(*key))
-      || target.get("resolver_version").and_then(Value::as_u64) != Some(1)
+      || target
+        .get("resolver_version")
+        .and_then(Value::as_u64)
+        .is_none_or(|version| version == 0 || version > u64::from(u32::MAX))
     {
       return Err(StateValueError::InvalidJson {
         field: "delivery target route",
       });
     }
-    let provider =
-      target
-        .get("provider")
-        .and_then(Value::as_str)
-        .ok_or(StateValueError::InvalidJson {
-          field: "delivery target route",
-        })?;
-    let tenant =
-      target
-        .get("tenant")
-        .and_then(Value::as_str)
-        .ok_or(StateValueError::InvalidJson {
-          field: "delivery target route",
-        })?;
+    let provider = required_delivery_route_text(target, "provider")?;
+    let connector = required_delivery_route_text(target, "connector")?;
+    let tenant = required_delivery_route_text(target, "tenant")?;
     let kind = target
       .get("kind")
       .and_then(Value::as_str)
       .ok_or(StateValueError::InvalidJson {
         field: "delivery target route",
       })?;
-    for value in [provider, tenant, kind] {
+    let resolver_digest = required_delivery_route_text(target, "resolver_digest")?;
+    for value in [provider, connector, tenant, kind, resolver_digest] {
       validate_text("delivery target route identity", value)?;
     }
+    let identity_digest = target
+      .get("identity_digest")
+      .and_then(Value::as_str)
+      .ok_or(StateValueError::InvalidJson {
+        field: "delivery target route",
+      })?;
+    validate_lowercase_sha256("delivery target identity digest", identity_digest)?;
     if !matches!(kind, "channel" | "direct_message" | "thread") {
       return Err(StateValueError::InvalidJson {
         field: "delivery target route",
@@ -318,13 +319,31 @@ impl DeliveryTargetRoute {
     let address = target.get("address").ok_or(StateValueError::InvalidJson {
       field: "delivery target route",
     })?;
-    let (conversation_id, thread_id) = parse_delivery_target_route_address(address, tenant, kind)?;
+    let (conversation_id, thread_id, requested_identity_digest, identity_address) =
+      parse_delivery_target_route_address(address, tenant, kind)?;
+    let expected_identity_digest = sha256_hex(
+      json!({
+        "address": identity_address,
+        "connector": connector,
+        "kind": kind,
+        "provider": provider,
+        "tenant": tenant,
+      })
+      .to_string()
+      .as_bytes(),
+    );
+    if expected_identity_digest != identity_digest {
+      return Err(StateValueError::InvalidSha256 {
+        field: "delivery target identity digest",
+      });
+    }
     Ok(Self {
       provider: provider.to_owned(),
       tenant: tenant.to_owned(),
       kind: kind.to_owned(),
       conversation_id,
       thread_id,
+      requested_identity_digest,
     })
   }
 
@@ -352,13 +371,30 @@ impl DeliveryTargetRoute {
   pub fn thread_id(&self) -> Option<&str> {
     self.thread_id.as_deref()
   }
+
+  #[must_use]
+  pub fn requested_identity_digest(&self) -> &str {
+    &self.requested_identity_digest
+  }
+}
+
+fn required_delivery_route_text<'a>(
+  object: &'a serde_json::Map<String, Value>,
+  key: &'static str,
+) -> Result<&'a str, StateValueError> {
+  object
+    .get(key)
+    .and_then(Value::as_str)
+    .ok_or(StateValueError::InvalidJson {
+      field: "delivery target route",
+    })
 }
 
 fn parse_delivery_target_route_address(
   address: &Value,
   tenant: &str,
   kind: &str,
-) -> Result<(String, Option<String>), StateValueError> {
+) -> Result<(String, Option<String>, String, Value), StateValueError> {
   let address = address.as_object().ok_or(StateValueError::InvalidJson {
     field: "delivery target route",
   })?;
@@ -375,27 +411,38 @@ fn parse_delivery_target_route_address(
     || address_keys.iter().any(|key| !address.contains_key(*key))
     || address.get("schema_version").and_then(Value::as_u64) != Some(1)
     || address.get("workspace_id").and_then(Value::as_str) != Some(tenant)
-    || !address
-      .get("authorization_evidence")
-      .is_some_and(Value::is_object)
-    || !address
-      .get("routing_authority")
-      .is_some_and(Value::is_object)
-    || address.get("created_at").and_then(Value::as_i64).is_none()
+    || address
+      .get("created_at")
+      .and_then(Value::as_i64)
+      .is_none_or(|created_at| created_at < 0)
   {
     return Err(StateValueError::InvalidJson {
       field: "delivery target route",
     });
   }
+  let requested_identity_digest = address
+    .get("requested_identity_digest")
+    .and_then(Value::as_str)
+    .ok_or(StateValueError::InvalidJson {
+      field: "delivery target route",
+    })?;
   validate_lowercase_sha256(
     "delivery target requested identity digest",
+    requested_identity_digest,
+  )?;
+  let routing_authority = validate_delivery_route_authority(
     address
-      .get("requested_identity_digest")
-      .and_then(Value::as_str)
+      .get("routing_authority")
       .ok_or(StateValueError::InvalidJson {
         field: "delivery target route",
       })?,
+    tenant,
   )?;
+  validate_delivery_route_evidence(address.get("authorization_evidence").ok_or(
+    StateValueError::InvalidJson {
+      field: "delivery target route",
+    },
+  )?)?;
   let coordinates = address
     .get("coordinates")
     .and_then(Value::as_object)
@@ -429,7 +476,80 @@ fn parse_delivery_target_route_address(
   if let Some(thread_id) = thread_id {
     validate_text("delivery target route thread", thread_id)?;
   }
-  Ok((conversation_id.to_owned(), thread_id.map(str::to_owned)))
+  let identity_address = json!({
+    "coordinates": Value::Object(coordinates.clone()),
+    "routing_authority": routing_authority,
+    "workspace_id": tenant,
+  });
+  Ok((
+    conversation_id.to_owned(),
+    thread_id.map(str::to_owned),
+    requested_identity_digest.to_owned(),
+    identity_address,
+  ))
+}
+
+fn validate_delivery_route_authority(
+  authority: &Value,
+  tenant: &str,
+) -> Result<Value, StateValueError> {
+  let authority = authority.as_object().ok_or(StateValueError::InvalidJson {
+    field: "delivery target route authority",
+  })?;
+  let keys = [
+    "context_team_id",
+    "conversation_host_id",
+    "enterprise_id",
+    "team_id",
+  ];
+  if authority.len() != keys.len()
+    || keys.iter().any(|key| !authority.contains_key(*key))
+    || authority.get("team_id").and_then(Value::as_str) != Some(tenant)
+    || authority.get("context_team_id").and_then(Value::as_str) != Some(tenant)
+  {
+    return Err(StateValueError::InvalidJson {
+      field: "delivery target route authority",
+    });
+  }
+  validate_text(
+    "delivery target conversation host",
+    required_delivery_route_text(authority, "conversation_host_id")?,
+  )?;
+  if let Some(enterprise_id) = authority.get("enterprise_id").and_then(Value::as_str) {
+    validate_text("delivery target enterprise", enterprise_id)?;
+  } else if !authority.get("enterprise_id").is_some_and(Value::is_null) {
+    return Err(StateValueError::InvalidJson {
+      field: "delivery target route authority",
+    });
+  }
+  Ok(Value::Object(authority.clone()))
+}
+
+fn validate_delivery_route_evidence(evidence: &Value) -> Result<(), StateValueError> {
+  let evidence = evidence.as_object().ok_or(StateValueError::InvalidJson {
+    field: "delivery target route evidence",
+  })?;
+  let keys = ["digest", "version"];
+  if evidence.len() != keys.len()
+    || keys.iter().any(|key| !evidence.contains_key(*key))
+    || evidence
+      .get("version")
+      .and_then(Value::as_u64)
+      .is_none_or(|version| version == 0)
+  {
+    return Err(StateValueError::InvalidJson {
+      field: "delivery target route evidence",
+    });
+  }
+  validate_lowercase_sha256(
+    "delivery target authorization evidence digest",
+    evidence
+      .get("digest")
+      .and_then(Value::as_str)
+      .ok_or(StateValueError::InvalidJson {
+        field: "delivery target route evidence",
+      })?,
+  )
 }
 
 impl DeliveryTargetSnapshot {

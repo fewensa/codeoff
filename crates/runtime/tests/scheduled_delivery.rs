@@ -10,7 +10,8 @@ use codeoff_runtime::scheduled_delivery::{
   DeliveryClock, DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderReadiness,
   DeliveryProviderReadinessRequest, DeliveryProviderRequest, ProviderMessageIdentity,
   ScheduledDeliveryTickOutcome, prepare_next_scheduled_delivery,
-  run_scheduled_delivery_tick_with_clock, run_scheduled_delivery_worker_with_clock,
+  run_scheduled_delivery_tick_with_clock as run_instrumented_scheduled_delivery_tick_with_clock,
+  run_scheduled_delivery_worker_with_clock,
 };
 use codeoff_runtime::scheduler_observability::{
   NoopSchedulerTelemetry, SchedulerOperation, SchedulerOperationStatus, SchedulerTelemetry,
@@ -19,7 +20,8 @@ use codeoff_runtime::scheduler_observability::{
 use codeoff_state::{
   AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
   CreateScheduledJob, DeliveryTargetSnapshot, PreparedScheduledDelivery, PrincipalKey,
-  ScheduleSpec, ScheduledJobDefinition, ScheduledRunResult, SkippedNoneBaselinePolicy, StateStore,
+  ScheduleSpec, ScheduledJobDefinition, ScheduledRunResult, SkippedNoneBaselinePolicy, StateError,
+  StateStore,
 };
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
@@ -512,6 +514,24 @@ fn delivery_id(run_id: &str, identity: &str) -> String {
 
 fn shutdown() -> watch::Receiver<bool> {
   watch::channel(false).1
+}
+
+async fn run_scheduled_delivery_tick_with_clock(
+  state: &StateStore,
+  provider: &dyn DeliveryProvider,
+  lease_owner: &str,
+  clock: Arc<dyn DeliveryClock>,
+  shutdown: watch::Receiver<bool>,
+) -> Result<ScheduledDeliveryTickOutcome, StateError> {
+  run_instrumented_scheduled_delivery_tick_with_clock(
+    state,
+    provider,
+    lease_owner,
+    clock,
+    shutdown,
+    Arc::new(NoopSchedulerTelemetry),
+  )
+  .await
 }
 
 fn baseline_identity(

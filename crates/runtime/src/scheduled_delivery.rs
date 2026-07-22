@@ -14,9 +14,8 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::scheduler_observability::{
-  NoopSchedulerTelemetry, SchedulerLoopGuard, SchedulerOperation, SchedulerOperationStatus,
-  SchedulerTelemetry, SchedulerTelemetryErrorKind, SchedulerTelemetryEvent, SchedulerWorker,
-  record_scheduler_event,
+  SchedulerLoopGuard, SchedulerOperation, SchedulerOperationStatus, SchedulerTelemetry,
+  SchedulerTelemetryErrorKind, SchedulerTelemetryEvent, SchedulerWorker, record_scheduler_event,
 };
 
 const DELIVERY_TICK_INTERVAL: Duration = Duration::from_millis(250);
@@ -472,6 +471,7 @@ pub async fn run_scheduled_delivery_tick(
   provider: &dyn DeliveryProvider,
   lease_owner: &str,
   shutdown: watch::Receiver<bool>,
+  telemetry: Arc<dyn SchedulerTelemetry>,
 ) -> Result<ScheduledDeliveryTickOutcome, StateError> {
   run_scheduled_delivery_tick_with_clock(
     state,
@@ -479,6 +479,7 @@ pub async fn run_scheduled_delivery_tick(
     lease_owner,
     Arc::new(SystemDeliveryClock),
     shutdown,
+    telemetry,
   )
   .await
 }
@@ -489,9 +490,9 @@ pub async fn run_scheduled_delivery_tick_with_clock(
   lease_owner: &str,
   clock: Arc<dyn DeliveryClock>,
   shutdown: watch::Receiver<bool>,
+  telemetry: Arc<dyn SchedulerTelemetry>,
 ) -> Result<ScheduledDeliveryTickOutcome, StateError> {
   let mut worker_state = DeliveryWorkerState::default();
-  let telemetry = NoopSchedulerTelemetry;
   run_scheduled_delivery_tick_with_timeline(
     state,
     provider,
@@ -499,7 +500,7 @@ pub async fn run_scheduled_delivery_tick_with_clock(
     DeliveryTimeline::new(clock),
     shutdown,
     &mut worker_state,
-    &telemetry,
+    telemetry.as_ref(),
   )
   .await
 }

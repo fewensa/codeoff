@@ -249,6 +249,23 @@ mod tests {
   }
 
   #[test]
+  fn test_loop_guard_drop_emits_exactly_one_aborted_terminal_event() {
+    let telemetry = Arc::new(RecordingTelemetry::default());
+    drop(SchedulerLoopGuard::start(
+      telemetry.clone(),
+      SchedulerWorker::Delivery,
+    ));
+    let events = telemetry.events.lock().expect("events");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].status, SchedulerOperationStatus::Started);
+    assert_eq!(events[1].status, SchedulerOperationStatus::Aborted);
+    assert_eq!(
+      events[1].error_kind,
+      Some(SchedulerTelemetryErrorKind::Worker)
+    );
+  }
+
+  #[test]
   fn test_loop_guard_reports_unwind_without_identifier_fields() {
     let telemetry = Arc::new(RecordingTelemetry::default());
     let unwind = catch_unwind(AssertUnwindSafe({

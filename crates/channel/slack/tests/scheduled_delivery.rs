@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use codeoff_channel_slack::{
@@ -13,6 +13,7 @@ use codeoff_runtime::scheduled_delivery::{
   DeliveryProviderReadinessRequest, DeliveryProviderRequest, ScheduledDeliveryTickOutcome,
   run_scheduled_delivery_tick,
 };
+use codeoff_runtime::scheduler_observability::NoopSchedulerTelemetry;
 use codeoff_state::{
   AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
   ClaimedScheduledDelivery, CreateScheduledJob, DeliveryTargetSnapshot, PreparedScheduledDelivery,
@@ -325,6 +326,7 @@ async fn runtime_terminalizes_oversized_slack_payload_without_write_retry_or_bas
       &provider,
       "oversized-worker",
       tokio::sync::watch::channel(false).1,
+      Arc::new(NoopSchedulerTelemetry),
     )
     .await
     .expect("oversized delivery"),
@@ -366,6 +368,7 @@ async fn runtime_terminalizes_oversized_slack_payload_without_write_retry_or_bas
       &provider,
       "oversized-worker",
       tokio::sync::watch::channel(false).1,
+      Arc::new(NoopSchedulerTelemetry),
     )
     .await
     .expect("terminal delivery is not retried"),
@@ -499,6 +502,7 @@ async fn runtime_delivers_slack_result_skips_exact_repeat_and_sends_utf8_change(
       &provider,
       "delivery-worker-a",
       tokio::sync::watch::channel(false).1,
+      Arc::new(NoopSchedulerTelemetry),
     )
     .await
     .expect("first delivery"),
@@ -574,6 +578,7 @@ async fn runtime_delivers_slack_result_skips_exact_repeat_and_sends_utf8_change(
       &provider,
       "delivery-worker-b",
       tokio::sync::watch::channel(false).1,
+      Arc::new(NoopSchedulerTelemetry),
     )
     .await
     .expect("repeat delivery"),
@@ -609,6 +614,7 @@ async fn runtime_delivers_slack_result_skips_exact_repeat_and_sends_utf8_change(
       &provider,
       "delivery-worker-c",
       tokio::sync::watch::channel(false).1,
+      Arc::new(NoopSchedulerTelemetry),
     )
     .await
     .expect("changed delivery"),

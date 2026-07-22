@@ -81,17 +81,39 @@ run_claims_enabled = false
 delivery_claims_enabled = false
 recovery_batch_limit = 32
 materialization_batch_limit = 32
+occurrence_search_limit = 100000
 tick_interval_ms = 250
 error_backoff_ms = 1000
-lease_seconds = 60
-heartbeat_interval_ms = 15000
-total_timeout_seconds = 1800
-prepare_grace_ms = 5000
-cancellation_grace_ms = 5000
-finalization_grace_ms = 5000
-retry_delay_seconds = 30
+minimum_schedule_cadence_seconds = 60
+max_active_jobs = 1000
+max_active_jobs_per_owner = 100
+max_prompt_bytes = 65536
+max_result_bytes = 65536
+max_summary_bytes = 32768
+run_lease_seconds = 60
+run_heartbeat_interval_ms = 15000
+run_timeout_seconds = 1800
+run_prepare_grace_ms = 5000
+run_cancellation_grace_ms = 5000
+run_finalization_grace_ms = 5000
+run_retry_base_seconds = 30
+run_retry_max_seconds = 300
 run_deadline_seconds = 3600
-max_attempts = 3
+run_max_attempts = 3
+delivery_tick_interval_ms = 250
+delivery_batch_limit = 32
+delivery_lease_seconds = 60
+delivery_heartbeat_interval_ms = 10000
+delivery_readiness_timeout_seconds = 10
+delivery_send_timeout_seconds = 30
+delivery_finalization_timeout_seconds = 5
+delivery_max_attempts = 5
+delivery_retry_base_seconds = 5
+delivery_retry_max_seconds = 300
+delivery_retry_after_max_seconds = 3600
+delivery_deadline_seconds = 3600
+delivery_readiness_retry_base_seconds = 1
+delivery_readiness_retry_max_seconds = 60
 
 [slack]
 workspace_id = "T00000000"
@@ -154,6 +176,8 @@ bind = "127.0.0.1:7789"
 Secrets 必須來自 environment variables 或 secret manager，不寫入版本控制。
 
 `scheduler.enabled` 是 scheduler global switch。`run_claims_enabled` 與 `delivery_claims_enabled` 是獨立的 fail-closed kill switches：run claims disabled 時不會消費 pending Agent work；delivery claims disabled 時仍會 prepare payload，但不會送往 provider。啟用 delivery claims 必須提供對應 provider credentials。Scheduler state 可跨 restart 持久保存，delivery retry 或 unknown-resolution operation 不會重新執行 Agent occurrence。
+
+每次 create、update 或 resume job 都會保存一份 validated operational policy snapshot。Materialized run 與 delivery intent 會繼承該 immutable snapshot，因此 retry、deadline、lease、size 與 attempt 行為在 restart 或後續 config 變更後仍保持穩定。`data_retention` 仍是 retention-day policy 的唯一 authority；scheduler operational snapshot 不會複製 retention 設定。
 
 啟用 `run_claims_enabled` 時也必須提供 dedicated `[agent.scheduled_codex]` profile。Startup 會驗證 Codex binary 與 dedicated config 的 exact digest、read-only filesystem boundary、pinned loopback GitHub MCP identity，以及綁定完整 profile 且仍在有效期內的 Ed25519-signed isolation attestation。Evidence 缺失、過期、格式錯誤或 mismatch 時，`serve` 會在 run claims 啟動前 fail closed。Scheduled turn 使用 fresh、channel-independent session，不暴露 dynamic tools，並在 `turn/start` 前持久化已 attested 的 read-only execution surface。
 

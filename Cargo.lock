@@ -364,6 +364,7 @@ dependencies = [
 name = "codeoff-config"
 version = "0.1.0"
 dependencies = [
+ "codeoff-core",
  "serde",
  "tempfile",
  "thiserror",
@@ -373,6 +374,9 @@ dependencies = [
 [[package]]
 name = "codeoff-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "codeoff-mcp"
@@ -397,6 +401,7 @@ dependencies = [
  "codeoff-agent-contract",
  "codeoff-channel-contract",
  "codeoff-config",
+ "codeoff-core",
  "codeoff-state",
  "serde_json",
  "sha2 0.10.9",
@@ -411,6 +416,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "codeoff-channel-contract",
+ "codeoff-core",
  "croner",
  "jiff",
  "jiff-tzdb",

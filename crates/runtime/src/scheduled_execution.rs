@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use codeoff_agent_contract::{
   AgentTask, InvocationPrincipal, InvocationSource, PreviousSuccessContext, SessionMode, ToolPolicy,
 };
+use codeoff_core::SchedulerOperationalPolicy;
 use codeoff_state::{
   AttestedExecutionProfileSnapshot, ClaimedScheduledRun, ExpiredRunReclaimOutcome,
   PreflightFailureDisposition, RunLeaseBinding, ScheduledExecutionDisposition,
@@ -64,45 +65,11 @@ impl GlobalTurnBudget {
   }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScheduledWorkerConfig {
   pub enabled: bool,
   pub run_claims_enabled: bool,
-  pub recovery_batch_limit: u16,
-  pub materialization_batch_limit: u16,
-  pub tick_interval_ms: u64,
-  pub error_backoff_ms: u64,
-  pub lease_seconds: u16,
-  pub heartbeat_interval_ms: u64,
-  pub total_timeout_seconds: u32,
-  pub prepare_grace_ms: u64,
-  pub cancellation_grace_ms: u64,
-  pub finalization_grace_ms: u64,
-  pub retry_delay_seconds: u32,
-  pub run_deadline_seconds: u32,
-  pub max_attempts: u16,
-}
-
-impl Default for ScheduledWorkerConfig {
-  fn default() -> Self {
-    Self {
-      enabled: false,
-      run_claims_enabled: false,
-      recovery_batch_limit: 32,
-      materialization_batch_limit: 32,
-      tick_interval_ms: 250,
-      error_backoff_ms: 1_000,
-      lease_seconds: 60,
-      heartbeat_interval_ms: 15_000,
-      total_timeout_seconds: 1_800,
-      prepare_grace_ms: 5_000,
-      cancellation_grace_ms: 5_000,
-      finalization_grace_ms: 5_000,
-      retry_delay_seconds: 30,
-      run_deadline_seconds: 3_600,
-      max_attempts: 3,
-    }
-  }
+  pub operational_policy: SchedulerOperationalPolicy,
 }
 
 pub struct ScheduledWorkerHandle {
@@ -205,7 +172,7 @@ pub fn spawn_scheduled_worker(
     format!("codeoff-scheduler-{}", std::process::id()),
   );
   orchestrator.run_claims_enabled = config.run_claims_enabled;
-  orchestrator.policy = ExecutionPolicy::from_config(config);
+  orchestrator.policy = ExecutionPolicy::from_policy(&config.operational_policy);
   orchestrator.telemetry = telemetry.clone();
   let join = tokio::spawn(run_scheduled_worker(
     state,
@@ -351,18 +318,9 @@ async fn run_scheduled_worker_tick(
     return Ok(TickOutcome::Cancelled);
   }
   let now = orchestrator.clock.now();
-  let retry_at = checked_add(
-    now,
-    orchestrator.policy.retry_delay_seconds,
-    "recovery retry",
-  )?;
   for _ in 0..orchestrator.policy.recovery_batch_limit {
     let outcome = tokio::select! {
-      result = state.reclaim_next_expired_scheduled_run(
-        now,
-        orchestrator.policy.max_attempts,
-        retry_at,
-      ) => result?,
+      result = state.reclaim_next_expired_scheduled_run_from_snapshot(now) => result?,
       () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
     };
     if outcome == ExpiredRunReclaimOutcome::Idle {
@@ -549,7 +507,7 @@ enum HeartbeatStop {
   HardDeadline,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutionPolicy {
   recovery_batch_limit: u16,
   materialization_batch_limit: u32,
@@ -561,47 +519,27 @@ struct ExecutionPolicy {
   prepare_grace: Duration,
   cancellation_grace: Duration,
   finalization_grace: Duration,
-  retry_delay_seconds: i64,
-  run_deadline_seconds: i64,
-  max_attempts: i64,
 }
 
 impl Default for ExecutionPolicy {
   fn default() -> Self {
-    Self {
-      recovery_batch_limit: 32,
-      materialization_batch_limit: 32,
-      tick_interval: Duration::from_millis(250),
-      error_backoff: Duration::from_secs(1),
-      lease_seconds: 60,
-      heartbeat_interval: Duration::from_secs(15),
-      total_timeout: Duration::from_mins(30),
-      prepare_grace: Duration::from_secs(5),
-      cancellation_grace: Duration::from_secs(5),
-      finalization_grace: Duration::from_secs(5),
-      retry_delay_seconds: 30,
-      run_deadline_seconds: 3_600,
-      max_attempts: 3,
-    }
+    Self::from_policy(&SchedulerOperationalPolicy::default())
   }
 }
 
 impl ExecutionPolicy {
-  fn from_config(config: ScheduledWorkerConfig) -> Self {
+  fn from_policy(policy: &SchedulerOperationalPolicy) -> Self {
     Self {
-      recovery_batch_limit: config.recovery_batch_limit,
-      materialization_batch_limit: u32::from(config.materialization_batch_limit),
-      tick_interval: Duration::from_millis(config.tick_interval_ms),
-      error_backoff: Duration::from_millis(config.error_backoff_ms),
-      lease_seconds: i64::from(config.lease_seconds),
-      heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
-      total_timeout: Duration::from_secs(u64::from(config.total_timeout_seconds)),
-      prepare_grace: Duration::from_millis(config.prepare_grace_ms),
-      cancellation_grace: Duration::from_millis(config.cancellation_grace_ms),
-      finalization_grace: Duration::from_millis(config.finalization_grace_ms),
-      retry_delay_seconds: i64::from(config.retry_delay_seconds),
-      run_deadline_seconds: i64::from(config.run_deadline_seconds),
-      max_attempts: i64::from(config.max_attempts),
+      recovery_batch_limit: policy.recovery_batch_limit,
+      materialization_batch_limit: u32::from(policy.materialization_batch_limit),
+      tick_interval: Duration::from_millis(policy.tick_interval_ms),
+      error_backoff: Duration::from_millis(policy.error_backoff_ms),
+      lease_seconds: i64::from(policy.run_lease_seconds),
+      heartbeat_interval: Duration::from_millis(policy.run_heartbeat_interval_ms),
+      total_timeout: Duration::from_secs(u64::from(policy.run_timeout_seconds)),
+      prepare_grace: Duration::from_millis(policy.run_prepare_grace_ms),
+      cancellation_grace: Duration::from_millis(policy.run_cancellation_grace_ms),
+      finalization_grace: Duration::from_millis(policy.run_finalization_grace_ms),
     }
   }
 }
@@ -934,7 +872,7 @@ impl ScheduledRunOrchestrator {
   }
 
   async fn run_supervised_inner(
-    self,
+    mut self,
     shutdown: watch::Receiver<bool>,
     observed_attempt: &AtomicU64,
   ) -> Result<TickOutcome, StateError> {
@@ -952,22 +890,6 @@ impl ScheduledRunOrchestrator {
     if *shutdown.borrow() {
       return Ok(TickOutcome::Cancelled);
     }
-    let total_deadline = tokio::time::Instant::now()
-      .checked_add(self.policy.total_timeout)
-      .ok_or_else(|| StateError::InvalidSchedulerState {
-        reason: "scheduled total deadline overflow".to_owned(),
-      })?;
-    let terminal_commit_deadline = total_deadline
-      .checked_add(self.policy.prepare_grace)
-      .and_then(|deadline| deadline.checked_add(self.policy.cancellation_grace))
-      .ok_or_else(|| StateError::InvalidSchedulerState {
-        reason: "scheduled terminal commit deadline overflow".to_owned(),
-      })?;
-    let heartbeat_stop_deadline = terminal_commit_deadline
-      .checked_add(self.policy.finalization_grace)
-      .ok_or_else(|| StateError::InvalidSchedulerState {
-        reason: "scheduled heartbeat stop deadline overflow".to_owned(),
-      })?;
     let now = self.clock.now();
     let lease_expires_at = checked_add(now, self.policy.lease_seconds, "lease expiry")?;
     let claim_result = match &admission {
@@ -1026,6 +948,31 @@ impl ScheduledRunOrchestrator {
     let Some(claim) = claim else {
       return Ok(TickOutcome::Idle);
     };
+    let snapshot_policy = ExecutionPolicy::from_policy(&claim.scheduler_policy);
+    #[cfg(not(test))]
+    {
+      self.policy = snapshot_policy;
+    }
+    #[cfg(test)]
+    if self.policy == ExecutionPolicy::default() {
+      self.policy = snapshot_policy;
+    }
+    let total_deadline = tokio::time::Instant::now()
+      .checked_add(self.policy.total_timeout)
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "scheduled total deadline overflow".to_owned(),
+      })?;
+    let terminal_commit_deadline = total_deadline
+      .checked_add(self.policy.prepare_grace)
+      .and_then(|deadline| deadline.checked_add(self.policy.cancellation_grace))
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "scheduled terminal commit deadline overflow".to_owned(),
+      })?;
+    let heartbeat_stop_deadline = terminal_commit_deadline
+      .checked_add(self.policy.finalization_grace)
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "scheduled heartbeat stop deadline overflow".to_owned(),
+      })?;
     observed_attempt.store(
       u64::try_from(claim.binding.attempt()).unwrap_or(u64::MAX),
       Ordering::Release,
@@ -1372,7 +1319,11 @@ impl ScheduledRunOrchestrator {
     let disposition = if failure.retryable {
       PreflightFailureDisposition::RetryAt(checked_add(
         now,
-        self.policy.retry_delay_seconds,
+        i64::from(
+          claim
+            .scheduler_policy
+            .run_retry_delay_seconds(claim.binding.run_id(), claim.binding.attempt()),
+        ),
         "preflight retry",
       )?)
     } else {
@@ -1470,8 +1421,7 @@ impl ScheduledRunOrchestrator {
       }
       result => result,
     };
-    let (disposition, kind, message) =
-      execution_failure_disposition(claim, result, &self.policy, now)?;
+    let (disposition, kind, message) = execution_failure_disposition(claim, result, now)?;
     self
       .state
       .record_scheduled_run_execution_outcome(&claim.binding, disposition, kind, message, now)
@@ -1551,6 +1501,13 @@ fn task_from_claim(
   authority: &ScheduledPrepareAuthority,
 ) -> Result<AgentTask, PrepareFailure> {
   reject_dynamic_tool_exposure(&claim.capability_json)?;
+  if authority.instruction().len()
+    > usize::try_from(claim.scheduler_policy.max_prompt_bytes).unwrap_or(usize::MAX)
+  {
+    return Err(PrepareFailure::fatal(
+      "scheduled_instruction_exceeds_max_prompt_bytes",
+    ));
+  }
   let previous_success = authority
     .previous_success()
     .map(|content| PreviousSuccessContext {
@@ -1613,19 +1570,26 @@ fn contains_prohibited_tool(value: &Value, prohibited: &[&str]) -> bool {
 fn execution_failure_disposition(
   claim: &ClaimedScheduledRun,
   result: ExecutionResult,
-  policy: &ExecutionPolicy,
   now: i64,
 ) -> Result<(ScheduledExecutionDisposition, &'static str, &'static str), StateError> {
-  let retry_at = checked_add(now, policy.retry_delay_seconds, "execution retry")?;
+  let retry_at = checked_add(
+    now,
+    i64::from(
+      claim
+        .scheduler_policy
+        .run_retry_delay_seconds(claim.binding.run_id(), claim.binding.attempt()),
+    ),
+    "execution retry",
+  )?;
   let deadline_at = checked_add(
     claim.scheduled_for,
-    policy.run_deadline_seconds,
+    i64::from(claim.scheduler_policy.run_deadline_seconds),
     "execution deadline",
   )?;
   let retry = |exhausted| ScheduledExecutionDisposition::RetryAt {
     retry_at,
     deadline_at,
-    max_attempts: policy.max_attempts,
+    max_attempts: i64::from(claim.scheduler_policy.run_max_attempts),
     transport: TransportConvergence::Converged,
     exhausted,
   };
@@ -2103,9 +2067,6 @@ mod tests {
         prepare_grace: Duration::from_millis(20),
         cancellation_grace: Duration::from_millis(20),
         finalization_grace: Duration::from_millis(20),
-        retry_delay_seconds: 5,
-        run_deadline_seconds: 100,
-        max_attempts: 3,
         ..ExecutionPolicy::default()
       },
       telemetry: Arc::new(NoopSchedulerTelemetry),
@@ -2974,13 +2935,13 @@ mod tests {
     assert_eq!(runtime.run_once().await.expect("tick"), TickOutcome::Failed);
     assert!(
       state
-        .claim_next_scheduled_run("too-early", 115, 130)
+        .claim_next_scheduled_run("too-early", 140, 150)
         .await
         .expect("early claim")
         .is_none()
     );
     let retry = state
-      .claim_next_scheduled_run("retry-proof", 116, 140)
+      .claim_next_scheduled_run("retry-proof", 141, 170)
       .await
       .expect("retry claim")
       .expect("same run retried");

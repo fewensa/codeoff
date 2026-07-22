@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use codeoff_core::SchedulerOperationalPolicy;
+
 use super::{StateValueError, validate_lowercase_sha256, validate_text};
 use crate::StateError;
 
@@ -253,6 +255,7 @@ pub struct ClaimedScheduledDelivery {
   pub binding: ScheduledDeliveryBinding,
   pub payload: DeliveryPayloadSnapshot,
   pub target_json: String,
+  pub scheduler_policy: SchedulerOperationalPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

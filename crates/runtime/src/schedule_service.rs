@@ -110,6 +110,9 @@ impl ScheduleServiceError {
       Self::IdempotencyConflict => "idempotency_conflict",
       Self::State(StateError::SchedulerGenerationConflict) => "stale_generation",
       Self::State(StateError::ScheduledOnceExpired) => "expired_not_resumable",
+      Self::State(StateError::ScheduledActiveJobLimitExceeded { .. }) => {
+        "active_job_limit_exceeded"
+      }
       Self::State(error) if error.is_transient_storage_contention() => "storage_busy",
       Self::State(_) => "storage_error",
     }
@@ -209,6 +212,23 @@ impl ScheduleService {
 }
 
 impl ScheduleService {
+  fn validate_operational_input(
+    &self,
+    instruction: &str,
+    schedule: &ScheduleSpec,
+    now: i64,
+  ) -> Result<(), ScheduleServiceError> {
+    let policy = self.state.scheduler_operational_policy();
+    if instruction.len() > usize::try_from(policy.max_prompt_bytes).unwrap_or(usize::MAX) {
+      return Err(ScheduleServiceError::InvalidRequest(
+        "instruction exceeds max_prompt_bytes".to_owned(),
+      ));
+    }
+    schedule
+      .validate_minimum_cadence(now, policy.minimum_schedule_cadence_seconds)
+      .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))
+  }
+
   #[must_use]
   pub fn with_components(
     state: StateStore,
@@ -288,6 +308,7 @@ impl ScheduleService {
     validate_request_id(&request.request_id)?;
     validate_instruction(&request.instruction)?;
     let owner = self.authorize_create_principal(invocation)?;
+    self.validate_operational_input(&request.instruction, &request.schedule, request.now)?;
     let job_id = format!(
       "job_{}",
       &digest_json(&json!({
@@ -374,6 +395,7 @@ impl ScheduleService {
     validate_request_id(&request.request_id)?;
     validate_instruction(&request.instruction)?;
     let (owner, current) = self.authorize_job(invocation, &request.job_id).await?;
+    self.validate_operational_input(&request.instruction, &request.schedule, request.now)?;
     let capability = self.resolve_capability(invocation, &owner, &request.capability)?;
     let targets = scope_targets(
       &request.job_id,

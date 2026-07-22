@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use codeoff_core::SchedulerOperationalPolicy;
 use codeoff_state::{
   AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
   ClaimedScheduledDelivery, ClaimedScheduledRun, ConsumeScheduledExecutionPermit,
@@ -830,6 +831,325 @@ fn test_fixed_interval_uses_anchor_without_drift() {
   assert_eq!(schedule.next_after(189).expect("next occurrence"), 190);
 }
 
+#[tokio::test]
+async fn scheduler_policy_enforces_owner_limit_and_minimum_cadence() {
+  let temp = tempdir().expect("tempdir");
+  let policy = SchedulerOperationalPolicy {
+    max_active_jobs: 2,
+    max_active_jobs_per_owner: 1,
+    minimum_schedule_cadence_seconds: 60,
+    ..SchedulerOperationalPolicy::default()
+  };
+  let store =
+    StateStore::initialize_with_scheduler_policy(&temp.path().join("state"), None, policy)
+      .await
+      .expect("state");
+
+  let too_soon = create_request("too-soon", ScheduleSpec::once(159), 100);
+  assert!(matches!(
+    store.create_scheduled_job(&too_soon).await,
+    Err(StateError::InvalidSchedulerState { ref reason })
+      if reason == "schedule cadence is shorter than the configured minimum"
+  ));
+  let too_frequent = create_request(
+    "too-frequent",
+    ScheduleSpec::fixed_interval(100, 30).expect("interval"),
+    100,
+  );
+  assert!(matches!(
+    store.create_scheduled_job(&too_frequent).await,
+    Err(StateError::InvalidSchedulerState { ref reason })
+      if reason == "schedule cadence is shorter than the configured minimum"
+  ));
+
+  store
+    .create_scheduled_job(&create_request("owner-one", ScheduleSpec::once(160), 100))
+    .await
+    .expect("first active job");
+  assert!(matches!(
+    store
+      .create_scheduled_job(&create_request("owner-two", ScheduleSpec::once(161), 100))
+      .await,
+    Err(StateError::ScheduledActiveJobLimitExceeded { scope: "owner" })
+  ));
+}
+
+#[tokio::test]
+async fn scheduler_global_active_limit_has_one_winner_across_stores() {
+  let temp = tempdir().expect("tempdir");
+  let state_dir = temp.path().join("state");
+  let policy = SchedulerOperationalPolicy {
+    max_active_jobs: 1,
+    max_active_jobs_per_owner: 1,
+    minimum_schedule_cadence_seconds: 1,
+    ..SchedulerOperationalPolicy::legacy_compatible()
+  };
+  let first = StateStore::initialize_with_scheduler_policy(&state_dir, None, policy.clone())
+    .await
+    .expect("first state");
+  let second = StateStore::initialize_with_scheduler_policy(&state_dir, None, policy)
+    .await
+    .expect("second state");
+  let mut first_request = create_request("global-one", ScheduleSpec::once(110), 100);
+  first_request.owner = PrincipalKey::new("user", "slack", "workspace", "U1").expect("owner");
+  let mut second_request = create_request("global-two", ScheduleSpec::once(110), 100);
+  second_request.owner = PrincipalKey::new("user", "slack", "workspace", "U2").expect("owner");
+  let gate = Arc::new(Barrier::new(3));
+  let first_gate = Arc::clone(&gate);
+  let first_task = tokio::spawn(async move {
+    first_gate.wait().await;
+    first.create_scheduled_job(&first_request).await
+  });
+  let second_gate = Arc::clone(&gate);
+  let second_task = tokio::spawn(async move {
+    second_gate.wait().await;
+    second.create_scheduled_job(&second_request).await
+  });
+  gate.wait().await;
+  let outcomes = [
+    first_task.await.expect("first task"),
+    second_task.await.expect("second task"),
+  ];
+  assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| matches!(
+        outcome,
+        Err(StateError::ScheduledActiveJobLimitExceeded { scope: "global" })
+      ))
+      .count(),
+    1
+  );
+}
+
+#[tokio::test]
+async fn scheduler_active_limit_excludes_updated_job_and_blocks_resume() {
+  let temp = tempdir().expect("tempdir");
+  let state_dir = temp.path().join("state");
+  let initial_policy = SchedulerOperationalPolicy {
+    max_active_jobs: 2,
+    max_active_jobs_per_owner: 2,
+    minimum_schedule_cadence_seconds: 1,
+    ..SchedulerOperationalPolicy::legacy_compatible()
+  };
+  let store = StateStore::initialize_with_scheduler_policy(&state_dir, None, initial_policy)
+    .await
+    .expect("state");
+  store
+    .create_scheduled_job(&create_request(
+      "limit-active",
+      ScheduleSpec::once(110),
+      100,
+    ))
+    .await
+    .expect("active job");
+  store
+    .create_scheduled_job(&create_request(
+      "limit-paused",
+      ScheduleSpec::once(120),
+      100,
+    ))
+    .await
+    .expect("second job");
+  store
+    .pause_scheduled_job("limit-paused", 0, 101)
+    .await
+    .expect("pause second job");
+  drop(store);
+
+  let strict_policy = SchedulerOperationalPolicy {
+    max_active_jobs: 1,
+    max_active_jobs_per_owner: 1,
+    minimum_schedule_cadence_seconds: 1,
+    ..SchedulerOperationalPolicy::legacy_compatible()
+  };
+  let store = StateStore::initialize_with_scheduler_policy(&state_dir, None, strict_policy)
+    .await
+    .expect("strict state");
+  let updated = UpdateScheduledJob {
+    job_id: "limit-active".to_owned(),
+    expected_generation: 0,
+    definition: ScheduledJobDefinition::new(2, r#"{"instruction":"updated"}"#).expect("definition"),
+    capability: CapabilityProfileSnapshot::new(2, "profile-v2", r#"{"tools":[]}"#)
+      .expect("capability"),
+    targets: vec![target("limit-updated")],
+    schedule: ScheduleSpec::once(130),
+    now: 102,
+  };
+  assert_eq!(
+    store.update_scheduled_job(&updated).await.expect("update"),
+    1
+  );
+  assert!(matches!(
+    store.resume_scheduled_job("limit-paused", 1, 103).await,
+    Err(StateError::ScheduledActiveJobLimitExceeded {
+      scope: "global" | "owner"
+    })
+  ));
+}
+
+#[tokio::test]
+async fn scheduler_occurrence_exhaustion_rolls_back_run_and_schedule_cursor() {
+  let temp = tempdir().expect("tempdir");
+  let policy = SchedulerOperationalPolicy {
+    occurrence_search_limit: 1,
+    minimum_schedule_cadence_seconds: 60,
+    ..SchedulerOperationalPolicy::legacy_compatible()
+  };
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize_with_scheduler_policy(&state_dir, None, policy)
+    .await
+    .expect("state");
+  let schedule = ScheduleSpec::cron("* * * * *", "UTC").expect("cron");
+  store
+    .create_scheduled_job(&create_request("bounded-occurrence", schedule, 100))
+    .await
+    .expect("job");
+
+  let outcome = store
+    .materialize_due_schedule("bounded-occurrence", 0, 300)
+    .await;
+  assert!(
+    matches!(
+      outcome,
+      Err(StateError::InvalidSchedulerState { ref reason })
+        if reason == "bounded occurrence search was exhausted"
+    ),
+    "unexpected materialization outcome: {outcome:?}"
+  );
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("pool");
+  let counts: (i64, Option<i64>) = sqlx::query_as(
+    "select (select count(*) from scheduled_runs where job_id = 'bounded-occurrence'), (select next_run_at from schedules where job_id = 'bounded-occurrence')",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("unchanged state");
+  assert_eq!(counts, (0, Some(120)));
+}
+
+#[tokio::test]
+async fn scheduler_reclaim_retry_uses_run_snapshot_after_restart() {
+  let temp = tempdir().expect("tempdir");
+  let state_dir = temp.path().join("state");
+  let policy = SchedulerOperationalPolicy {
+    minimum_schedule_cadence_seconds: 1,
+    run_retry_base_seconds: 5,
+    run_retry_max_seconds: 20,
+    ..SchedulerOperationalPolicy::legacy_compatible()
+  };
+  let expected_delay = i64::from(policy.run_retry_delay_seconds("scheduled:restart-retry:110", 1));
+  let store = StateStore::initialize_with_scheduler_policy(&state_dir, None, policy)
+    .await
+    .expect("state");
+  store
+    .create_scheduled_job(&create_request(
+      "restart-retry",
+      ScheduleSpec::once(110),
+      100,
+    ))
+    .await
+    .expect("job");
+  store
+    .materialize_due_schedule("restart-retry", 0, 110)
+    .await
+    .expect("materialize");
+  store
+    .claim_next_scheduled_run("worker", 111, 120)
+    .await
+    .expect("claim")
+    .expect("run");
+  drop(store);
+
+  let restarted = StateStore::initialize_with_scheduler_policy(
+    &state_dir,
+    None,
+    SchedulerOperationalPolicy::legacy_compatible(),
+  )
+  .await
+  .expect("restart");
+  assert!(matches!(
+    restarted
+      .reclaim_next_expired_scheduled_run_from_snapshot(121)
+      .await
+      .expect("reclaim"),
+    ExpiredRunReclaimOutcome::Retried { .. }
+  ));
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("pool");
+  let retry_at: i64 = sqlx::query_scalar(
+    "select next_attempt_at from scheduled_runs where run_id = 'scheduled:restart-retry:110'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("retry timestamp");
+  assert_eq!(retry_at, 121 + expected_delay);
+}
+
+#[tokio::test]
+async fn scheduler_policy_rejects_oversize_prompt_and_result_before_side_effects() {
+  let temp = tempdir().expect("tempdir");
+  let state_dir = temp.path().join("state");
+  let policy = SchedulerOperationalPolicy {
+    minimum_schedule_cadence_seconds: 1,
+    max_prompt_bytes: 4,
+    max_summary_bytes: 4,
+    max_result_bytes: 64,
+    ..SchedulerOperationalPolicy::legacy_compatible()
+  };
+  let store = StateStore::initialize_with_scheduler_policy(&state_dir, None, policy)
+    .await
+    .expect("state");
+  let mut oversized = create_request("oversized-prompt", ScheduleSpec::once(110), 100);
+  oversized.definition =
+    ScheduledJobDefinition::new(1, r#"{"instruction":"12345"}"#).expect("definition");
+  assert!(matches!(
+    store.create_scheduled_job(&oversized).await,
+    Err(StateError::InvalidSchedulerState { ref reason })
+      if reason == "scheduled instruction exceeds max_prompt_bytes"
+  ));
+
+  let mut valid = create_request("oversized-result", ScheduleSpec::once(110), 100);
+  valid.definition =
+    ScheduledJobDefinition::new(1, r#"{"instruction":"1234"}"#).expect("definition");
+  store.create_scheduled_job(&valid).await.expect("valid job");
+  store
+    .materialize_due_schedule("oversized-result", 0, 110)
+    .await
+    .expect("materialize");
+  let claim = store
+    .claim_next_scheduled_run("worker", 111, 180)
+    .await
+    .expect("claim")
+    .expect("run");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&claim.binding, &profile, 112)
+    .await
+    .expect("executing");
+  let result = ScheduledRunResult::new("12345", "").expect("result");
+  assert!(matches!(
+    store.complete_scheduled_run_success(&claim.binding, &result, 113).await,
+    Err(StateError::InvalidSchedulerState { ref reason })
+      if reason == "scheduled result summary exceeds max_summary_bytes"
+  ));
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("pool");
+  let counts: (i64, i64, String) = sqlx::query_as(
+    "select (select count(*) from scheduled_run_result_artifacts where run_id = ?1), (select count(*) from scheduled_run_deliveries where run_id = ?1), (select state from scheduled_runs where run_id = ?1)",
+  )
+  .bind(claim.binding.run_id())
+  .fetch_one(&pool)
+  .await
+  .expect("side effects");
+  assert_eq!(counts, (0, 0, "executing".to_owned()));
+}
+
 #[test]
 fn test_scheduled_run_result_is_typed_and_bounded() {
   assert!(ScheduledDeliveryState::from_str("intent").is_err());
@@ -1037,6 +1357,7 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
+      && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2271,6 +2592,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
+      && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2359,6 +2681,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
+      && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2445,6 +2768,7 @@ async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_pay
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
+      && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy issue-06 migration");
@@ -2628,6 +2952,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
+      && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2736,6 +3061,18 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
   .fetch_all(&pool)
   .await
   .expect("read upgraded deliveries");
+  let policy_snapshot: (i64, String) = sqlx::query_as(
+    "select scheduler_policy_version, scheduler_policy_json from scheduled_jobs where job_id = 'delivery-upgrade'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read migrated scheduler policy");
+  assert_eq!(policy_snapshot.0, 1);
+  assert_eq!(
+    policy_snapshot.1,
+    serde_json::to_string(&SchedulerOperationalPolicy::legacy_compatible())
+      .expect("legacy policy JSON")
+  );
   assert_eq!(rows.len(), 7);
   assert_eq!(rows[0].0, "legacy-delivered");
   assert_eq!(
@@ -2879,6 +3216,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
+      && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2957,6 +3295,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
+      && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -3048,6 +3387,7 @@ async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_ident
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
+      && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");

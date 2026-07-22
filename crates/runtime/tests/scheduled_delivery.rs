@@ -1200,12 +1200,19 @@ async fn shutdown_after_predispatch_check_but_before_first_send_poll_requeues_sa
       .expect("authority"),
     ("failed_retryable".to_owned(), 1, 1, 1)
   );
+  let retry_at = store
+    .get_scheduled_delivery_operator_projection(&delivery_id)
+    .await
+    .expect("projection")
+    .expect("delivery")
+    .next_attempt_at
+    .expect("retry timestamp");
   assert_eq!(
     run_scheduled_delivery_tick_with_clock(
       &store,
       provider.as_ref(),
       "worker",
-      clock(123),
+      clock(retry_at),
       shutdown(),
     )
     .await

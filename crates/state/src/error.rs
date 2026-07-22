@@ -144,6 +144,9 @@ pub enum StateError {
   #[error("scheduled executor admission is no longer current")]
   ScheduledExecutorAdmissionUnavailable,
 
+  #[error("scheduled active job limit exceeded for {scope}")]
+  ScheduledActiveJobLimitExceeded { scope: &'static str },
+
   #[error("scheduled run completion conflicts with durable authority")]
   ScheduledRunCompletionConflict,
 

@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use codeoff_core::{SCHEDULER_OPERATIONAL_POLICY_VERSION, SchedulerOperationalPolicy};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqliteRow;
@@ -11,21 +12,20 @@ use super::{
   AcceptedDeliveryBaseline, AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot,
   BoundedSchedulerAge, BoundedSchedulerGauge, CapabilityProfileSnapshot, ClaimedScheduledDelivery,
   ClaimedScheduledRun, ConsumeScheduledExecutionPermit, CreateScheduledJob,
-  DEFAULT_OCCURRENCE_STEPS, DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION,
-  DeliveryPayloadSnapshot, DeliveryTargetRoute, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome,
-  IdempotencyDecision, LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES, MAX_DELIVERY_TARGETS,
-  MAX_SNAPSHOT_BYTES, MaterializationOutcome, PreflightFailureDisposition,
-  PreparedScheduledDelivery, PrincipalKey, RunLeaseBinding, ScheduleAuditSummary,
-  ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryAuthority,
-  ScheduledDeliveryBinding, ScheduledDeliveryFailure, ScheduledDeliveryOperatorProjection,
-  ScheduledDeliveryReconcileOutcome, ScheduledDeliveryRenderInput,
-  ScheduledDeliveryRetentionReport, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
-  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
-  ScheduledExecutorAdmission, ScheduledExecutorEpochAuthority, ScheduledExecutorEpochRegistration,
-  ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation,
-  ScheduledJobStatus, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind,
-  ScheduledRunOperatorProjection, ScheduledRunReconcileCandidate, ScheduledRunReconcileOutcome,
-  ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION, DeliveryPayloadSnapshot,
+  DeliveryTargetRoute, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome, IdempotencyDecision,
+  LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES, MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES,
+  MaterializationOutcome, PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey,
+  RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency,
+  ScheduleSpec, ScheduledDeliveryAuthority, ScheduledDeliveryBinding, ScheduledDeliveryFailure,
+  ScheduledDeliveryOperatorProjection, ScheduledDeliveryReconcileOutcome,
+  ScheduledDeliveryRenderInput, ScheduledDeliveryRetentionReport, ScheduledDeliveryState,
+  ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
+  ScheduledExecutionTerminal, ScheduledExecutorAdmission, ScheduledExecutorEpochAuthority,
+  ScheduledExecutorEpochRegistration, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
+  ScheduledJobMutation, ScheduledJobStatus, ScheduledRunExecutionOutcome,
+  ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection, ScheduledRunReconcileCandidate,
+  ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
   SchedulerObservabilitySnapshot, SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome,
   SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome,
   UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
@@ -441,9 +441,18 @@ impl StateStore {
   /// # Errors
   /// Returns an error when the request is invalid or `SQLite` rejects the transaction.
   pub async fn create_scheduled_job(&self, request: &CreateScheduledJob) -> Result<(), StateError> {
-    let next_run_at = validate_create_request(request)?;
+    let next_run_at = validate_create_request(request, &self.scheduler_policy)?;
+    let policy_json = scheduler_policy_json(&self.scheduler_policy)?;
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
-    insert_scheduled_job(&mut transaction, request, next_run_at).await?;
+    acquire_scheduler_policy_lock(&mut transaction, request.now).await?;
+    enforce_active_job_limits(
+      &mut transaction,
+      &self.scheduler_policy,
+      &request.owner,
+      None,
+    )
+    .await?;
+    insert_scheduled_job(&mut transaction, request, next_run_at, &policy_json).await?;
     transaction.commit().await.map_err(scheduler_error)
   }
 
@@ -459,9 +468,16 @@ impl StateStore {
     &self,
     request: &UpdateScheduledJob,
   ) -> Result<i64, StateError> {
-    validate_update_request(request)?;
+    validate_update_request(request, &self.scheduler_policy)?;
+    let policy_json = scheduler_policy_json(&self.scheduler_policy)?;
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
-    apply_update(&mut transaction, request).await?;
+    apply_update(
+      &mut transaction,
+      request,
+      &self.scheduler_policy,
+      &policy_json,
+    )
+    .await?;
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(request.expected_generation + 1)
   }
@@ -512,7 +528,7 @@ impl StateStore {
     .await?;
     match decision {
       IdempotencyDecision::Claimed => {
-        apply_typed_mutation(&mut transaction, mutation).await?;
+        apply_typed_mutation(&mut transaction, mutation, &self.scheduler_policy).await?;
         if let Some(audit) = audit {
           insert_mutation_audit(&mut transaction, audit).await?;
         }
@@ -869,7 +885,7 @@ impl StateStore {
     acquire_and_validate_executor_admission(&mut transaction, admission, clock).await?;
     ensure_executor_admission_not_cancelled(admission, cancellation)?;
     let row = sqlx::query(
-      "update scheduled_runs set state = 'leased', attempt = attempt + 1, fence = fence + 1, next_attempt_at = null, lease_owner = ?1, lease_expires_at = ?2, updated_at = ?3 where run_id = (select run_id from scheduled_runs indexed by idx_scheduled_runs_claim where state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 order by scheduled_for, run_id limit 1) and state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 returning run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, attempt, fence",
+      "update scheduled_runs set state = 'leased', attempt = attempt + 1, fence = fence + 1, next_attempt_at = null, lease_owner = ?1, lease_expires_at = ?2, updated_at = ?3 where run_id = (select run_id from scheduled_runs indexed by idx_scheduled_runs_claim where state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 order by scheduled_for, run_id limit 1) and state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 returning run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, scheduler_policy_version, scheduler_policy_json, attempt, fence",
     )
     .bind(lease_owner)
     .bind(lease_expires_at)
@@ -948,6 +964,14 @@ impl StateStore {
       capability_json: row.try_get("capability_json").map_err(scheduler_error)?,
       targets_json: row.try_get("targets_json").map_err(scheduler_error)?,
       execution_baseline_json,
+      scheduler_policy: scheduler_policy_from_snapshot(
+        row
+          .try_get("scheduler_policy_version")
+          .map_err(scheduler_error)?,
+        row
+          .try_get("scheduler_policy_json")
+          .map_err(scheduler_error)?,
+      )?,
     };
     #[cfg(feature = "test-support")]
     self.run_scheduled_executor_before_commit_hook_for_tests();
@@ -1393,7 +1417,7 @@ impl StateStore {
       return Ok(None);
     }
     let row = sqlx::query(
-      "update scheduled_run_deliveries set state = 'sending', attempt = attempt + 1, fence = fence + 1, lease_owner = ?1, lease_expires_at = ?2, idempotency_key = coalesce(idempotency_key, 'delivery-v1:' || lower(hex(cast(delivery_id as blob))) || ':' || payload_digest), claimed_baseline_version = coalesce((select baseline.baseline_version from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm), 0), updated_at = ?3 where delivery_id = (select candidate.delivery_id from scheduled_run_deliveries candidate where candidate.state = 'pending' and candidate.authority_kind = 'intent_v1' and candidate.payload_snapshot is not null and candidate.attempt < 9223372036854775807 and candidate.fence < 9223372036854775807 and candidate.updated_at <= ?3 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.job_id = candidate.job_id and active.target_identity_digest = candidate.target_identity_digest and active.target_snapshot_digest = candidate.target_snapshot_digest and active.delivery_policy_version = candidate.delivery_policy_version and active.render_version = candidate.render_version and active.hash_algorithm = candidate.hash_algorithm) order by candidate.created_at, candidate.delivery_id limit 1) and state = 'pending' and updated_at <= ?3 and not exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest) returning delivery_id, run_id, result_artifact_id, content_type, payload_schema_version, hash_algorithm, payload_snapshot, payload_digest, payload_created_at, target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, target_snapshot_version, delivery_policy_version, render_version, attempt, fence, lease_owner, idempotency_key, claimed_baseline_version",
+      "update scheduled_run_deliveries set state = 'sending', attempt = attempt + 1, fence = fence + 1, lease_owner = ?1, lease_expires_at = ?2, idempotency_key = coalesce(idempotency_key, 'delivery-v1:' || lower(hex(cast(delivery_id as blob))) || ':' || payload_digest), claimed_baseline_version = coalesce((select baseline.baseline_version from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm), 0), updated_at = ?3 where delivery_id = (select candidate.delivery_id from scheduled_run_deliveries candidate where candidate.state = 'pending' and candidate.authority_kind = 'intent_v1' and candidate.payload_snapshot is not null and candidate.attempt < 9223372036854775807 and candidate.fence < 9223372036854775807 and candidate.updated_at <= ?3 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.job_id = candidate.job_id and active.target_identity_digest = candidate.target_identity_digest and active.target_snapshot_digest = candidate.target_snapshot_digest and active.delivery_policy_version = candidate.delivery_policy_version and active.render_version = candidate.render_version and active.hash_algorithm = candidate.hash_algorithm) order by candidate.created_at, candidate.delivery_id limit 1) and state = 'pending' and updated_at <= ?3 and not exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest) returning delivery_id, run_id, result_artifact_id, content_type, payload_schema_version, hash_algorithm, payload_snapshot, payload_digest, payload_created_at, target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, target_snapshot_version, delivery_policy_version, render_version, scheduler_policy_version, scheduler_policy_json, attempt, fence, lease_owner, idempotency_key, claimed_baseline_version",
     )
     .bind(lease_owner)
     .bind(lease_expires_at)
@@ -1461,6 +1485,14 @@ impl StateStore {
       binding,
       payload,
       target_json,
+      scheduler_policy: scheduler_policy_from_snapshot(
+        row
+          .try_get("scheduler_policy_version")
+          .map_err(scheduler_error)?,
+        row
+          .try_get("scheduler_policy_json")
+          .map_err(scheduler_error)?,
+      )?,
     }))
   }
 
@@ -1471,6 +1503,10 @@ impl StateStore {
   ///
   /// # Errors
   /// Returns an error for invalid authority, lease, exhausted counters, or storage failure.
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps exact delivery claim and attempt authority in one transaction"
+  )]
   pub async fn claim_scheduled_delivery(
     &self,
     authority: &ScheduledDeliveryAuthority,
@@ -1493,7 +1529,7 @@ impl StateStore {
       return Ok(None);
     }
     let row = sqlx::query(
-      "update scheduled_run_deliveries set state = 'sending', attempt = attempt + 1, fence = fence + 1, lease_owner = ?1, lease_expires_at = ?2, next_attempt_at = null, idempotency_key = coalesce(idempotency_key, 'delivery-v1:' || lower(hex(cast(delivery_id as blob))) || ':' || payload_digest), claimed_baseline_version = coalesce((select baseline.baseline_version from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm), 0), provider_outcome = null, error_kind = null, error_message = null, updated_at = ?3 where delivery_id = ?4 and state = 'pending' and authority_kind = 'intent_v1' and payload_snapshot is not null and target_json = ?5 and target_snapshot_digest = ?6 and payload_digest = ?7 and intent_key = ?8 and attempt < 9223372036854775807 and fence < 9223372036854775807 and updated_at <= ?3 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.delivery_id <> scheduled_run_deliveries.delivery_id and active.job_id = scheduled_run_deliveries.job_id and active.target_identity_digest = scheduled_run_deliveries.target_identity_digest and active.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and active.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and active.render_version = scheduled_run_deliveries.render_version and active.hash_algorithm = scheduled_run_deliveries.hash_algorithm) and not exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest) returning delivery_id, run_id, result_artifact_id, content_type, payload_schema_version, hash_algorithm, payload_snapshot, payload_digest, payload_created_at, target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, target_snapshot_version, delivery_policy_version, render_version, attempt, fence, lease_owner, idempotency_key, claimed_baseline_version",
+      "update scheduled_run_deliveries set state = 'sending', attempt = attempt + 1, fence = fence + 1, lease_owner = ?1, lease_expires_at = ?2, next_attempt_at = null, idempotency_key = coalesce(idempotency_key, 'delivery-v1:' || lower(hex(cast(delivery_id as blob))) || ':' || payload_digest), claimed_baseline_version = coalesce((select baseline.baseline_version from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm), 0), provider_outcome = null, error_kind = null, error_message = null, updated_at = ?3 where delivery_id = ?4 and state = 'pending' and authority_kind = 'intent_v1' and payload_snapshot is not null and target_json = ?5 and target_snapshot_digest = ?6 and payload_digest = ?7 and intent_key = ?8 and attempt < 9223372036854775807 and fence < 9223372036854775807 and updated_at <= ?3 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.delivery_id <> scheduled_run_deliveries.delivery_id and active.job_id = scheduled_run_deliveries.job_id and active.target_identity_digest = scheduled_run_deliveries.target_identity_digest and active.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and active.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and active.render_version = scheduled_run_deliveries.render_version and active.hash_algorithm = scheduled_run_deliveries.hash_algorithm) and not exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest) returning delivery_id, run_id, result_artifact_id, content_type, payload_schema_version, hash_algorithm, payload_snapshot, payload_digest, payload_created_at, target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, target_snapshot_version, delivery_policy_version, render_version, scheduler_policy_version, scheduler_policy_json, attempt, fence, lease_owner, idempotency_key, claimed_baseline_version",
     )
     .bind(lease_owner)
     .bind(lease_expires_at)
@@ -1568,6 +1604,14 @@ impl StateStore {
       binding,
       payload,
       target_json,
+      scheduler_policy: scheduler_policy_from_snapshot(
+        row
+          .try_get("scheduler_policy_version")
+          .map_err(scheduler_error)?,
+        row
+          .try_get("scheduler_policy_json")
+          .map_err(scheduler_error)?,
+      )?,
     }))
   }
 
@@ -2637,7 +2681,7 @@ where run.run_id = ?2
     );
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let row = sqlx::query(
-      "select r.targets_json, r.execution_baseline_json, r.lease_expires_at, a.claimed_at, a.executing_at from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner where r.run_id = ?1 and r.job_id = ?2 and r.attempt = ?3 and r.fence = ?4 and r.lease_owner = ?5 and r.state = 'executing' and a.state = 'executing' and r.lease_expires_at > ?6 and a.lease_expires_at > ?6",
+      "select r.targets_json, r.execution_baseline_json, r.scheduler_policy_version, r.scheduler_policy_json, r.lease_expires_at, a.claimed_at, a.executing_at from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner where r.run_id = ?1 and r.job_id = ?2 and r.attempt = ?3 and r.fence = ?4 and r.lease_owner = ?5 and r.state = 'executing' and a.state = 'executing' and r.lease_expires_at > ?6 and a.lease_expires_at > ?6",
     )
     .bind(binding.run_id())
     .bind(binding.job_id())
@@ -2660,6 +2704,27 @@ where run.run_id = ?2
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledRunSuccessOutcome::LateEvidence(evidence));
     };
+    let scheduler_policy_version: i64 = row
+      .try_get("scheduler_policy_version")
+      .map_err(scheduler_error)?;
+    let scheduler_policy_json: String = row
+      .try_get("scheduler_policy_json")
+      .map_err(scheduler_error)?;
+    let scheduler_policy =
+      scheduler_policy_from_snapshot(scheduler_policy_version, &scheduler_policy_json)?;
+    if result.summary.len()
+      > usize::try_from(scheduler_policy.max_summary_bytes).unwrap_or(usize::MAX)
+    {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled result summary exceeds max_summary_bytes".to_owned(),
+      });
+    }
+    if result_json.len() > usize::try_from(scheduler_policy.max_result_bytes).unwrap_or(usize::MAX)
+    {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled result exceeds max_result_bytes".to_owned(),
+      });
+    }
     let claimed_at: i64 = row.try_get("claimed_at").map_err(scheduler_error)?;
     let executing_at: i64 = row
       .try_get::<Option<i64>, _>("executing_at")
@@ -2731,7 +2796,7 @@ where run.run_id = ?2
       let intent_key = delivery_intent_key(binding.run_id(), &target.identity_digest)?;
       let delivery_id = format!("intent:{intent_key}");
       let intent_insert = sqlx::query(
-        "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'pending', 0, 0, ?6, ?7, ?8, ?9, 'sha256-v1', ?10, ?11, 'intent_v1', ?12, ?12) returning target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest",
+        "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, scheduler_policy_version, scheduler_policy_json, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'pending', 0, 0, ?6, ?7, ?8, ?9, 'sha256-v1', ?10, ?11, 'intent_v1', ?12, ?13, ?14, ?14) returning target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest",
       )
       .bind(delivery_id)
       .bind(binding.run_id())
@@ -2744,6 +2809,8 @@ where run.run_id = ?2
       .bind(binding.fence())
       .bind(target.snapshot_digest)
       .bind(intent_key)
+      .bind(scheduler_policy_version)
+      .bind(&scheduler_policy_json)
       .bind(completed_at)
       .fetch_one(&mut *transaction)
       .await
@@ -2978,7 +3045,7 @@ where run.run_id = ?2
     );
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let row = sqlx::query(
-      "select r.schedule_id, r.job_generation, r.schedule_generation, r.scheduled_for, r.coalesced_through, r.definition_version, r.definition_json, r.capability_schema_version, r.capability_digest, r.capability_json, r.targets_json, r.execution_baseline_json, a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner where r.run_id = ?1 and r.job_id = ?2 and r.attempt = ?3 and r.fence = ?4 and r.lease_owner = ?5 and r.state = 'executing' and a.state = 'executing' and r.lease_expires_at > ?6 and a.lease_expires_at > ?6",
+      "select r.schedule_id, r.job_generation, r.schedule_generation, r.scheduled_for, r.coalesced_through, r.definition_version, r.definition_json, r.capability_schema_version, r.capability_digest, r.capability_json, r.targets_json, r.execution_baseline_json, r.scheduler_policy_version, r.scheduler_policy_json, a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner where r.run_id = ?1 and r.job_id = ?2 and r.attempt = ?3 and r.fence = ?4 and r.lease_owner = ?5 and r.state = 'executing' and a.state = 'executing' and r.lease_expires_at > ?6 and a.lease_expires_at > ?6",
     )
     .bind(binding.run_id())
     .bind(binding.job_id())
@@ -3060,9 +3127,36 @@ where run.run_id = ?2
         reason: "invalid scheduled run reclaim policy".to_owned(),
       });
     }
+    self
+      .reclaim_next_expired_scheduled_run_inner(now, Some((max_attempts, next_attempt_at)))
+      .await
+  }
+
+  /// Reclaims one expired lease using the immutable policy snapshot on the run.
+  ///
+  /// # Errors
+  /// Returns an error for an invalid persisted policy or storage failure.
+  pub async fn reclaim_next_expired_scheduled_run_from_snapshot(
+    &self,
+    now: i64,
+  ) -> Result<ExpiredRunReclaimOutcome, StateError> {
+    self
+      .reclaim_next_expired_scheduled_run_inner(now, None)
+      .await
+  }
+
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps snapshot policy recovery and fenced transition in one transaction"
+  )]
+  async fn reclaim_next_expired_scheduled_run_inner(
+    &self,
+    now: i64,
+    override_policy: Option<(i64, i64)>,
+  ) -> Result<ExpiredRunReclaimOutcome, StateError> {
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let row = sqlx::query(
-      "select r.run_id, r.job_id, r.attempt, r.fence, r.lease_owner, r.state, r.schedule_id, r.job_generation, r.schedule_generation, r.scheduled_for, r.coalesced_through, r.definition_version, r.definition_json, r.capability_schema_version, r.capability_digest, r.capability_json, r.targets_json, r.execution_baseline_json, a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r indexed by idx_scheduled_runs_recovery join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner and a.state = r.state where r.state in ('leased', 'executing') and r.lease_expires_at <= ?1 and a.lease_expires_at <= ?1 order by r.lease_expires_at, r.run_id limit 1",
+      "select r.run_id, r.job_id, r.attempt, r.fence, r.lease_owner, r.state, r.schedule_id, r.job_generation, r.schedule_generation, r.scheduled_for, r.coalesced_through, r.definition_version, r.definition_json, r.capability_schema_version, r.capability_digest, r.capability_json, r.targets_json, r.execution_baseline_json, r.scheduler_policy_version, r.scheduler_policy_json, a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r indexed by idx_scheduled_runs_recovery join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner and a.state = r.state where r.state in ('leased', 'executing') and r.lease_expires_at <= ?1 and a.lease_expires_at <= ?1 order by r.lease_expires_at, r.run_id limit 1",
     )
     .bind(now)
     .fetch_optional(&mut *transaction)
@@ -3078,6 +3172,37 @@ where run.run_id = ?2
     let fence: i64 = row.try_get("fence").map_err(scheduler_error)?;
     let lease_owner: String = row.try_get("lease_owner").map_err(scheduler_error)?;
     let state: String = row.try_get("state").map_err(scheduler_error)?;
+    let (max_attempts, next_attempt_at) = if let Some(policy) = override_policy {
+      policy
+    } else {
+      let policy = scheduler_policy_from_snapshot(
+        row
+          .try_get("scheduler_policy_version")
+          .map_err(scheduler_error)?,
+        row
+          .try_get("scheduler_policy_json")
+          .map_err(scheduler_error)?,
+      )?;
+      let delay = i64::from(policy.run_retry_delay_seconds(&run_id, attempt));
+      let retry_at = now
+        .checked_add(delay)
+        .ok_or_else(|| StateError::InvalidSchedulerState {
+          reason: "scheduled run reclaim retry overflow".to_owned(),
+        })?;
+      let deadline_at = row
+        .try_get::<i64, _>("scheduled_for")
+        .map_err(scheduler_error)?
+        .checked_add(i64::from(policy.run_deadline_seconds))
+        .ok_or_else(|| StateError::InvalidSchedulerState {
+          reason: "scheduled run reclaim deadline overflow".to_owned(),
+        })?;
+      let max_attempts = if retry_at > deadline_at {
+        attempt
+      } else {
+        i64::from(policy.run_max_attempts)
+      };
+      (max_attempts, retry_at)
+    };
     let binding = RunLeaseBinding {
       run_id: run_id.clone(),
       job_id: job_id.clone(),
@@ -3179,7 +3304,7 @@ where run.run_id = ?2
     }
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let row = sqlx::query(
-      "select r.job_id, r.state, r.attempt, r.fence, r.lease_owner, r.lease_expires_at, r.updated_at, r.schedule_id, r.job_generation, r.schedule_generation, r.scheduled_for, r.coalesced_through, r.definition_version, r.definition_json, r.capability_schema_version, r.capability_digest, r.capability_json, r.targets_json, r.execution_baseline_json, a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r left join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner and a.state = r.state where r.run_id = ?1",
+      "select r.job_id, r.state, r.attempt, r.fence, r.lease_owner, r.lease_expires_at, r.updated_at, r.schedule_id, r.job_generation, r.schedule_generation, r.scheduled_for, r.coalesced_through, r.definition_version, r.definition_json, r.capability_schema_version, r.capability_digest, r.capability_json, r.targets_json, r.execution_baseline_json, r.scheduler_policy_version, r.scheduler_policy_json, a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r left join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner and a.state = r.state where r.run_id = ?1",
     )
     .bind(run_id)
     .fetch_optional(&mut *transaction)
@@ -3986,8 +4111,17 @@ where run.run_id = ?2
     expected_generation: i64,
     now: i64,
   ) -> Result<i64, StateError> {
+    let policy_json = scheduler_policy_json(&self.scheduler_policy)?;
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
-    apply_resume(&mut transaction, job_id, expected_generation, now).await?;
+    apply_resume(
+      &mut transaction,
+      job_id,
+      expected_generation,
+      now,
+      &self.scheduler_policy,
+      &policy_json,
+    )
+    .await?;
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(expected_generation + 1)
   }
@@ -4064,7 +4198,7 @@ where run.run_id = ?2
     acquire_and_validate_executor_admission(&mut transaction, admission, clock).await?;
     ensure_executor_admission_not_cancelled(admission, cancellation)?;
     let row = sqlx::query(
-      "select j.definition_version, j.definition_json, j.capability_schema_version, j.capability_digest, j.capability_json, j.status, j.generation, s.schedule_id, s.generation as schedule_generation, s.kind, s.canonical_spec, s.timezone, s.once_at, s.anchor_at, s.interval_seconds, s.next_run_at from scheduled_jobs j join schedules s on s.job_id = j.job_id where j.job_id = ?1",
+      "select j.definition_version, j.definition_json, j.capability_schema_version, j.capability_digest, j.capability_json, j.scheduler_policy_version, j.scheduler_policy_json, j.status, j.generation, s.schedule_id, s.generation as schedule_generation, s.kind, s.canonical_spec, s.timezone, s.once_at, s.anchor_at, s.interval_seconds, s.next_run_at from scheduled_jobs j join schedules s on s.job_id = j.job_id where j.job_id = ?1",
     )
     .bind(job_id)
     .fetch_optional(&mut *transaction)
@@ -4094,13 +4228,21 @@ where run.run_id = ?2
     }
     let due = required_due(next_run_at)?;
     let schedule = schedule_from_row(&row)?;
+    let scheduler_policy_version: i64 = row
+      .try_get("scheduler_policy_version")
+      .map_err(scheduler_error)?;
+    let scheduler_policy_json: String = row
+      .try_get("scheduler_policy_json")
+      .map_err(scheduler_error)?;
+    let scheduler_policy =
+      scheduler_policy_from_snapshot(scheduler_policy_version, &scheduler_policy_json)?;
     let window = schedule
-      .coalesce(due, now, DEFAULT_OCCURRENCE_STEPS)
+      .coalesce(due, now, scheduler_policy.occurrence_search_limit)
       .map_err(invalid_occurrence)?;
     let snapshots = load_materialization_snapshots(&mut transaction, job_id).await?;
     let run_id = format!("scheduled:{job_id}:{}", window.scheduled_for);
     let inserted = sqlx::query(
-      "insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, skipped_count, skipped_count_saturated, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, state, overlap_slot, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'pending', 1, ?17, ?17) on conflict(job_id, scheduled_for) do nothing",
+      "insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, skipped_count, skipped_count_saturated, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, scheduler_policy_version, scheduler_policy_json, state, overlap_slot, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'pending', 1, ?19, ?19) on conflict(job_id, scheduled_for) do nothing",
     )
     .bind(&run_id)
     .bind(job_id)
@@ -4118,6 +4260,8 @@ where run.run_id = ?2
     .bind(row.try_get::<String, _>("capability_json").map_err(scheduler_error)?)
     .bind(snapshots.targets_json)
     .bind(snapshots.execution_baseline_json)
+    .bind(scheduler_policy_version)
+    .bind(scheduler_policy_json)
     .bind(now)
     .execute(&mut *transaction)
     .await
@@ -5205,7 +5349,10 @@ async fn replace_delivery_targets(
   Ok(())
 }
 
-fn validate_create_request(request: &CreateScheduledJob) -> Result<i64, StateError> {
+fn validate_create_request(
+  request: &CreateScheduledJob,
+  policy: &SchedulerOperationalPolicy,
+) -> Result<i64, StateError> {
   validate_text("job id", &request.job_id).map_err(invalid_value)?;
   validate_text("schedule id", &request.schedule_id).map_err(invalid_value)?;
   request.creator.validate().map_err(invalid_value)?;
@@ -5216,6 +5363,11 @@ fn validate_create_request(request: &CreateScheduledJob) -> Result<i64, StateErr
     .schedule
     .validate_for_create(request.now)
     .map_err(invalid_value)?;
+  request
+    .schedule
+    .validate_minimum_cadence(request.now, policy.minimum_schedule_cadence_seconds)
+    .map_err(invalid_value)?;
+  validate_definition_policy(&request.definition, policy)?;
   validate_delivery_targets(&request.targets)?;
   request
     .schedule
@@ -5239,9 +5391,10 @@ async fn insert_scheduled_job(
   transaction: &mut Transaction<'_, Sqlite>,
   request: &CreateScheduledJob,
   next_run_at: i64,
+  policy_json: &str,
 ) -> Result<(), StateError> {
   sqlx::query(
-    "insert into scheduled_jobs (job_id, definition_version, definition_json, creator_kind, creator_provider, creator_tenant, creator_subject, owner_kind, owner_provider, owner_tenant, owner_subject, status, generation, capability_schema_version, capability_digest, capability_json, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', 0, ?12, ?13, ?14, ?15, ?15)",
+    "insert into scheduled_jobs (job_id, definition_version, definition_json, creator_kind, creator_provider, creator_tenant, creator_subject, owner_kind, owner_provider, owner_tenant, owner_subject, status, generation, capability_schema_version, capability_digest, capability_json, scheduler_policy_version, scheduler_policy_json, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', 0, ?12, ?13, ?14, 1, ?15, ?16, ?16)",
   )
   .bind(&request.job_id)
   .bind(i64::from(request.definition.version))
@@ -5257,6 +5410,7 @@ async fn insert_scheduled_job(
   .bind(i64::from(request.capability.schema_version))
   .bind(&request.capability.digest)
   .bind(&request.capability.canonical_json)
+  .bind(policy_json)
   .bind(request.now)
   .execute(&mut **transaction)
   .await
@@ -5291,17 +5445,23 @@ async fn insert_scheduled_job(
 async fn apply_update(
   transaction: &mut Transaction<'_, Sqlite>,
   request: &UpdateScheduledJob,
+  policy: &SchedulerOperationalPolicy,
+  policy_json: &str,
 ) -> Result<(), StateError> {
-  let status: Option<String> = sqlx::query_scalar(
-    "select status from scheduled_jobs where job_id = ?1 and generation = ?2 and status in ('active', 'paused')",
+  acquire_scheduler_policy_lock(transaction, request.now).await?;
+  let row = sqlx::query(
+    "select status, owner_kind, owner_provider, owner_tenant, owner_subject from scheduled_jobs where job_id = ?1 and generation = ?2 and status in ('active', 'paused')",
   )
   .bind(&request.job_id)
   .bind(request.expected_generation)
   .fetch_optional(&mut **transaction)
   .await
-  .map_err(scheduler_error)?;
-  let status = status.ok_or(StateError::SchedulerGenerationConflict)?;
+  .map_err(scheduler_error)?
+  .ok_or(StateError::SchedulerGenerationConflict)?;
+  let status: String = row.try_get("status").map_err(scheduler_error)?;
+  let owner = owner_from_row(&row)?;
   let next_run_at = if status == "active" {
+    enforce_active_job_limits(transaction, policy, &owner, Some(&request.job_id)).await?;
     Some(
       request
         .schedule
@@ -5312,13 +5472,14 @@ async fn apply_update(
     None
   };
   let updated = sqlx::query(
-    "update scheduled_jobs set definition_version = ?1, definition_json = ?2, capability_schema_version = ?3, capability_digest = ?4, capability_json = ?5, generation = generation + 1, updated_at = ?6 where job_id = ?7 and generation = ?8 and status = ?9",
+    "update scheduled_jobs set definition_version = ?1, definition_json = ?2, capability_schema_version = ?3, capability_digest = ?4, capability_json = ?5, scheduler_policy_version = 1, scheduler_policy_json = ?6, generation = generation + 1, updated_at = ?7 where job_id = ?8 and generation = ?9 and status = ?10",
   )
   .bind(i64::from(request.definition.version))
   .bind(&request.definition.canonical_json)
   .bind(i64::from(request.capability.schema_version))
   .bind(&request.capability.digest)
   .bind(&request.capability.canonical_json)
+  .bind(policy_json)
   .bind(request.now)
   .bind(&request.job_id)
   .bind(request.expected_generation)
@@ -5393,9 +5554,12 @@ async fn apply_resume(
   job_id: &str,
   expected_generation: i64,
   now: i64,
+  policy: &SchedulerOperationalPolicy,
+  policy_json: &str,
 ) -> Result<(), StateError> {
+  acquire_scheduler_policy_lock(transaction, now).await?;
   let row = sqlx::query(
-    "select s.kind, s.canonical_spec, s.timezone, s.once_at, s.anchor_at, s.interval_seconds from schedules s join scheduled_jobs j on j.job_id = s.job_id where j.job_id = ?1 and j.status = 'paused' and j.generation = ?2",
+    "select s.kind, s.canonical_spec, s.timezone, s.once_at, s.anchor_at, s.interval_seconds, j.owner_kind, j.owner_provider, j.owner_tenant, j.owner_subject from schedules s join scheduled_jobs j on j.job_id = s.job_id where j.job_id = ?1 and j.status = 'paused' and j.generation = ?2",
   )
   .bind(job_id)
   .bind(expected_generation)
@@ -5404,6 +5568,11 @@ async fn apply_resume(
   .map_err(scheduler_error)?
   .ok_or(StateError::SchedulerGenerationConflict)?;
   let schedule = schedule_from_row(&row)?;
+  schedule
+    .validate_minimum_cadence(now, policy.minimum_schedule_cadence_seconds)
+    .map_err(invalid_value)?;
+  let owner = owner_from_row(&row)?;
+  enforce_active_job_limits(transaction, policy, &owner, None).await?;
   let next_run_at = schedule.next_after(now).map_err(|error| {
     if matches!(schedule, ScheduleSpec::Once { .. }) {
       StateError::ScheduledOnceExpired
@@ -5412,8 +5581,9 @@ async fn apply_resume(
     }
   })?;
   sqlx::query(
-    "update scheduled_jobs set status = 'active', generation = generation + 1, updated_at = ?1 where job_id = ?2 and generation = ?3 and status = 'paused'",
+    "update scheduled_jobs set status = 'active', scheduler_policy_version = 1, scheduler_policy_json = ?1, generation = generation + 1, updated_at = ?2 where job_id = ?3 and generation = ?4 and status = 'paused'",
   )
+  .bind(policy_json)
   .bind(now)
   .bind(job_id)
   .bind(expected_generation)
@@ -5433,15 +5603,19 @@ async fn apply_resume(
 async fn apply_typed_mutation(
   transaction: &mut Transaction<'_, Sqlite>,
   mutation: &ScheduledJobMutation,
+  policy: &SchedulerOperationalPolicy,
 ) -> Result<(), StateError> {
+  let policy_json = scheduler_policy_json(policy)?;
   match mutation {
     ScheduledJobMutation::Create(request) => {
-      let next_run_at = validate_create_request(request)?;
-      insert_scheduled_job(transaction, request, next_run_at).await
+      let next_run_at = validate_create_request(request, policy)?;
+      acquire_scheduler_policy_lock(transaction, request.now).await?;
+      enforce_active_job_limits(transaction, policy, &request.owner, None).await?;
+      insert_scheduled_job(transaction, request, next_run_at, &policy_json).await
     }
     ScheduledJobMutation::Update(request) => {
-      validate_update_request(request)?;
-      apply_update(transaction, request).await
+      validate_update_request(request, policy)?;
+      apply_update(transaction, request, policy, &policy_json).await
     }
     ScheduledJobMutation::Pause {
       job_id,
@@ -5457,7 +5631,15 @@ async fn apply_typed_mutation(
       now,
     } => {
       validate_lifecycle_mutation(job_id, *expected_generation)?;
-      apply_resume(transaction, job_id, *expected_generation, *now).await
+      apply_resume(
+        transaction,
+        job_id,
+        *expected_generation,
+        *now,
+        policy,
+        &policy_json,
+      )
+      .await
     }
     ScheduledJobMutation::Delete {
       job_id,
@@ -5754,13 +5936,21 @@ async fn cancel_pre_execution_runs(
   .map_err(scheduler_error)
 }
 
-fn validate_update_request(request: &UpdateScheduledJob) -> Result<(), StateError> {
+fn validate_update_request(
+  request: &UpdateScheduledJob,
+  policy: &SchedulerOperationalPolicy,
+) -> Result<(), StateError> {
   validate_text("job id", &request.job_id).map_err(invalid_value)?;
   request
     .schedule
     .validate_for_create(request.now)
     .map_err(invalid_value)?;
+  request
+    .schedule
+    .validate_minimum_cadence(request.now, policy.minimum_schedule_cadence_seconds)
+    .map_err(invalid_value)?;
   request.definition.validate().map_err(invalid_value)?;
+  validate_definition_policy(&request.definition, policy)?;
   request.capability.validate().map_err(invalid_value)?;
   if request.expected_generation < 0 {
     return Err(StateError::InvalidSchedulerState {
@@ -5768,6 +5958,123 @@ fn validate_update_request(request: &UpdateScheduledJob) -> Result<(), StateErro
     });
   }
   validate_delivery_targets(&request.targets)
+}
+
+fn validate_definition_policy(
+  definition: &ScheduledJobDefinition,
+  policy: &SchedulerOperationalPolicy,
+) -> Result<(), StateError> {
+  let value: Value = serde_json::from_str(definition.canonical_json()).map_err(invalid_json)?;
+  let Some(instruction) = value.get("instruction").and_then(Value::as_str) else {
+    return Ok(());
+  };
+  if instruction.len() > usize::try_from(policy.max_prompt_bytes).unwrap_or(usize::MAX) {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled instruction exceeds max_prompt_bytes".to_owned(),
+    });
+  }
+  Ok(())
+}
+
+fn scheduler_policy_json(policy: &SchedulerOperationalPolicy) -> Result<String, StateError> {
+  policy
+    .validate()
+    .map_err(|error| StateError::InvalidSchedulerState {
+      reason: error.to_string(),
+    })?;
+  serde_json::to_string(policy).map_err(invalid_json)
+}
+
+fn scheduler_policy_from_snapshot(
+  version: i64,
+  snapshot: &str,
+) -> Result<SchedulerOperationalPolicy, StateError> {
+  if version != i64::from(SCHEDULER_OPERATIONAL_POLICY_VERSION) {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "unsupported scheduler operational policy version".to_owned(),
+    });
+  }
+  let policy: SchedulerOperationalPolicy = serde_json::from_str(snapshot).map_err(invalid_json)?;
+  policy
+    .validate()
+    .map_err(|error| StateError::InvalidSchedulerState {
+      reason: error.to_string(),
+    })?;
+  if scheduler_policy_json(&policy)? != snapshot {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduler operational policy snapshot is not canonical".to_owned(),
+    });
+  }
+  Ok(policy)
+}
+
+async fn acquire_scheduler_policy_lock(
+  transaction: &mut Transaction<'_, Sqlite>,
+  now: i64,
+) -> Result<(), StateError> {
+  let locked =
+    sqlx::query("update scheduler_operational_policy_lock set touched_at = ?1 where lock_id = 1")
+      .bind(now)
+      .execute(&mut **transaction)
+      .await
+      .map_err(scheduler_error)?;
+  if locked.rows_affected() != 1 {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduler operational policy lock is unavailable".to_owned(),
+    });
+  }
+  Ok(())
+}
+
+async fn enforce_active_job_limits(
+  transaction: &mut Transaction<'_, Sqlite>,
+  policy: &SchedulerOperationalPolicy,
+  owner: &PrincipalKey,
+  excluded_job_id: Option<&str>,
+) -> Result<(), StateError> {
+  let global: i64 = sqlx::query_scalar(
+    "select count(*) from scheduled_jobs where status = 'active' and (?1 is null or job_id <> ?1)",
+  )
+  .bind(excluded_job_id)
+  .fetch_one(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  if global >= i64::from(policy.max_active_jobs) {
+    return Err(StateError::ScheduledActiveJobLimitExceeded { scope: "global" });
+  }
+  let owner_active_count: i64 = sqlx::query_scalar(
+    "select count(*) from scheduled_jobs where status = 'active' and owner_kind = ?1 and owner_provider = ?2 and owner_tenant = ?3 and owner_subject = ?4 and (?5 is null or job_id <> ?5)",
+  )
+  .bind(owner.kind())
+  .bind(owner.provider())
+  .bind(owner.tenant())
+  .bind(owner.subject())
+  .bind(excluded_job_id)
+  .fetch_one(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  if owner_active_count >= i64::from(policy.max_active_jobs_per_owner) {
+    return Err(StateError::ScheduledActiveJobLimitExceeded { scope: "owner" });
+  }
+  Ok(())
+}
+
+fn owner_from_row(row: &SqliteRow) -> Result<PrincipalKey, StateError> {
+  PrincipalKey::new(
+    row
+      .try_get::<String, _>("owner_kind")
+      .map_err(scheduler_error)?,
+    row
+      .try_get::<String, _>("owner_provider")
+      .map_err(scheduler_error)?,
+    row
+      .try_get::<String, _>("owner_tenant")
+      .map_err(scheduler_error)?,
+    row
+      .try_get::<String, _>("owner_subject")
+      .map_err(scheduler_error)?,
+  )
+  .map_err(invalid_value)
 }
 
 fn validate_delivery_targets(targets: &[DeliveryTargetSnapshot]) -> Result<(), StateError> {
@@ -5967,6 +6274,14 @@ fn persisted_profile_allows_retry(
       .ok_or_else(|| StateError::InvalidSchedulerState {
         reason: "materialized run is missing its execution baseline snapshot".to_owned(),
       })?,
+    scheduler_policy: scheduler_policy_from_snapshot(
+      row
+        .try_get("scheduler_policy_version")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("scheduler_policy_json")
+        .map_err(scheduler_error)?,
+    )?,
   };
   let Ok(authority) = super::ScheduledPrepareAuthority::for_claim(&claim, nonce) else {
     return Ok(false);
@@ -6025,6 +6340,14 @@ fn persisted_profile_allows_recovery(
       .ok_or_else(|| StateError::InvalidSchedulerState {
         reason: "materialized run is missing its execution baseline snapshot".to_owned(),
       })?,
+    scheduler_policy: scheduler_policy_from_snapshot(
+      row
+        .try_get("scheduler_policy_version")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("scheduler_policy_json")
+        .map_err(scheduler_error)?,
+    )?,
   };
   let Ok(authority) = super::ScheduledPrepareAuthority::for_claim(&claim, nonce) else {
     return Ok(false);
@@ -6496,7 +6819,7 @@ mod tests {
     let mutation = ScheduledJobMutation::Create(Box::new(CreateScheduledJob {
       job_id: "audited".to_owned(),
       schedule_id: "schedule-audited".to_owned(),
-      definition: ScheduledJobDefinition::new(1, "{}").expect("definition"),
+      definition: ScheduledJobDefinition::new(1, r#"{"instruction":"test"}"#).expect("definition"),
       creator: owner.clone(),
       owner: owner.clone(),
       capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("profile"),
@@ -6681,7 +7004,7 @@ mod tests {
     let request = CreateScheduledJob {
       job_id: "busy".to_owned(),
       schedule_id: "schedule-busy".to_owned(),
-      definition: ScheduledJobDefinition::new(1, "{}").expect("definition"),
+      definition: ScheduledJobDefinition::new(1, r#"{"instruction":"test"}"#).expect("definition"),
       creator: PrincipalKey::new("user", "test", "tenant", "creator").expect("creator"),
       owner: PrincipalKey::new("user", "test", "tenant", "owner").expect("owner"),
       capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("profile"),
@@ -6722,7 +7045,7 @@ mod tests {
     let request = CreateScheduledJob {
       job_id: "terminal-transaction".to_owned(),
       schedule_id: "schedule-terminal-transaction".to_owned(),
-      definition: ScheduledJobDefinition::new(1, "{}").expect("definition"),
+      definition: ScheduledJobDefinition::new(1, r#"{"instruction":"test"}"#).expect("definition"),
       creator: PrincipalKey::new("user", "test", "tenant", "creator").expect("creator"),
       owner: PrincipalKey::new("user", "test", "tenant", "owner").expect("owner"),
       capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("profile"),

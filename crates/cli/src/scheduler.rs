@@ -461,7 +461,7 @@ async fn execute_scheduler_operator_command(
         .await
         .map_err(state_command_error)?;
       let next_attempt_at = now
-        .checked_add(i64::from(policy.retry_delay_seconds))
+        .checked_add(i64::from(policy.run_retry_base_seconds))
         .ok_or_else(|| command_error("invalid_policy", "scheduler retry timing overflowed"))?;
       let run_plan = run_candidates
         .iter()
@@ -485,7 +485,7 @@ async fn execute_scheduler_operator_command(
       let plan = json!({
         "delivery_candidates": delivery_plan,
         "limit": limit,
-        "max_attempts": policy.max_attempts,
+        "max_attempts": policy.run_max_attempts,
         "next_attempt_at": next_attempt_at,
         "now": now,
         "run_candidates": run_plan,
@@ -508,7 +508,7 @@ async fn execute_scheduler_operator_command(
         let outcome = state
           .reconcile_scheduled_run_candidate(
             candidate,
-            i64::from(policy.max_attempts),
+            i64::from(policy.run_max_attempts),
             next_attempt_at,
             now,
           )
@@ -555,7 +555,7 @@ async fn execute_scheduler_operator_command(
       let authority = read_bounded_file(&authority_file)?;
       let expected_state = retry_run_state(expected_state);
       let next_attempt_at = now
-        .checked_add(i64::from(policy.retry_delay_seconds))
+        .checked_add(i64::from(policy.run_retry_base_seconds))
         .ok_or_else(|| command_error("invalid_policy", "scheduler retry timing overflowed"))?;
       let provisional = SchedulerOperatorRequest::for_run_retry(
         provisional_principal(),

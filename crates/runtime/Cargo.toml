@@ -13,6 +13,7 @@ async-trait = "0.1"
 codeoff-agent-contract = { path = "../agent/contract" }
 codeoff-channel-contract = { path = "../channel/contract" }
 codeoff-config = { path = "../config" }
+codeoff-core = { path = "../core" }
 codeoff-state = { path = "../state" }
 serde_json.workspace = true
 sha2.workspace = true

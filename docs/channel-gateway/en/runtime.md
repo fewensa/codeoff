@@ -81,17 +81,39 @@ run_claims_enabled = false
 delivery_claims_enabled = false
 recovery_batch_limit = 32
 materialization_batch_limit = 32
+occurrence_search_limit = 100000
 tick_interval_ms = 250
 error_backoff_ms = 1000
-lease_seconds = 60
-heartbeat_interval_ms = 15000
-total_timeout_seconds = 1800
-prepare_grace_ms = 5000
-cancellation_grace_ms = 5000
-finalization_grace_ms = 5000
-retry_delay_seconds = 30
+minimum_schedule_cadence_seconds = 60
+max_active_jobs = 1000
+max_active_jobs_per_owner = 100
+max_prompt_bytes = 65536
+max_result_bytes = 65536
+max_summary_bytes = 32768
+run_lease_seconds = 60
+run_heartbeat_interval_ms = 15000
+run_timeout_seconds = 1800
+run_prepare_grace_ms = 5000
+run_cancellation_grace_ms = 5000
+run_finalization_grace_ms = 5000
+run_retry_base_seconds = 30
+run_retry_max_seconds = 300
 run_deadline_seconds = 3600
-max_attempts = 3
+run_max_attempts = 3
+delivery_tick_interval_ms = 250
+delivery_batch_limit = 32
+delivery_lease_seconds = 60
+delivery_heartbeat_interval_ms = 10000
+delivery_readiness_timeout_seconds = 10
+delivery_send_timeout_seconds = 30
+delivery_finalization_timeout_seconds = 5
+delivery_max_attempts = 5
+delivery_retry_base_seconds = 5
+delivery_retry_max_seconds = 300
+delivery_retry_after_max_seconds = 3600
+delivery_deadline_seconds = 3600
+delivery_readiness_retry_base_seconds = 1
+delivery_readiness_retry_max_seconds = 60
 
 [slack]
 workspace_id = "T00000000"
@@ -154,6 +176,8 @@ bind = "127.0.0.1:7789"
 Secrets must come from environment variables or a secret manager, not checked-in config files.
 
 `scheduler.enabled` is the global scheduler switch. `run_claims_enabled` and `delivery_claims_enabled` are independent fail-closed kill switches: disabled run claims do not consume pending Agent work; disabled delivery claims still allow payload preparation but do not send to the provider. Enabling delivery claims requires the configured provider credentials. Scheduler state remains durable across restarts, and delivery retry or unknown-resolution operations never rerun the Agent occurrence.
+
+Every created, updated, or resumed job snapshots the validated operational policy. Materialized runs and delivery intents inherit that immutable snapshot, so retry, deadline, lease, size, and attempt behavior remains stable across restarts and later config changes. `data_retention` remains the only authority for retention-day policy; scheduler operational snapshots do not duplicate retention settings.
 
 Enabling `run_claims_enabled` also requires the dedicated `[agent.scheduled_codex]` profile. Startup verifies the exact Codex binary and dedicated config digests, read-only filesystem boundaries, pinned loopback GitHub MCP identity, and a current Ed25519-signed isolation attestation bound to that complete profile. Missing, stale, malformed, or mismatched evidence stops `serve` before run claims start. Scheduled turns are fresh and channel-independent, use no dynamic tools, and persist the attested read-only execution surface before `turn/start`.
 

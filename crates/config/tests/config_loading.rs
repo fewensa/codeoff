@@ -241,8 +241,8 @@ enabled = true
 run_claims_enabled = true
 delivery_claims_enabled = true
 recovery_batch_limit = 64
-retry_delay_seconds = 60
-max_attempts = 5
+run_retry_base_seconds = 60
+run_max_attempts = 5
 
 [agent.scheduled_codex]
 codex_program = "/opt/codeoff/bin/codex"
@@ -274,8 +274,8 @@ runtime_gid = 65534
   assert!(loaded.scheduler.run_claims_enabled);
   assert!(loaded.scheduler.delivery_claims_enabled);
   assert_eq!(loaded.scheduler.recovery_batch_limit, 64);
-  assert_eq!(loaded.scheduler.retry_delay_seconds, 60);
-  assert_eq!(loaded.scheduler.max_attempts, 5);
+  assert_eq!(loaded.scheduler.run_retry_base_seconds, 60);
+  assert_eq!(loaded.scheduler.run_max_attempts, 5);
   loaded.validate().expect("scheduler config");
 }
 
@@ -293,21 +293,69 @@ fn test_scheduler_config_rejects_claims_without_lifecycle_and_unsafe_limits() {
 
   config.scheduler.enabled = true;
   config.scheduler.run_claims_enabled = false;
-  config.scheduler.heartbeat_interval_ms = u64::from(config.scheduler.lease_seconds) * 1_000;
+  config.scheduler.run_heartbeat_interval_ms =
+    u64::from(config.scheduler.run_lease_seconds) * 1_000;
   assert!(matches!(
     config.validate(),
     Err(ConfigError::InvalidScheduler {
-      field: "heartbeat_interval_ms",
+      field: "run_heartbeat_interval_ms",
       ..
     })
   ));
 
-  config.scheduler.heartbeat_interval_ms = 1_000;
-  config.scheduler.max_attempts = 0;
+  config.scheduler.run_heartbeat_interval_ms = 1_000;
+  config.scheduler.run_max_attempts = 0;
   assert!(matches!(
     config.validate(),
     Err(ConfigError::InvalidScheduler {
-      field: "max_attempts",
+      field: "run_max_attempts",
+      ..
+    })
+  ));
+}
+
+#[test]
+fn test_scheduler_policy_rejects_strict_heartbeat_and_incoherent_deadlines() {
+  let mut config = CodeoffConfig::default();
+  config.scheduler.run_heartbeat_interval_ms =
+    u64::from(config.scheduler.run_lease_seconds) * 1_000 / 3;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "run_heartbeat_interval_ms",
+      ..
+    })
+  ));
+
+  config.scheduler.run_heartbeat_interval_ms = u64::MAX;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "run_heartbeat_interval_ms",
+      ..
+    })
+  ));
+
+  config.scheduler.run_heartbeat_interval_ms = 1_000;
+  config.scheduler.run_deadline_seconds = config.scheduler.run_timeout_seconds;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "run_deadline_seconds",
+      ..
+    })
+  ));
+
+  config.scheduler.run_deadline_seconds = SchedulerRuntimeConfig::default().run_deadline_seconds;
+  config.scheduler.delivery_deadline_seconds = u32::from(
+    config.scheduler.delivery_send_timeout_seconds
+      + config.scheduler.delivery_finalization_timeout_seconds
+      - 1,
+  );
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "delivery_retry_after_max_seconds" | "delivery_deadline_seconds",
       ..
     })
   ));

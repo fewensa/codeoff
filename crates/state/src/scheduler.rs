@@ -2,6 +2,7 @@ use std::fmt::{self, Write as _};
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
+use codeoff_core::SchedulerOperationalPolicy;
 use croner::parser::CronParser;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -36,7 +37,6 @@ const MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 const MAX_PREVIOUS_SUCCESS_BYTES: usize = 16 * 1024;
 const MAX_DELIVERY_TARGETS: usize = 32;
-const DEFAULT_OCCURRENCE_STEPS: u32 = 100_000;
 const MAX_CRON_HORIZON_SECONDS: i64 = 366 * 24 * 60 * 60 * 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -61,6 +61,8 @@ pub enum StateValueError {
   OnceNotFuture,
   #[error("fixed interval must be positive")]
   InvalidInterval,
+  #[error("schedule cadence is shorter than the configured minimum")]
+  CadenceTooShort,
   #[error("cron must contain exactly five fields")]
   InvalidCronFieldCount,
   #[error("invalid cron expression")]
@@ -758,6 +760,38 @@ impl ScheduleSpec {
     }
   }
 
+  /// Validates that this schedule cannot produce occurrences faster than the policy minimum.
+  ///
+  /// # Errors
+  /// Returns `CadenceTooShort` when the first once delay, fixed interval, or consecutive cron
+  /// occurrences are shorter than the configured minimum.
+  pub fn validate_minimum_cadence(
+    &self,
+    now: i64,
+    minimum_seconds: u32,
+  ) -> Result<(), StateValueError> {
+    let minimum = i64::from(minimum_seconds);
+    let valid = match self {
+      Self::Once { at } => at.checked_sub(now).is_some_and(|delay| delay >= minimum),
+      Self::FixedInterval { every_seconds, .. } => *every_seconds >= minimum,
+      Self::Cron { .. } => {
+        let first = self
+          .next_after(now)
+          .map_err(|_| StateValueError::InvalidCron)?;
+        let second = self
+          .next_after(first)
+          .map_err(|_| StateValueError::InvalidCron)?;
+        second
+          .checked_sub(first)
+          .is_some_and(|cadence| cadence >= minimum)
+      }
+    };
+    if !valid {
+      return Err(StateValueError::CadenceTooShort);
+    }
+    Ok(())
+  }
+
   /// Finds the first canonical occurrence strictly after `reference`.
   ///
   /// # Errors
@@ -1113,6 +1147,7 @@ pub struct ClaimedScheduledRun {
   pub capability_json: String,
   pub targets_json: String,
   pub execution_baseline_json: String,
+  pub scheduler_policy: SchedulerOperationalPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1155,6 +1190,12 @@ impl ScheduledPrepareAuthority {
       "scheduled execution baseline",
       &claim.execution_baseline_json,
     )?;
+    claim
+      .scheduler_policy
+      .validate()
+      .map_err(|_| StateValueError::InvalidValue {
+        field: "scheduled operational policy",
+      })?;
     let definition: Value =
       serde_json::from_str(&claim.definition_json).map_err(|_| StateValueError::InvalidJson {
         field: "scheduled definition",
@@ -1250,6 +1291,7 @@ impl ScheduledPrepareAuthority {
         "task": task_digest,
       },
       "nonce": nonce,
+      "operational_policy": claim.scheduler_policy,
       "schema_version": 1,
     })
     .to_string();

@@ -187,7 +187,8 @@ impl CodexScheduledExecutionBackend {
     deployment: ScheduledCodexConfig,
     config: ScheduledWorkerConfig,
   ) -> Self {
-    let cancellation_grace = Duration::from_millis(config.cancellation_grace_ms);
+    let cancellation_grace =
+      Duration::from_millis(config.operational_policy.run_cancellation_grace_ms);
     let third = cancellation_grace / 3;
     Self {
       state: state.clone(),
@@ -199,7 +200,7 @@ impl CodexScheduledExecutionBackend {
         deployment,
         built.profile,
       ),
-      timeout: Duration::from_secs(u64::from(config.total_timeout_seconds)),
+      timeout: Duration::from_secs(u64::from(config.operational_policy.run_timeout_seconds)),
       interrupt_grace: third,
       terminate_grace: third,
       kill_grace: cancellation_grace

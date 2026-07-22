@@ -2,14 +2,16 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::Mutex;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(feature = "test-support")]
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
 use codeoff_channel_contract::ChannelEvent;
+use codeoff_core::SchedulerOperationalPolicy;
 use serde_json::Value;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -69,6 +71,7 @@ where updated_at < datetime(?1, 'unixepoch', ?2)
 #[derive(Debug, Clone)]
 pub struct StateStore {
   pub(crate) pool: SqlitePool,
+  pub(crate) scheduler_policy: Arc<SchedulerOperationalPolicy>,
   #[cfg(any(test, feature = "test-support"))]
   test_connect_options: SqliteConnectOptions,
   #[cfg(feature = "test-support")]
@@ -518,6 +521,28 @@ impl StateStore {
     state_dir: &Path,
     database_url: Option<&str>,
   ) -> Result<Self, StateError> {
+    Self::initialize_with_scheduler_policy(
+      state_dir,
+      database_url,
+      SchedulerOperationalPolicy::legacy_compatible(),
+    )
+    .await
+  }
+
+  /// Initializes state with one validated canonical scheduler policy.
+  ///
+  /// # Errors
+  /// Returns an error for an invalid policy, storage setup failure, or migration failure.
+  pub async fn initialize_with_scheduler_policy(
+    state_dir: &Path,
+    database_url: Option<&str>,
+    scheduler_policy: SchedulerOperationalPolicy,
+  ) -> Result<Self, StateError> {
+    scheduler_policy
+      .validate()
+      .map_err(|error| StateError::InvalidSchedulerState {
+        reason: error.to_string(),
+      })?;
     prepare_state_dir(state_dir)?;
 
     let options = connect_options(state_dir, database_url)?;
@@ -538,11 +563,17 @@ impl StateStore {
 
     Ok(Self {
       pool,
+      scheduler_policy: Arc::new(scheduler_policy),
       #[cfg(any(test, feature = "test-support"))]
       test_connect_options,
       #[cfg(feature = "test-support")]
       test_hooks: Arc::new(StateStoreTestHooks::default()),
     })
+  }
+
+  #[must_use]
+  pub fn scheduler_operational_policy(&self) -> Arc<SchedulerOperationalPolicy> {
+    Arc::clone(&self.scheduler_policy)
   }
 
   /// Confirms that the current `SQLite` connection can execute a minimal read.

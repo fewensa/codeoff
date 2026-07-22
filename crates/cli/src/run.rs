@@ -112,9 +112,10 @@ fn run_scheduler(
   let config = load_config(config_path, state_dir)?;
   config.validate()?;
   let runtime = tokio::runtime::Runtime::new()?;
-  let state = runtime.block_on(StateStore::initialize(
+  let state = runtime.block_on(StateStore::initialize_with_scheduler_policy(
     config.state_dir(),
     config.database_url(),
+    config.scheduler.operational_policy()?,
   ))?;
   let now = i64::try_from(now_unix_seconds()).unwrap_or(i64::MAX);
   let mut targets = TargetResolverRegistry::with_defaults();
@@ -149,9 +150,10 @@ fn run_serve(
   let config = load_config(config_path, state_dir)?;
   config.validate()?;
   let runtime = tokio::runtime::Runtime::new()?;
-  let state = runtime.block_on(StateStore::initialize(
+  let state = runtime.block_on(StateStore::initialize_with_scheduler_policy(
     config.state_dir(),
     config.database_url(),
+    config.scheduler.operational_policy()?,
   ))?;
 
   if check {
@@ -893,19 +895,9 @@ fn scheduled_worker_config(config: &SchedulerRuntimeConfig) -> ScheduledWorkerCo
   ScheduledWorkerConfig {
     enabled: config.enabled,
     run_claims_enabled: config.run_claims_enabled,
-    recovery_batch_limit: config.recovery_batch_limit,
-    materialization_batch_limit: config.materialization_batch_limit,
-    tick_interval_ms: config.tick_interval_ms,
-    error_backoff_ms: config.error_backoff_ms,
-    lease_seconds: config.lease_seconds,
-    heartbeat_interval_ms: config.heartbeat_interval_ms,
-    total_timeout_seconds: config.total_timeout_seconds,
-    prepare_grace_ms: config.prepare_grace_ms,
-    cancellation_grace_ms: config.cancellation_grace_ms,
-    finalization_grace_ms: config.finalization_grace_ms,
-    retry_delay_seconds: config.retry_delay_seconds,
-    run_deadline_seconds: config.run_deadline_seconds,
-    max_attempts: config.max_attempts,
+    operational_policy: config
+      .operational_policy()
+      .expect("validated scheduler operational policy"),
   }
 }
 
@@ -2949,9 +2941,10 @@ fn run_worker(
       let slack_check = check_slack_worker(&config.slack)?;
 
       let runtime = tokio::runtime::Runtime::new()?;
-      let state = runtime.block_on(StateStore::initialize(
+      let state = runtime.block_on(StateStore::initialize_with_scheduler_policy(
         config.state_dir(),
         config.database_url(),
+        config.scheduler.operational_policy()?,
       ))?;
 
       if !check {
@@ -2990,9 +2983,15 @@ fn run_worker(
 
       let config = load_config(config_path, state_dir)?;
       config.validate()?;
+      let scheduler_policy = config.scheduler.operational_policy()?;
       let runtime = tokio::runtime::Runtime::new()?;
       let event = runtime.block_on(async {
-        let store = StateStore::initialize(config.state_dir(), config.database_url()).await?;
+        let store = StateStore::initialize_with_scheduler_policy(
+          config.state_dir(),
+          config.database_url(),
+          scheduler_policy,
+        )
+        .await?;
         let Some(event) = store.claim_next_channel_event().await? else {
           return Ok(None);
         };
@@ -3083,9 +3082,10 @@ fn run_migrate(
   config.validate()?;
 
   let runtime = tokio::runtime::Runtime::new()?;
-  runtime.block_on(StateStore::initialize(
+  runtime.block_on(StateStore::initialize_with_scheduler_policy(
     config.state_dir(),
     config.database_url(),
+    config.scheduler.operational_policy()?,
   ))?;
 
   println!("state migrated: state_dir={}", config.state_dir().display());
@@ -3398,15 +3398,15 @@ mod tests {
       materialization_batch_limit: 9,
       tick_interval_ms: 125,
       error_backoff_ms: 2_500,
-      lease_seconds: 90,
-      heartbeat_interval_ms: 10_000,
-      total_timeout_seconds: 1_200,
-      prepare_grace_ms: 1_500,
-      cancellation_grace_ms: 2_000,
-      finalization_grace_ms: 2_500,
-      retry_delay_seconds: 45,
+      run_lease_seconds: 90,
+      run_heartbeat_interval_ms: 10_000,
+      run_timeout_seconds: 1_200,
+      run_prepare_grace_ms: 1_500,
+      run_cancellation_grace_ms: 2_000,
+      run_finalization_grace_ms: 2_500,
+      run_retry_base_seconds: 45,
       run_deadline_seconds: 7_200,
-      max_attempts: 4,
+      run_max_attempts: 4,
       ..SchedulerRuntimeConfig::default()
     };
 
@@ -3415,19 +3415,7 @@ mod tests {
       ScheduledWorkerConfig {
         enabled: true,
         run_claims_enabled: true,
-        recovery_batch_limit: 7,
-        materialization_batch_limit: 9,
-        tick_interval_ms: 125,
-        error_backoff_ms: 2_500,
-        lease_seconds: 90,
-        heartbeat_interval_ms: 10_000,
-        total_timeout_seconds: 1_200,
-        prepare_grace_ms: 1_500,
-        cancellation_grace_ms: 2_000,
-        finalization_grace_ms: 2_500,
-        retry_delay_seconds: 45,
-        run_deadline_seconds: 7_200,
-        max_attempts: 4,
+        operational_policy: scheduler.operational_policy().expect("policy"),
       }
     );
   }
@@ -3476,7 +3464,8 @@ mod tests {
       .create_scheduled_job(&CreateScheduledJob {
         job_id: "serve-none-only".to_owned(),
         schedule_id: "schedule-serve-none-only".to_owned(),
-        definition: ScheduledJobDefinition::new(1, "{}").expect("definition"),
+        definition: ScheduledJobDefinition::new(1, r#"{"instruction":"test"}"#)
+          .expect("definition"),
         creator: owner.clone(),
         owner,
         capability: CapabilityProfileSnapshot::new(1, "none", "{}").expect("capability"),

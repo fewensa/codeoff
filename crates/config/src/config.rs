@@ -4,6 +4,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use codeoff_core::{SCHEDULER_OPERATIONAL_POLICY_VERSION, SchedulerOperationalPolicy};
 use serde::Deserialize;
 
 use crate::ConfigError;
@@ -78,17 +79,39 @@ pub struct SchedulerRuntimeConfig {
   pub delivery_claims_enabled: bool,
   pub recovery_batch_limit: u16,
   pub materialization_batch_limit: u16,
+  pub occurrence_search_limit: u32,
   pub tick_interval_ms: u64,
   pub error_backoff_ms: u64,
-  pub lease_seconds: u16,
-  pub heartbeat_interval_ms: u64,
-  pub total_timeout_seconds: u32,
-  pub prepare_grace_ms: u64,
-  pub cancellation_grace_ms: u64,
-  pub finalization_grace_ms: u64,
-  pub retry_delay_seconds: u32,
+  pub minimum_schedule_cadence_seconds: u32,
+  pub max_active_jobs: u32,
+  pub max_active_jobs_per_owner: u32,
+  pub max_prompt_bytes: u32,
+  pub max_result_bytes: u32,
+  pub max_summary_bytes: u32,
+  pub run_lease_seconds: u16,
+  pub run_heartbeat_interval_ms: u64,
+  pub run_timeout_seconds: u32,
+  pub run_prepare_grace_ms: u64,
+  pub run_cancellation_grace_ms: u64,
+  pub run_finalization_grace_ms: u64,
+  pub run_retry_base_seconds: u32,
+  pub run_retry_max_seconds: u32,
   pub run_deadline_seconds: u32,
-  pub max_attempts: u16,
+  pub run_max_attempts: u16,
+  pub delivery_tick_interval_ms: u64,
+  pub delivery_batch_limit: u16,
+  pub delivery_lease_seconds: u16,
+  pub delivery_heartbeat_interval_ms: u64,
+  pub delivery_readiness_timeout_seconds: u16,
+  pub delivery_send_timeout_seconds: u16,
+  pub delivery_finalization_timeout_seconds: u16,
+  pub delivery_max_attempts: u16,
+  pub delivery_retry_base_seconds: u32,
+  pub delivery_retry_max_seconds: u32,
+  pub delivery_retry_after_max_seconds: u32,
+  pub delivery_deadline_seconds: u32,
+  pub delivery_readiness_retry_base_seconds: u16,
+  pub delivery_readiness_retry_max_seconds: u16,
 }
 
 impl Default for SchedulerRuntimeConfig {
@@ -99,17 +122,39 @@ impl Default for SchedulerRuntimeConfig {
       delivery_claims_enabled: false,
       recovery_batch_limit: 32,
       materialization_batch_limit: 32,
+      occurrence_search_limit: 100_000,
       tick_interval_ms: 250,
       error_backoff_ms: 1_000,
-      lease_seconds: 60,
-      heartbeat_interval_ms: 15_000,
-      total_timeout_seconds: 1_800,
-      prepare_grace_ms: 5_000,
-      cancellation_grace_ms: 5_000,
-      finalization_grace_ms: 5_000,
-      retry_delay_seconds: 30,
+      minimum_schedule_cadence_seconds: 60,
+      max_active_jobs: 1_000,
+      max_active_jobs_per_owner: 100,
+      max_prompt_bytes: 64 * 1024,
+      max_result_bytes: 64 * 1024,
+      max_summary_bytes: 32 * 1024,
+      run_lease_seconds: 60,
+      run_heartbeat_interval_ms: 15_000,
+      run_timeout_seconds: 1_800,
+      run_prepare_grace_ms: 5_000,
+      run_cancellation_grace_ms: 5_000,
+      run_finalization_grace_ms: 5_000,
+      run_retry_base_seconds: 30,
+      run_retry_max_seconds: 300,
       run_deadline_seconds: 3_600,
-      max_attempts: 3,
+      run_max_attempts: 3,
+      delivery_tick_interval_ms: 250,
+      delivery_batch_limit: 32,
+      delivery_lease_seconds: 60,
+      delivery_heartbeat_interval_ms: 10_000,
+      delivery_readiness_timeout_seconds: 10,
+      delivery_send_timeout_seconds: 30,
+      delivery_finalization_timeout_seconds: 5,
+      delivery_max_attempts: 5,
+      delivery_retry_base_seconds: 5,
+      delivery_retry_max_seconds: 300,
+      delivery_retry_after_max_seconds: 3_600,
+      delivery_deadline_seconds: 3_600,
+      delivery_readiness_retry_base_seconds: 1,
+      delivery_readiness_retry_max_seconds: 60,
     }
   }
 }
@@ -260,6 +305,58 @@ impl CodeoffConfig {
 }
 
 impl SchedulerRuntimeConfig {
+  /// Converts strict deserialized settings into the canonical scheduler policy.
+  ///
+  /// # Errors
+  /// Returns the stable invalid field when the complete policy is incoherent.
+  pub fn operational_policy(&self) -> Result<SchedulerOperationalPolicy, ConfigError> {
+    let policy = SchedulerOperationalPolicy {
+      schema_version: SCHEDULER_OPERATIONAL_POLICY_VERSION,
+      recovery_batch_limit: self.recovery_batch_limit,
+      materialization_batch_limit: self.materialization_batch_limit,
+      occurrence_search_limit: self.occurrence_search_limit,
+      tick_interval_ms: self.tick_interval_ms,
+      error_backoff_ms: self.error_backoff_ms,
+      minimum_schedule_cadence_seconds: self.minimum_schedule_cadence_seconds,
+      max_active_jobs: self.max_active_jobs,
+      max_active_jobs_per_owner: self.max_active_jobs_per_owner,
+      max_prompt_bytes: self.max_prompt_bytes,
+      max_result_bytes: self.max_result_bytes,
+      max_summary_bytes: self.max_summary_bytes,
+      run_lease_seconds: self.run_lease_seconds,
+      run_heartbeat_interval_ms: self.run_heartbeat_interval_ms,
+      run_timeout_seconds: self.run_timeout_seconds,
+      run_prepare_grace_ms: self.run_prepare_grace_ms,
+      run_cancellation_grace_ms: self.run_cancellation_grace_ms,
+      run_finalization_grace_ms: self.run_finalization_grace_ms,
+      run_retry_base_seconds: self.run_retry_base_seconds,
+      run_retry_max_seconds: self.run_retry_max_seconds,
+      run_deadline_seconds: self.run_deadline_seconds,
+      run_max_attempts: self.run_max_attempts,
+      delivery_tick_interval_ms: self.delivery_tick_interval_ms,
+      delivery_batch_limit: self.delivery_batch_limit,
+      delivery_lease_seconds: self.delivery_lease_seconds,
+      delivery_heartbeat_interval_ms: self.delivery_heartbeat_interval_ms,
+      delivery_readiness_timeout_seconds: self.delivery_readiness_timeout_seconds,
+      delivery_send_timeout_seconds: self.delivery_send_timeout_seconds,
+      delivery_finalization_timeout_seconds: self.delivery_finalization_timeout_seconds,
+      delivery_max_attempts: self.delivery_max_attempts,
+      delivery_retry_base_seconds: self.delivery_retry_base_seconds,
+      delivery_retry_max_seconds: self.delivery_retry_max_seconds,
+      delivery_retry_after_max_seconds: self.delivery_retry_after_max_seconds,
+      delivery_deadline_seconds: self.delivery_deadline_seconds,
+      delivery_readiness_retry_base_seconds: self.delivery_readiness_retry_base_seconds,
+      delivery_readiness_retry_max_seconds: self.delivery_readiness_retry_max_seconds,
+    };
+    policy
+      .validate()
+      .map_err(|error| ConfigError::InvalidScheduler {
+        field: error.field,
+        reason: error.reason,
+      })?;
+    Ok(policy)
+  }
+
   fn validate(&self) -> Result<(), ConfigError> {
     let invalid = |field, reason| ConfigError::InvalidScheduler { field, reason };
     if !self.enabled && (self.run_claims_enabled || self.delivery_claims_enabled) {
@@ -268,72 +365,7 @@ impl SchedulerRuntimeConfig {
         "must be true when run or delivery claims are enabled",
       ));
     }
-    if !(1..=1_024).contains(&self.recovery_batch_limit) {
-      return Err(invalid(
-        "recovery_batch_limit",
-        "must be between 1 and 1024",
-      ));
-    }
-    if !(1..=1_024).contains(&self.materialization_batch_limit) {
-      return Err(invalid(
-        "materialization_batch_limit",
-        "must be between 1 and 1024",
-      ));
-    }
-    if !(10..=60_000).contains(&self.tick_interval_ms) {
-      return Err(invalid("tick_interval_ms", "must be between 10 and 60000"));
-    }
-    if !(10..=300_000).contains(&self.error_backoff_ms) {
-      return Err(invalid("error_backoff_ms", "must be between 10 and 300000"));
-    }
-    if !(5..=3_600).contains(&self.lease_seconds) {
-      return Err(invalid("lease_seconds", "must be between 5 and 3600"));
-    }
-    if self.heartbeat_interval_ms == 0
-      || self.heartbeat_interval_ms >= u64::from(self.lease_seconds) * 1_000
-    {
-      return Err(invalid(
-        "heartbeat_interval_ms",
-        "must be positive and shorter than lease_seconds",
-      ));
-    }
-    if !(1..=21_600).contains(&self.total_timeout_seconds) {
-      return Err(invalid(
-        "total_timeout_seconds",
-        "must be between 1 and 21600",
-      ));
-    }
-    for (field, value) in [
-      ("prepare_grace_ms", self.prepare_grace_ms),
-      ("finalization_grace_ms", self.finalization_grace_ms),
-    ] {
-      if !(1..=60_000).contains(&value) {
-        return Err(invalid(field, "must be between 1 and 60000"));
-      }
-    }
-    if !(3..=60_000).contains(&self.cancellation_grace_ms) {
-      return Err(invalid(
-        "cancellation_grace_ms",
-        "must be between 3 and 60000",
-      ));
-    }
-    if !(1..=86_400).contains(&self.retry_delay_seconds) {
-      return Err(invalid(
-        "retry_delay_seconds",
-        "must be between 1 and 86400",
-      ));
-    }
-    if self.run_deadline_seconds < self.total_timeout_seconds || self.run_deadline_seconds > 604_800
-    {
-      return Err(invalid(
-        "run_deadline_seconds",
-        "must cover total_timeout_seconds and not exceed 604800",
-      ));
-    }
-    if !(1..=20).contains(&self.max_attempts) {
-      return Err(invalid("max_attempts", "must be between 1 and 20"));
-    }
-    Ok(())
+    self.operational_policy().map(|_| ())
   }
 }
 

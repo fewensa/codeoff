@@ -9,6 +9,7 @@ repository.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+codeoff-core = { path = "../core" }
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true

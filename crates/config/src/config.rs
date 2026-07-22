@@ -223,6 +223,7 @@ impl CodeoffConfig {
     }
 
     self.scheduler.validate()?;
+    self.data_retention.validate()?;
 
     if self.mcp.enabled {
       match self.mcp.transport.as_str() {
@@ -328,6 +329,27 @@ impl SchedulerRuntimeConfig {
   }
 }
 
+impl DataRetentionConfig {
+  fn validate(&self) -> Result<(), ConfigError> {
+    let invalid = |field, reason| ConfigError::InvalidDataRetention { field, reason };
+    for (field, value) in [
+      ("scheduled_run_days", self.scheduled_run_days),
+      ("scheduled_delivery_days", self.scheduled_delivery_days),
+    ] {
+      if !(1..=3_650).contains(&value) {
+        return Err(invalid(field, "must be between 1 and 3650"));
+      }
+    }
+    if !(1..=1_024).contains(&self.scheduled_retention_batch_limit) {
+      return Err(invalid(
+        "scheduled_retention_batch_limit",
+        "must be between 1 and 1024",
+      ));
+    }
+    Ok(())
+  }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -373,6 +395,9 @@ pub struct DataRetentionConfig {
   pub context_attempt_days: u16,
   pub conversation_summary_days: u16,
   pub artifact_days: u16,
+  pub scheduled_run_days: u16,
+  pub scheduled_delivery_days: u16,
+  pub scheduled_retention_batch_limit: u16,
 }
 
 impl Default for DataRetentionConfig {
@@ -384,6 +409,9 @@ impl Default for DataRetentionConfig {
       context_attempt_days: 14,
       conversation_summary_days: 90,
       artifact_days: 7,
+      scheduled_run_days: 30,
+      scheduled_delivery_days: 30,
+      scheduled_retention_batch_limit: 100,
     }
   }
 }

@@ -2,7 +2,10 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+#[cfg(feature = "test-support")]
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use codeoff_channel_contract::ChannelEvent;
 use serde_json::Value;
@@ -66,6 +69,21 @@ pub struct StateStore {
   pub(crate) pool: SqlitePool,
   #[cfg(any(test, feature = "test-support"))]
   test_connect_options: SqliteConnectOptions,
+  #[cfg(feature = "test-support")]
+  test_hooks: Arc<StateStoreTestHooks>,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct StateStoreTestHooks {
+  scheduled_retention_after_scan: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl std::fmt::Debug for StateStoreTestHooks {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.debug_struct("StateStoreTestHooks").finish()
+  }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -210,6 +228,9 @@ pub struct RetentionPolicy {
   pub context_attempt_days: u16,
   pub conversation_summary_days: u16,
   pub artifact_days: u16,
+  pub scheduled_run_days: u16,
+  pub scheduled_delivery_days: u16,
+  pub scheduled_retention_batch_limit: u16,
 }
 
 impl Default for RetentionPolicy {
@@ -221,6 +242,9 @@ impl Default for RetentionPolicy {
       context_attempt_days: 14,
       conversation_summary_days: 90,
       artifact_days: 7,
+      scheduled_run_days: 30,
+      scheduled_delivery_days: 30,
+      scheduled_retention_batch_limit: 100,
     }
   }
 }
@@ -234,6 +258,11 @@ pub struct RetentionCleanupReport {
   pub slack_processing_indicators: u64,
   pub context_fetch_attempts: u64,
   pub channel_conversation_summaries: u64,
+  pub scheduled_runs_scanned: u64,
+  pub scheduled_runs_deleted: u64,
+  pub scheduled_runs_protected: u64,
+  pub scheduled_rows_deleted: u64,
+  pub scheduled_duration_milliseconds: u64,
 }
 
 impl RetentionCleanupReport {
@@ -246,6 +275,7 @@ impl RetentionCleanupReport {
       + self.slack_processing_indicators
       + self.context_fetch_attempts
       + self.channel_conversation_summaries
+      + self.scheduled_rows_deleted
   }
 }
 
@@ -429,6 +459,8 @@ impl StateStore {
       pool,
       #[cfg(any(test, feature = "test-support"))]
       test_connect_options,
+      #[cfg(feature = "test-support")]
+      test_hooks: Arc::new(StateStoreTestHooks::default()),
     })
   }
 
@@ -1545,6 +1577,10 @@ do update set summary = excluded.summary, updated_at = datetime('now')
   /// # Errors
   ///
   /// Returns an error when `SQLite` rejects one of the cleanup statements.
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps one ordered retention cleanup transaction and report assembly visible"
+  )]
   pub async fn cleanup_retained_data(
     &self,
     workspace_id: Option<&str>,
@@ -1641,6 +1677,18 @@ do update set summary = excluded.summary, updated_at = datetime('now')
       .await
       .map_err(|source| StateError::CleanupRetainedData { source })?;
 
+    let scheduler_started = Instant::now();
+    let scheduled = self
+      .cleanup_scheduled_history(
+        now,
+        retention_cutoff_unix_seconds(now, policy.scheduled_run_days),
+        retention_cutoff_unix_seconds(now, policy.scheduled_delivery_days),
+        u32::from(policy.scheduled_retention_batch_limit),
+      )
+      .await?;
+    let scheduled_duration_milliseconds =
+      u64::try_from(scheduler_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
     Ok(RetentionCleanupReport {
       slack_source_events,
       channel_event_queue,
@@ -1649,7 +1697,38 @@ do update set summary = excluded.summary, updated_at = datetime('now')
       slack_processing_indicators,
       context_fetch_attempts,
       channel_conversation_summaries,
+      scheduled_runs_scanned: scheduled.scanned,
+      scheduled_runs_deleted: scheduled.runs_deleted,
+      scheduled_runs_protected: scheduled.protected,
+      scheduled_rows_deleted: scheduled.rows_deleted,
+      scheduled_duration_milliseconds,
     })
+  }
+
+  /// Installs a one-shot callback after scheduler retention candidate scanning.
+  #[cfg(feature = "test-support")]
+  pub fn set_scheduled_retention_after_scan_hook_for_tests(
+    &self,
+    hook: impl FnOnce() + Send + 'static,
+  ) {
+    *self
+      .test_hooks
+      .scheduled_retention_after_scan
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+  }
+
+  #[cfg(feature = "test-support")]
+  pub(crate) fn run_scheduled_retention_after_scan_hook_for_tests(&self) {
+    let hook = self
+      .test_hooks
+      .scheduled_retention_after_scan
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .take();
+    if let Some(hook) = hook {
+      hook();
+    }
   }
 
   /// Sets the storage contention timeout for tests.
@@ -2182,6 +2261,10 @@ fn normalized_key_part(value: Option<&String>) -> &str {
 
 fn retention_cutoff_modifier(days: u16) -> String {
   format!("-{days} days")
+}
+
+fn retention_cutoff_unix_seconds(now: i64, days: u16) -> i64 {
+  now.saturating_sub(i64::from(days) * 24 * 60 * 60)
 }
 
 async fn delete_retained_rows(

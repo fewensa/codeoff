@@ -146,6 +146,9 @@ fn test_data_retention_defaults_and_toml_overrides() {
       context_attempt_days: 14,
       conversation_summary_days: 90,
       artifact_days: 7,
+      scheduled_run_days: 30,
+      scheduled_delivery_days: 30,
+      scheduled_retention_batch_limit: 100,
     }
   );
 
@@ -161,6 +164,9 @@ delivery_days = 60
 context_attempt_days = 21
 conversation_summary_days = 120
 artifact_days = 10
+scheduled_run_days = 75
+scheduled_delivery_days = 80
+scheduled_retention_batch_limit = 125
 ",
   )
   .expect("write config");
@@ -177,8 +183,44 @@ artifact_days = 10
       context_attempt_days: 21,
       conversation_summary_days: 120,
       artifact_days: 10,
+      scheduled_run_days: 75,
+      scheduled_delivery_days: 80,
+      scheduled_retention_batch_limit: 125,
     }
   );
+}
+
+#[test]
+fn test_data_retention_rejects_zero_and_unsafe_scheduler_limits() {
+  let mut config = CodeoffConfig::default();
+  config.data_retention.scheduled_run_days = 0;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidDataRetention {
+      field: "scheduled_run_days",
+      ..
+    })
+  ));
+
+  config.data_retention.scheduled_run_days = 30;
+  config.data_retention.scheduled_delivery_days = 3_651;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidDataRetention {
+      field: "scheduled_delivery_days",
+      ..
+    })
+  ));
+
+  config.data_retention.scheduled_delivery_days = 30;
+  config.data_retention.scheduled_retention_batch_limit = 0;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidDataRetention {
+      field: "scheduled_retention_batch_limit",
+      ..
+    })
+  ));
 }
 
 #[test]

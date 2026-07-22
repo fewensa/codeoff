@@ -41,6 +41,13 @@ const READINESS_REJECTION_MESSAGE: &str =
   "provider rejected exact delivery target during readiness";
 const MAX_OBSERVABILITY_COUNT_CAP: u64 = 1_000_000;
 const MAX_OBSERVABILITY_AGE_CAP_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+
+pub(crate) struct ScheduledHistoryCleanup {
+  pub(crate) scanned: u64,
+  pub(crate) runs_deleted: u64,
+  pub(crate) protected: u64,
+  pub(crate) rows_deleted: u64,
+}
 const SCHEDULER_OBSERVABILITY_QUERY: &str = r"
 select
   (select count(*) from (
@@ -1756,13 +1763,86 @@ impl StateStore {
     run_id: &str,
     now: i64,
   ) -> Result<ScheduledDeliveryRetentionReport, StateError> {
+    self
+      .prune_scheduled_delivery_history_with_cutoffs(
+        operation_id,
+        run_id,
+        now,
+        now,
+        now,
+        None,
+        None,
+        None,
+      )
+      .await
+  }
+
+  #[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "keeps the complete retention authority transaction auditable in one scope"
+  )]
+  async fn prune_scheduled_delivery_history_with_cutoffs(
+    &self,
+    operation_id: &str,
+    run_id: &str,
+    run_cutoff: i64,
+    delivery_cutoff: i64,
+    now: i64,
+    expected_job_generation: Option<i64>,
+    expected_schedule_generation: Option<i64>,
+    expected_terminal_at: Option<i64>,
+  ) -> Result<ScheduledDeliveryRetentionReport, StateError> {
     validate_delivery_retention_request(operation_id, run_id, now)?;
+    if run_cutoff < 0 || delivery_cutoff < 0 || run_cutoff > now || delivery_cutoff > now {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled retention cutoffs must be nonnegative and not after authorization"
+          .to_owned(),
+      });
+    }
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let rows = sqlx::query(
-      "select delivery.delivery_id, delivery.job_id, delivery.state, delivery.payload_digest from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id where delivery.run_id = ?1 and delivery.authority_kind = 'intent_v1' and delivery.payload_snapshot is not null and delivery.state in ('delivered', 'failed_terminal', 'skipped_none', 'skipped_unchanged') and delivery.updated_at <= ?2 and run.state = 'succeeded' and run.result_artifact_id is not null and run.updated_at <= ?2 and not exists (select 1 from scheduled_execution_baselines baseline where baseline.source_run_id = run.run_id and baseline.job_id = run.job_id) order by delivery.delivery_id",
+      r"
+select delivery.delivery_id, delivery.job_id, delivery.state, delivery.payload_digest,
+  run.job_generation, run.schedule_generation, attempt.completed_at as terminal_at
+from scheduled_run_deliveries delivery
+join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id
+join scheduled_run_attempts attempt
+  on attempt.run_id = run.run_id and attempt.job_id = run.job_id
+  and attempt.attempt = run.attempt and attempt.fence = run.fence
+join scheduled_run_result_artifacts artifact
+  on artifact.artifact_id = run.result_artifact_id
+  and artifact.run_id = run.run_id and artifact.job_id = run.job_id
+  and artifact.accepted_attempt = run.attempt and artifact.accepted_fence = run.fence
+where delivery.run_id = ?1
+  and delivery.authority_kind = 'intent_v1'
+  and delivery.payload_snapshot is not null
+  and delivery.state in ('delivered', 'failed_terminal', 'skipped_none', 'skipped_unchanged')
+  and delivery.updated_at <= ?2
+  and run.state = 'succeeded'
+  and run.updated_at <= ?3
+  and attempt.state = 'succeeded'
+  and attempt.completed_at <= ?3
+  and artifact.completed_at = attempt.completed_at
+  and artifact.hash_algorithm = run.result_hash_algorithm
+  and artifact.result_hash = run.result_hash
+  and artifact.previous_success_context = run.result_context
+  and (?4 is null or run.job_generation = ?4)
+  and (?5 is null or run.schedule_generation = ?5)
+  and (?6 is null or attempt.completed_at = ?6)
+  and not exists (
+    select 1 from scheduled_execution_baselines baseline
+    where baseline.source_run_id = run.run_id and baseline.job_id = run.job_id
+  )
+order by delivery.delivery_id
+",
     )
     .bind(run_id)
-    .bind(now)
+    .bind(delivery_cutoff)
+    .bind(run_cutoff)
+    .bind(expected_job_generation)
+    .bind(expected_schedule_generation)
+    .bind(expected_terminal_at)
     .fetch_all(&mut *transaction)
     .await
     .map_err(scheduler_error)?;
@@ -1777,7 +1857,7 @@ impl StateStore {
     }
     for row in &rows {
       sqlx::query(
-        "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
       )
       .bind(operation_id)
       .bind(row.try_get::<String, _>("delivery_id").map_err(scheduler_error)?)
@@ -1786,6 +1866,15 @@ impl StateStore {
       .bind(row.try_get::<String, _>("state").map_err(scheduler_error)?)
       .bind(row.try_get::<String, _>("payload_digest").map_err(scheduler_error)?)
       .bind(now)
+      .bind(row.try_get::<i64, _>("job_generation").map_err(scheduler_error)?)
+      .bind(
+        row
+          .try_get::<i64, _>("schedule_generation")
+          .map_err(scheduler_error)?,
+      )
+      .bind(row.try_get::<i64, _>("terminal_at").map_err(scheduler_error)?)
+      .bind(run_cutoff)
+      .bind(delivery_cutoff)
       .execute(&mut *transaction)
       .await
       .map_err(scheduler_error)?;
@@ -1835,7 +1924,7 @@ impl StateStore {
     {
       return Err(StateError::ScheduledDeliveryRetentionConflict);
     }
-    sqlx::query(
+    let completion = sqlx::query(
       "update scheduled_delivery_retention_audit set attempts_deleted = ?1, completed_at = ?2 where operation_id = ?3 and run_id = ?4 and completed_at is null",
     )
     .bind(i64::try_from(delivery_attempts).unwrap_or(i64::MAX))
@@ -1845,6 +1934,9 @@ impl StateStore {
     .execute(&mut *transaction)
     .await
     .map_err(scheduler_error)?;
+    if completion.rows_affected() != deliveries {
+      return Err(StateError::ScheduledDeliveryRetentionConflict);
+    }
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(ScheduledDeliveryRetentionReport {
       delivery_attempts,
@@ -1854,6 +1946,322 @@ impl StateStore {
       result_artifacts,
       runs,
     })
+  }
+
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps candidate eligibility and bounded prune dispatch visibly aligned"
+  )]
+  pub(crate) async fn cleanup_scheduled_history(
+    &self,
+    now: i64,
+    run_cutoff: i64,
+    delivery_cutoff: i64,
+    limit: u32,
+  ) -> Result<ScheduledHistoryCleanup, StateError> {
+    if now < 0 || limit == 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled retention timestamp and limit must be positive".to_owned(),
+      });
+    }
+    let candidates = sqlx::query(
+      r"
+select
+  run.run_id,
+  run.job_generation,
+  run.schedule_generation,
+  run.state,
+  case
+    when run.attempt = 0 then run.updated_at
+    else (
+      select attempt.completed_at
+      from scheduled_run_attempts attempt
+      where attempt.run_id = run.run_id
+        and attempt.job_id = run.job_id
+        and attempt.attempt = run.attempt
+        and attempt.fence = run.fence
+        and (
+          attempt.state = run.state
+          or (run.state = 'failed' and attempt.state in ('preflight_rejected', 'lease_expired'))
+        )
+    )
+  end as terminal_at
+from scheduled_runs run indexed by idx_scheduled_runs_retention
+where run.state in ('succeeded', 'failed', 'timed_out', 'cancelled')
+  and run.updated_at <= ?1
+  and not exists (
+    select 1
+    from scheduled_execution_baselines baseline
+    where baseline.source_run_id = run.run_id and baseline.job_id = run.job_id
+  )
+  and (
+    (run.attempt = 0 and run.state = 'cancelled' and run.updated_at <= ?1)
+    or exists (
+      select 1
+      from scheduled_run_attempts attempt
+      where attempt.run_id = run.run_id
+        and attempt.job_id = run.job_id
+        and attempt.attempt = run.attempt
+        and attempt.fence = run.fence
+        and (
+          attempt.state = run.state
+          or (run.state = 'failed' and attempt.state in ('preflight_rejected', 'lease_expired'))
+        )
+        and attempt.completed_at <= ?1
+    )
+  )
+  and (
+    (run.state in ('failed', 'timed_out', 'cancelled')
+      and run.result_artifact_id is null
+      and not exists (
+        select 1 from scheduled_run_deliveries delivery where delivery.run_id = run.run_id
+      ))
+    or
+    (run.state = 'succeeded'
+      and run.result_artifact_id is not null
+      and exists (
+        select 1
+        from scheduled_run_attempts attempt
+        join scheduled_run_result_artifacts artifact
+          on artifact.artifact_id = run.result_artifact_id
+          and artifact.run_id = run.run_id and artifact.job_id = run.job_id
+          and artifact.accepted_attempt = run.attempt and artifact.accepted_fence = run.fence
+        where attempt.run_id = run.run_id and attempt.job_id = run.job_id
+          and attempt.attempt = run.attempt and attempt.fence = run.fence
+          and attempt.state = 'succeeded'
+          and attempt.completed_at <= ?1
+          and artifact.completed_at = attempt.completed_at
+          and artifact.hash_algorithm = run.result_hash_algorithm
+          and artifact.result_hash = run.result_hash
+          and artifact.previous_success_context = run.result_context
+      )
+      and exists (
+        select 1 from scheduled_run_deliveries delivery where delivery.run_id = run.run_id
+      )
+      and (
+        select count(*) from scheduled_run_deliveries delivery where delivery.run_id = run.run_id
+      ) = (
+        select count(*)
+        from scheduled_run_deliveries delivery indexed by idx_scheduled_deliveries_retention
+        where delivery.run_id = run.run_id
+          and delivery.authority_kind = 'intent_v1'
+          and delivery.state in ('delivered', 'failed_terminal', 'skipped_none', 'skipped_unchanged')
+          and delivery.payload_snapshot is not null
+          and delivery.updated_at <= ?2
+      ))
+  )
+order by run.updated_at, run.run_id
+limit ?3
+",
+    )
+    .bind(run_cutoff)
+    .bind(delivery_cutoff)
+    .bind(i64::from(limit))
+    .fetch_all(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+
+    #[cfg(feature = "test-support")]
+    self.run_scheduled_retention_after_scan_hook_for_tests();
+
+    let mut cleanup = ScheduledHistoryCleanup {
+      scanned: u64::try_from(candidates.len()).unwrap_or(u64::MAX),
+      runs_deleted: 0,
+      protected: 0,
+      rows_deleted: 0,
+    };
+    for candidate in candidates {
+      let run_id = candidate
+        .try_get::<String, _>("run_id")
+        .map_err(scheduler_error)?;
+      let state = candidate
+        .try_get::<String, _>("state")
+        .map_err(scheduler_error)?;
+      let result = if state == "succeeded" {
+        self
+          .prune_scheduled_delivery_history_with_cutoffs(
+            &format!("automatic:{now}:{run_id}"),
+            &run_id,
+            run_cutoff,
+            delivery_cutoff,
+            now,
+            Some(
+              candidate
+                .try_get::<i64, _>("job_generation")
+                .map_err(scheduler_error)?,
+            ),
+            Some(
+              candidate
+                .try_get::<i64, _>("schedule_generation")
+                .map_err(scheduler_error)?,
+            ),
+            Some(
+              candidate
+                .try_get::<i64, _>("terminal_at")
+                .map_err(scheduler_error)?,
+            ),
+          )
+          .await
+          .map(|report| {
+            report.delivery_attempts
+              + report.deliveries
+              + report.late_evidence
+              + report.run_attempts
+              + report.result_artifacts
+              + report.runs
+          })
+      } else {
+        self
+          .prune_terminal_scheduled_run_history(
+            &format!("automatic:{now}:{run_id}"),
+            &run_id,
+            candidate
+              .try_get::<i64, _>("job_generation")
+              .map_err(scheduler_error)?,
+            candidate
+              .try_get::<i64, _>("schedule_generation")
+              .map_err(scheduler_error)?,
+            &state,
+            candidate
+              .try_get::<i64, _>("terminal_at")
+              .map_err(scheduler_error)?,
+            run_cutoff,
+            now,
+          )
+          .await
+      };
+      match result {
+        Ok(rows_deleted) => {
+          cleanup.runs_deleted = cleanup.runs_deleted.saturating_add(1);
+          cleanup.rows_deleted = cleanup.rows_deleted.saturating_add(rows_deleted);
+        }
+        Err(
+          StateError::ScheduledDeliveryRetentionConflict
+          | StateError::ScheduledRunRetentionConflict,
+        ) => cleanup.protected = cleanup.protected.saturating_add(1),
+        Err(error) => return Err(error),
+      }
+    }
+    Ok(cleanup)
+  }
+
+  #[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "keeps the exact non-success retention authority transaction auditable"
+  )]
+  async fn prune_terminal_scheduled_run_history(
+    &self,
+    operation_id: &str,
+    run_id: &str,
+    job_generation: i64,
+    schedule_generation: i64,
+    state: &str,
+    terminal_at: i64,
+    cutoff_at: i64,
+    now: i64,
+  ) -> Result<u64, StateError> {
+    validate_delivery_retention_request(operation_id, run_id, now)?;
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let authority = sqlx::query(
+      r"
+insert into scheduled_run_retention_audit (
+  operation_id, run_id, job_id, job_generation, schedule_generation, run_state,
+  terminal_at, cutoff_at, authorized_at, expected_attempts_deleted,
+  expected_late_evidence_deleted
+)
+select ?1, run.run_id, run.job_id, run.job_generation, run.schedule_generation, run.state,
+  ?6, ?7, ?8,
+  (select count(*) from scheduled_run_attempts item where item.run_id = run.run_id),
+  (select count(*) from scheduled_run_late_evidence item where item.run_id = run.run_id)
+from scheduled_runs run
+where run.run_id = ?2
+  and run.job_generation = ?3
+  and run.schedule_generation = ?4
+  and run.state = ?5
+  and run.state in ('failed', 'timed_out', 'cancelled')
+  and run.result_artifact_id is null
+  and run.updated_at <= ?7
+  and ?6 <= ?7 and ?7 <= ?8
+  and not exists (select 1 from scheduled_run_deliveries delivery where delivery.run_id = run.run_id)
+  and not exists (
+    select 1 from scheduled_execution_baselines baseline
+    where baseline.source_run_id = run.run_id and baseline.job_id = run.job_id
+  )
+  and (
+    (run.attempt = 0 and run.state = 'cancelled' and run.updated_at = ?6)
+    or exists (
+      select 1 from scheduled_run_attempts attempt
+      where attempt.run_id = run.run_id
+        and attempt.job_id = run.job_id
+        and attempt.attempt = run.attempt
+        and attempt.fence = run.fence
+        and (
+          attempt.state = run.state
+          or (run.state = 'failed' and attempt.state in ('preflight_rejected', 'lease_expired'))
+        )
+        and attempt.completed_at = ?6
+    )
+  )
+",
+    )
+    .bind(operation_id)
+    .bind(run_id)
+    .bind(job_generation)
+    .bind(schedule_generation)
+    .bind(state)
+    .bind(terminal_at)
+    .bind(cutoff_at)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if authority.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunRetentionConflict);
+    }
+    let late_evidence = sqlx::query("delete from scheduled_run_late_evidence where run_id = ?1")
+      .bind(run_id)
+      .execute(&mut *transaction)
+      .await
+      .map_err(scheduler_error)?
+      .rows_affected();
+    let attempts = sqlx::query("delete from scheduled_run_attempts where run_id = ?1")
+      .bind(run_id)
+      .execute(&mut *transaction)
+      .await
+      .map_err(scheduler_error)?
+      .rows_affected();
+    let runs = sqlx::query(
+      "delete from scheduled_runs where run_id = ?1 and job_generation = ?2 and schedule_generation = ?3 and state = ?4",
+    )
+    .bind(run_id)
+    .bind(job_generation)
+    .bind(schedule_generation)
+    .bind(state)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?
+    .rows_affected();
+    if runs != 1 {
+      return Err(StateError::ScheduledRunRetentionConflict);
+    }
+    let completion = sqlx::query(
+      "update scheduled_run_retention_audit set attempts_deleted = ?1, late_evidence_deleted = ?2, deleted_rows = ?3, completed_at = ?4 where operation_id = ?5 and run_id = ?6 and completed_at is null",
+    )
+    .bind(i64::try_from(attempts).unwrap_or(i64::MAX))
+    .bind(i64::try_from(late_evidence).unwrap_or(i64::MAX))
+    .bind(i64::try_from(late_evidence + attempts + runs).unwrap_or(i64::MAX))
+    .bind(now)
+    .bind(operation_id)
+    .bind(run_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if completion.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunRetentionConflict);
+    }
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(late_evidence + attempts + runs)
   }
 
   /// Atomically accepts a live execution result, advances its execution baseline, and records

@@ -48,4 +48,10 @@ pub enum ConfigError {
     field: &'static str,
     reason: &'static str,
   },
+
+  #[error("invalid data retention configuration for {field}: {reason}")]
+  InvalidDataRetention {
+    field: &'static str,
+    reason: &'static str,
+  },
 }

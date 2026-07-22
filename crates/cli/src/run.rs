@@ -1093,7 +1093,11 @@ fn maybe_spawn_retention_cleanup_loop(
       {
         Ok(RetentionCleanupStep::Cancelled) => return Ok(ServeTaskExit::Cancelled),
         Ok(RetentionCleanupStep::Completed) => {}
-        Err(error) => eprintln!("retention cleanup failed: {error}"),
+        Err(_) => tracing::warn!(
+          event = "retention_cleanup",
+          status = "failed",
+          error_kind = "storage"
+        ),
       }
       if sleep_until_serve_shutdown(Duration::from_secs(24 * 60 * 60), shutdown.clone()).await {
         return Ok(ServeTaskExit::Cancelled);
@@ -1126,9 +1130,18 @@ async fn run_retention_cleanup_once(
   if *shutdown.borrow() {
     return Ok(RetentionCleanupStep::Cancelled);
   }
-  state
+  let report = state
     .cleanup_retained_data(Some(workspace_id), now, policy)
     .await?;
+  tracing::info!(
+    event = "retention_cleanup",
+    status = "completed",
+    scheduled_runs_scanned = report.scheduled_runs_scanned,
+    scheduled_runs_deleted = report.scheduled_runs_deleted,
+    scheduled_runs_protected = report.scheduled_runs_protected,
+    scheduled_rows_deleted = report.scheduled_rows_deleted,
+    scheduled_duration_milliseconds = report.scheduled_duration_milliseconds
+  );
   Ok(RetentionCleanupStep::Completed)
 }
 
@@ -1140,6 +1153,9 @@ fn retention_policy_from_config(config: &CodeoffConfig) -> RetentionPolicy {
     context_attempt_days: config.data_retention.context_attempt_days,
     conversation_summary_days: config.data_retention.conversation_summary_days,
     artifact_days: config.data_retention.artifact_days,
+    scheduled_run_days: config.data_retention.scheduled_run_days,
+    scheduled_delivery_days: config.data_retention.scheduled_delivery_days,
+    scheduled_retention_batch_limit: config.data_retention.scheduled_retention_batch_limit,
   }
 }
 
@@ -3721,6 +3737,7 @@ mod tests {
       context_attempt_days: 1,
       conversation_summary_days: 1,
       artifact_days: 1,
+      ..RetentionPolicy::default()
     };
     let cleanup = run_retention_cleanup_once(
       &state,
@@ -3882,6 +3899,9 @@ mod tests {
     config.data_retention.context_attempt_days = 13;
     config.data_retention.conversation_summary_days = 14;
     config.data_retention.artifact_days = 15;
+    config.data_retention.scheduled_run_days = 16;
+    config.data_retention.scheduled_delivery_days = 17;
+    config.data_retention.scheduled_retention_batch_limit = 18;
 
     let policy = retention_policy_from_config(&config);
 
@@ -3891,6 +3911,9 @@ mod tests {
     assert_eq!(policy.context_attempt_days, 13);
     assert_eq!(policy.conversation_summary_days, 14);
     assert_eq!(policy.artifact_days, 15);
+    assert_eq!(policy.scheduled_run_days, 16);
+    assert_eq!(policy.scheduled_delivery_days, 17);
+    assert_eq!(policy.scheduled_retention_batch_limit, 18);
   }
 
   #[test]

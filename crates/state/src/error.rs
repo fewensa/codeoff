@@ -159,6 +159,9 @@ pub enum StateError {
   #[error("scheduled delivery history is not eligible for retention")]
   ScheduledDeliveryRetentionConflict,
 
+  #[error("scheduled run history is not eligible for retention")]
+  ScheduledRunRetentionConflict,
+
   #[error("scheduled once occurrence is expired and cannot be resumed")]
   ScheduledOnceExpired,
 

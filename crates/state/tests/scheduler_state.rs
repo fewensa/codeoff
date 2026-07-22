@@ -570,6 +570,7 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
+      && entry.file_name() != "20260722070000_scheduler_observability.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1190,6 +1191,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
           | "20260722040000_scheduler_run_retry_reason.sql"
           | "20260722050000_scheduler_operator_reason_authority.sql"
           | "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
+          | "20260722070000_scheduler_observability.sql"
       )
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
@@ -1515,6 +1517,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
+      && entry.file_name() != "20260722070000_scheduler_observability.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1599,6 +1602,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
+      && entry.file_name() != "20260722070000_scheduler_observability.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1681,6 +1685,7 @@ async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_pay
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
+      && entry.file_name() != "20260722070000_scheduler_observability.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy issue-06 migration");
@@ -1860,6 +1865,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
+      && entry.file_name() != "20260722070000_scheduler_observability.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2107,6 +2113,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
+      && entry.file_name() != "20260722070000_scheduler_observability.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2181,6 +2188,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
+      && entry.file_name() != "20260722070000_scheduler_observability.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2268,6 +2276,7 @@ async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_ident
       && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
       && entry.file_name() != "20260722050000_scheduler_operator_reason_authority.sql"
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
+      && entry.file_name() != "20260722070000_scheduler_observability.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -5556,6 +5565,7 @@ async fn test_due_query_uses_due_index_and_overlap_index_is_enforced() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_scheduler_observability_is_bounded_indexed_and_ignores_terminal_history() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -5564,7 +5574,69 @@ async fn test_scheduler_observability_is_bounded_indexed_and_ignores_terminal_hi
     .expect("initialize store");
   store.check_readable().await.expect("readiness read");
 
-  for ordinal in 0..12 {
+  let mut delivery_ids = Vec::new();
+  for ordinal in 0..10 {
+    delivery_ids.push(
+      create_observability_delivery_intent(
+        &store,
+        &format!("observability-intent-{ordinal}"),
+        100 + ordinal,
+      )
+      .await,
+    );
+  }
+  for (job_id, scheduled_for) in [
+    ("observability-delivery-pending", 947),
+    ("observability-delivery-sending", 960),
+    ("observability-delivery-retry", 970),
+    ("observability-delivery-unknown", 980),
+  ] {
+    delivery_ids.push(create_observability_delivery_intent(&store, job_id, scheduled_for).await);
+  }
+  prepare_observability_delivery(&store, &delivery_ids[11], 964).await;
+  let sending = store
+    .claim_next_scheduled_delivery("observability-sending", 965, 2_000)
+    .await
+    .expect("claim sending delivery")
+    .expect("sending delivery");
+  prepare_observability_delivery(&store, &delivery_ids[12], 974).await;
+  let retryable = store
+    .claim_next_scheduled_delivery("observability-retry", 975, 2_000)
+    .await
+    .expect("claim retryable delivery")
+    .expect("retryable delivery");
+  store
+    .complete_scheduled_delivery_failure(
+      &retryable.binding,
+      &ScheduledDeliveryFailure::ConfirmedNoWriteRetryable {
+        error_kind: "bounded_test".to_owned(),
+        redacted_message: None,
+        next_attempt_at: 1_100,
+      },
+      976,
+    )
+    .await
+    .expect("defer retryable delivery");
+  prepare_observability_delivery(&store, &delivery_ids[13], 984).await;
+  let unknown = store
+    .claim_next_scheduled_delivery("observability-unknown", 985, 2_000)
+    .await
+    .expect("claim unknown delivery")
+    .expect("unknown delivery");
+  store
+    .complete_scheduled_delivery_failure(
+      &unknown.binding,
+      &ScheduledDeliveryFailure::AmbiguousPostWrite {
+        error_kind: "bounded_test".to_owned(),
+        redacted_message: None,
+      },
+      986,
+    )
+    .await
+    .expect("record unknown delivery");
+  prepare_observability_delivery(&store, &delivery_ids[10], 951).await;
+
+  for ordinal in 0..14 {
     let job_id = format!("observability-{ordinal}");
     store
       .create_scheduled_job(&create_request(
@@ -5579,6 +5651,50 @@ async fn test_scheduler_observability_is_bounded_indexed_and_ignores_terminal_hi
       .await
       .expect("materialize observed run");
   }
+  let leased = store
+    .claim_next_scheduled_run("observability-leased", 200, 2_000)
+    .await
+    .expect("claim leased run")
+    .expect("leased run");
+  let executing = store
+    .claim_next_scheduled_run("observability-executing", 200, 2_000)
+    .await
+    .expect("claim executing run")
+    .expect("executing run");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&executing.binding, &profile, 201)
+    .await
+    .expect("mark executing run");
+  let expiring = store
+    .claim_next_scheduled_run("observability-unknown", 200, 600)
+    .await
+    .expect("claim expiring run")
+    .expect("expiring run");
+  store
+    .mark_scheduled_run_executing(&expiring.binding, &profile, 201)
+    .await
+    .expect("mark expiring run executing");
+  assert!(matches!(
+    store
+      .reclaim_next_expired_scheduled_run(1_000, 1, 1_100)
+      .await
+      .expect("reclaim expired execution"),
+    ExpiredRunReclaimOutcome::OutcomeUnknown { .. }
+  ));
+  assert_eq!(leased.binding.attempt(), 1);
+
+  for ordinal in 0..10 {
+    store
+      .create_scheduled_job(&create_request(
+        &format!("observability-due-{ordinal}"),
+        ScheduleSpec::fixed_interval(100, 60).expect("interval"),
+        90,
+      ))
+      .await
+      .expect("create exact due job");
+  }
 
   let pool = SqlitePool::connect(&database_url(&state_dir))
     .await
@@ -5589,15 +5705,153 @@ async fn test_scheduler_observability_is_bounded_indexed_and_ignores_terminal_hi
     .scheduler_observability_snapshot(1_000, 10, 50)
     .await
     .expect("observability snapshot");
-  assert_eq!(snapshot.pending_runs, 10);
-  assert_eq!(snapshot.leased_runs, 0);
-  assert_eq!(snapshot.executing_runs, 0);
-  assert_eq!(snapshot.unknown_runs, 0);
-  assert_eq!(snapshot.due_jobs, 0, "active overlap suppresses due work");
-  assert_eq!(snapshot.oldest_pending_run_age_seconds, Some(50));
-  assert!(snapshot.counts_saturated);
-  assert!(snapshot.ages_saturated);
+  assert_eq!(
+    (snapshot.pending_runs.value, snapshot.pending_runs.saturated),
+    (10, true)
+  );
+  assert_eq!(
+    (snapshot.due_jobs.value, snapshot.due_jobs.saturated),
+    (10, false)
+  );
+  assert_eq!(snapshot.leased_runs.value, 1);
+  assert_eq!(snapshot.executing_runs.value, 1);
+  assert_eq!(snapshot.unknown_runs.value, 1);
+  assert_eq!(
+    (
+      snapshot.unprepared_delivery_intents.value,
+      snapshot.unprepared_delivery_intents.saturated,
+    ),
+    (10, false)
+  );
+  assert_eq!(snapshot.pending_deliveries.value, 1);
+  assert_eq!(snapshot.sending_deliveries.value, 1);
+  assert_eq!(snapshot.retryable_deliveries.value, 1);
+  assert_eq!(snapshot.unknown_deliveries.value, 1);
+  assert_eq!(
+    snapshot.oldest_pending_run_age,
+    Some(codeoff_state::BoundedSchedulerAge {
+      value: 50,
+      saturated: true,
+    })
+  );
+  assert_eq!(
+    snapshot.oldest_pending_delivery_age,
+    Some(codeoff_state::BoundedSchedulerAge {
+      value: 50,
+      saturated: false,
+    })
+  );
+  assert_eq!(sending.binding.attempt(), 1);
   assert_observability_query_plans(&pool).await;
+}
+
+async fn create_observability_delivery_intent(
+  store: &StateStore,
+  job_id: &str,
+  scheduled_for: i64,
+) -> String {
+  let mut request = create_request(
+    job_id,
+    ScheduleSpec::once(scheduled_for),
+    scheduled_for - 10,
+  );
+  request.targets = vec![second_target(job_id)];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule(job_id, 0, scheduled_for)
+    .await
+    .expect("materialize delivery run");
+  let run = store
+    .claim_next_scheduled_run(
+      "observability-delivery-run",
+      scheduled_for + 1,
+      scheduled_for + 100,
+    )
+    .await
+    .expect("claim delivery run")
+    .expect("delivery run");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&run.binding, &profile, scheduled_for + 2)
+    .await
+    .expect("execute delivery run");
+  store
+    .complete_scheduled_run_success(
+      &run.binding,
+      &ScheduledRunResult::new("payload", "").expect("result"),
+      scheduled_for + 3,
+    )
+    .await
+    .expect("complete delivery run");
+  store
+    .list_scheduled_delivery_operator_projections(None, 100)
+    .await
+    .expect("list deliveries")
+    .into_iter()
+    .find(|delivery| delivery.job_id == job_id)
+    .expect("delivery intent")
+    .delivery_id
+}
+
+async fn prepare_observability_delivery(store: &StateStore, delivery_id: &str, now: i64) {
+  assert!(matches!(
+    store
+      .prepare_scheduled_delivery(
+        delivery_id,
+        "text/plain; charset=utf-8",
+        "payload",
+        1,
+        now,
+        SkippedNoneBaselinePolicy::DoNotAdvance,
+      )
+      .await
+      .expect("prepare delivery"),
+    PreparedScheduledDelivery::Pending(_)
+  ));
+}
+
+#[tokio::test]
+async fn test_scheduler_observability_rejects_negative_time_and_clamps_future_age() {
+  let temp = tempdir().expect("create tempdir");
+  let store = StateStore::initialize(temp.path(), None)
+    .await
+    .expect("initialize store");
+  let error = store
+    .scheduler_observability_snapshot(-1, 10, 10)
+    .await
+    .expect_err("negative observation time must fail closed");
+  assert!(matches!(
+    error,
+    StateError::InvalidSchedulerState { reason }
+      if reason == "scheduler observability time must be nonnegative"
+  ));
+  store
+    .create_scheduled_job(&create_request(
+      "observability-future",
+      ScheduleSpec::once(2_000),
+      1_900,
+    ))
+    .await
+    .expect("create future job");
+  store
+    .materialize_due_schedule("observability-future", 0, 2_000)
+    .await
+    .expect("materialize future run");
+  let snapshot = store
+    .scheduler_observability_snapshot(1_000, 10, 10)
+    .await
+    .expect("future age snapshot");
+  assert_eq!(
+    snapshot.oldest_pending_run_age,
+    Some(codeoff_state::BoundedSchedulerAge {
+      value: 0,
+      saturated: false,
+    })
+  );
 }
 
 async fn insert_observability_terminal_history(pool: &SqlitePool) {
@@ -5666,8 +5920,12 @@ async fn assert_observability_query_plans(pool: &SqlitePool) {
       "idx_scheduled_runs_observability",
     ),
     (
-      "explain query plan select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability where state = 'pending' limit 11",
-      "idx_scheduled_deliveries_observability",
+      "explain query plan select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability_unprepared where state = 'pending' and payload_snapshot is null limit 11",
+      "idx_scheduled_deliveries_observability_unprepared",
+    ),
+    (
+      "explain query plan select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability_prepared where state = 'pending' and payload_snapshot is not null limit 11",
+      "idx_scheduled_deliveries_observability_prepared",
     ),
   ] {
     let plan = sqlx::query(query)

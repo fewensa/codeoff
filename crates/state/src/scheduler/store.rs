@@ -8,26 +8,27 @@ use sqlx::{Row, Sqlite, Transaction};
 
 use super::{
   AcceptedDeliveryBaseline, AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot,
-  CapabilityProfileSnapshot, ClaimedScheduledDelivery, ClaimedScheduledRun, CreateScheduledJob,
-  DEFAULT_OCCURRENCE_STEPS, DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION,
-  DeliveryPayloadSnapshot, DeliveryTargetRoute, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome,
-  IdempotencyDecision, LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES, MAX_DELIVERY_TARGETS,
-  MAX_SNAPSHOT_BYTES, MaterializationOutcome, PreflightFailureDisposition,
-  PreparedScheduledDelivery, PrincipalKey, RunLeaseBinding, ScheduleAuditSummary,
-  ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryAuthority,
-  ScheduledDeliveryBinding, ScheduledDeliveryFailure, ScheduledDeliveryOperatorProjection,
-  ScheduledDeliveryReconcileOutcome, ScheduledDeliveryRenderInput,
-  ScheduledDeliveryRetentionReport, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
-  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob,
-  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
-  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
-  ScheduledRunReconcileCandidate, ScheduledRunReconcileOutcome, ScheduledRunResult,
-  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerObservabilitySnapshot,
-  SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
-  SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome, UpdateExecutionBaseline,
-  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
-  operator_action_request_digest, operator_delivery_evidence_binding, positive_u32,
-  scheduler_error, validate_lowercase_sha256, validate_text,
+  BoundedSchedulerAge, BoundedSchedulerGauge, CapabilityProfileSnapshot, ClaimedScheduledDelivery,
+  ClaimedScheduledRun, CreateScheduledJob, DEFAULT_OCCURRENCE_STEPS,
+  DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION, DeliveryPayloadSnapshot,
+  DeliveryTargetRoute, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome, IdempotencyDecision,
+  LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES, MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES,
+  MaterializationOutcome, PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey,
+  RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency,
+  ScheduleSpec, ScheduledDeliveryAuthority, ScheduledDeliveryBinding, ScheduledDeliveryFailure,
+  ScheduledDeliveryOperatorProjection, ScheduledDeliveryReconcileOutcome,
+  ScheduledDeliveryRenderInput, ScheduledDeliveryRetentionReport, ScheduledDeliveryState,
+  ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
+  ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
+  ScheduledJobMutation, ScheduledJobStatus, ScheduledRunExecutionOutcome,
+  ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection, ScheduledRunReconcileCandidate,
+  ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  SchedulerObservabilitySnapshot, SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome,
+  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome,
+  UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
+  invalid_value, materialized_run, operator_action_request_digest,
+  operator_delivery_evidence_binding, positive_u32, scheduler_error, validate_lowercase_sha256,
+  validate_text,
 };
 use crate::StateStore;
 
@@ -72,8 +73,16 @@ select
     where state = 'outcome_unknown' limit ?2
   )) as unknown_runs,
   (select count(*) from (
-    select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability
-    where state = 'pending' limit ?2
+    select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability_unprepared
+    where state = 'pending'
+      and payload_snapshot is null
+    limit ?2
+  )) as unprepared_delivery_intents,
+  (select count(*) from (
+    select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability_prepared
+    where state = 'pending'
+      and payload_snapshot is not null
+    limit ?2
   )) as pending_deliveries,
   (select count(*) from (
     select 1 from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability
@@ -89,14 +98,30 @@ select
   )) as unknown_deliveries,
   (select scheduled_for from scheduled_runs indexed by idx_scheduled_runs_observability
     where state = 'pending' order by scheduled_for limit 1) as oldest_pending_run,
-  (select created_at from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability
-    where state = 'pending' order by created_at limit 1) as oldest_pending_delivery
+  (select created_at from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability_unprepared
+    where state = 'pending'
+      and payload_snapshot is null
+    order by created_at limit 1) as oldest_unprepared_delivery_intent,
+  (select created_at from scheduled_run_deliveries indexed by idx_scheduled_deliveries_observability_prepared
+    where state = 'pending'
+      and payload_snapshot is not null
+    order by created_at limit 1) as oldest_pending_delivery
 ";
 
-fn age_seconds(now: i64, created_at: i64, cap: u64) -> (u64, bool) {
+fn bounded_age(now: i64, created_at: i64, cap: u64) -> BoundedSchedulerAge {
   let age = now.saturating_sub(created_at);
   let age = u64::try_from(age).unwrap_or(0);
-  (age.min(cap), age > cap)
+  BoundedSchedulerAge {
+    value: age.min(cap),
+    saturated: age > cap,
+  }
+}
+
+const fn bounded_gauge(value: u64, cap: u64) -> BoundedSchedulerGauge {
+  BoundedSchedulerGauge {
+    value: if value > cap { cap } else { value },
+    saturated: value > cap,
+  }
 }
 
 fn observability_snapshot_from_row(
@@ -111,49 +136,52 @@ fn observability_snapshot_from_row(
     "leased_runs",
     "executing_runs",
     "unknown_runs",
+    "unprepared_delivery_intents",
     "pending_deliveries",
     "sending_deliveries",
     "retryable_deliveries",
     "unknown_deliveries",
   ];
-  let mut counts = [0_u64; 9];
+  let mut counts = [0_u64; 10];
   for (index, column) in count_columns.into_iter().enumerate() {
     let value = row.try_get::<i64, _>(column).map_err(scheduler_error)?;
     counts[index] = u64::try_from(value).unwrap_or(0);
   }
-  let bounded = counts.map(|value| value.min(count_cap));
   let oldest_run = row
     .try_get::<Option<i64>, _>("oldest_pending_run")
+    .map_err(scheduler_error)?;
+  let oldest_unprepared_delivery_intent = row
+    .try_get::<Option<i64>, _>("oldest_unprepared_delivery_intent")
     .map_err(scheduler_error)?;
   let oldest_delivery = row
     .try_get::<Option<i64>, _>("oldest_pending_delivery")
     .map_err(scheduler_error)?;
-  let run_age = oldest_run.map(|created_at| age_seconds(now, created_at, age_cap_seconds));
-  let delivery_age =
-    oldest_delivery.map(|created_at| age_seconds(now, created_at, age_cap_seconds));
   Ok(SchedulerObservabilitySnapshot {
-    due_jobs: bounded[0],
-    pending_runs: bounded[1],
-    leased_runs: bounded[2],
-    executing_runs: bounded[3],
-    unknown_runs: bounded[4],
-    pending_deliveries: bounded[5],
-    sending_deliveries: bounded[6],
-    retryable_deliveries: bounded[7],
-    unknown_deliveries: bounded[8],
-    oldest_pending_run_age_seconds: run_age.map(|(age, _)| age),
-    oldest_pending_delivery_age_seconds: delivery_age.map(|(age, _)| age),
-    counts_saturated: counts.into_iter().any(|value| value > count_cap),
-    ages_saturated: run_age.is_some_and(|(_, saturated)| saturated)
-      || delivery_age.is_some_and(|(_, saturated)| saturated),
+    due_jobs: bounded_gauge(counts[0], count_cap),
+    pending_runs: bounded_gauge(counts[1], count_cap),
+    leased_runs: bounded_gauge(counts[2], count_cap),
+    executing_runs: bounded_gauge(counts[3], count_cap),
+    unknown_runs: bounded_gauge(counts[4], count_cap),
+    unprepared_delivery_intents: bounded_gauge(counts[5], count_cap),
+    pending_deliveries: bounded_gauge(counts[6], count_cap),
+    sending_deliveries: bounded_gauge(counts[7], count_cap),
+    retryable_deliveries: bounded_gauge(counts[8], count_cap),
+    unknown_deliveries: bounded_gauge(counts[9], count_cap),
+    oldest_pending_run_age: oldest_run
+      .map(|created_at| bounded_age(now, created_at, age_cap_seconds)),
+    oldest_unprepared_delivery_intent_age: oldest_unprepared_delivery_intent
+      .map(|created_at| bounded_age(now, created_at, age_cap_seconds)),
+    oldest_pending_delivery_age: oldest_delivery
+      .map(|created_at| bounded_age(now, created_at, age_cap_seconds)),
   })
 }
 
 impl StateStore {
   /// Reads a bounded, identifier-free scheduler telemetry snapshot.
   ///
-  /// Counts stop after `count_cap + 1` indexed active-state rows so callers can distinguish an
-  /// exact count from a saturated value. Pending ages are capped independently.
+  /// Each count stops after `count_cap + 1` indexed active-state rows and carries its own
+  /// saturation bit. Delivery intent age covers unprepared pending rows; delivery pending age
+  /// covers prepared pending rows. Each oldest age carries an independent saturation bit.
   ///
   /// # Errors
   /// Returns an error when `SQLite` cannot read the scheduler tables.
@@ -163,6 +191,11 @@ impl StateStore {
     count_cap: u64,
     age_cap_seconds: u64,
   ) -> Result<SchedulerObservabilitySnapshot, StateError> {
+    if now < 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduler observability time must be nonnegative".to_owned(),
+      });
+    }
     let count_cap = count_cap.clamp(1, MAX_OBSERVABILITY_COUNT_CAP);
     let age_cap_seconds = age_cap_seconds.clamp(1, MAX_OBSERVABILITY_AGE_CAP_SECONDS);
     let row = sqlx::query(SCHEDULER_OBSERVABILITY_QUERY)

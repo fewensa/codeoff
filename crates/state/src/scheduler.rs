@@ -911,20 +911,32 @@ pub enum ScheduledRunState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedSchedulerGauge {
+  pub value: u64,
+  pub saturated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedSchedulerAge {
+  pub value: u64,
+  pub saturated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerObservabilitySnapshot {
-  pub due_jobs: u64,
-  pub pending_runs: u64,
-  pub leased_runs: u64,
-  pub executing_runs: u64,
-  pub unknown_runs: u64,
-  pub pending_deliveries: u64,
-  pub sending_deliveries: u64,
-  pub retryable_deliveries: u64,
-  pub unknown_deliveries: u64,
-  pub oldest_pending_run_age_seconds: Option<u64>,
-  pub oldest_pending_delivery_age_seconds: Option<u64>,
-  pub counts_saturated: bool,
-  pub ages_saturated: bool,
+  pub due_jobs: BoundedSchedulerGauge,
+  pub pending_runs: BoundedSchedulerGauge,
+  pub leased_runs: BoundedSchedulerGauge,
+  pub executing_runs: BoundedSchedulerGauge,
+  pub unknown_runs: BoundedSchedulerGauge,
+  pub unprepared_delivery_intents: BoundedSchedulerGauge,
+  pub pending_deliveries: BoundedSchedulerGauge,
+  pub sending_deliveries: BoundedSchedulerGauge,
+  pub retryable_deliveries: BoundedSchedulerGauge,
+  pub unknown_deliveries: BoundedSchedulerGauge,
+  pub oldest_pending_run_age: Option<BoundedSchedulerAge>,
+  pub oldest_unprepared_delivery_intent_age: Option<BoundedSchedulerAge>,
+  pub oldest_pending_delivery_age: Option<BoundedSchedulerAge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

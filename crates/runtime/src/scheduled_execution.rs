@@ -1263,6 +1263,7 @@ mod tests {
     prepare_delay: Duration,
     execution_delay: Duration,
     honor_execution_cancellation: bool,
+    completion_barrier: Option<Arc<Barrier>>,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
   }
@@ -1275,6 +1276,7 @@ mod tests {
         prepare_delay: Duration::ZERO,
         execution_delay: Duration::ZERO,
         honor_execution_cancellation: true,
+        completion_barrier: None,
         active: Arc::new(AtomicUsize::new(0)),
         max_active: Arc::new(AtomicUsize::new(0)),
       }
@@ -1305,6 +1307,7 @@ mod tests {
           result: self.result.clone(),
           execution_delay: self.execution_delay,
           honor_cancellation: self.honor_execution_cancellation,
+          completion_barrier: self.completion_barrier.clone(),
           active: Arc::clone(&self.active),
           max_active: Arc::clone(&self.max_active),
         }),
@@ -1316,6 +1319,7 @@ mod tests {
     result: ExecutionResult,
     execution_delay: Duration,
     honor_cancellation: bool,
+    completion_barrier: Option<Arc<Barrier>>,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
   }
@@ -1377,6 +1381,9 @@ mod tests {
         && (!self.honor_cancellation || !cancellation.load(Ordering::Acquire))
       {
         std::thread::sleep(Duration::from_millis(1));
+      }
+      if let Some(barrier) = self.completion_barrier {
+        barrier.wait();
       }
       self.active.fetch_sub(1, Ordering::AcqRel);
       self.result
@@ -2178,7 +2185,8 @@ mod tests {
     let mut backend = FakeBackend::new(ExecutionResult::Completed {
       summary: "must roll back".to_owned(),
     });
-    backend.execution_delay = Duration::from_millis(15);
+    let completion_barrier = Arc::new(Barrier::new(2));
+    backend.completion_barrier = Some(Arc::clone(&completion_barrier));
     let backend = Arc::new(backend);
     let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
     let mut configured = orchestrator(state.clone(), backend.clone(), clock.clone(), 1);
@@ -2199,6 +2207,7 @@ mod tests {
       .acquire_exclusive_storage_lock_for_tests()
       .await
       .expect("exclusive lock");
+    completion_barrier.wait();
     let outcome = tokio::time::timeout(Duration::from_millis(150), caller)
       .await
       .expect("supervisor hard stop")

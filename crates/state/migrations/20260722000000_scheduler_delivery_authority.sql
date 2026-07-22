@@ -34,6 +34,7 @@ create table scheduled_run_deliveries (
   payload_snapshot blob,
   payload_created_at integer,
   expected_baseline_version integer,
+  claimed_baseline_version integer,
   result_artifact_id text,
   result_attempt integer,
   result_fence integer,
@@ -129,6 +130,7 @@ create table scheduled_run_deliveries (
       and delivery_id = 'intent:' || intent_key
       and (
         (state = 'pending' and payload_snapshot is null)
+        or (state = 'failed_terminal' and payload_snapshot is null)
         or payload_snapshot is not null
       )
     )
@@ -146,6 +148,18 @@ create table scheduled_run_deliveries (
       and lease_expires_at is null)
   ),
   check (next_attempt_at is null or state = 'failed_retryable'),
+  check (claimed_baseline_version is null or claimed_baseline_version >= 0),
+  check (
+    authority_kind != 'intent_v1'
+    or state not in (
+      'sending',
+      'delivered',
+      'failed_retryable',
+      'delivery_unknown',
+      'skipped_unchanged'
+    )
+    or claimed_baseline_version is not null
+  ),
   check (provider_receipt is null or state = 'delivered'),
   check (
     (state in ('pending', 'sending') and provider_outcome is null)
@@ -204,6 +218,7 @@ insert into scheduled_run_deliveries (
   payload_snapshot,
   payload_created_at,
   expected_baseline_version,
+  claimed_baseline_version,
   result_artifact_id,
   result_attempt,
   result_fence,
@@ -274,6 +289,7 @@ select
   null,
   null,
   null,
+  null,
   result_artifact_id,
   result_attempt,
   result_fence,
@@ -317,6 +333,7 @@ create table scheduled_delivery_attempts (
   lease_owner text not null,
   lease_expires_at integer not null,
   idempotency_key text not null,
+  claimed_baseline_version integer not null,
   state text not null,
   provider_receipt text,
   provider_outcome text,
@@ -328,7 +345,7 @@ create table scheduled_delivery_attempts (
   unique (delivery_id, fence),
   unique (idempotency_key),
   foreign key (delivery_id) references scheduled_run_deliveries(delivery_id) on delete restrict,
-  check (attempt > 0 and fence > 0),
+  check (attempt > 0 and fence > 0 and claimed_baseline_version >= 0),
   check (length(lease_owner) > 0 and lease_expires_at > started_at),
   check (length(idempotency_key) > 0),
   check (state in (
@@ -353,6 +370,97 @@ create table scheduled_delivery_attempts (
 
 create index idx_scheduled_delivery_attempts_recovery
   on scheduled_delivery_attempts (state, lease_expires_at, delivery_id, attempt);
+
+create trigger trg_scheduled_delivery_attempt_claim_authority
+before update of claimed_baseline_version on scheduled_delivery_attempts
+when new.claimed_baseline_version is not old.claimed_baseline_version
+begin
+  select raise(abort, 'scheduled delivery attempt claim authority is immutable');
+end;
+
+create table scheduled_delivery_legacy_baseline_audit (
+  job_id text not null references scheduled_jobs(job_id) on delete restrict,
+  target_identity_digest text not null,
+  delivery_policy_version integer not null,
+  render_version integer not null,
+  claimed_hash_algorithm text not null,
+  claimed_payload_digest text not null,
+  source_delivery_id text not null,
+  source_run_id text not null,
+  source_result_hash text not null,
+  accepted_at integer not null,
+  claimed_baseline_version integer not null,
+  quarantine_reason text not null,
+  primary key (
+    job_id,
+    target_identity_digest,
+    delivery_policy_version,
+    render_version,
+    claimed_hash_algorithm
+  ),
+  check (
+    delivery_policy_version > 0
+    and render_version > 0
+    and claimed_baseline_version > 0
+    and accepted_at >= 0
+  ),
+  check (
+    length(target_identity_digest) > 0
+    and length(claimed_hash_algorithm) > 0
+    and length(claimed_payload_digest) > 0
+    and length(source_delivery_id) > 0
+    and length(source_run_id) > 0
+    and length(source_result_hash) > 0
+    and quarantine_reason = 'pre_authority_baseline_unverified'
+  )
+);
+
+insert into scheduled_delivery_legacy_baseline_audit (
+  job_id,
+  target_identity_digest,
+  delivery_policy_version,
+  render_version,
+  claimed_hash_algorithm,
+  claimed_payload_digest,
+  source_delivery_id,
+  source_run_id,
+  source_result_hash,
+  accepted_at,
+  claimed_baseline_version,
+  quarantine_reason
+)
+select
+  job_id,
+  target_identity_digest,
+  delivery_policy_version,
+  render_version,
+  hash_algorithm,
+  accepted_payload_digest,
+  source_delivery_id,
+  source_run_id,
+  source_result_hash,
+  accepted_at,
+  baseline_version,
+  'pre_authority_baseline_unverified'
+from _scheduled_delivery_baselines_220000;
+
+create trigger trg_scheduled_delivery_legacy_baseline_insert
+before insert on scheduled_delivery_legacy_baseline_audit
+begin
+  select raise(abort, 'legacy delivery baseline quarantine is migration-owned');
+end;
+
+create trigger trg_scheduled_delivery_legacy_baseline_update
+before update on scheduled_delivery_legacy_baseline_audit
+begin
+  select raise(abort, 'legacy delivery baseline quarantine is immutable');
+end;
+
+create trigger trg_scheduled_delivery_legacy_baseline_delete
+before delete on scheduled_delivery_legacy_baseline_audit
+begin
+  select raise(abort, 'legacy delivery baseline quarantine cannot be deleted');
+end;
 
 create table scheduled_delivery_baselines (
   job_id text not null references scheduled_jobs(job_id) on delete restrict,
@@ -396,43 +504,6 @@ create table scheduled_delivery_baselines (
   )
 );
 
-insert into scheduled_delivery_baselines (
-  job_id,
-  target_identity_digest,
-  target_snapshot_digest_algorithm,
-  target_snapshot_digest,
-  delivery_policy_version,
-  render_version,
-  hash_algorithm,
-  accepted_payload_digest,
-  source_delivery_id,
-  source_run_id,
-  source_result_id,
-  source_result_hash,
-  accepted_at,
-  baseline_version
-)
-select
-  baseline.job_id,
-  baseline.target_identity_digest,
-  coalesce(delivery.target_snapshot_digest_algorithm, 'legacy-target-identity-sha256-v1'),
-  coalesce(delivery.target_snapshot_digest, baseline.target_identity_digest),
-  baseline.delivery_policy_version,
-  baseline.render_version,
-  baseline.hash_algorithm,
-  baseline.accepted_payload_digest,
-  baseline.source_delivery_id,
-  baseline.source_run_id,
-  delivery.result_artifact_id,
-  baseline.source_result_hash,
-  baseline.accepted_at,
-  baseline.baseline_version
-from _scheduled_delivery_baselines_220000 baseline
-join scheduled_run_deliveries delivery
-  on delivery.delivery_id = baseline.source_delivery_id
-  and delivery.run_id = baseline.source_run_id
-  and delivery.job_id = baseline.job_id;
-
 drop table _scheduled_delivery_baselines_220000;
 
 create table scheduled_delivery_retention_audit (
@@ -473,6 +544,12 @@ when new.completed_at is not null
     and run.state = 'succeeded'
     and delivery.updated_at <= new.authorized_at
     and run.updated_at <= new.authorized_at
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = run.run_id
+        and baseline.job_id = run.job_id
+    )
 )
 begin
   select raise(abort, 'scheduled delivery retention authority mismatch');
@@ -600,6 +677,22 @@ begin
   select raise(abort, 'scheduled delivery authority identity is immutable');
 end;
 
+create trigger trg_scheduled_delivery_claimed_baseline_authority
+before update of claimed_baseline_version on scheduled_run_deliveries
+when old.authority_kind = 'intent_v1' and not (
+  (old.state = 'pending'
+    and new.state in ('sending', 'skipped_unchanged')
+    and old.claimed_baseline_version is null
+    and new.claimed_baseline_version >= 0)
+  or (old.state = 'failed_retryable'
+    and new.state = 'pending'
+    and old.claimed_baseline_version is not null
+    and new.claimed_baseline_version is null)
+)
+begin
+  select raise(abort, 'scheduled delivery claim baseline authority is immutable');
+end;
+
 create trigger trg_scheduled_delivery_payload_immutable
 before update on scheduled_run_deliveries
 when old.authority_kind = 'intent_v1'
@@ -625,7 +718,7 @@ when new.state = 'skipped_unchanged' and not exists (
   select 1
   from scheduled_delivery_baselines baseline
   where old.state = 'pending'
-    and old.payload_snapshot is null
+    and old.payload_snapshot is not null
     and new.authority_kind = 'intent_v1'
     and new.payload_snapshot is not null
     and new.provider_outcome = 'skipped_unchanged'
@@ -638,7 +731,7 @@ when new.state = 'skipped_unchanged' and not exists (
     and baseline.render_version = new.render_version
     and baseline.hash_algorithm = new.hash_algorithm
     and baseline.accepted_payload_digest = new.payload_digest
-    and baseline.baseline_version = new.expected_baseline_version
+    and baseline.baseline_version = new.claimed_baseline_version
 )
 begin
   select raise(abort, 'unchanged delivery requires exact accepted baseline authority');
@@ -679,6 +772,12 @@ when not exists (
     and audit.delivery_state = old.state
     and audit.payload_digest = old.payload_digest
     and audit.completed_at is null
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id
+        and baseline.job_id = old.job_id
+    )
 )
 begin
   select raise(abort, 'scheduled delivery deletion requires retention authority');
@@ -697,6 +796,12 @@ when not exists (
     and audit.payload_digest = delivery.payload_digest
   where delivery.delivery_id = old.delivery_id
     and audit.completed_at is null
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = delivery.run_id
+        and baseline.job_id = delivery.job_id
+    )
 )
 begin
   select raise(abort, 'scheduled delivery attempt deletion requires retention authority');
@@ -716,6 +821,12 @@ when not exists (
     and audit.completed_at is null
     and run.state = 'succeeded'
     and run.result_artifact_id = old.artifact_id
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id
+        and baseline.job_id = old.job_id
+    )
     and not exists (
       select 1
       from scheduled_run_deliveries delivery
@@ -747,6 +858,12 @@ when not exists (
     and attempt.attempt = old.attempt
     and attempt.fence = old.fence
     and audit.completed_at is null
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = attempt.run_id
+        and baseline.job_id = attempt.job_id
+    )
 )
 begin
   select raise(abort, 'scheduled late evidence deletion requires retention authority');
@@ -760,6 +877,12 @@ when not exists (
   where audit.run_id = old.run_id
     and audit.job_id = old.job_id
     and audit.completed_at is null
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id
+        and baseline.job_id = old.job_id
+    )
 )
 begin
   select raise(abort, 'scheduled run attempt deletion requires retention authority');
@@ -774,6 +897,12 @@ when not exists (
     and audit.job_id = old.job_id
     and audit.completed_at is null
     and old.state = 'succeeded'
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id
+        and baseline.job_id = old.job_id
+    )
 )
 begin
   select raise(abort, 'scheduled run deletion requires retention authority');

@@ -29,8 +29,8 @@ use codeoff_channel_slack::{
   run_socket_worker,
 };
 use codeoff_config::{
-  CodeoffConfig, ConfigLoadOptions, SlackConfig, SlackDirectMessageFeedbackMode,
-  SlackResponseFeedbackMode,
+  CodeoffConfig, ConfigLoadOptions, SchedulerRuntimeConfig, SlackConfig,
+  SlackDirectMessageFeedbackMode, SlackResponseFeedbackMode,
 };
 use codeoff_mcp::McpTcpServer;
 use codeoff_runtime::{
@@ -401,7 +401,7 @@ fn build_scheduled_delivery_provider_with<F>(
 where
   F: FnOnce(&str) -> Result<String, std::env::VarError>,
 {
-  if !config.scheduler.delivery_enabled {
+  if !config.scheduler.enabled || !config.scheduler.delivery_claims_enabled {
     return Ok(None);
   }
   let bot_token = env_var(&config.slack.bot_token_env).map_err(|_| {
@@ -522,7 +522,7 @@ where
   let mut lifecycle = ServeLifecycle::new(
     state.clone(),
     turn_budget.clone(),
-    config.scheduler.run_claims_enabled,
+    &config.scheduler,
     scheduled_delivery,
     mcp_server,
   );
@@ -665,7 +665,7 @@ impl ServeLifecycle {
   fn new(
     state: StateStore,
     turn_budget: GlobalTurnBudget,
-    run_claims_enabled: bool,
+    scheduler: &SchedulerRuntimeConfig,
     scheduled_delivery: Option<Arc<dyn DeliveryProvider>>,
     mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
   ) -> Self {
@@ -673,14 +673,16 @@ impl ServeLifecycle {
       scheduled_worker: spawn_scheduled_worker(
         state.clone(),
         turn_budget,
-        ScheduledWorkerConfig { run_claims_enabled },
+        scheduled_worker_config(scheduler),
       ),
       background_tasks: ServeTaskGroup::new(),
     };
-    if let Some(provider) = scheduled_delivery {
-      lifecycle.spawn_scheduled_delivery_worker(state, provider);
-    } else {
-      lifecycle.spawn_scheduled_delivery_preparation_worker(state);
+    if scheduler.enabled {
+      if let Some(provider) = scheduled_delivery {
+        lifecycle.spawn_scheduled_delivery_worker(state, provider);
+      } else {
+        lifecycle.spawn_scheduled_delivery_preparation_worker(state);
+      }
     }
     if let Some(server) = mcp_server {
       lifecycle.spawn_mcp_server(server);
@@ -749,6 +751,26 @@ impl ServeLifecycle {
     }
     record_serve_error(&mut result, self.background_tasks.join().await);
     result
+  }
+}
+
+fn scheduled_worker_config(config: &SchedulerRuntimeConfig) -> ScheduledWorkerConfig {
+  ScheduledWorkerConfig {
+    enabled: config.enabled,
+    run_claims_enabled: config.run_claims_enabled,
+    recovery_batch_limit: config.recovery_batch_limit,
+    materialization_batch_limit: config.materialization_batch_limit,
+    tick_interval_ms: config.tick_interval_ms,
+    error_backoff_ms: config.error_backoff_ms,
+    lease_seconds: config.lease_seconds,
+    heartbeat_interval_ms: config.heartbeat_interval_ms,
+    total_timeout_seconds: config.total_timeout_seconds,
+    prepare_grace_ms: config.prepare_grace_ms,
+    cancellation_grace_ms: config.cancellation_grace_ms,
+    finalization_grace_ms: config.finalization_grace_ms,
+    retry_delay_seconds: config.retry_delay_seconds,
+    run_deadline_seconds: config.run_deadline_seconds,
+    max_attempts: config.max_attempts,
   }
 }
 
@@ -3182,7 +3204,8 @@ mod tests {
 
   #[test]
   fn scheduled_delivery_provider_is_disabled_without_reading_slack_credentials() {
-    let config = CodeoffConfig::default();
+    let mut config = CodeoffConfig::default();
+    config.scheduler.enabled = true;
     let provider = build_scheduled_delivery_provider_with(&config, |_| {
       panic!("disabled scheduled delivery must not read Slack credentials")
     })
@@ -3193,7 +3216,8 @@ mod tests {
   #[test]
   fn scheduled_delivery_provider_fails_closed_when_enabled_secret_is_missing() {
     let mut config = CodeoffConfig::default();
-    config.scheduler.delivery_enabled = true;
+    config.scheduler.enabled = true;
+    config.scheduler.delivery_claims_enabled = true;
     let error =
       build_scheduled_delivery_provider_with(&config, |_| Err(std::env::VarError::NotPresent))
         .err()
@@ -3204,12 +3228,56 @@ mod tests {
   #[test]
   fn scheduled_delivery_provider_defers_slack_client_initialization_until_send() {
     let mut config = CodeoffConfig::default();
-    config.scheduler.delivery_enabled = true;
+    config.scheduler.enabled = true;
+    config.scheduler.delivery_claims_enabled = true;
     let provider = build_scheduled_delivery_provider_with(&config, |_| {
       Ok("xoxb-not-contacted-during-construction".to_owned())
     })
     .expect("lazy provider");
     assert!(provider.is_some());
+  }
+
+  #[test]
+  fn scheduled_worker_config_preserves_validated_operational_policy() {
+    let scheduler = SchedulerRuntimeConfig {
+      enabled: true,
+      run_claims_enabled: true,
+      recovery_batch_limit: 7,
+      materialization_batch_limit: 9,
+      tick_interval_ms: 125,
+      error_backoff_ms: 2_500,
+      lease_seconds: 90,
+      heartbeat_interval_ms: 10_000,
+      total_timeout_seconds: 1_200,
+      prepare_grace_ms: 1_500,
+      cancellation_grace_ms: 2_000,
+      finalization_grace_ms: 2_500,
+      retry_delay_seconds: 45,
+      run_deadline_seconds: 7_200,
+      max_attempts: 4,
+      ..SchedulerRuntimeConfig::default()
+    };
+
+    assert_eq!(
+      scheduled_worker_config(&scheduler),
+      ScheduledWorkerConfig {
+        enabled: true,
+        run_claims_enabled: true,
+        recovery_batch_limit: 7,
+        materialization_batch_limit: 9,
+        tick_interval_ms: 125,
+        error_backoff_ms: 2_500,
+        lease_seconds: 90,
+        heartbeat_interval_ms: 10_000,
+        total_timeout_seconds: 1_200,
+        prepare_grace_ms: 1_500,
+        cancellation_grace_ms: 2_000,
+        finalization_grace_ms: 2_500,
+        retry_delay_seconds: 45,
+        run_deadline_seconds: 7_200,
+        max_attempts: 4,
+      }
+    );
   }
 
   #[test]
@@ -3310,9 +3378,10 @@ mod tests {
     );
     let observer = state.clone();
     let mut config = CodeoffConfig::default();
+    config.scheduler.enabled = true;
     config.scheduler.run_claims_enabled = false;
     config.data_retention.enabled = false;
-    assert!(!config.scheduler.delivery_enabled);
+    assert!(!config.scheduler.delivery_claims_enabled);
 
     tokio::time::timeout(
       Duration::from_secs(2),

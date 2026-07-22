@@ -22,11 +22,7 @@ use crate::channel_tools::CHANNEL_DYNAMIC_TOOL_NAMES;
 use crate::schedule_tools::SCHEDULE_DYNAMIC_TOOL_NAMES;
 
 static PREPARE_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(250);
-const SCHEDULER_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 const SCHEDULER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
-const MATERIALIZATION_BATCH_LIMIT: u32 = 32;
-const RECOVERY_BATCH_LIMIT: u32 = 32;
 const MAX_LOG_ERROR_BYTES: usize = 512;
 
 #[derive(Clone)]
@@ -61,9 +57,45 @@ impl GlobalTurnBudget {
   }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledWorkerConfig {
+  pub enabled: bool,
   pub run_claims_enabled: bool,
+  pub recovery_batch_limit: u16,
+  pub materialization_batch_limit: u16,
+  pub tick_interval_ms: u64,
+  pub error_backoff_ms: u64,
+  pub lease_seconds: u16,
+  pub heartbeat_interval_ms: u64,
+  pub total_timeout_seconds: u32,
+  pub prepare_grace_ms: u64,
+  pub cancellation_grace_ms: u64,
+  pub finalization_grace_ms: u64,
+  pub retry_delay_seconds: u32,
+  pub run_deadline_seconds: u32,
+  pub max_attempts: u16,
+}
+
+impl Default for ScheduledWorkerConfig {
+  fn default() -> Self {
+    Self {
+      enabled: false,
+      run_claims_enabled: false,
+      recovery_batch_limit: 32,
+      materialization_batch_limit: 32,
+      tick_interval_ms: 250,
+      error_backoff_ms: 1_000,
+      lease_seconds: 60,
+      heartbeat_interval_ms: 15_000,
+      total_timeout_seconds: 1_800,
+      prepare_grace_ms: 5_000,
+      cancellation_grace_ms: 5_000,
+      finalization_grace_ms: 5_000,
+      retry_delay_seconds: 30,
+      run_deadline_seconds: 3_600,
+      max_attempts: 3,
+    }
+  }
 }
 
 pub struct ScheduledWorkerHandle {
@@ -123,17 +155,19 @@ pub fn spawn_scheduled_worker(
   budget: GlobalTurnBudget,
   config: ScheduledWorkerConfig,
 ) -> Option<ScheduledWorkerHandle> {
-  if !config.run_claims_enabled {
+  if !config.enabled {
     return None;
   }
   let (shutdown, shutdown_rx) = watch::channel(false);
   let guardians = Arc::new(BlockingGuardianRegistry::default());
-  let orchestrator = ScheduledRunOrchestrator::unavailable(
+  let mut orchestrator = ScheduledRunOrchestrator::unavailable(
     state.clone(),
     budget,
     Arc::clone(&guardians),
     format!("codeoff-scheduler-{}", std::process::id()),
   );
+  orchestrator.run_claims_enabled = config.run_claims_enabled;
+  orchestrator.policy = ExecutionPolicy::from_config(config);
   let join = tokio::spawn(run_scheduled_worker(state, orchestrator, shutdown_rx));
   Some(ScheduledWorkerHandle {
     shutdown,
@@ -213,9 +247,9 @@ async fn run_scheduled_worker(
     let tick = run_scheduled_worker_tick(&state, &orchestrator, shutdown.clone()).await;
     let delay = if let Err(error) = &tick {
       eprintln!("scheduled worker tick failed: {}", bounded_log_error(error));
-      SCHEDULER_ERROR_BACKOFF
+      orchestrator.policy.error_backoff
     } else {
-      SCHEDULER_TICK_INTERVAL
+      orchestrator.policy.tick_interval
     };
     tokio::select! {
       () = cancellation_requested(shutdown.clone()) => return,
@@ -238,7 +272,7 @@ async fn run_scheduled_worker_tick(
     orchestrator.policy.retry_delay_seconds,
     "recovery retry",
   )?;
-  for _ in 0..RECOVERY_BATCH_LIMIT {
+  for _ in 0..orchestrator.policy.recovery_batch_limit {
     let outcome = tokio::select! {
       result = state.reclaim_next_expired_scheduled_run(
         now,
@@ -251,11 +285,14 @@ async fn run_scheduled_worker_tick(
       break;
     }
   }
+  if !orchestrator.run_claims_enabled {
+    return Ok(TickOutcome::Unavailable);
+  }
   if orchestrator.backend.readiness() != ExecutorReadiness::Ready {
     return Ok(TickOutcome::Unavailable);
   }
   let due_jobs = tokio::select! {
-    result = state.list_due_scheduled_jobs(now, MATERIALIZATION_BATCH_LIMIT) => result?,
+    result = state.list_due_scheduled_jobs(now, orchestrator.policy.materialization_batch_limit) => result?,
     () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
   };
   for job_id in due_jobs {
@@ -337,6 +374,10 @@ enum HeartbeatStop {
 
 #[derive(Debug, Clone)]
 struct ExecutionPolicy {
+  recovery_batch_limit: u16,
+  materialization_batch_limit: u32,
+  tick_interval: Duration,
+  error_backoff: Duration,
   lease_seconds: i64,
   heartbeat_interval: Duration,
   total_timeout: Duration,
@@ -351,6 +392,10 @@ struct ExecutionPolicy {
 impl Default for ExecutionPolicy {
   fn default() -> Self {
     Self {
+      recovery_batch_limit: 32,
+      materialization_batch_limit: 32,
+      tick_interval: Duration::from_millis(250),
+      error_backoff: Duration::from_secs(1),
       lease_seconds: 60,
       heartbeat_interval: Duration::from_secs(15),
       total_timeout: Duration::from_mins(30),
@@ -360,6 +405,26 @@ impl Default for ExecutionPolicy {
       retry_delay_seconds: 30,
       run_deadline_seconds: 3_600,
       max_attempts: 3,
+    }
+  }
+}
+
+impl ExecutionPolicy {
+  fn from_config(config: ScheduledWorkerConfig) -> Self {
+    Self {
+      recovery_batch_limit: config.recovery_batch_limit,
+      materialization_batch_limit: u32::from(config.materialization_batch_limit),
+      tick_interval: Duration::from_millis(config.tick_interval_ms),
+      error_backoff: Duration::from_millis(config.error_backoff_ms),
+      lease_seconds: i64::from(config.lease_seconds),
+      heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
+      total_timeout: Duration::from_secs(u64::from(config.total_timeout_seconds)),
+      prepare_grace: Duration::from_millis(config.prepare_grace_ms),
+      cancellation_grace: Duration::from_millis(config.cancellation_grace_ms),
+      finalization_grace: Duration::from_millis(config.finalization_grace_ms),
+      retry_delay_seconds: i64::from(config.retry_delay_seconds),
+      run_deadline_seconds: i64::from(config.run_deadline_seconds),
+      max_attempts: i64::from(config.max_attempts),
     }
   }
 }
@@ -520,6 +585,7 @@ struct ScheduledRunOrchestrator {
   budget: GlobalTurnBudget,
   guardians: Arc<BlockingGuardianRegistry>,
   lease_owner: String,
+  run_claims_enabled: bool,
   policy: ExecutionPolicy,
 }
 
@@ -537,6 +603,7 @@ impl ScheduledRunOrchestrator {
       budget,
       guardians,
       lease_owner: lease_owner.into(),
+      run_claims_enabled: true,
       policy: ExecutionPolicy::default(),
     }
   }
@@ -565,6 +632,9 @@ impl ScheduledRunOrchestrator {
       result = self.budget.acquire() => result?,
       () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
     });
+    if !self.run_claims_enabled {
+      return Ok(TickOutcome::Unavailable);
+    }
     if self.backend.readiness() != ExecutorReadiness::Ready {
       return Ok(TickOutcome::Unavailable);
     }
@@ -1475,6 +1545,7 @@ mod tests {
       budget: GlobalTurnBudget::new(parallelism),
       guardians: Arc::new(BlockingGuardianRegistry::default()),
       lease_owner: "runtime-test".to_owned(),
+      run_claims_enabled: true,
       policy: ExecutionPolicy {
         lease_seconds: 20,
         heartbeat_interval: Duration::from_mins(1),
@@ -1485,6 +1556,7 @@ mod tests {
         retry_delay_seconds: 5,
         run_deadline_seconds: 100,
         max_attempts: 3,
+        ..ExecutionPolicy::default()
       },
     }
   }
@@ -1511,20 +1583,23 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_unavailable_worker_reconciles_expired_run_before_readiness_gate() {
+  async fn test_run_claim_kill_switch_reconciles_without_materializing_or_claiming() {
     let (_temp, state) = fixture(&[("unavailable-recovery", 110)]).await;
+    create_job(&state, "kill-switch-due", 111).await;
     let expired_claim = state
       .claim_next_scheduled_run("stale-worker", 111, 120)
       .await
       .expect("claim stale run")
       .expect("stale run");
-    let mut runtime = ScheduledRunOrchestrator::unavailable(
+    let mut runtime = orchestrator(
       state.clone(),
-      GlobalTurnBudget::new(1),
-      Arc::new(BlockingGuardianRegistry::default()),
-      "runtime-test",
+      Arc::new(FakeBackend::new(ExecutionResult::Completed {
+        summary: "must not execute".to_owned(),
+      })),
+      Arc::new(TestClock(AtomicI64::new(121), 1)),
+      1,
     );
-    runtime.clock = Arc::new(TestClock(AtomicI64::new(121), 1));
+    runtime.run_claims_enabled = false;
     let (_shutdown, shutdown_rx) = watch::channel(false);
 
     assert_eq!(
@@ -1533,6 +1608,13 @@ mod tests {
         .expect("tick"),
       TickOutcome::Unavailable
     );
+    assert!(matches!(
+      state
+        .materialize_due_schedule("kill-switch-due", 0, 121)
+        .await
+        .expect("materialize proof"),
+      MaterializationOutcome::Created(_)
+    ));
     let current = state
       .claim_next_scheduled_run("current-worker", 151, 180)
       .await
@@ -1566,7 +1648,9 @@ mod tests {
       state.clone(),
       GlobalTurnBudget::new(1),
       ScheduledWorkerConfig {
+        enabled: true,
         run_claims_enabled: true,
+        ..ScheduledWorkerConfig::default()
       },
     )
     .expect("enabled worker");
@@ -1774,6 +1858,7 @@ mod tests {
       budget: budget.clone(),
       guardians: Arc::new(BlockingGuardianRegistry::default()),
       lease_owner: "runtime-test".to_owned(),
+      run_claims_enabled: true,
       policy: ExecutionPolicy::default(),
     });
     let scheduled = {

@@ -39,4 +39,10 @@ pub enum ConfigError {
 
   #[error("unsupported database driver; only sqlite is supported")]
   UnsupportedDatabaseDriver,
+
+  #[error("invalid scheduler configuration for {field}: {reason}")]
+  InvalidScheduler {
+    field: &'static str,
+    reason: &'static str,
+  },
 }

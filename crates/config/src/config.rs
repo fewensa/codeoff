@@ -70,11 +70,48 @@ pub struct CodeoffConfig {
   database_driver: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SchedulerRuntimeConfig {
+  pub enabled: bool,
   pub run_claims_enabled: bool,
-  pub delivery_enabled: bool,
+  pub delivery_claims_enabled: bool,
+  pub recovery_batch_limit: u16,
+  pub materialization_batch_limit: u16,
+  pub tick_interval_ms: u64,
+  pub error_backoff_ms: u64,
+  pub lease_seconds: u16,
+  pub heartbeat_interval_ms: u64,
+  pub total_timeout_seconds: u32,
+  pub prepare_grace_ms: u64,
+  pub cancellation_grace_ms: u64,
+  pub finalization_grace_ms: u64,
+  pub retry_delay_seconds: u32,
+  pub run_deadline_seconds: u32,
+  pub max_attempts: u16,
+}
+
+impl Default for SchedulerRuntimeConfig {
+  fn default() -> Self {
+    Self {
+      enabled: false,
+      run_claims_enabled: false,
+      delivery_claims_enabled: false,
+      recovery_batch_limit: 32,
+      materialization_batch_limit: 32,
+      tick_interval_ms: 250,
+      error_backoff_ms: 1_000,
+      lease_seconds: 60,
+      heartbeat_interval_ms: 15_000,
+      total_timeout_seconds: 1_800,
+      prepare_grace_ms: 5_000,
+      cancellation_grace_ms: 5_000,
+      finalization_grace_ms: 5_000,
+      retry_delay_seconds: 30,
+      run_deadline_seconds: 3_600,
+      max_attempts: 3,
+    }
+  }
 }
 
 impl CodeoffConfig {
@@ -179,6 +216,8 @@ impl CodeoffConfig {
       return Err(ConfigError::UnsupportedDatabaseDriver);
     }
 
+    self.scheduler.validate()?;
+
     if self.mcp.enabled {
       match self.mcp.transport.as_str() {
         "stdio" => {}
@@ -206,6 +245,79 @@ impl CodeoffConfig {
       }
     }
 
+    Ok(())
+  }
+}
+
+impl SchedulerRuntimeConfig {
+  fn validate(&self) -> Result<(), ConfigError> {
+    let invalid = |field, reason| ConfigError::InvalidScheduler { field, reason };
+    if !self.enabled && (self.run_claims_enabled || self.delivery_claims_enabled) {
+      return Err(invalid(
+        "enabled",
+        "must be true when run or delivery claims are enabled",
+      ));
+    }
+    if !(1..=1_024).contains(&self.recovery_batch_limit) {
+      return Err(invalid(
+        "recovery_batch_limit",
+        "must be between 1 and 1024",
+      ));
+    }
+    if !(1..=1_024).contains(&self.materialization_batch_limit) {
+      return Err(invalid(
+        "materialization_batch_limit",
+        "must be between 1 and 1024",
+      ));
+    }
+    if !(10..=60_000).contains(&self.tick_interval_ms) {
+      return Err(invalid("tick_interval_ms", "must be between 10 and 60000"));
+    }
+    if !(10..=300_000).contains(&self.error_backoff_ms) {
+      return Err(invalid("error_backoff_ms", "must be between 10 and 300000"));
+    }
+    if !(5..=3_600).contains(&self.lease_seconds) {
+      return Err(invalid("lease_seconds", "must be between 5 and 3600"));
+    }
+    if self.heartbeat_interval_ms == 0
+      || self.heartbeat_interval_ms >= u64::from(self.lease_seconds) * 1_000
+    {
+      return Err(invalid(
+        "heartbeat_interval_ms",
+        "must be positive and shorter than lease_seconds",
+      ));
+    }
+    if !(1..=21_600).contains(&self.total_timeout_seconds) {
+      return Err(invalid(
+        "total_timeout_seconds",
+        "must be between 1 and 21600",
+      ));
+    }
+    for (field, value) in [
+      ("prepare_grace_ms", self.prepare_grace_ms),
+      ("cancellation_grace_ms", self.cancellation_grace_ms),
+      ("finalization_grace_ms", self.finalization_grace_ms),
+    ] {
+      if !(1..=60_000).contains(&value) {
+        return Err(invalid(field, "must be between 1 and 60000"));
+      }
+    }
+    if !(1..=86_400).contains(&self.retry_delay_seconds) {
+      return Err(invalid(
+        "retry_delay_seconds",
+        "must be between 1 and 86400",
+      ));
+    }
+    if self.run_deadline_seconds < self.total_timeout_seconds || self.run_deadline_seconds > 604_800
+    {
+      return Err(invalid(
+        "run_deadline_seconds",
+        "must cover total_timeout_seconds and not exceed 604800",
+      ));
+    }
+    if !(1..=20).contains(&self.max_attempts) {
+      return Err(invalid("max_attempts", "must be between 1 and 20"));
+    }
     Ok(())
   }
 }

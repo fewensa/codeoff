@@ -164,13 +164,10 @@ artifact_days = 10
 
 #[test]
 fn test_scheduler_run_claims_default_off_and_loads_explicit_opt_in() {
-  assert_eq!(
-    CodeoffConfig::default().scheduler,
-    SchedulerRuntimeConfig {
-      run_claims_enabled: false,
-      delivery_enabled: false,
-    }
-  );
+  let defaults = SchedulerRuntimeConfig::default();
+  assert!(!defaults.enabled);
+  assert!(!defaults.run_claims_enabled);
+  assert!(!defaults.delivery_claims_enabled);
 
   let dir = tempdir().expect("create tempdir");
   let config_path = dir.path().join("codeoff.toml");
@@ -178,8 +175,12 @@ fn test_scheduler_run_claims_default_off_and_loads_explicit_opt_in() {
     &config_path,
     r"
 [scheduler]
+enabled = true
 run_claims_enabled = true
-delivery_enabled = true
+delivery_claims_enabled = true
+recovery_batch_limit = 64
+retry_delay_seconds = 60
+max_attempts = 5
 ",
   )
   .expect("write config");
@@ -187,8 +188,66 @@ delivery_enabled = true
   let loaded =
     CodeoffConfig::load(ConfigLoadOptions::new().config_path(config_path)).expect("load config");
 
+  assert!(loaded.scheduler.enabled);
   assert!(loaded.scheduler.run_claims_enabled);
-  assert!(loaded.scheduler.delivery_enabled);
+  assert!(loaded.scheduler.delivery_claims_enabled);
+  assert_eq!(loaded.scheduler.recovery_batch_limit, 64);
+  assert_eq!(loaded.scheduler.retry_delay_seconds, 60);
+  assert_eq!(loaded.scheduler.max_attempts, 5);
+  loaded.validate().expect("scheduler config");
+}
+
+#[test]
+fn test_scheduler_config_rejects_claims_without_lifecycle_and_unsafe_limits() {
+  let mut config = CodeoffConfig::default();
+  config.scheduler.run_claims_enabled = true;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "enabled",
+      ..
+    })
+  ));
+
+  config.scheduler.enabled = true;
+  config.scheduler.run_claims_enabled = false;
+  config.scheduler.heartbeat_interval_ms = u64::from(config.scheduler.lease_seconds) * 1_000;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "heartbeat_interval_ms",
+      ..
+    })
+  ));
+
+  config.scheduler.heartbeat_interval_ms = 1_000;
+  config.scheduler.max_attempts = 0;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "max_attempts",
+      ..
+    })
+  ));
+}
+
+#[test]
+fn test_scheduler_config_rejects_retired_delivery_enabled_name() {
+  let dir = tempdir().expect("create tempdir");
+  let config_path = dir.path().join("codeoff.toml");
+  fs::write(
+    &config_path,
+    r"
+[scheduler]
+enabled = true
+delivery_enabled = true
+",
+  )
+  .expect("write config");
+  assert!(matches!(
+    CodeoffConfig::load(ConfigLoadOptions::new().config_path(config_path)),
+    Err(ConfigError::Parse { .. })
+  ));
 }
 
 #[test]

@@ -156,6 +156,25 @@ fn test_scheduled_run_result_is_typed_and_bounded() {
 }
 
 #[test]
+fn test_delivery_target_identity_requires_lowercase_sha256_at_construction() {
+  for invalid in [
+    "identity",
+    "A000000000000000000000000000000000000000000000000000000000000000",
+    "g000000000000000000000000000000000000000000000000000000000000000",
+  ] {
+    assert!(matches!(
+      DeliveryTargetSnapshot::new(
+        "target", "none", "none", "tenant", "none", "{}", 1, "resolver", invalid,
+      ),
+      Err(StateValueError::InvalidSha256 {
+        field: "target identity digest"
+      })
+    ));
+  }
+  assert_eq!(target("valid").identity_digest(), NONE_TARGET_IDENTITY);
+}
+
+#[test]
 fn test_cron_rejects_seconds_and_preserves_dst_utc_order() {
   assert!(ScheduleSpec::cron("0 0 0 * * *", "UTC").is_err());
   let schedule = ScheduleSpec::cron("30 1 * * *", "America/New_York").expect("valid cron");
@@ -245,7 +264,7 @@ async fn test_delivery_target_count_and_aggregate_snapshot_bounds_are_enforced()
         "{}",
         1,
         "resolver-v1",
-        format!("identity-{index}"),
+        test_sha256_hex(&format!("identity-{index}")),
       )
       .expect("target")
     })
@@ -264,7 +283,7 @@ async fn test_delivery_target_count_and_aggregate_snapshot_bounds_are_enforced()
         format!(r#"{{"address":"{}"}}"#, "x".repeat(8_200)),
         1,
         "resolver-v1",
-        format!("large-identity-{index}"),
+        test_sha256_hex(&format!("large-identity-{index}")),
       )
       .expect("target")
     })
@@ -687,7 +706,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
       matches!(state, "leased" | "executing") || label == "succeeded-matching";
     let attempt = i64::from(has_current_attempt);
     let fence = attempt * 2;
-    sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, attempt, fence, lease_owner, lease_expires_at, overlap_slot, result_context, result_hash_algorithm, result_hash, created_at, updated_at) values (?1, ?2, ?3, 0, 0, ?4, ?4, 1, '{}', 1, 'profile', '{}', '[{}]', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 100, 100)")
+    sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, attempt, fence, lease_owner, lease_expires_at, overlap_slot, result_context, result_hash_algorithm, result_hash, created_at, updated_at) values (?1, ?2, ?3, 0, 0, ?4, ?4, 1, '{}', 1, 'profile', '{}', '[{\"identity_digest\":\"0000000000000000000000000000000000000000000000000000000000000001\"}]', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 100, 100)")
       .bind(run_id)
       .bind(&job_id)
       .bind(&schedule_id)
@@ -733,11 +752,11 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
     .execute(&pool)
     .await
     .expect("seed valid legacy baseline");
-  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, state, overlap_slot, created_at, updated_at) values ('upgrade-run-after-invalid', 'upgrade-succeeded-invalid', 'schedule-succeeded-invalid', 0, 0, 150, 150, 1, '{}', 1, 'profile', '{}', '[{}]', '{\"baseline_version\":3,\"hash_algorithm\":\"legacy-digest-v1\",\"result_hash\":\"succeeded-invalid\",\"previous_success_context\":\"invalid context\",\"source_run_id\":\"upgrade-run-succeeded-invalid\",\"completed_at\":100}', 'pending', 1, 100, 100)")
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, state, overlap_slot, created_at, updated_at) values ('upgrade-run-after-invalid', 'upgrade-succeeded-invalid', 'schedule-succeeded-invalid', 0, 0, 150, 150, 1, '{}', 1, 'profile', '{}', '[{\"identity_digest\":\"0000000000000000000000000000000000000000000000000000000000000001\"}]', '{\"baseline_version\":3,\"hash_algorithm\":\"legacy-digest-v1\",\"result_hash\":\"succeeded-invalid\",\"previous_success_context\":\"invalid context\",\"source_run_id\":\"upgrade-run-succeeded-invalid\",\"completed_at\":100}', 'pending', 1, 100, 100)")
     .execute(&pool)
     .await
     .expect("seed pending run with invalid baseline snapshot");
-  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, state, overlap_slot, created_at, updated_at) values ('upgrade-run-after-valid', 'upgrade-succeeded-valid', 'schedule-succeeded-valid', 0, 0, 151, 151, 1, '{}', 1, 'profile', '{}', '[{}]', '{\"baseline_version\":4,\"hash_algorithm\":\"legacy-digest-v1\",\"result_hash\":\"succeeded-valid\",\"previous_success_context\":\"legacy context\",\"source_run_id\":\"upgrade-run-succeeded-valid\",\"completed_at\":100}', 'pending', 1, 100, 100)")
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, state, overlap_slot, created_at, updated_at) values ('upgrade-run-after-valid', 'upgrade-succeeded-valid', 'schedule-succeeded-valid', 0, 0, 151, 151, 1, '{}', 1, 'profile', '{}', '[{\"identity_digest\":\"0000000000000000000000000000000000000000000000000000000000000001\"}]', '{\"baseline_version\":4,\"hash_algorithm\":\"legacy-digest-v1\",\"result_hash\":\"succeeded-valid\",\"previous_success_context\":\"legacy context\",\"source_run_id\":\"upgrade-run-succeeded-valid\",\"completed_at\":100}', 'pending', 1, 100, 100)")
     .execute(&pool)
     .await
     .expect("seed pending run with valid baseline snapshot");
@@ -951,7 +970,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
     .execute(&pool)
     .await
     .expect("seed baseline");
-  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, attempt, fence, lease_owner, lease_expires_at, overlap_slot, created_at, updated_at) values ('mismatch-run', 'mismatch', 'schedule-mismatch', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{}]', 'leased', 1, 2, 'worker', 200, 1, 100, 100)")
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, attempt, fence, lease_owner, lease_expires_at, overlap_slot, created_at, updated_at) values ('mismatch-run', 'mismatch', 'schedule-mismatch', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{\"identity_digest\":\"0000000000000000000000000000000000000000000000000000000000000001\"}]', 'leased', 1, 2, 'worker', 200, 1, 100, 100)")
     .execute(&pool)
     .await
     .expect("seed run");
@@ -1028,7 +1047,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
     .execute(&pool)
     .await
     .expect("seed baseline");
-  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, overlap_slot, created_at, updated_at) values ('baseline-max-run', 'baseline-max', 'schedule-baseline-max', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{}]', 'succeeded', null, 100, 100)")
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, overlap_slot, created_at, updated_at) values ('baseline-max-run', 'baseline-max', 'schedule-baseline-max', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{\"identity_digest\":\"0000000000000000000000000000000000000000000000000000000000000001\"}]', 'succeeded', null, 100, 100)")
     .execute(&pool)
     .await
     .expect("seed invalid success");
@@ -1103,7 +1122,7 @@ async fn test_delivery_intent_migration_preserves_all_legacy_states_and_baseline
     .execute(&pool)
     .await
     .expect("seed execution baseline");
-  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, state, overlap_slot, created_at, updated_at) values ('delivery-upgrade-run', 'delivery-upgrade', 'schedule-delivery-upgrade', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{}]', '{\"baseline_version\":0,\"completed_at\":null,\"hash_algorithm\":null,\"previous_success_context\":null,\"result_hash\":null,\"source_run_id\":null}', 'pending', 1, 100, 100)")
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, state, overlap_slot, created_at, updated_at) values ('delivery-upgrade-run', 'delivery-upgrade', 'schedule-delivery-upgrade', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{\"identity_digest\":\"0000000000000000000000000000000000000000000000000000000000000001\"}]', '{\"baseline_version\":0,\"completed_at\":null,\"hash_algorithm\":null,\"previous_success_context\":null,\"result_hash\":null,\"source_run_id\":null}', 'pending', 1, 100, 100)")
     .execute(&pool)
     .await
     .expect("seed run");
@@ -1289,6 +1308,156 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
   .await
   .expect("read migration state");
   assert_eq!(migration_applied, 0);
+}
+
+#[tokio::test]
+async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_identities() {
+  let temp = tempdir().expect("create tempdir");
+  let parent_migrations = temp.path().join("parent-migrations");
+  std::fs::create_dir(&parent_migrations).expect("create migration fixture");
+  let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+  for entry in std::fs::read_dir(source).expect("read migrations") {
+    let entry = entry.expect("migration entry");
+    if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql" {
+      std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
+        .expect("copy parent migration");
+    }
+  }
+  let state_dir = temp.path().join("state");
+  std::fs::create_dir(&state_dir).expect("create state dir");
+  let options = SqliteConnectOptions::from_str(&database_url(&state_dir))
+    .expect("database options")
+    .create_if_missing(true);
+  let pool = SqlitePoolOptions::new()
+    .max_connections(1)
+    .connect_with(options)
+    .await
+    .expect("connect parent database");
+  Migrator::new(parent_migrations)
+    .await
+    .expect("load parent migrator")
+    .run(&pool)
+    .await
+    .expect("run parent migrations");
+  sqlx::query("insert into scheduled_jobs (job_id, definition_version, definition_json, creator_kind, creator_provider, creator_tenant, creator_subject, owner_kind, owner_provider, owner_tenant, owner_subject, status, generation, capability_schema_version, capability_digest, capability_json, created_at, updated_at) values ('invalid-identity-upgrade', 1, '{}', 'user', 'test', 'tenant', 'creator', 'user', 'test', 'tenant', 'owner', 'active', 0, 1, 'profile', '{}', 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed job");
+  sqlx::query("insert into schedules (schedule_id, job_id, kind, canonical_spec, once_at, next_run_at, created_at, updated_at) values ('schedule-invalid-identity-upgrade', 'invalid-identity-upgrade', 'once', '200', 200, 200, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed schedule");
+  sqlx::query(
+    "insert into scheduled_execution_baselines (job_id) values ('invalid-identity-upgrade')",
+  )
+  .execute(&pool)
+  .await
+  .expect("seed baseline");
+  sqlx::query("insert into scheduled_job_delivery_targets (target_id, job_id, ordinal, provider, connector, tenant, kind, address_json, resolver_version, resolver_digest, identity_digest) values ('invalid-target', 'invalid-identity-upgrade', 0, 'none', 'none', 'tenant', 'none', '{}', 1, 'resolver', 'not-a-sha')")
+    .execute(&pool)
+    .await
+    .expect("seed invalid job target");
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, overlap_slot, created_at, updated_at) values ('invalid-identity-run', 'invalid-identity-upgrade', 'schedule-invalid-identity-upgrade', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{\"identity_digest\":\"also-not-a-sha\"}]', 'pending', 1, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed invalid run target");
+  pool.close().await;
+
+  assert!(matches!(
+    StateStore::initialize(&state_dir, None).await,
+    Err(StateError::Migrate { .. })
+  ));
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("reopen rejected database");
+  let unchanged: (String, String) = sqlx::query_as(
+    "select (select identity_digest from scheduled_job_delivery_targets where target_id = 'invalid-target'), (select json_extract(targets_json, '$[0].identity_digest') from scheduled_runs where run_id = 'invalid-identity-run')",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled back invalid identities");
+  assert_eq!(
+    unchanged,
+    ("not-a-sha".to_owned(), "also-not-a-sha".to_owned())
+  );
+  let migration_applied: i64 = sqlx::query_scalar(
+    "select count(*) from _sqlx_migrations where version = 20260721040000 and success = true",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read migration state");
+  assert_eq!(migration_applied, 0);
+}
+
+#[tokio::test]
+async fn test_current_schema_rejects_future_invalid_job_and_run_target_identities() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let job_id = "future-identity-guard";
+  store
+    .create_scheduled_job(&create_request(job_id, ScheduleSpec::once(110), 100))
+    .await
+    .expect("create job");
+  let MaterializationOutcome::Created(run) = store
+    .materialize_due_schedule(job_id, 0, 110)
+    .await
+    .expect("materialize")
+  else {
+    panic!("expected materialized run");
+  };
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  assert!(
+    sqlx::query(
+      "update scheduled_job_delivery_targets set identity_digest = 'invalid' where job_id = ?1"
+    )
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .is_err()
+  );
+  assert!(
+    sqlx::query("insert into scheduled_job_delivery_targets (target_id, job_id, ordinal, provider, connector, tenant, kind, address_json, resolver_version, resolver_digest, identity_digest) values ('future-invalid-target', ?1, 1, 'none', 'none', 'tenant', 'none', '{}', 1, 'resolver', 'invalid')")
+      .bind(job_id)
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  assert!(
+    sqlx::query("update scheduled_runs set targets_json = '[{\"identity_digest\":\"invalid\"}]' where run_id = ?1")
+      .bind(&run.run_id)
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  assert!(
+    sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, overlap_slot, created_at, updated_at) select 'future-invalid-run', job_id, schedule_id, job_generation, schedule_generation, scheduled_for + 1, coalesced_through + 1, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, '[{\"identity_digest\":\"invalid\"}]', 'failed', null, created_at, updated_at from scheduled_runs where run_id = ?1")
+      .bind(&run.run_id)
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  let preserved: (String, String, i64, i64) = sqlx::query_as(
+    "select (select identity_digest from scheduled_job_delivery_targets where job_id = ?1 and ordinal = 0), (select json_extract(targets_json, '$[0].identity_digest') from scheduled_runs where run_id = ?2), (select count(*) from scheduled_job_delivery_targets where target_id = 'future-invalid-target'), (select count(*) from scheduled_runs where run_id = 'future-invalid-run')",
+  )
+  .bind(job_id)
+  .bind(&run.run_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read preserved target identities");
+  assert_eq!(
+    preserved,
+    (
+      NONE_TARGET_IDENTITY.to_owned(),
+      NONE_TARGET_IDENTITY.to_owned(),
+      0,
+      0
+    )
+  );
 }
 
 #[tokio::test]
@@ -1661,7 +1830,7 @@ async fn test_complete_success_atomically_persists_result_baseline_and_exact_del
   let pool = SqlitePool::connect(&database_url(&state_dir))
     .await
     .expect("connect mutable job database");
-  sqlx::query("update scheduled_job_delivery_targets set identity_digest = 'mutated-' || ordinal, address_json = '{\"mutated\":true}' where job_id = ?1")
+  sqlx::query("update scheduled_job_delivery_targets set identity_digest = case ordinal when 0 then '0000000000000000000000000000000000000000000000000000000000000003' else '0000000000000000000000000000000000000000000000000000000000000004' end, address_json = '{\"mutated\":true}' where job_id = ?1")
     .bind(job_id)
     .execute(&pool)
     .await
@@ -1847,6 +2016,104 @@ async fn test_direct_delivery_intents_require_database_verifiable_authority() {
   let identity = NONE_TARGET_IDENTITY;
   let natural_key = test_intent_key(claim.binding.run_id(), identity);
   let natural_delivery_id = format!("intent:{natural_key}");
+  let target_snapshot_digest = test_sha256_hex(&target_json);
+  let nullable_authority = [
+    (
+      "artifact",
+      None,
+      Some(claim.binding.attempt()),
+      Some(claim.binding.fence()),
+      Some("sha256-v1"),
+      Some(target_snapshot_digest.as_str()),
+      Some(natural_key.as_str()),
+    ),
+    (
+      "result attempt",
+      Some(artifact_id),
+      None,
+      Some(claim.binding.fence()),
+      Some("sha256-v1"),
+      Some(target_snapshot_digest.as_str()),
+      Some(natural_key.as_str()),
+    ),
+    (
+      "result fence",
+      Some(artifact_id),
+      Some(claim.binding.attempt()),
+      None,
+      Some("sha256-v1"),
+      Some(target_snapshot_digest.as_str()),
+      Some(natural_key.as_str()),
+    ),
+    (
+      "snapshot algorithm",
+      Some(artifact_id),
+      Some(claim.binding.attempt()),
+      Some(claim.binding.fence()),
+      None,
+      Some(target_snapshot_digest.as_str()),
+      Some(natural_key.as_str()),
+    ),
+    (
+      "snapshot digest",
+      Some(artifact_id),
+      Some(claim.binding.attempt()),
+      Some(claim.binding.fence()),
+      Some("sha256-v1"),
+      None,
+      Some(natural_key.as_str()),
+    ),
+    (
+      "intent key",
+      Some(artifact_id),
+      Some(claim.binding.attempt()),
+      Some(claim.binding.fence()),
+      Some("sha256-v1"),
+      Some(target_snapshot_digest.as_str()),
+      None,
+    ),
+  ];
+  for (field, artifact, result_attempt, result_fence, algorithm, digest, intent_key) in
+    nullable_authority
+  {
+    let insert = sqlx::query(
+      "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'intent', 0, 0, 1, ?6, ?7, ?8, ?9, ?10, ?11, 'intent_v1', 114, 114)",
+    )
+    .bind(&natural_delivery_id)
+    .bind(claim.binding.run_id())
+    .bind(job_id)
+    .bind(identity)
+    .bind(&target_json)
+    .bind(artifact)
+    .bind(result_attempt)
+    .bind(result_fence)
+    .bind(algorithm)
+    .bind(digest)
+    .bind(intent_key)
+    .execute(&pool)
+    .await;
+    assert!(insert.is_err(), "NULL {field} must be rejected");
+  }
+  assert!(
+    sqlx::query(
+      "insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, attempt, fence, delivery_policy_version, render_version, hash_algorithm, payload_digest, payload_snapshot, expected_baseline_version, result_artifact_id, result_attempt, result_fence, target_snapshot_digest_algorithm, target_snapshot_digest, intent_key, authority_kind, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, 'pending', 0, 0, 1, 1, 'sha256-v1', 'payload', ?6, 0, ?7, ?8, ?9, 'sha256-v1', ?10, ?11, 'intent_v1', 114, 114)"
+    )
+    .bind(&natural_delivery_id)
+    .bind(claim.binding.run_id())
+    .bind(job_id)
+    .bind(identity)
+    .bind(&target_json)
+    .bind(b"rendered payload".as_slice())
+    .bind(artifact_id)
+    .bind(claim.binding.attempt())
+    .bind(claim.binding.fence())
+    .bind(&target_snapshot_digest)
+    .bind(&natural_key)
+    .execute(&pool)
+    .await
+    .is_err(),
+    "direct pending intent insert must be rejected even with a complete payload"
+  );
   let mut foreign_target: serde_json::Value =
     serde_json::from_str(&target_json).expect("parse target");
   foreign_target["address"] = serde_json::json!({"foreign": true});

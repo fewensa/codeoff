@@ -2521,6 +2521,9 @@ mod tests {
     compare_and_swap_execution_baseline_in_transaction, delivery_intent_key,
   };
 
+  const TEST_TARGET_IDENTITY: &str =
+    "0000000000000000000000000000000000000000000000000000000000000001";
+
   #[test]
   fn test_delivery_intent_key_is_unambiguous_and_enforces_its_byte_bound() {
     let first_identity = "1".repeat(64);
@@ -2581,7 +2584,7 @@ mod tests {
           address_json,
           1,
           "resolver",
-          "identity",
+          TEST_TARGET_IDENTITY,
         )
         .expect("target"),
       ],
@@ -2637,7 +2640,15 @@ mod tests {
       capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("profile"),
       targets: vec![
         DeliveryTargetSnapshot::new(
-          "none", "none", "none", "tenant", "none", "{}", 1, "resolver", "identity",
+          "none",
+          "none",
+          "none",
+          "tenant",
+          "none",
+          "{}",
+          1,
+          "resolver",
+          TEST_TARGET_IDENTITY,
         )
         .expect("target"),
       ],
@@ -2814,7 +2825,15 @@ mod tests {
       capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("profile"),
       targets: vec![
         DeliveryTargetSnapshot::new(
-          "none", "none", "none", "none", "none", "{}", 1, "resolver", "identity",
+          "none",
+          "none",
+          "none",
+          "none",
+          "none",
+          "{}",
+          1,
+          "resolver",
+          TEST_TARGET_IDENTITY,
         )
         .expect("target"),
       ],
@@ -2847,7 +2866,15 @@ mod tests {
       capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("profile"),
       targets: vec![
         DeliveryTargetSnapshot::new(
-          "none", "none", "none", "none", "none", "{}", 1, "resolver", "identity",
+          "none",
+          "none",
+          "none",
+          "none",
+          "none",
+          "{}",
+          1,
+          "resolver",
+          TEST_TARGET_IDENTITY,
         )
         .expect("target"),
       ],

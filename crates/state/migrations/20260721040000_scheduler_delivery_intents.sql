@@ -1,3 +1,77 @@
+create table _scheduler_target_identity_guard_040000 (
+  invalid_count integer not null check (invalid_count = 0)
+);
+
+insert into _scheduler_target_identity_guard_040000 (invalid_count)
+select
+  (select count(*)
+   from scheduled_job_delivery_targets target
+   where length(target.identity_digest) != 64
+      or target.identity_digest glob '*[^0-9a-f]*')
+  +
+  (select count(*)
+   from scheduled_runs run
+   where json_type(run.targets_json) is not 'array'
+      or json_array_length(run.targets_json) = 0
+      or exists (
+        select 1
+        from json_each(run.targets_json) target
+        where json_type(target.value) is not 'object'
+           or json_type(target.value, '$.identity_digest') is not 'text'
+           or length(json_extract(target.value, '$.identity_digest')) != 64
+           or json_extract(target.value, '$.identity_digest') glob '*[^0-9a-f]*'
+      ));
+
+drop table _scheduler_target_identity_guard_040000;
+
+create trigger trg_scheduled_job_target_identity_insert
+before insert on scheduled_job_delivery_targets
+when length(new.identity_digest) != 64
+  or new.identity_digest glob '*[^0-9a-f]*'
+begin
+  select raise(abort, 'scheduled job target identity must be lowercase sha256');
+end;
+
+create trigger trg_scheduled_job_target_identity_update
+before update of identity_digest on scheduled_job_delivery_targets
+when length(new.identity_digest) != 64
+  or new.identity_digest glob '*[^0-9a-f]*'
+begin
+  select raise(abort, 'scheduled job target identity must be lowercase sha256');
+end;
+
+create trigger trg_scheduled_run_target_identities_insert
+before insert on scheduled_runs
+when json_type(new.targets_json) is not 'array'
+  or json_array_length(new.targets_json) = 0
+  or exists (
+    select 1
+    from json_each(new.targets_json) target
+    where json_type(target.value) is not 'object'
+       or json_type(target.value, '$.identity_digest') is not 'text'
+       or length(json_extract(target.value, '$.identity_digest')) != 64
+       or json_extract(target.value, '$.identity_digest') glob '*[^0-9a-f]*'
+  )
+begin
+  select raise(abort, 'scheduled run target identity must be lowercase sha256');
+end;
+
+create trigger trg_scheduled_run_target_identities_update
+before update of targets_json on scheduled_runs
+when json_type(new.targets_json) is not 'array'
+  or json_array_length(new.targets_json) = 0
+  or exists (
+    select 1
+    from json_each(new.targets_json) target
+    where json_type(target.value) is not 'object'
+       or json_type(target.value, '$.identity_digest') is not 'text'
+       or length(json_extract(target.value, '$.identity_digest')) != 64
+       or json_extract(target.value, '$.identity_digest') glob '*[^0-9a-f]*'
+  )
+begin
+  select raise(abort, 'scheduled run target identity must be lowercase sha256');
+end;
+
 create table _scheduler_delivery_baselines_040000 as
 select * from scheduled_delivery_baselines;
 
@@ -87,16 +161,22 @@ create table scheduled_run_deliveries (
       and intent_key is null)
     or
     (authority_kind = 'intent_v1'
+      and result_artifact_id is not null
       and length(result_artifact_id) > 0
+      and result_attempt is not null
       and result_attempt > 0
+      and result_fence is not null
       and result_fence > 0
       and delivery_policy_version = 1
+      and target_snapshot_digest_algorithm is not null
       and target_snapshot_digest_algorithm = 'sha256-v1'
+      and target_snapshot_digest is not null
       and length(target_snapshot_digest) = 64
       and target_snapshot_digest not glob '*[^0-9a-f]*'
       and length(cast(run_id as blob)) between 1 and 1050
       and length(target_identity_digest) = 64
       and target_identity_digest not glob '*[^0-9a-f]*'
+      and intent_key is not null
       and length(intent_key) between 72 and 2170
       and intent_key = 'v1:' || lower(hex(cast(run_id as blob))) || ':' || target_identity_digest || ':1'
       and delivery_id = 'intent:' || intent_key)
@@ -188,6 +268,21 @@ create trigger trg_scheduled_delivery_intent_acceptance
 before insert on scheduled_run_deliveries
 when new.authority_kind = 'intent_v1' or new.intent_key is not null
 begin
+  select case when not (
+    new.state = 'intent'
+    and new.attempt = 0
+    and new.fence = 0
+    and new.next_attempt_at is null
+    and new.lease_owner is null
+    and new.lease_expires_at is null
+    and new.provider_receipt is null
+    and new.error_message is null
+    and new.render_version is null
+    and new.hash_algorithm is null
+    and new.payload_digest is null
+    and new.payload_snapshot is null
+    and new.expected_baseline_version is null
+  ) then raise(abort, 'scheduled delivery intent must start unrendered') end;
   select case when not exists (
     select 1
     from scheduled_run_result_artifacts a

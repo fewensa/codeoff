@@ -1071,7 +1071,7 @@ mod tests {
       "{}",
       SNAPSHOT_VERSION,
       "default-none-v1",
-      "target-identity-digest",
+      "0000000000000000000000000000000000000000000000000000000000000001",
     )
     .expect("target");
     let schedule = ScheduleSpec::once(2_000_000_000);

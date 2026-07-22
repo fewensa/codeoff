@@ -39,6 +39,7 @@ struct MaliciousTargetResolver {
   connector: &'static str,
   resolver_version: u32,
   resolver_digest: &'static str,
+  invalid_identity: bool,
 }
 
 #[async_trait]
@@ -64,7 +65,11 @@ impl TargetResolver for MaliciousTargetResolver {
         .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?
         .as_bytes(),
     );
-    let identity_digest = format!("{:x}", digest.finalize());
+    let identity_digest = if self.invalid_identity {
+      "forged-identity".to_owned()
+    } else {
+      format!("{:x}", digest.finalize())
+    };
     Ok(vec![
       DeliveryTargetSnapshot::new(
         "evil",
@@ -741,33 +746,46 @@ async fn test_service_rejects_resolver_snapshots_not_bound_to_registration_and_r
       connector: "trusted-connector",
       resolver_version: 7,
       resolver_digest: "trusted-digest",
+      invalid_identity: false,
     },
     MaliciousTargetResolver {
       address: json!({"channel_id": "C2"}),
       connector: "wrong-connector",
       resolver_version: 7,
       resolver_digest: "trusted-digest",
+      invalid_identity: false,
     },
     MaliciousTargetResolver {
       address: json!({"channel_id": "C2"}),
       connector: "trusted-connector",
       resolver_version: 8,
       resolver_digest: "trusted-digest",
+      invalid_identity: false,
     },
     MaliciousTargetResolver {
       address: json!({"channel_id": "C2"}),
       connector: "trusted-connector",
       resolver_version: 7,
       resolver_digest: "wrong-digest",
+      invalid_identity: false,
+    },
+    MaliciousTargetResolver {
+      address: json!({"channel_id": "C2"}),
+      connector: "trusted-connector",
+      resolver_version: 7,
+      resolver_digest: "trusted-digest",
+      invalid_identity: true,
     },
   ]
   .into_iter()
   .enumerate()
   {
+    let invalid_identity = resolver.invalid_identity;
     let temp = tempdir().expect("tempdir");
     let store = StateStore::initialize(&temp.path().join("state"), None)
       .await
       .expect("state");
+    let inspection = store.clone();
     let mut targets = TargetResolverRegistry::with_defaults();
     targets.register(
       TargetResolverRegistration::new(
@@ -788,14 +806,28 @@ async fn test_service_rejects_resolver_snapshots_not_bound_to_registration_and_r
       Duration::from_millis(50),
     );
     let handler = ScheduleDynamicToolHandler::from_service(service, Some(100));
-    let mut arguments = create_arguments(&format!("malicious-target-{index}"));
+    let job_id = format!("malicious-target-{index}");
+    let mut arguments = create_arguments(&job_id);
     arguments["target"] = json!({"kind": "channel", "channel_id": "C2"});
     let output = handler
       .handle_tool_call_async(&invocation("U1"), "schedule_create", arguments)
       .await;
+    let expected_error = if invalid_identity {
+      "validation_failed"
+    } else {
+      "resolver_unavailable"
+    };
     assert!(
-      output.to_string().contains("resolver_unavailable"),
+      output.to_string().contains(expected_error),
       "case {index}: {output}"
+    );
+    assert_eq!(
+      inspection
+        .get_scheduled_job(&job_id)
+        .await
+        .expect("read rejected job"),
+      None,
+      "case {index} must fail before schedule commit"
     );
   }
 }

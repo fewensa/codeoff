@@ -39,6 +39,8 @@ pub enum StateValueError {
   NonCanonicalJson { field: &'static str },
   #[error("{field} contains forbidden durable data")]
   ForbiddenDurableData { field: &'static str },
+  #[error("{field} must be lowercase sha256")]
+  InvalidSha256 { field: &'static str },
   #[error("version must be positive")]
   InvalidVersion,
   #[error("once timestamp must be strictly later than now")]
@@ -269,10 +271,10 @@ impl DeliveryTargetSnapshot {
       ("target tenant", self.tenant.as_str()),
       ("target kind", self.kind.as_str()),
       ("resolver digest", self.resolver_digest.as_str()),
-      ("target identity digest", self.identity_digest.as_str()),
     ] {
       validate_text(field, value)?;
     }
+    validate_lowercase_sha256("target identity digest", &self.identity_digest)?;
     validate_canonical_snapshot(self.resolver_version, "target address", &self.address_json)
   }
   #[must_use]
@@ -1217,6 +1219,17 @@ fn validate_text(field: &'static str, value: &str) -> Result<(), StateValueError
   }
   if value.len() > MAX_CONTEXT_BYTES {
     return Err(StateValueError::TooLarge { field });
+  }
+  Ok(())
+}
+
+fn validate_lowercase_sha256(field: &'static str, value: &str) -> Result<(), StateValueError> {
+  if value.len() != 64
+    || !value
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+  {
+    return Err(StateValueError::InvalidSha256 { field });
   }
   Ok(())
 }

@@ -2049,6 +2049,92 @@ async fn test_execution_retry_requires_persisted_side_effect_free_attestation_an
 }
 
 #[tokio::test]
+async fn test_prepare_authority_covers_all_immutable_claim_metadata() {
+  let temp = tempdir().expect("create tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("initialize state store");
+  let mut request = create_request("authority-metadata", ScheduleSpec::once(110), 100);
+  request.definition = ScheduledJobDefinition::new(
+    1,
+    r#"{"instruction":"execute metadata","previous_success":{"kind":"none"},"schema_version":1}"#,
+  )
+  .expect("execution definition");
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule("authority-metadata", 0, 110)
+    .await
+    .expect("materialize");
+  let claim = store
+    .claim_next_scheduled_run("worker", 111, 150)
+    .await
+    .expect("claim")
+    .expect("claimed run");
+  let nonce = "7".repeat(64);
+  let authority = ScheduledPrepareAuthority::for_claim(&claim, &nonce).expect("authority");
+  let attestation = authority.attestation_json(true);
+  let attestation_digest = test_sha256_hex(&attestation);
+  let mutations = [
+    {
+      let mut changed = claim.clone();
+      changed.schedule_id.push_str("-changed");
+      ("schedule_id", changed)
+    },
+    {
+      let mut changed = claim.clone();
+      changed.job_generation += 1;
+      ("job_generation", changed)
+    },
+    {
+      let mut changed = claim.clone();
+      changed.schedule_generation += 1;
+      ("schedule_generation", changed)
+    },
+    {
+      let mut changed = claim.clone();
+      changed.scheduled_for += 1;
+      ("scheduled_for", changed)
+    },
+    {
+      let mut changed = claim.clone();
+      changed.coalesced_through += 1;
+      ("coalesced_through", changed)
+    },
+    {
+      let mut changed = claim.clone();
+      changed.definition_version += 1;
+      ("definition_version", changed)
+    },
+    {
+      let mut changed = claim.clone();
+      changed.capability_schema_version += 1;
+      ("capability_schema_version", changed)
+    },
+  ];
+  for (field, changed) in mutations {
+    let changed_authority = ScheduledPrepareAuthority::for_claim(&changed, &nonce)
+      .unwrap_or_else(|error| panic!("{field} authority: {error}"));
+    assert_ne!(
+      changed_authority.digest(),
+      authority.digest(),
+      "{field} must alter authority",
+    );
+    assert_ne!(
+      changed_authority.canonical_json(),
+      authority.canonical_json(),
+      "{field} must alter canonical authority bytes",
+    );
+    assert!(
+      !changed_authority.attestation_matches(&attestation, &attestation_digest, false),
+      "{field} must reject the original attestation",
+    );
+  }
+}
+
+#[tokio::test]
 async fn test_two_independent_stores_cannot_apply_equal_heartbeat_extension() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");

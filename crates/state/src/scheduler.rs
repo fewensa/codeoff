@@ -732,6 +732,15 @@ impl ScheduledPrepareAuthority {
         "run_id": claim.binding.run_id(),
       },
       "capability_identity_digest": claim.capability_digest,
+      "claim": {
+        "capability_schema_version": claim.capability_schema_version,
+        "coalesced_through": claim.coalesced_through,
+        "definition_version": claim.definition_version,
+        "job_generation": claim.job_generation,
+        "schedule_generation": claim.schedule_generation,
+        "schedule_id": claim.schedule_id,
+        "scheduled_for": claim.scheduled_for,
+      },
       "digests": {
         "baseline": baseline_digest,
         "capability": capability_digest,

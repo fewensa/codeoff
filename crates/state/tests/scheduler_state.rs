@@ -6921,6 +6921,62 @@ async fn test_exact_delivery_reconciliation_is_cas_bound_and_has_one_winner() {
 }
 
 #[tokio::test]
+async fn test_exact_delivery_reconciliation_rejects_inconsistent_attempt_and_rolls_back() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let claim = prepare_operator_sending_delivery(&store, "exact-delivery-inconsistent", 110).await;
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  sqlx::query(
+    "update scheduled_delivery_attempts set lease_expires_at = 211 where delivery_id = ?1 and attempt = ?2 and fence = ?3 and state = 'sending'",
+  )
+  .bind(claim.binding.delivery_id())
+  .bind(claim.binding.attempt())
+  .bind(claim.binding.fence())
+  .execute(&pool)
+  .await
+  .expect("create inconsistent paired attempt fixture");
+
+  assert!(matches!(
+    store
+      .reconcile_expired_scheduled_delivery(
+        claim.binding.delivery_id(),
+        ScheduledDeliveryState::Sending,
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        210,
+        210,
+      )
+      .await,
+    Err(StateError::InvalidSchedulerState { reason })
+      if reason == "exact delivery reconciliation found inconsistent attempt authority"
+  ));
+  let authority: (String, i64, String, i64, i64, i64, i64) = sqlx::query_as(
+    "select delivery.state, delivery.lease_expires_at, attempt.state, attempt.lease_expires_at, (select count(*) from scheduled_delivery_baselines where job_id = delivery.job_id), (select count(*) from scheduler_operator_actions where target_id = delivery.delivery_id), (select count(*) from scheduler_operator_action_consumptions where target_id = delivery.delivery_id) from scheduled_run_deliveries delivery join scheduled_delivery_attempts attempt on attempt.delivery_id = delivery.delivery_id and attempt.attempt = delivery.attempt and attempt.fence = delivery.fence where delivery.delivery_id = ?1",
+  )
+  .bind(claim.binding.delivery_id())
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled back inconsistent authority");
+  assert_eq!(
+    authority,
+    (
+      "sending".to_owned(),
+      210,
+      "sending".to_owned(),
+      211,
+      0,
+      0,
+      0
+    )
+  );
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_operator_delivery_evidence_is_canonical_versioned_and_target_bound() {
   let malformed_receipt = "not-json".to_owned();

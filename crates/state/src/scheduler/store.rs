@@ -1337,6 +1337,10 @@ impl StateStore {
     .execute(&mut *transaction)
     .await
     .map_err(scheduler_error)?;
+    if delivery.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      return Ok(ScheduledDeliveryReconcileOutcome::Stale);
+    }
     let attempt_updated = sqlx::query(
       "update scheduled_delivery_attempts set state = 'delivery_unknown', provider_outcome = 'ambiguous_post_write', error_kind = 'delivery_lease_expired', error_message = 'provider write outcome is unknown after delivery lease expiry', completed_at = ?1 where delivery_id = ?2 and attempt = ?3 and fence = ?4 and lease_owner = ?5 and idempotency_key = ?6 and lease_expires_at = ?7 and state = 'sending' and lease_expires_at <= ?1 and started_at <= ?1",
     )
@@ -1350,9 +1354,11 @@ impl StateStore {
     .execute(&mut *transaction)
     .await
     .map_err(scheduler_error)?;
-    if delivery.rows_affected() != 1 || attempt_updated.rows_affected() != 1 {
+    if attempt_updated.rows_affected() != 1 {
       transaction.rollback().await.map_err(scheduler_error)?;
-      return Ok(ScheduledDeliveryReconcileOutcome::Stale);
+      return Err(StateError::InvalidSchedulerState {
+        reason: "exact delivery reconciliation found inconsistent attempt authority".to_owned(),
+      });
     }
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(ScheduledDeliveryReconcileOutcome::Applied {

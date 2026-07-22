@@ -541,6 +541,33 @@ async fn transient_readiness_preserves_authority_then_recovery_claims_once() {
 }
 
 #[tokio::test]
+async fn oversized_readiness_retry_after_is_capped_without_delivery_mutation() {
+  let (_temp, store, delivery_id, _) =
+    prepared_delivery("delivery-readiness-oversized-retry-after", "body").await;
+  let provider = FakeProvider::new([]).with_readiness([DeliveryProviderReadiness::Retryable {
+    retry_after_seconds: Some(u64::MAX),
+    error_kind: "provider_unavailable".to_owned(),
+  }]);
+
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(&store, &provider, "worker", clock(122), shutdown(),)
+      .await
+      .expect("deferred tick"),
+    ScheduledDeliveryTickOutcome::ReadinessDeferred {
+      retry_after: Duration::from_hours(1),
+    }
+  );
+  assert_eq!(
+    store
+      .scheduled_delivery_authority_for_tests(&delivery_id)
+      .await
+      .expect("authority"),
+    ("pending".to_owned(), 0, 0, 0)
+  );
+  assert!(provider.observed().is_empty());
+}
+
+#[tokio::test]
 async fn permanent_readiness_failure_surfaces_without_delivery_mutation() {
   let (_temp, store, delivery_id, _) =
     prepared_delivery("delivery-readiness-permanent", "body").await;
@@ -728,7 +755,7 @@ async fn shutdown_between_readiness_and_claim_leaves_authority_unmodified() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_after_claim_but_before_first_send_poll_requeues_safely() {
+async fn shutdown_after_predispatch_check_but_before_first_send_poll_requeues_safely() {
   let (_temp, store, delivery_id, _) =
     prepared_delivery("delivery-shutdown-predispatch", "body").await;
   let provider = Arc::new(FakeProvider::new([success()]));
@@ -771,6 +798,19 @@ async fn shutdown_after_claim_but_before_first_send_poll_requeues_safely() {
       .expect("authority"),
     ("failed_retryable".to_owned(), 1, 1, 1)
   );
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(
+      &store,
+      provider.as_ref(),
+      "worker",
+      clock(123),
+      shutdown(),
+    )
+    .await
+    .expect("retry tick"),
+    ScheduledDeliveryTickOutcome::Delivered
+  );
+  assert_eq!(provider.observed().len(), 1);
 }
 
 #[tokio::test]

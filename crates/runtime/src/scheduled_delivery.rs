@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, task::Context, task::Poll};
 
@@ -26,6 +26,8 @@ const MAX_RETRY_DELAY_SECONDS: i64 = 300;
 const MAX_RETRY_AFTER_SECONDS: i64 = 3_600;
 const DEFAULT_READINESS_RETRY: Duration = Duration::from_secs(1);
 const MAX_READINESS_RETRY: Duration = Duration::from_mins(1);
+// Provider readiness hints are advisory and share the delivery retry policy's one-hour ceiling.
+const MAX_READINESS_RETRY_AFTER_SECONDS: u64 = 3_600;
 
 pub struct DeliveryProviderReadinessRequest<'a> {
   pub delivery_id: &'a str,
@@ -144,6 +146,7 @@ impl DeliveryWorkerState {
       .min(MAX_READINESS_RETRY.as_secs());
     let provider_seconds = retry_after_seconds
       .filter(|seconds| *seconds > 0)
+      .map(|seconds| seconds.min(MAX_READINESS_RETRY_AFTER_SECONDS))
       .unwrap_or(0);
     Duration::from_secs(local_seconds.max(provider_seconds))
   }
@@ -367,22 +370,29 @@ async fn dispatch_claimed_delivery(
 ) -> Result<ScheduledDeliveryTickOutcome, StateError> {
   let mut heartbeat =
     DeliveryHeartbeat::start(state.clone(), claim.binding.clone(), timeline.clone());
-  timeline.fresh_now();
   if *shutdown.borrow() {
     return release_before_dispatch(state, &claim, &timeline, &mut heartbeat).await;
   }
+  timeline.fresh_now();
 
   let request = DeliveryProviderRequest {
     payload: &claim.payload,
     target_json: &claim.target_json,
     idempotency_key: claim.binding.idempotency_key(),
   };
-  let send = CatchUnwindFuture::new(provider.send(request));
+  let send_polled = Arc::new(AtomicBool::new(false));
+  let send = CatchUnwindFuture::new(provider.send(request), Arc::clone(&send_polled));
   tokio::pin!(send);
   let outcome = tokio::select! {
     biased;
-    () = cancellation_requested(shutdown) => DeliveryProviderOutcome::AmbiguousPostWrite {
-      error_kind: "cancelled_after_dispatch".to_owned(),
+    () = cancellation_requested(shutdown) => {
+      if send_polled.load(Ordering::Acquire) {
+        DeliveryProviderOutcome::AmbiguousPostWrite {
+          error_kind: "cancelled_after_dispatch".to_owned(),
+        }
+      } else {
+        return release_before_dispatch(state, &claim, &timeline, &mut heartbeat).await;
+      }
     },
     heartbeat_result = &mut heartbeat.join => {
       return heartbeat_ended(heartbeat_result);
@@ -408,12 +418,14 @@ async fn dispatch_claimed_delivery(
 
 struct CatchUnwindFuture<F> {
   inner: Pin<Box<F>>,
+  polled: Arc<AtomicBool>,
 }
 
 impl<F> CatchUnwindFuture<F> {
-  fn new(inner: F) -> Self {
+  fn new(inner: F, polled: Arc<AtomicBool>) -> Self {
     Self {
       inner: Box::pin(inner),
+      polled,
     }
   }
 }
@@ -422,6 +434,7 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
   type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
 
   fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+    self.polled.store(true, Ordering::Release);
     std::panic::catch_unwind(AssertUnwindSafe(|| self.inner.as_mut().poll(context)))
       .map_or_else(|panic| Poll::Ready(Err(panic)), |poll| poll.map(Ok))
   }
@@ -747,7 +760,7 @@ mod tests {
   use super::*;
 
   #[test]
-  fn readiness_backoff_caps_honors_retry_after_and_resets() {
+  fn readiness_backoff_caps_local_and_provider_delays_and_resets() {
     let mut state = DeliveryWorkerState::default();
     assert_eq!(state.readiness_retry(None), Duration::from_secs(1));
     assert_eq!(state.readiness_retry(Some(0)), Duration::from_secs(2));
@@ -757,7 +770,32 @@ mod tests {
     assert_eq!(state.readiness_retry(None), Duration::from_secs(32));
     assert_eq!(state.readiness_retry(None), Duration::from_mins(1));
     assert_eq!(state.readiness_retry(Some(120)), Duration::from_mins(2));
+    assert_eq!(
+      state.readiness_retry(Some(u64::MAX)),
+      Duration::from_hours(1)
+    );
     state.readiness_ready();
     assert_eq!(state.readiness_retry(None), Duration::from_secs(1));
+  }
+
+  #[tokio::test]
+  async fn send_poll_tracking_marks_ready_and_panicking_futures() {
+    let ready_polled = Arc::new(AtomicBool::new(false));
+    let Ok(value) = CatchUnwindFuture::new(async { 42 }, Arc::clone(&ready_polled)).await else {
+      panic!("ready future panicked")
+    };
+    assert_eq!(value, 42);
+    assert!(ready_polled.load(Ordering::Acquire));
+
+    let panic_polled = Arc::new(AtomicBool::new(false));
+    assert!(
+      CatchUnwindFuture::new(
+        async { panic!("test send panic") },
+        Arc::clone(&panic_polled),
+      )
+      .await
+      .is_err()
+    );
+    assert!(panic_polled.load(Ordering::Acquire));
   }
 }

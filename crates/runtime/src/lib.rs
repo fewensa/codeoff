@@ -16,6 +16,7 @@ mod schedule_contract;
 mod schedule_resolution;
 pub mod schedule_service;
 pub mod schedule_tools;
+pub mod scheduled_delivery;
 pub mod scheduled_execution;
 
 use std::collections::HashSet;

@@ -805,7 +805,7 @@ impl StateStore {
       return Ok(None);
     }
     let row = sqlx::query(
-      "update scheduled_run_deliveries set state = 'sending', attempt = attempt + 1, fence = fence + 1, lease_owner = ?1, lease_expires_at = ?2, idempotency_key = 'delivery-v1:' || lower(hex(cast(delivery_id as blob))) || ':' || cast(attempt + 1 as text) || ':' || cast(fence + 1 as text) || ':' || payload_digest, claimed_baseline_version = coalesce((select baseline.baseline_version from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm), 0), updated_at = ?3 where delivery_id = (select candidate.delivery_id from scheduled_run_deliveries candidate where candidate.state = 'pending' and candidate.authority_kind = 'intent_v1' and candidate.payload_snapshot is not null and candidate.attempt < 9223372036854775807 and candidate.fence < 9223372036854775807 and candidate.updated_at <= ?3 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.job_id = candidate.job_id and active.target_identity_digest = candidate.target_identity_digest and active.target_snapshot_digest = candidate.target_snapshot_digest and active.delivery_policy_version = candidate.delivery_policy_version and active.render_version = candidate.render_version and active.hash_algorithm = candidate.hash_algorithm) order by candidate.created_at, candidate.delivery_id limit 1) and state = 'pending' and updated_at <= ?3 and not exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest) returning delivery_id, run_id, result_artifact_id, content_type, payload_schema_version, hash_algorithm, payload_snapshot, payload_digest, payload_created_at, target_identity_digest, target_snapshot_digest, target_snapshot_version, delivery_policy_version, render_version, attempt, fence, lease_owner, idempotency_key, claimed_baseline_version",
+      "update scheduled_run_deliveries set state = 'sending', attempt = attempt + 1, fence = fence + 1, lease_owner = ?1, lease_expires_at = ?2, idempotency_key = coalesce(idempotency_key, 'delivery-v1:' || lower(hex(cast(delivery_id as blob))) || ':' || payload_digest), claimed_baseline_version = coalesce((select baseline.baseline_version from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm), 0), updated_at = ?3 where delivery_id = (select candidate.delivery_id from scheduled_run_deliveries candidate where candidate.state = 'pending' and candidate.authority_kind = 'intent_v1' and candidate.payload_snapshot is not null and candidate.attempt < 9223372036854775807 and candidate.fence < 9223372036854775807 and candidate.updated_at <= ?3 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.job_id = candidate.job_id and active.target_identity_digest = candidate.target_identity_digest and active.target_snapshot_digest = candidate.target_snapshot_digest and active.delivery_policy_version = candidate.delivery_policy_version and active.render_version = candidate.render_version and active.hash_algorithm = candidate.hash_algorithm) order by candidate.created_at, candidate.delivery_id limit 1) and state = 'pending' and updated_at <= ?3 and not exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest) returning delivery_id, run_id, result_artifact_id, content_type, payload_schema_version, hash_algorithm, payload_snapshot, payload_digest, payload_created_at, target_json, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, target_snapshot_version, delivery_policy_version, render_version, attempt, fence, lease_owner, idempotency_key, claimed_baseline_version",
     )
     .bind(lease_owner)
     .bind(lease_expires_at)
@@ -855,8 +855,25 @@ impl StateStore {
       return Err(StateError::ScheduledDeliveryLostLease);
     }
     let payload = delivery_payload_from_row(&row)?;
+    let target_json: String = row.try_get("target_json").map_err(scheduler_error)?;
+    validate_delivery_intent_target_snapshot(
+      &target_json,
+      row
+        .try_get("target_identity_digest")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("target_snapshot_digest_algorithm")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("target_snapshot_digest")
+        .map_err(scheduler_error)?,
+    )?;
     transaction.commit().await.map_err(scheduler_error)?;
-    Ok(Some(ClaimedScheduledDelivery { binding, payload }))
+    Ok(Some(ClaimedScheduledDelivery {
+      binding,
+      payload,
+      target_json,
+    }))
   }
 
   /// Extends the current delivery attempt lease using strict owner/fence authority.
@@ -1103,7 +1120,7 @@ impl StateStore {
       });
     }
     sqlx::query(
-      "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, idempotency_key = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id in (select delivery_id from scheduled_run_deliveries where state = 'failed_retryable' and next_attempt_at <= ?1 order by next_attempt_at, delivery_id limit ?2)",
+      "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id in (select delivery_id from scheduled_run_deliveries where state = 'failed_retryable' and next_attempt_at <= ?1 order by next_attempt_at, delivery_id limit ?2)",
     )
     .bind(now)
     .bind(i64::from(limit))

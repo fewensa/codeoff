@@ -23,12 +23,14 @@ use codeoff_channel_contract::{
   ChannelReplyTarget,
 };
 use codeoff_channel_slack::{
-  SlackConfigError, SlackDeliveryQueue, SlackIntake, SlackIntakeResult, SlackReqwestWebApiClient,
-  SlackScheduleTargetVerifier, SlackSocketClient, SlackWebApiClient, SlackWebApiError,
-  SocketWorkerAction, SocketWorkerOptions, check_slack_worker, run_socket_worker,
+  SlackApiErrorClass, SlackConfigError, SlackDeliveryQueue, SlackIntake, SlackIntakeResult,
+  SlackReqwestWebApiClient, SlackScheduleTargetVerifier, SlackScheduledDeliveryProvider,
+  SlackSocketClient, SlackWebApiClient, SlackWebApiError, SocketWorkerAction, SocketWorkerOptions,
+  check_slack_worker, run_socket_worker,
 };
 use codeoff_config::{
-  CodeoffConfig, ConfigLoadOptions, SlackDirectMessageFeedbackMode, SlackResponseFeedbackMode,
+  CodeoffConfig, ConfigLoadOptions, SlackConfig, SlackDirectMessageFeedbackMode,
+  SlackResponseFeedbackMode,
 };
 use codeoff_mcp::McpTcpServer;
 use codeoff_runtime::{
@@ -45,12 +47,17 @@ use codeoff_runtime::{
     TargetResolverRegistry, VerifiedSlackTargetResolver,
   },
   schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler},
+  scheduled_delivery::{
+    DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderRequest,
+    run_scheduled_delivery_worker,
+  },
   scheduled_execution::{
     GlobalTurnBudget, ScheduledWorkerConfig, ScheduledWorkerHandle, ScheduledWorkerShutdown,
     spawn_scheduled_worker,
   },
 };
 use codeoff_state::{RetentionPolicy, StateError, StateStore};
+use tokio::sync::OnceCell;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
@@ -330,6 +337,113 @@ fn build_slack_web_api_client(
   )
 }
 
+struct LazySlackScheduledDeliveryProvider {
+  slack: SlackConfig,
+  state_dir: PathBuf,
+  bot_token: String,
+  provider: OnceCell<SlackScheduledDeliveryProvider<SlackReqwestWebApiClient>>,
+}
+
+impl LazySlackScheduledDeliveryProvider {
+  fn new(config: &CodeoffConfig, bot_token: String) -> Self {
+    Self {
+      slack: config.slack.clone(),
+      state_dir: config.state_dir().to_path_buf(),
+      bot_token,
+      provider: OnceCell::new(),
+    }
+  }
+
+  async fn provider(
+    &self,
+  ) -> Result<&SlackScheduledDeliveryProvider<SlackReqwestWebApiClient>, SlackWebApiError> {
+    self
+      .provider
+      .get_or_try_init(|| async {
+        let provider =
+          SlackScheduledDeliveryProvider::new(SlackWebApiClient::new_with_artifact_root(
+            SlackReqwestWebApiClient::new(),
+            "slack-default",
+            self.bot_token.clone(),
+            self.slack.clone(),
+            now_unix_seconds(),
+            self.state_dir.clone(),
+          ));
+        provider.verify_authority().await?;
+        Ok(provider)
+      })
+      .await
+  }
+}
+
+#[async_trait]
+impl DeliveryProvider for LazySlackScheduledDeliveryProvider {
+  async fn send(&self, request: DeliveryProviderRequest<'_>) -> DeliveryProviderOutcome {
+    match self.provider().await {
+      Ok(provider) => provider.send(request).await,
+      Err(error) => classify_slack_authority_error(error),
+    }
+  }
+}
+
+fn classify_slack_authority_error(error: SlackWebApiError) -> DeliveryProviderOutcome {
+  match error {
+    SlackWebApiError::RateLimited {
+      retry_after_seconds,
+    } => DeliveryProviderOutcome::ConfirmedNoWriteRetryable {
+      retry_after_seconds,
+      error_kind: "slack_authority_rate_limited".to_owned(),
+    },
+    SlackWebApiError::Request { .. }
+    | SlackWebApiError::InvalidResponse { .. }
+    | SlackWebApiError::Provider { .. }
+    | SlackWebApiError::Deferred { .. }
+    | SlackWebApiError::Api {
+      classification: SlackApiErrorClass::Transient,
+    } => DeliveryProviderOutcome::ConfirmedNoWriteRetryable {
+      retry_after_seconds: None,
+      error_kind: "slack_authority_unavailable".to_owned(),
+    },
+    SlackWebApiError::Api {
+      classification:
+        SlackApiErrorClass::Invalid
+        | SlackApiErrorClass::Unauthorized
+        | SlackApiErrorClass::TargetUnavailable,
+    }
+    | SlackWebApiError::Unavailable
+    | SlackWebApiError::UnsupportedTarget => DeliveryProviderOutcome::ConfirmedNoWriteTerminal {
+      error_kind: "slack_authority_rejected".to_owned(),
+    },
+  }
+}
+
+fn build_scheduled_delivery_provider(
+  config: &CodeoffConfig,
+) -> Result<Option<Arc<dyn DeliveryProvider>>, Box<dyn Error>> {
+  build_scheduled_delivery_provider_with(config, |name| std::env::var(name))
+}
+
+fn build_scheduled_delivery_provider_with<F>(
+  config: &CodeoffConfig,
+  env_var: F,
+) -> Result<Option<Arc<dyn DeliveryProvider>>, Box<dyn Error>>
+where
+  F: FnOnce(&str) -> Result<String, std::env::VarError>,
+{
+  if !config.scheduler.delivery_enabled {
+    return Ok(None);
+  }
+  let bot_token = env_var(&config.slack.bot_token_env).map_err(|_| {
+    Box::new(io::Error::other(format!(
+      "scheduled delivery requires secret env {}",
+      config.slack.bot_token_env
+    ))) as Box<dyn Error>
+  })?;
+  Ok(Some(Arc::new(LazySlackScheduledDeliveryProvider::new(
+    config, bot_token,
+  ))))
+}
+
 #[derive(Clone)]
 enum ServeChannelContextProvider {
   Slack(Arc<SlackWebApiClient<SlackReqwestWebApiClient>>),
@@ -433,10 +547,12 @@ where
 {
   let tick_limit = serve_tick_limit();
   let turn_budget = GlobalTurnBudget::new(config.agent.codex_app_server.max_parallel_turns);
+  let scheduled_delivery = build_scheduled_delivery_provider(&config)?;
   let mut lifecycle = ServeLifecycle::new(
     state.clone(),
     turn_budget.clone(),
     config.scheduler.run_claims_enabled,
+    scheduled_delivery,
     mcp_server,
   );
   if tick_limit.is_none() {
@@ -579,20 +695,41 @@ impl ServeLifecycle {
     state: StateStore,
     turn_budget: GlobalTurnBudget,
     run_claims_enabled: bool,
+    scheduled_delivery: Option<Arc<dyn DeliveryProvider>>,
     mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
   ) -> Self {
     let mut lifecycle = Self {
       scheduled_worker: spawn_scheduled_worker(
-        state,
+        state.clone(),
         turn_budget,
         ScheduledWorkerConfig { run_claims_enabled },
       ),
       background_tasks: ServeTaskGroup::new(),
     };
+    if let Some(provider) = scheduled_delivery {
+      lifecycle.spawn_scheduled_delivery_worker(state, provider);
+    }
     if let Some(server) = mcp_server {
       lifecycle.spawn_mcp_server(server);
     }
     lifecycle
+  }
+
+  fn spawn_scheduled_delivery_worker(
+    &mut self,
+    state: StateStore,
+    provider: Arc<dyn DeliveryProvider>,
+  ) {
+    let shutdown = self.background_tasks.subscribe();
+    let lease_owner = format!("codeoff-delivery-{}", std::process::id());
+    self
+      .background_tasks
+      .spawn("scheduled delivery", async move {
+        run_scheduled_delivery_worker(state, provider, lease_owner, shutdown)
+          .await
+          .map_err(|error| Box::new(error) as ServeTaskError)?;
+        Ok(ServeTaskExit::Cancelled)
+      });
   }
 
   fn spawn_mcp_server(&mut self, server: McpTcpServer<ServeChannelContextProvider>) {
@@ -3056,6 +3193,38 @@ mod tests {
       })))
       .expect("delivered")
     );
+  }
+
+  #[test]
+  fn scheduled_delivery_provider_is_disabled_without_reading_slack_credentials() {
+    let config = CodeoffConfig::default();
+    let provider = build_scheduled_delivery_provider_with(&config, |_| {
+      panic!("disabled scheduled delivery must not read Slack credentials")
+    })
+    .expect("disabled provider");
+    assert!(provider.is_none());
+  }
+
+  #[test]
+  fn scheduled_delivery_provider_fails_closed_when_enabled_secret_is_missing() {
+    let mut config = CodeoffConfig::default();
+    config.scheduler.delivery_enabled = true;
+    let error =
+      build_scheduled_delivery_provider_with(&config, |_| Err(std::env::VarError::NotPresent))
+        .err()
+        .expect("missing secret must fail");
+    assert!(error.to_string().contains(&config.slack.bot_token_env));
+  }
+
+  #[test]
+  fn scheduled_delivery_provider_defers_slack_client_initialization_until_send() {
+    let mut config = CodeoffConfig::default();
+    config.scheduler.delivery_enabled = true;
+    let provider = build_scheduled_delivery_provider_with(&config, |_| {
+      Ok("xoxb-not-contacted-during-construction".to_owned())
+    })
+    .expect("lazy provider");
+    assert!(provider.is_some());
   }
 
   #[test]

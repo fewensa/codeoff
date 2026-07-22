@@ -5435,6 +5435,8 @@ async fn test_two_independent_stores_claim_once_and_reject_stale_delivery_fence(
   let first_claim = outcomes.into_iter().flatten().next().expect("claim winner");
   assert_eq!(first_claim.binding.attempt(), 1);
   assert_eq!(first_claim.payload, payload);
+  assert!(first_claim.target_json.contains(r#""channel_id":"C1""#));
+  let stable_idempotency_key = first_claim.binding.idempotency_key().to_owned();
   let retry = ScheduledDeliveryFailure::ConfirmedNoWriteRetryable {
     error_kind: "slack_rate_limited".to_owned(),
     redacted_message: Some("retry later".to_owned()),
@@ -5467,6 +5469,7 @@ async fn test_two_independent_stores_claim_once_and_reject_stale_delivery_fence(
     .expect("second claim")
     .expect("requeued delivery");
   assert_eq!(next_claim.binding.attempt(), 2);
+  assert_eq!(next_claim.binding.idempotency_key(), stable_idempotency_key);
   assert_eq!(next_claim.payload.digest(), payload.digest());
   assert_eq!(next_claim.payload.body(), payload.body());
   assert!(matches!(

@@ -74,6 +74,7 @@ pub struct CodeoffConfig {
 #[serde(default)]
 pub struct SchedulerRuntimeConfig {
   pub run_claims_enabled: bool,
+  pub delivery_enabled: bool,
 }
 
 impl CodeoffConfig {

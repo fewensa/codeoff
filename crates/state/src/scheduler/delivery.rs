@@ -241,6 +241,7 @@ impl ScheduledDeliveryBinding {
 pub struct ClaimedScheduledDelivery {
   pub binding: ScheduledDeliveryBinding,
   pub payload: DeliveryPayloadSnapshot,
+  pub target_json: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

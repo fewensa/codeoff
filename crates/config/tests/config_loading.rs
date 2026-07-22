@@ -168,6 +168,7 @@ fn test_scheduler_run_claims_default_off_and_loads_explicit_opt_in() {
     CodeoffConfig::default().scheduler,
     SchedulerRuntimeConfig {
       run_claims_enabled: false,
+      delivery_enabled: false,
     }
   );
 
@@ -178,6 +179,7 @@ fn test_scheduler_run_claims_default_off_and_loads_explicit_opt_in() {
     r"
 [scheduler]
 run_claims_enabled = true
+delivery_enabled = true
 ",
   )
   .expect("write config");
@@ -186,6 +188,7 @@ run_claims_enabled = true
     CodeoffConfig::load(ConfigLoadOptions::new().config_path(config_path)).expect("load config");
 
   assert!(loaded.scheduler.run_claims_enabled);
+  assert!(loaded.scheduler.delivery_enabled);
 }
 
 #[test]

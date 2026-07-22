@@ -15,6 +15,7 @@ mod intake;
 mod mention_filter;
 mod normalize;
 mod schedule_target;
+mod scheduled_delivery;
 mod socket_mode;
 mod web_api;
 mod worker;
@@ -30,6 +31,7 @@ pub use normalize::{
   normalize_socket_mode_envelope_with_mention_filter,
 };
 pub use schedule_target::SlackScheduleTargetVerifier;
+pub use scheduled_delivery::SlackScheduledDeliveryProvider;
 pub use socket_mode::{SlackSocketTransport, SocketModeEnvelope, TransportReceive};
 pub use web_api::{
   SlackApiErrorClass, SlackAuthIdentity, SlackChannelAddress, SlackConfiguredSender,

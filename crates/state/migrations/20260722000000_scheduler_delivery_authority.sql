@@ -343,7 +343,6 @@ create table scheduled_delivery_attempts (
   completed_at integer,
   primary key (delivery_id, attempt),
   unique (delivery_id, fence),
-  unique (idempotency_key),
   foreign key (delivery_id) references scheduled_run_deliveries(delivery_id) on delete restrict,
   check (attempt > 0 and fence > 0 and claimed_baseline_version >= 0),
   check (length(lease_owner) > 0 and lease_expires_at > started_at),

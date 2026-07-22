@@ -240,6 +240,10 @@ impl PrometheusSchedulerTelemetry {
   }
 
   fn readiness_reason(&self) -> (&'static str, bool) {
+    self.readiness_reason_at(Instant::now())
+  }
+
+  fn readiness_reason_at(&self, now: Instant) -> (&'static str, bool) {
     let state = self.readiness.read().expect("scheduler readiness");
     if state.scheduler == ComponentState::Disabled {
       return ("scheduler_disabled", true);
@@ -258,14 +262,14 @@ impl PrometheusSchedulerTelemetry {
     if state.delivery_loop != LoopHealth::Ready {
       return ("delivery_loop_unavailable", false);
     }
-    if state.snapshot_error.is_some() {
-      return ("scheduler_snapshot_unavailable", false);
-    }
     let Some(last_success) = state.snapshot_last_success else {
       return ("scheduler_snapshot_unavailable", false);
     };
-    if last_success.elapsed() > SNAPSHOT_STALE_AFTER {
+    if now.saturating_duration_since(last_success) > SNAPSHOT_STALE_AFTER {
       return ("scheduler_snapshot_stale", false);
+    }
+    if state.snapshot_error.is_some() {
+      return ("scheduler_snapshot_unavailable", false);
     }
     ("ready", true)
   }
@@ -435,8 +439,36 @@ fn set_age(metric: &Gauge, age: Option<&BoundedSchedulerAge>) -> i64 {
   i64::from(age.saturated)
 }
 
+#[derive(Debug)]
+pub(crate) struct SnapshotReadError;
+
+#[async_trait]
+pub(crate) trait SchedulerSnapshotSource: Send + Sync {
+  async fn scheduler_snapshot(
+    &self,
+    now: i64,
+    count_cap: u64,
+    age_cap_seconds: u64,
+  ) -> Result<SchedulerObservabilitySnapshot, SnapshotReadError>;
+}
+
+#[async_trait]
+impl SchedulerSnapshotSource for codeoff_state::StateStore {
+  async fn scheduler_snapshot(
+    &self,
+    now: i64,
+    count_cap: u64,
+    age_cap_seconds: u64,
+  ) -> Result<SchedulerObservabilitySnapshot, SnapshotReadError> {
+    self
+      .scheduler_observability_snapshot(now, count_cap, age_cap_seconds)
+      .await
+      .map_err(|_| SnapshotReadError)
+  }
+}
+
 pub(crate) async fn refresh_scheduler_snapshot(
-  state: &codeoff_state::StateStore,
+  source: &dyn SchedulerSnapshotSource,
   telemetry: &PrometheusSchedulerTelemetry,
 ) {
   let now = SystemTime::now()
@@ -446,7 +478,7 @@ pub(crate) async fn refresh_scheduler_snapshot(
     });
   match tokio::time::timeout(
     SNAPSHOT_TIMEOUT,
-    state.scheduler_observability_snapshot(now, SNAPSHOT_COUNT_CAP, SNAPSHOT_AGE_CAP_SECONDS),
+    source.scheduler_snapshot(now, SNAPSHOT_COUNT_CAP, SNAPSHOT_AGE_CAP_SECONDS),
   )
   .await
   {
@@ -460,6 +492,8 @@ pub(crate) struct OperationalHttpServer {
   listener: TcpListener,
   telemetry: Arc<PrometheusSchedulerTelemetry>,
   readiness_probe: Arc<dyn ReadinessProbe>,
+  #[cfg(test)]
+  panic_next_connection: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait]
@@ -495,12 +529,21 @@ impl OperationalHttpServer {
       listener,
       telemetry,
       readiness_probe,
+      #[cfg(test)]
+      panic_next_connection: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
   }
 
   #[cfg(test)]
   pub(crate) fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
     self.listener.local_addr()
+  }
+
+  #[cfg(test)]
+  pub(crate) fn panic_next_connection(&self) {
+    self
+      .panic_next_connection
+      .store(true, std::sync::atomic::Ordering::SeqCst);
   }
 
   pub(crate) async fn run_until(self, mut shutdown: watch::Receiver<bool>) -> io::Result<()> {
@@ -522,7 +565,14 @@ impl OperationalHttpServer {
           };
           let telemetry = self.telemetry.clone();
           let readiness_probe = self.readiness_probe.clone();
+          #[cfg(test)]
+          let panic_next_connection = self.panic_next_connection.clone();
           connections.spawn(async move {
+            #[cfg(test)]
+            assert!(
+              !panic_next_connection.swap(false, std::sync::atomic::Ordering::SeqCst),
+              "injected operational HTTP connection panic"
+            );
             let service = service_fn(move |request| {
               route_request(request, telemetry.clone(), readiness_probe.clone())
             });
@@ -534,9 +584,12 @@ impl OperationalHttpServer {
             drop(permit);
           });
         }
-      }
-      while let Some(joined) = connections.try_join_next() {
-        joined.map_err(io::Error::other)?;
+        joined = connections.join_next(), if !connections.is_empty() => {
+          let Some(joined) = joined else {
+            continue;
+          };
+          joined.map_err(io::Error::other)?;
+        }
       }
     }
     while let Some(joined) = connections.join_next().await {
@@ -647,6 +700,7 @@ pub(crate) fn init_scheduler_tracing() {
 #[cfg(test)]
 mod tests {
   use std::net::SocketAddr;
+  use std::sync::Mutex;
   use std::sync::atomic::{AtomicUsize, Ordering};
 
   use codeoff_runtime::scheduler_observability::SchedulerTelemetryErrorKind;
@@ -659,11 +713,59 @@ mod tests {
     calls: AtomicUsize,
   }
 
+  #[derive(Clone, Copy)]
+  enum ProbeOutcome {
+    False,
+    Hang,
+  }
+
+  struct FaultReadinessProbe {
+    calls: AtomicUsize,
+    outcome: ProbeOutcome,
+  }
+
+  #[derive(Clone)]
+  enum SnapshotOutcome {
+    Success(Box<SchedulerObservabilitySnapshot>),
+    Hang,
+  }
+
+  struct ControlledSnapshotSource {
+    outcome: Mutex<SnapshotOutcome>,
+  }
+
   #[async_trait]
   impl ReadinessProbe for CountingReadinessProbe {
     async fn check_readable(&self) -> bool {
       self.calls.fetch_add(1, Ordering::SeqCst);
       true
+    }
+  }
+
+  #[async_trait]
+  impl ReadinessProbe for FaultReadinessProbe {
+    async fn check_readable(&self) -> bool {
+      self.calls.fetch_add(1, Ordering::SeqCst);
+      match self.outcome {
+        ProbeOutcome::False => false,
+        ProbeOutcome::Hang => std::future::pending().await,
+      }
+    }
+  }
+
+  #[async_trait]
+  impl SchedulerSnapshotSource for ControlledSnapshotSource {
+    async fn scheduler_snapshot(
+      &self,
+      _now: i64,
+      _count_cap: u64,
+      _age_cap_seconds: u64,
+    ) -> Result<SchedulerObservabilitySnapshot, SnapshotReadError> {
+      let outcome = self.outcome.lock().expect("snapshot outcome").clone();
+      match outcome {
+        SnapshotOutcome::Success(snapshot) => Ok(*snapshot),
+        SnapshotOutcome::Hang => std::future::pending().await,
+      }
     }
   }
 
@@ -756,6 +858,48 @@ mod tests {
     }
   }
 
+  async fn assert_faulty_readiness_probe(outcome: ProbeOutcome) {
+    let telemetry =
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+    let readiness_probe = Arc::new(FaultReadinessProbe {
+      calls: AtomicUsize::new(0),
+      outcome,
+    });
+    let server =
+      OperationalHttpServer::bind_with_probe("127.0.0.1:0", telemetry, readiness_probe.clone())
+        .await
+        .expect("bind server");
+    let address = server.local_addr().expect("server address");
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(server.run_until(shutdown_rx));
+
+    for path in ["/healthz", "/metrics"] {
+      let response = request(
+        address,
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
+      )
+      .await;
+      assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+    assert_eq!(readiness_probe.calls.load(Ordering::SeqCst), 0);
+
+    let readiness = request(
+      address,
+      b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(readiness.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+    assert!(readiness.ends_with(r#"{"ready":false,"reason":"state_unavailable"}"#));
+    assert_eq!(readiness_probe.calls.load(Ordering::SeqCst), 1);
+
+    shutdown.send(true).expect("shutdown server");
+    tokio::time::timeout(Duration::from_secs(1), task)
+      .await
+      .expect("server shutdown deadline")
+      .expect("server task")
+      .expect("server shutdown");
+  }
+
   #[tokio::test]
   async fn test_readiness_reports_disabled_without_scheduler_dependencies() {
     let (_temp, state) = test_state().await;
@@ -811,16 +955,28 @@ mod tests {
     );
   }
 
-  #[test]
-  fn test_snapshot_failure_preserves_last_successful_gauges_and_fails_readiness() {
+  #[tokio::test]
+  async fn test_snapshot_timeout_preserves_cache_becomes_stale_and_recovers() {
     let telemetry = PrometheusSchedulerTelemetry::new(&scheduler_config(true, false, false), false);
-    telemetry.apply_snapshot(&empty_snapshot(7));
+    let source = ControlledSnapshotSource {
+      outcome: Mutex::new(SnapshotOutcome::Success(Box::new(empty_snapshot(7)))),
+    };
+    refresh_scheduler_snapshot(&source, &telemetry).await;
     record_loop_started(&telemetry, SchedulerWorker::Execution);
     record_loop_started(&telemetry, SchedulerWorker::DeliveryPreparation);
     assert_eq!(telemetry.readiness_reason(), ("ready", true));
+    let first_success = telemetry
+      .readiness
+      .read()
+      .expect("scheduler readiness")
+      .snapshot_last_success
+      .expect("snapshot success");
 
-    telemetry.record_snapshot_error(SnapshotErrorKind::Timeout);
+    *source.outcome.lock().expect("snapshot outcome") = SnapshotOutcome::Hang;
+    let timeout_started = Instant::now();
+    refresh_scheduler_snapshot(&source, &telemetry).await;
 
+    assert!(timeout_started.elapsed() >= SNAPSHOT_TIMEOUT);
     assert_eq!(
       telemetry.readiness_reason(),
       ("scheduler_snapshot_unavailable", false)
@@ -828,6 +984,31 @@ mod tests {
     let metrics = telemetry.encode_metrics().expect("metrics");
     assert!(metrics.contains("codeoff_scheduler_due_jobs 7"));
     assert!(metrics.contains("codeoff_scheduler_snapshot_refresh_success 0"));
+    assert_eq!(
+      telemetry.readiness_reason_at(first_success + SNAPSHOT_STALE_AFTER + Duration::from_secs(1)),
+      ("scheduler_snapshot_stale", false)
+    );
+
+    *source.outcome.lock().expect("snapshot outcome") =
+      SnapshotOutcome::Success(Box::new(empty_snapshot(9)));
+    refresh_scheduler_snapshot(&source, &telemetry).await;
+
+    assert_eq!(telemetry.readiness_reason(), ("ready", true));
+    let metrics = telemetry.encode_metrics().expect("metrics");
+    assert!(metrics.contains("codeoff_scheduler_due_jobs 9"));
+    assert!(metrics.contains("codeoff_scheduler_snapshot_refresh_success 1"));
+  }
+
+  #[tokio::test]
+  async fn test_readiness_false_probe_is_fixed_sanitized_and_route_isolated() {
+    assert_faulty_readiness_probe(ProbeOutcome::False).await;
+  }
+
+  #[tokio::test]
+  async fn test_readiness_timeout_is_fixed_sanitized_and_route_isolated() {
+    let started = Instant::now();
+    assert_faulty_readiness_probe(ProbeOutcome::Hang).await;
+    assert!(started.elapsed() >= STATE_READ_TIMEOUT);
   }
 
   #[test]
@@ -941,6 +1122,31 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn test_operational_http_connection_panic_is_fatal_without_later_traffic() {
+    let (_temp, state) = test_state().await;
+    let telemetry =
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+    let server = OperationalHttpServer::bind("127.0.0.1:0", telemetry, state)
+      .await
+      .expect("bind server");
+    let address = server.local_addr().expect("server address");
+    server.panic_next_connection();
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(server.run_until(shutdown_rx));
+
+    let _connection = tokio::net::TcpStream::connect(address)
+      .await
+      .expect("connect fault-injected request");
+    let error = tokio::time::timeout(Duration::from_secs(1), task)
+      .await
+      .expect("connection panic propagation deadline")
+      .expect("server task")
+      .expect_err("connection panic must be fatal");
+
+    assert!(error.to_string().contains("panicked"));
+  }
+
+  #[tokio::test]
   async fn test_operational_http_server_bounds_headers_connections_and_idle_time() {
     let (_temp, state) = test_state().await;
     let telemetry =
@@ -955,12 +1161,12 @@ mod tests {
     let mut oversized = tokio::net::TcpStream::connect(address)
       .await
       .expect("connect oversized request");
-    let request = format!(
+    let oversized_request = format!(
       "GET /healthz HTTP/1.1\r\nHost: localhost\r\nX-Large: {}\r\n\r\n",
       "a".repeat(9 * 1024)
     );
     oversized
-      .write_all(request.as_bytes())
+      .write_all(oversized_request.as_bytes())
       .await
       .expect("write oversized request");
     let mut response = Vec::new();
@@ -989,6 +1195,13 @@ mod tests {
     .expect("idle connection close deadline");
     assert_connection_closed(idle_result);
     assert!(idle_started.elapsed() >= CONNECTION_TIMEOUT);
+
+    let health = request(
+      address,
+      b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
 
     let mut held = Vec::with_capacity(MAX_CONNECTIONS);
     for _ in 0..MAX_CONNECTIONS {

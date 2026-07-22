@@ -3627,6 +3627,46 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn operational_http_connection_panic_reaches_serve_lifecycle_without_later_traffic() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    let scheduler = SchedulerRuntimeConfig::default();
+    let telemetry = PrometheusSchedulerTelemetry::new(&scheduler, false);
+    let server = OperationalHttpServer::bind("127.0.0.1:0", telemetry, state)
+      .await
+      .expect("bind operational server");
+    let address = server.local_addr().expect("operational address");
+    server.panic_next_connection();
+    let mut lifecycle = ServeLifecycle {
+      scheduled_worker: None,
+      background_tasks: ServeTaskGroup::new(),
+    };
+    lifecycle.spawn_operational_http_server(server);
+
+    let _connection = tokio::net::TcpStream::connect(address)
+      .await
+      .expect("connect fault-injected request");
+    let failure = tokio::time::timeout(
+      Duration::from_secs(1),
+      lifecycle.background_tasks.wait_for_failure(),
+    )
+    .await
+    .expect("operational failure deadline");
+
+    assert!(
+      failure
+        .to_string()
+        .contains("operational HTTP server failed")
+    );
+    lifecycle
+      .finish(Err(failure))
+      .await
+      .expect_err("serve fails");
+  }
+
+  #[tokio::test]
   async fn retention_shutdown_while_waiting_for_durable_gate_prevents_cleanup() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state = StateStore::initialize(&temp.path().join("state"), None)

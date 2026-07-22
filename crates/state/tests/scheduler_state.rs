@@ -2731,6 +2731,13 @@ async fn test_current_schema_rejects_future_invalid_job_and_run_target_identitie
 
 #[tokio::test]
 async fn test_two_independent_stores_materialize_only_one_logical_occurrence() {
+  for _ in 0..20 {
+    assert_two_independent_stores_materialize_only_one_logical_occurrence().await;
+    tokio::task::yield_now().await;
+  }
+}
+
+async fn assert_two_independent_stores_materialize_only_one_logical_occurrence() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
   let first = StateStore::initialize(&state_dir, None)
@@ -2789,6 +2796,13 @@ async fn materialize_after_barrier(
 
 #[tokio::test]
 async fn test_two_independent_stores_claim_one_run_and_create_one_bound_attempt() {
+  for _ in 0..20 {
+    assert_two_independent_stores_claim_one_run_and_create_one_bound_attempt().await;
+    tokio::task::yield_now().await;
+  }
+}
+
+async fn assert_two_independent_stores_claim_one_run_and_create_one_bound_attempt() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
   let first = StateStore::initialize(&state_dir, None)
@@ -4108,6 +4122,13 @@ async fn test_complete_success_baseline_and_insert_conflicts_roll_back_all_autho
 
 #[tokio::test]
 async fn test_two_stores_complete_one_success_and_record_repeated_completion_as_late_evidence() {
+  for _ in 0..20 {
+    assert_two_stores_complete_one_success_and_record_repeated_completion_as_late_evidence().await;
+    tokio::task::yield_now().await;
+  }
+}
+
+async fn assert_two_stores_complete_one_success_and_record_repeated_completion_as_late_evidence() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
   let first = StateStore::initialize(&state_dir, None)
@@ -4169,6 +4190,274 @@ async fn test_two_stores_complete_one_success_and_record_repeated_completion_as_
   .await
   .expect("read converged success");
   assert_eq!(authority, ("succeeded".to_owned(), 1, 1, 1, 1));
+}
+
+#[tokio::test]
+#[cfg(feature = "test-support")]
+async fn test_success_completion_rolls_back_when_sqlite_is_query_only() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let claim = prepare_executing_run(&store, "query-only-completion", 200).await;
+  let fault = store
+    .install_query_only_fault_for_tests()
+    .await
+    .expect("install query-only fault");
+  let error = store
+    .complete_scheduled_run_success(
+      &claim.binding,
+      &ScheduledRunResult::new("summary", "context").expect("result"),
+      120,
+    )
+    .await
+    .expect_err("query-only connection must reject completion");
+  assert_sqlite_code(&error, "8");
+  assert_uncommitted_success_authority(&state_dir, &claim, "query-only-completion").await;
+  fault.reset().await.expect("reset query-only fault");
+  assert_eq!(
+    store
+      .complete_scheduled_run_success(
+        &claim.binding,
+        &ScheduledRunResult::new("summary", "context").expect("result"),
+        120,
+      )
+      .await
+      .expect("complete after reset"),
+    ScheduledRunSuccessOutcome::Committed
+  );
+}
+
+#[tokio::test]
+#[cfg(feature = "test-support")]
+async fn test_success_completion_rolls_back_on_post_write_sqlite_interrupt() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let claim = prepare_executing_run(&store, "interrupt-completion", 200).await;
+  let fault = store
+    .install_post_write_interrupt_fault_for_tests()
+    .await
+    .expect("install interrupt fault");
+  let error = store
+    .complete_scheduled_run_success(
+      &claim.binding,
+      &ScheduledRunResult::new("summary", "context").expect("result"),
+      120,
+    )
+    .await
+    .expect_err("progress handler must interrupt completion");
+  assert_sqlite_code(&error, "9");
+  let writes_observed = fault.writes_observed();
+  assert!(
+    writes_observed >= 1,
+    "interrupt must follow a write callback"
+  );
+  assert_uncommitted_success_authority(&state_dir, &claim, "interrupt-completion").await;
+  fault.reset().await.expect("remove interrupt hooks");
+  assert_eq!(
+    store
+      .complete_scheduled_run_success(
+        &claim.binding,
+        &ScheduledRunResult::new("summary", "context").expect("result"),
+        120,
+      )
+      .await
+      .unwrap_or_else(|error| panic!(
+        "complete after interrupt reset ({writes_observed} writes): {error}"
+      )),
+    ScheduledRunSuccessOutcome::Committed
+  );
+}
+
+#[tokio::test]
+#[cfg(feature = "test-support")]
+async fn test_success_completion_rolls_back_on_deterministic_sqlite_full() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let claim = prepare_executing_run(&store, "full-completion", 200).await;
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect maintenance pool");
+  sqlx::query("vacuum")
+    .execute(&pool)
+    .await
+    .expect("consume freelist before capping database");
+  pool.close().await;
+  let (fault, page_count, freelist_count) = store
+    .install_database_full_fault_for_tests()
+    .await
+    .expect("cap database pages");
+  assert!(page_count > 0);
+  assert_eq!(
+    freelist_count, 0,
+    "fixture must have no reusable free pages"
+  );
+  let error = store
+    .complete_scheduled_run_success(
+      &claim.binding,
+      &ScheduledRunResult::new("summary", "x".repeat(64 * 1024)).expect("large result"),
+      120,
+    )
+    .await
+    .expect_err("page cap must force SQLITE_FULL");
+  assert_sqlite_code(&error, "13");
+  assert_uncommitted_success_authority(&state_dir, &claim, "full-completion").await;
+  fault.reset().await.expect("restore page limit");
+  assert_eq!(
+    store
+      .complete_scheduled_run_success(
+        &claim.binding,
+        &ScheduledRunResult::new("summary", "context").expect("result"),
+        120,
+      )
+      .await
+      .expect("complete after page-limit reset"),
+    ScheduledRunSuccessOutcome::Committed
+  );
+}
+
+#[tokio::test]
+#[cfg(feature = "test-support")]
+async fn test_delivery_terminal_window_rolls_back_on_post_write_sqlite_interrupt() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let job_id = "interrupt-delivery-terminal";
+  let mut request = create_request(job_id, ScheduleSpec::once(110), 100);
+  request.targets = vec![second_target(job_id)];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  let run = complete_due_run(&store, job_id, 110, 120).await;
+  let delivery_id: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("delivery id");
+  store
+    .prepare_scheduled_delivery(
+      &delivery_id,
+      "text/plain; charset=utf-8",
+      "payload",
+      1,
+      121,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare delivery");
+  let claim = store
+    .claim_next_scheduled_delivery("delivery-worker", 122, 200)
+    .await
+    .expect("claim delivery")
+    .expect("delivery claim");
+  let fault = store
+    .install_post_write_interrupt_fault_for_tests()
+    .await
+    .expect("install interrupt fault");
+  let error = store
+    .complete_scheduled_delivery_delivered(&claim.binding, "receipt", 123)
+    .await
+    .expect_err("interrupt delivery terminal window");
+  assert_sqlite_code(&error, "9");
+  assert!(fault.writes_observed() >= 1);
+  let authority: (String, String, i64) = sqlx::query_as(
+    "select delivery.state, attempt.state, (select count(*) from scheduled_delivery_baselines where job_id = ?2) from scheduled_run_deliveries delivery join scheduled_delivery_attempts attempt on attempt.delivery_id = delivery.delivery_id and attempt.attempt = delivery.attempt and attempt.fence = delivery.fence where delivery.delivery_id = ?1",
+  )
+  .bind(&delivery_id)
+  .bind(job_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled-back delivery authority");
+  assert_eq!(authority, ("sending".to_owned(), "sending".to_owned(), 0));
+  fault.reset().await.expect("remove interrupt hooks");
+  store
+    .complete_scheduled_delivery_delivered(&claim.binding, "receipt", 123)
+    .await
+    .expect("complete delivery after reset");
+}
+
+#[tokio::test]
+#[cfg(feature = "test-support")]
+async fn test_retention_audit_delete_window_rolls_back_on_post_write_sqlite_interrupt() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let run_id = fail_due_run(&store, "interrupt-retention", 110, 120).await;
+  let fault = store
+    .install_post_write_interrupt_fault_for_tests()
+    .await
+    .expect("install interrupt fault");
+  let error = store
+    .cleanup_retained_data(None, 1_000_000, &scheduler_retention_policy())
+    .await
+    .expect_err("interrupt retention transaction");
+  assert_sqlite_code(&error, "9");
+  assert!(fault.writes_observed() >= 1);
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let authority: (i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduled_runs where run_id = ?1), (select count(*) from scheduled_run_retention_audit where run_id = ?1)",
+  )
+  .bind(&run_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled-back retention authority");
+  assert_eq!(authority, (1, 0));
+  fault.reset().await.expect("remove interrupt hooks");
+  let report = store
+    .cleanup_retained_data(None, 1_000_000, &scheduler_retention_policy())
+    .await
+    .expect("cleanup after reset");
+  assert_eq!(report.scheduled_runs_deleted, 1);
+}
+
+fn assert_sqlite_code(error: &StateError, expected: &str) {
+  let StateError::Scheduler {
+    source: sqlx::Error::Database(database),
+  } = error
+  else {
+    panic!("expected scheduler database error, got {error}");
+  };
+  assert_eq!(database.code().as_deref(), Some(expected));
+}
+
+async fn assert_uncommitted_success_authority(
+  state_dir: &Path,
+  claim: &ClaimedScheduledRun,
+  job_id: &str,
+) {
+  let pool = SqlitePool::connect(&database_url(state_dir))
+    .await
+    .expect("connect assertion pool");
+  let authority: (String, String, i64, i64, i64) = sqlx::query_as(
+    "select run.state, attempt.state, (select count(*) from scheduled_run_result_artifacts where run_id = run.run_id), (select baseline_version from scheduled_execution_baselines where job_id = ?2), (select count(*) from scheduled_run_deliveries where run_id = run.run_id) from scheduled_runs run join scheduled_run_attempts attempt on attempt.run_id = run.run_id and attempt.attempt = run.attempt and attempt.fence = run.fence where run.run_id = ?1",
+  )
+  .bind(claim.binding.run_id())
+  .bind(job_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled-back authority");
+  assert_eq!(
+    authority,
+    ("executing".to_owned(), "executing".to_owned(), 0, 0, 0)
+  );
 }
 
 #[tokio::test]
@@ -4371,6 +4660,95 @@ async fn complete_due_run(
   claim
 }
 
+async fn complete_due_run_with_summary(
+  store: &StateStore,
+  job_id: &str,
+  due_at: i64,
+  completed_at: i64,
+  summary: &str,
+) -> ClaimedScheduledRun {
+  store
+    .materialize_due_schedule(job_id, 0, due_at)
+    .await
+    .expect("materialize occurrence");
+  let claim = store
+    .claim_next_scheduled_run(
+      "matching-result-worker",
+      completed_at - 2,
+      completed_at + 100,
+    )
+    .await
+    .expect("claim occurrence")
+    .expect("due occurrence");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&claim.binding, &profile, completed_at - 1)
+    .await
+    .expect("execute occurrence");
+  store
+    .complete_scheduled_run_success(
+      &claim.binding,
+      &ScheduledRunResult::new(summary, "").expect("result"),
+      completed_at,
+    )
+    .await
+    .expect("complete occurrence");
+  claim
+}
+
+async fn complete_delivered_occurrence(
+  store: &StateStore,
+  pool: &SqlitePool,
+  job_id: &str,
+  due_at: i64,
+  completed_at: i64,
+) -> ClaimedScheduledRun {
+  let run = complete_due_run(store, job_id, due_at, completed_at).await;
+  let delivery_id: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(run.binding.run_id())
+      .fetch_one(pool)
+      .await
+      .expect("delivery id");
+  let payload = format!("payload-{due_at}");
+  store
+    .prepare_scheduled_delivery(
+      &delivery_id,
+      "text/plain; charset=utf-8",
+      &payload,
+      1,
+      completed_at + 1,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare delivery");
+  let claim = store
+    .claim_next_scheduled_delivery(
+      &format!("delivery-worker-{due_at}"),
+      completed_at + 2,
+      completed_at + 100,
+    )
+    .await
+    .expect("claim delivery")
+    .expect("delivery claim");
+  let receipt = format!("receipt-{due_at}");
+  store
+    .complete_scheduled_delivery_delivered(&claim.binding, &receipt, completed_at + 3)
+    .await
+    .expect("complete delivery");
+  run
+}
+
+fn scheduler_retention_policy() -> RetentionPolicy {
+  RetentionPolicy {
+    scheduled_run_days: 1,
+    scheduled_delivery_days: 1,
+    scheduled_retention_batch_limit: 10,
+    ..RetentionPolicy::default()
+  }
+}
+
 async fn prepare_succeeded_retention_candidate(
   store: &StateStore,
   pool: &SqlitePool,
@@ -4568,13 +4946,13 @@ async fn complete_success_after_barrier(
   completed_at: i64,
 ) -> Result<ScheduledRunSuccessOutcome, StateError> {
   barrier.wait().await;
-  for _ in 0..20 {
+  for _ in 0..200 {
     match store
       .complete_scheduled_run_success(&binding, &result, completed_at)
       .await
     {
       Err(error) if error.is_transient_storage_contention() => {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
       }
       outcome => return outcome,
     }
@@ -8333,8 +8711,219 @@ async fn test_succeeded_retention_rechecks_attempt_after_candidate_scan() {
   }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "test-support")]
+async fn test_retention_rechecks_latest_execution_success_baseline_after_scan() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let cleanup_store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize cleanup store");
+  let writer_store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize authorized-writer simulation store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let job_id = "retention-execution-baseline-race";
+  let mut request = create_request(
+    job_id,
+    ScheduleSpec::fixed_interval(110, 10).expect("interval"),
+    100,
+  );
+  request.targets = vec![second_target(job_id)];
+  cleanup_store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create race job");
+  let first = complete_delivered_occurrence(&cleanup_store, &pool, job_id, 110, 120).await;
+  let _second = complete_delivered_occurrence(&cleanup_store, &pool, job_id, 120, 130).await;
+
+  let (scanned_tx, scanned_rx) = std::sync::mpsc::channel();
+  let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+  cleanup_store.set_scheduled_retention_after_scan_hook_for_tests(move || {
+    scanned_tx.send(()).expect("signal candidate scan");
+    resume_rx.recv().expect("resume retention cleanup");
+  });
+  let cleanup = tokio::spawn(async move {
+    cleanup_store
+      .cleanup_retained_data(None, 1_000_000, &scheduler_retention_policy())
+      .await
+  });
+  tokio::task::spawn_blocking(move || scanned_rx.recv().expect("wait for candidate scan"))
+    .await
+    .expect("join candidate scan wait");
+
+  // Simulates an authorized migration/reconciliation writer. Normal success advancement cannot
+  // rebind backward; the database guard must still serialize this transaction with retention.
+  let mut writer = writer_store
+    .pool_for_tests()
+    .await
+    .expect("writer connection");
+  sqlx::query(
+    "update scheduled_execution_baselines set hash_algorithm = artifact.hash_algorithm, result_hash = artifact.result_hash, previous_success_context = artifact.previous_success_context, source_run_id = artifact.run_id, completed_at = artifact.completed_at from scheduled_run_result_artifacts artifact where scheduled_execution_baselines.job_id = ?1 and artifact.run_id = ?2 and artifact.job_id = scheduled_execution_baselines.job_id",
+  )
+  .bind(job_id)
+  .bind(first.binding.run_id())
+  .execute(&mut *writer)
+  .await
+  .expect("simulate authorized execution baseline rebind");
+  drop(writer);
+  resume_tx.send(()).expect("resume cleanup");
+  let report = cleanup.await.expect("join cleanup").expect("cleanup");
+  assert_eq!(
+    (
+      report.scheduled_runs_deleted,
+      report.scheduled_runs_protected
+    ),
+    (0, 1)
+  );
+  let persisted: (i64, i64, String) = sqlx::query_as(
+    "select (select count(*) from scheduled_runs where run_id = ?1), (select count(*) from scheduled_delivery_retention_audit where run_id = ?1), (select source_run_id from scheduled_execution_baselines where job_id = ?2)",
+  )
+  .bind(first.binding.run_id())
+  .bind(job_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read serialized baseline authority");
+  assert_eq!(persisted, (1, 0, first.binding.run_id().to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "test-support")]
+#[allow(clippy::too_many_lines)]
+async fn test_retention_rechecks_accepted_delivery_baseline_after_scan() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let cleanup_store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize cleanup store");
+  let writer_store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize authorized-writer simulation store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let job_id = "retention-delivery-baseline-race";
+  let mut request = create_request(
+    job_id,
+    ScheduleSpec::fixed_interval(110, 10).expect("interval"),
+    100,
+  );
+  request.targets = vec![second_target(job_id)];
+  cleanup_store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create race job");
+  let first = complete_delivered_occurrence(&cleanup_store, &pool, job_id, 110, 120).await;
+  let first_delivery: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(first.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("first delivery");
+  let _second = complete_delivered_occurrence(&cleanup_store, &pool, job_id, 120, 130).await;
+
+  let (scanned_tx, scanned_rx) = std::sync::mpsc::channel();
+  let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+  cleanup_store.set_scheduled_retention_after_scan_hook_for_tests(move || {
+    scanned_tx.send(()).expect("signal candidate scan");
+    resume_rx.recv().expect("resume retention cleanup");
+  });
+  let cleanup = tokio::spawn(async move {
+    cleanup_store
+      .cleanup_retained_data(None, 1_000_000, &scheduler_retention_policy())
+      .await
+  });
+  tokio::task::spawn_blocking(move || scanned_rx.recv().expect("wait for candidate scan"))
+    .await
+    .expect("join candidate scan wait");
+
+  // Simulates an authorized migration/reconciliation writer. Normal delivery acceptance cannot
+  // rebind backward; retention must still recheck the accepted source inside its transaction.
+  let mut writer = writer_store
+    .pool_for_tests()
+    .await
+    .expect("writer connection");
+  sqlx::query(
+    "update scheduled_delivery_baselines as baseline set accepted_payload_digest = delivery.payload_digest, source_delivery_id = delivery.delivery_id, source_run_id = delivery.run_id, source_result_id = delivery.result_artifact_id, source_result_hash = artifact.result_hash, accepted_at = delivery.updated_at from scheduled_run_deliveries delivery join scheduled_run_result_artifacts artifact on artifact.artifact_id = delivery.result_artifact_id and artifact.run_id = delivery.run_id and artifact.job_id = delivery.job_id where delivery.delivery_id = ?1 and baseline.job_id = delivery.job_id and baseline.target_identity_digest = delivery.target_identity_digest and baseline.target_snapshot_digest_algorithm = delivery.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = delivery.target_snapshot_digest and baseline.delivery_policy_version = delivery.delivery_policy_version and baseline.render_version = delivery.render_version and baseline.hash_algorithm = delivery.hash_algorithm",
+  )
+  .bind(&first_delivery)
+  .execute(&mut *writer)
+  .await
+  .expect("simulate authorized accepted delivery baseline rebind");
+  drop(writer);
+  resume_tx.send(()).expect("resume cleanup");
+  let report = cleanup.await.expect("join cleanup").expect("cleanup");
+  assert_eq!(
+    (
+      report.scheduled_runs_deleted,
+      report.scheduled_runs_protected
+    ),
+    (1, 0)
+  );
+  let persisted: (i64, i64, String, String) = sqlx::query_as(
+    "select (select count(*) from scheduled_run_deliveries where delivery_id = ?1), (select count(*) from scheduled_delivery_retention_audit where delivery_id = ?1), source_delivery_id, accepted_payload_digest from scheduled_delivery_baselines where job_id = ?2",
+  )
+  .bind(&first_delivery)
+  .bind(job_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read serialized delivery baseline authority");
+  assert_eq!(persisted.0, 0);
+  assert_eq!(persisted.1, 1);
+  assert_eq!(persisted.2, first_delivery);
+
+  let third = complete_due_run_with_summary(&writer_store, job_id, 130, 140, "result-120").await;
+  let third_delivery: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(third.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("third delivery");
+  let prepared = writer_store
+    .prepare_scheduled_delivery(
+      &third_delivery,
+      "text/plain; charset=utf-8",
+      "payload-110",
+      1,
+      141,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare matching historical payload");
+  let prepared_digest = match &prepared {
+    PreparedScheduledDelivery::Pending(snapshot)
+    | PreparedScheduledDelivery::SkippedNone(snapshot)
+    | PreparedScheduledDelivery::SkippedUnchanged(snapshot) => snapshot.digest(),
+  };
+  assert_eq!(prepared_digest, persisted.3, "matching payload digest");
+  assert!(matches!(prepared, PreparedScheduledDelivery::Pending(_)));
+  assert!(
+    writer_store
+      .claim_next_scheduled_delivery("unchanged-probe", 142, 200)
+      .await
+      .expect("claim-time baseline recheck")
+      .is_none()
+  );
+  let state: String =
+    sqlx::query_scalar("select state from scheduled_run_deliveries where delivery_id = ?1")
+      .bind(&third_delivery)
+      .fetch_one(&pool)
+      .await
+      .expect("read unchanged delivery state");
+  assert_eq!(state, "skipped_unchanged");
+}
+
 #[tokio::test]
 async fn test_two_independent_stores_serialize_scheduler_retention_cleanup() {
+  for _ in 0..20 {
+    assert_two_independent_stores_serialize_scheduler_retention_cleanup().await;
+    tokio::task::yield_now().await;
+  }
+}
+
+async fn assert_two_independent_stores_serialize_scheduler_retention_cleanup() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
   let first = StateStore::initialize(&state_dir, None)
@@ -8707,6 +9296,14 @@ async fn test_retention_guards_reject_dynamic_nonterminal_and_latest_source_dele
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_two_independent_stores_claim_once_and_reject_stale_delivery_fence() {
+  for _ in 0..20 {
+    assert_two_independent_stores_claim_once_and_reject_stale_delivery_fence().await;
+    tokio::task::yield_now().await;
+  }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_two_independent_stores_claim_once_and_reject_stale_delivery_fence() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
   let first = StateStore::initialize(&state_dir, None)
@@ -8856,7 +9453,7 @@ async fn delivery_claim_after_barrier(
   for _ in 0..20 {
     match store.claim_next_scheduled_delivery(owner, 122, 200).await {
       Err(error) if error.is_transient_storage_contention() => {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
       }
       result => return result,
     }

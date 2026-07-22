@@ -3,6 +3,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 #[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(feature = "test-support")]
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
@@ -89,6 +91,82 @@ impl std::fmt::Debug for StateStoreTestHooks {
 #[cfg(any(test, feature = "test-support"))]
 pub struct StateStoreTestLock {
   connection: SqliteConnection,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+enum StateStoreTestFaultReset {
+  QueryOnly,
+  MaxPageCount(i64),
+  Interrupt,
+}
+
+/// Restores a connection-local `SQLite` fault installed by scheduler tests.
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+#[must_use = "the fault remains active until the guard is reset or the store is dropped"]
+pub struct StateStoreTestFaultGuard {
+  pool: SqlitePool,
+  reset: Option<StateStoreTestFaultReset>,
+  writes_observed: Option<Arc<AtomicUsize>>,
+}
+
+#[cfg(feature = "test-support")]
+impl StateStoreTestFaultGuard {
+  /// Returns the number of row-write callbacks observed by an interrupt fault.
+  #[must_use]
+  pub fn writes_observed(&self) -> usize {
+    self
+      .writes_observed
+      .as_ref()
+      .map_or(0, |writes| writes.load(Ordering::SeqCst))
+  }
+
+  /// Removes the installed fault before the connection is reused.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the pooled connection cannot be restored.
+  pub async fn reset(mut self) -> Result<(), StateError> {
+    let reset = self.reset.take().expect("test fault reset is present");
+    reset_test_fault(&self.pool, reset).await
+  }
+}
+
+#[cfg(feature = "test-support")]
+async fn reset_test_fault(
+  pool: &SqlitePool,
+  reset: StateStoreTestFaultReset,
+) -> Result<(), StateError> {
+  match reset {
+    StateStoreTestFaultReset::QueryOnly => {
+      sqlx::query("pragma query_only = off")
+        .execute(pool)
+        .await
+        .map_err(|source| StateError::Scheduler { source })?;
+    }
+    StateStoreTestFaultReset::MaxPageCount(previous) => {
+      sqlx::query(sqlx::AssertSqlSafe(format!(
+        "pragma max_page_count = {previous}"
+      )))
+      .execute(pool)
+      .await
+      .map_err(|source| StateError::Scheduler { source })?;
+    }
+    StateStoreTestFaultReset::Interrupt => {
+      let mut connection = pool
+        .acquire()
+        .await
+        .map_err(|source| StateError::Scheduler { source })?;
+      let mut handle = connection
+        .lock_handle()
+        .await
+        .map_err(|source| StateError::Scheduler { source })?;
+      handle.remove_progress_handler();
+      handle.remove_update_hook();
+    }
+  }
+  Ok(())
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1748,6 +1826,115 @@ do update set summary = excluded.summary, updated_at = datetime('now')
     .await
     .map_err(|source| StateError::SlackDelivery { source })?;
     Ok(())
+  }
+
+  /// Makes the store's pooled connection reject mutations for a test.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when `SQLite` cannot enable query-only mode.
+  #[cfg(feature = "test-support")]
+  pub async fn install_query_only_fault_for_tests(
+    &self,
+  ) -> Result<StateStoreTestFaultGuard, StateError> {
+    sqlx::query("pragma query_only = on")
+      .execute(&self.pool)
+      .await
+      .map_err(|source| StateError::Scheduler { source })?;
+    Ok(StateStoreTestFaultGuard {
+      pool: self.pool.clone(),
+      reset: Some(StateStoreTestFaultReset::QueryOnly),
+      writes_observed: None,
+    })
+  }
+
+  /// Caps the store's database at its current page count for a deterministic full-disk test.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when page accounting or the limit update fails.
+  #[cfg(feature = "test-support")]
+  pub async fn install_database_full_fault_for_tests(
+    &self,
+  ) -> Result<(StateStoreTestFaultGuard, i64, i64), StateError> {
+    let page_count = sqlx::query_scalar::<_, i64>("pragma page_count")
+      .fetch_one(&self.pool)
+      .await
+      .map_err(|source| StateError::Scheduler { source })?;
+    let freelist_count = sqlx::query_scalar::<_, i64>("pragma freelist_count")
+      .fetch_one(&self.pool)
+      .await
+      .map_err(|source| StateError::Scheduler { source })?;
+    let previous = sqlx::query_scalar::<_, i64>("pragma max_page_count")
+      .fetch_one(&self.pool)
+      .await
+      .map_err(|source| StateError::Scheduler { source })?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+      "pragma max_page_count = {page_count}"
+    )))
+    .execute(&self.pool)
+    .await
+    .map_err(|source| StateError::Scheduler { source })?;
+    Ok((
+      StateStoreTestFaultGuard {
+        pool: self.pool.clone(),
+        reset: Some(StateStoreTestFaultReset::MaxPageCount(previous)),
+        writes_observed: None,
+      },
+      page_count,
+      freelist_count,
+    ))
+  }
+
+  /// Interrupts a later statement only after the transaction has attempted a row write.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the pooled `SQLite` handle cannot be configured.
+  #[cfg(feature = "test-support")]
+  pub async fn install_post_write_interrupt_fault_for_tests(
+    &self,
+  ) -> Result<StateStoreTestFaultGuard, StateError> {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut connection = self
+      .pool
+      .acquire()
+      .await
+      .map_err(|source| StateError::Scheduler { source })?;
+    let mut handle = connection
+      .lock_handle()
+      .await
+      .map_err(|source| StateError::Scheduler { source })?;
+    let update_writes = Arc::clone(&writes);
+    handle.set_update_hook(move |_| {
+      update_writes.fetch_add(1, Ordering::SeqCst);
+    });
+    let interrupt_writes = Arc::clone(&writes);
+    let interrupted = AtomicBool::new(false);
+    handle.set_progress_handler(1, move || {
+      interrupt_writes.load(Ordering::SeqCst) == 0 || interrupted.swap(true, Ordering::SeqCst)
+    });
+    drop(handle);
+    drop(connection);
+    Ok(StateStoreTestFaultGuard {
+      pool: self.pool.clone(),
+      reset: Some(StateStoreTestFaultReset::Interrupt),
+      writes_observed: Some(writes),
+    })
+  }
+
+  /// Acquires this store's connection for an explicit cross-store test transaction.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the test connection cannot be acquired.
+  #[cfg(feature = "test-support")]
+  pub async fn pool_for_tests(&self) -> Result<sqlx::pool::PoolConnection<Sqlite>, StateError> {
+    self
+      .pool
+      .acquire()
+      .await
+      .map_err(|source| StateError::Scheduler { source })
   }
 
   /// Acquires a test-only exclusive storage lock against the state database.

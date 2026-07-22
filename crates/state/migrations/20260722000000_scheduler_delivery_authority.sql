@@ -402,7 +402,6 @@ create table scheduled_delivery_legacy_baseline_audit (
     delivery_policy_version > 0
     and render_version > 0
     and claimed_baseline_version > 0
-    and accepted_at >= 0
   ),
   check (
     length(target_identity_digest) > 0
@@ -489,7 +488,8 @@ create table scheduled_delivery_baselines (
   check (
     delivery_policy_version > 0
     and render_version > 0
-    and baseline_version > 0
+    and typeof(baseline_version) = 'integer'
+    and baseline_version between 1 and 9223372036854775807
     and accepted_at >= 0
   ),
   check (

@@ -1363,7 +1363,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
   }
   let legacy_exact_body = "legacy exact payload  \n";
   let legacy_claimed_digest = test_sha256_hex(legacy_exact_body);
-  sqlx::query("insert into scheduled_delivery_baselines (job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_hash, accepted_at, baseline_version) values ('delivery-upgrade', ?1, 1, 1, 'sha256-utf8-exact-v1', ?2, 'legacy-delivered', 'delivery-upgrade-run', 'result', 101, 3)")
+  sqlx::query("insert into scheduled_delivery_baselines (job_id, target_identity_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_hash, accepted_at, baseline_version) values ('delivery-upgrade', ?1, 1, 1, 'sha256-utf8-exact-v1', ?2, 'legacy-delivered', 'delivery-upgrade-run', 'result', -1, 3)")
     .bind(SLACK_TARGET_IDENTITY)
     .bind(&legacy_claimed_digest)
     .execute(&pool)
@@ -1410,8 +1410,8 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
   .await
   .expect("count active baselines");
   assert_eq!(active_baselines, 0);
-  let baseline: (String, String, String, String, i64) = sqlx::query_as(
-    "select source_delivery_id, claimed_payload_digest, claimed_hash_algorithm, quarantine_reason, claimed_baseline_version from scheduled_delivery_legacy_baseline_audit where job_id = 'delivery-upgrade'",
+  let baseline: (String, String, String, String, i64, i64) = sqlx::query_as(
+    "select source_delivery_id, claimed_payload_digest, claimed_hash_algorithm, quarantine_reason, claimed_baseline_version, accepted_at from scheduled_delivery_legacy_baseline_audit where job_id = 'delivery-upgrade'",
   )
   .fetch_one(&pool)
   .await
@@ -1423,7 +1423,8 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
       legacy_claimed_digest,
       "sha256-utf8-exact-v1".to_owned(),
       "pre_authority_baseline_unverified".to_owned(),
-      3
+      3,
+      -1
     )
   );
   assert_eq!(
@@ -4817,6 +4818,232 @@ async fn test_claim_time_baseline_rebases_second_prepared_different_payload_acro
   .await
   .expect("read payload B baseline");
   assert_eq!(baseline, (test_sha256_hex("payload B"), 2));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_delivery_baseline_generation_exhaustion_is_typed_and_atomic() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+
+  let delivered_job = "delivery-baseline-max";
+  let mut request = create_request(delivered_job, ScheduleSpec::once(110), 100);
+  request.targets = vec![second_target(delivered_job)];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create delivered max job");
+  let delivered_run = complete_due_run(&store, delivered_job, 110, 120).await;
+  let delivered_id: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(delivered_run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("delivered max id");
+  let PreparedScheduledDelivery::Pending(delivered_payload) = store
+    .prepare_scheduled_delivery(
+      &delivered_id,
+      "text/plain; charset=utf-8",
+      "new payload at max",
+      1,
+      121,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare delivered max payload")
+  else {
+    panic!("delivered max fixture must remain pending");
+  };
+  sqlx::query(
+    "insert into scheduled_delivery_baselines (job_id, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_id, source_result_hash, accepted_at, baseline_version) values (?1, ?2, 'sha256-v1', ?3, 1, 1, 'sha256-utf8-exact-v1', ?4, 'prior-delivery', 'prior-run', null, 'prior-result', 121, 9223372036854775807)",
+  )
+  .bind(delivered_job)
+  .bind(delivered_payload.target_identity_digest())
+  .bind(delivered_payload.target_snapshot_digest())
+  .bind(test_sha256_hex("prior payload"))
+  .execute(&pool)
+  .await
+  .expect("seed max delivered baseline");
+  assert!(
+    sqlx::query(
+      "update scheduled_delivery_baselines set baseline_version = cast(1.5 as real) where job_id = ?1",
+    )
+    .bind(delivered_job)
+    .execute(&pool)
+    .await
+    .is_err(),
+    "active baseline authority must reject REAL generations"
+  );
+  assert!(
+    sqlx::query(
+      "insert into scheduled_delivery_baselines (job_id, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_hash, accepted_at, baseline_version) values (?1, ?2, 'sha256-v1', ?3, 1, 2, 'sha256-utf8-exact-v1', ?4, 'real-delivery', 'real-run', 'real-result', 121, cast(1.5 as real))",
+    )
+    .bind(delivered_job)
+    .bind(delivered_payload.target_identity_digest())
+    .bind(delivered_payload.target_snapshot_digest())
+    .bind(test_sha256_hex("real payload"))
+    .execute(&pool)
+    .await
+    .is_err(),
+    "new REAL baseline authority must be rejected"
+  );
+  let delivered_claim = store
+    .claim_next_scheduled_delivery("max-delivery-worker", 122, 200)
+    .await
+    .expect("claim delivered max payload")
+    .expect("delivered max claim");
+  let before_delivered: (String, i64, String, Option<i64>, i64) = sqlx::query_as(
+    "select delivery.state, delivery.updated_at, attempt.state, attempt.completed_at, baseline.baseline_version from scheduled_run_deliveries delivery join scheduled_delivery_attempts attempt on attempt.delivery_id = delivery.delivery_id and attempt.attempt = delivery.attempt join scheduled_delivery_baselines baseline on baseline.job_id = delivery.job_id where delivery.delivery_id = ?1",
+  )
+  .bind(&delivered_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read pre-completion max authority");
+  assert!(matches!(
+    store
+      .complete_scheduled_delivery_delivered(&delivered_claim.binding, "must-rollback", 123)
+      .await,
+    Err(StateError::ScheduledDeliveryBaselineConflict)
+  ));
+  let after_delivered: (String, i64, String, Option<i64>, i64) = sqlx::query_as(
+    "select delivery.state, delivery.updated_at, attempt.state, attempt.completed_at, baseline.baseline_version from scheduled_run_deliveries delivery join scheduled_delivery_attempts attempt on attempt.delivery_id = delivery.delivery_id and attempt.attempt = delivery.attempt join scheduled_delivery_baselines baseline on baseline.job_id = delivery.job_id where delivery.delivery_id = ?1",
+  )
+  .bind(&delivered_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled-back max authority");
+  assert_eq!(after_delivered, before_delivered);
+  assert_eq!(after_delivered.0, "sending");
+  assert_eq!(after_delivered.2, "sending");
+  assert_eq!(after_delivered.4, i64::MAX);
+
+  let skipped_none_job = "skipped-none-baseline-max";
+  store
+    .create_scheduled_job(&create_request(
+      skipped_none_job,
+      ScheduleSpec::once(210),
+      200,
+    ))
+    .await
+    .expect("create skipped-none max job");
+  let skipped_none_run = complete_due_run(&store, skipped_none_job, 210, 220).await;
+  let skipped_none_id: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(skipped_none_run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("skipped-none max id");
+  let skipped_none_target: (String, String) = sqlx::query_as(
+    "select target_identity_digest, target_json from scheduled_run_deliveries where delivery_id = ?1",
+  )
+  .bind(&skipped_none_id)
+  .fetch_one(&pool)
+  .await
+  .expect("skipped-none target authority");
+  sqlx::query(
+    "insert into scheduled_delivery_baselines (job_id, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_id, source_result_hash, accepted_at, baseline_version) values (?1, ?2, 'sha256-v1', ?3, 1, 1, 'sha256-utf8-exact-v1', ?4, 'prior-none-delivery', 'prior-none-run', null, 'prior-none-result', 221, 9223372036854775807)",
+  )
+  .bind(skipped_none_job)
+  .bind(&skipped_none_target.0)
+  .bind(test_sha256_hex(&skipped_none_target.1))
+  .bind(test_sha256_hex("prior none payload"))
+  .execute(&pool)
+  .await
+  .expect("seed skipped-none max baseline");
+  let before_skipped_none: (String, i64, Option<Vec<u8>>, i64) = sqlx::query_as(
+    "select delivery.state, delivery.updated_at, delivery.payload_snapshot, baseline.baseline_version from scheduled_run_deliveries delivery join scheduled_delivery_baselines baseline on baseline.job_id = delivery.job_id where delivery.delivery_id = ?1",
+  )
+  .bind(&skipped_none_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read pre-prepare skipped-none authority");
+  assert!(matches!(
+    store
+      .prepare_scheduled_delivery(
+        &skipped_none_id,
+        "text/plain; charset=utf-8",
+        "none payload at max",
+        1,
+        221,
+        SkippedNoneBaselinePolicy::Accept,
+      )
+      .await,
+    Err(StateError::ScheduledDeliveryBaselineConflict)
+  ));
+  let after_skipped_none: (String, i64, Option<Vec<u8>>, i64) = sqlx::query_as(
+    "select delivery.state, delivery.updated_at, delivery.payload_snapshot, baseline.baseline_version from scheduled_run_deliveries delivery join scheduled_delivery_baselines baseline on baseline.job_id = delivery.job_id where delivery.delivery_id = ?1",
+  )
+  .bind(&skipped_none_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled-back skipped-none authority");
+  assert_eq!(after_skipped_none, before_skipped_none);
+  assert_eq!(after_skipped_none.0, "pending");
+  assert!(after_skipped_none.2.is_none());
+  assert_eq!(after_skipped_none.3, i64::MAX);
+
+  let unchanged_job = "unchanged-baseline-max";
+  let mut request = create_request(unchanged_job, ScheduleSpec::once(310), 300);
+  request.targets = vec![second_target(unchanged_job)];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create unchanged max job");
+  let unchanged_run = complete_due_run(&store, unchanged_job, 310, 320).await;
+  let unchanged_id: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(unchanged_run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("unchanged max id");
+  let PreparedScheduledDelivery::Pending(unchanged_payload) = store
+    .prepare_scheduled_delivery(
+      &unchanged_id,
+      "text/plain; charset=utf-8",
+      "exact unchanged at max",
+      1,
+      321,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare unchanged max payload")
+  else {
+    panic!("prepare remains advisory");
+  };
+  sqlx::query(
+    "insert into scheduled_delivery_baselines (job_id, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_id, source_result_hash, accepted_at, baseline_version) values (?1, ?2, 'sha256-v1', ?3, 1, 1, 'sha256-utf8-exact-v1', ?4, 'prior-unchanged-delivery', 'prior-unchanged-run', null, 'prior-unchanged-result', 321, 9223372036854775807)",
+  )
+  .bind(unchanged_job)
+  .bind(unchanged_payload.target_identity_digest())
+  .bind(unchanged_payload.target_snapshot_digest())
+  .bind(unchanged_payload.digest())
+  .execute(&pool)
+  .await
+  .expect("seed exact max baseline");
+  assert!(
+    store
+      .claim_next_scheduled_delivery("unchanged-max-worker", 322, 400)
+      .await
+      .expect("claim-time exact max comparison")
+      .is_none()
+  );
+  let unchanged_authority: (String, i64, i64, i64) = sqlx::query_as(
+    "select delivery.state, delivery.claimed_baseline_version, (select count(*) from scheduled_delivery_attempts where delivery_id = ?1), baseline.baseline_version from scheduled_run_deliveries delivery join scheduled_delivery_baselines baseline on baseline.job_id = delivery.job_id where delivery.delivery_id = ?1",
+  )
+  .bind(&unchanged_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read unchanged max authority");
+  assert_eq!(
+    unchanged_authority,
+    ("skipped_unchanged".to_owned(), i64::MAX, 0, i64::MAX)
+  );
 }
 
 #[tokio::test]

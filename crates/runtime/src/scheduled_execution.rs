@@ -15,13 +15,211 @@ use codeoff_state::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::channel_tools::CHANNEL_DYNAMIC_TOOL_NAMES;
 use crate::schedule_tools::SCHEDULE_DYNAMIC_TOOL_NAMES;
 
 static PREPARE_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(250);
+const SCHEDULER_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+const SCHEDULER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+const MATERIALIZATION_BATCH_LIMIT: u32 = 32;
+const MAX_LOG_ERROR_BYTES: usize = 512;
+
+#[derive(Clone)]
+pub struct GlobalTurnBudget {
+  semaphore: Arc<Semaphore>,
+}
+
+impl GlobalTurnBudget {
+  #[must_use]
+  pub fn new(max_parallel_turns: usize) -> Self {
+    Self {
+      semaphore: Arc::new(Semaphore::new(max_parallel_turns.max(1))),
+    }
+  }
+
+  /// Acquires one global agent-turn slot.
+  ///
+  /// # Errors
+  /// Returns an error when the budget has been closed.
+  pub async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StateError> {
+    Arc::clone(&self.semaphore)
+      .acquire_owned()
+      .await
+      .map_err(|_| StateError::InvalidSchedulerState {
+        reason: "global turn budget is closed".to_owned(),
+      })
+  }
+
+  #[cfg(test)]
+  fn available_permits(&self) -> usize {
+    self.semaphore.available_permits()
+  }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScheduledWorkerConfig {
+  pub run_claims_enabled: bool,
+}
+
+pub struct ScheduledWorkerHandle {
+  shutdown: watch::Sender<bool>,
+  join: Option<JoinHandle<()>>,
+}
+
+impl ScheduledWorkerHandle {
+  /// Stops materialization and new claims, then drains the active scheduled run.
+  pub async fn shutdown(mut self) {
+    let _ = self.shutdown.send(true);
+    let mut join = self.join.take().expect("scheduled worker join is owned");
+    if tokio::time::timeout(SCHEDULER_DRAIN_TIMEOUT, &mut join)
+      .await
+      .is_err()
+    {
+      join.abort();
+      let _ = join.await;
+    }
+  }
+}
+
+impl Drop for ScheduledWorkerHandle {
+  fn drop(&mut self) {
+    let _ = self.shutdown.send(true);
+  }
+}
+
+#[must_use]
+pub fn spawn_scheduled_worker(
+  state: StateStore,
+  budget: GlobalTurnBudget,
+  config: ScheduledWorkerConfig,
+) -> Option<ScheduledWorkerHandle> {
+  if !config.run_claims_enabled {
+    return None;
+  }
+  let (shutdown, shutdown_rx) = watch::channel(false);
+  let orchestrator = ScheduledRunOrchestrator::unavailable(
+    state.clone(),
+    budget,
+    format!("codeoff-scheduler-{}", std::process::id()),
+  );
+  let join = tokio::spawn(run_scheduled_worker(state, orchestrator, shutdown_rx));
+  Some(ScheduledWorkerHandle {
+    shutdown,
+    join: Some(join),
+  })
+}
+
+#[cfg(test)]
+struct ScheduledRunHandle {
+  _shutdown: watch::Sender<bool>,
+  join: JoinHandle<Result<TickOutcome, StateError>>,
+}
+
+#[cfg(test)]
+impl ScheduledRunHandle {
+  #[cfg(test)]
+  async fn join(self) -> Result<TickOutcome, StateError> {
+    self.join.await.map_err(join_error)?
+  }
+}
+
+async fn run_scheduled_worker(
+  state: StateStore,
+  orchestrator: ScheduledRunOrchestrator,
+  shutdown: watch::Receiver<bool>,
+) {
+  loop {
+    if *shutdown.borrow() {
+      return;
+    }
+    let tick = run_scheduled_worker_tick(&state, &orchestrator, shutdown.clone()).await;
+    let delay = if let Err(error) = &tick {
+      eprintln!("scheduled worker tick failed: {}", bounded_log_error(error));
+      SCHEDULER_ERROR_BACKOFF
+    } else {
+      SCHEDULER_TICK_INTERVAL
+    };
+    tokio::select! {
+      () = cancellation_requested(shutdown.clone()) => return,
+      () = tokio::time::sleep(delay) => {}
+    }
+  }
+}
+
+async fn run_scheduled_worker_tick(
+  state: &StateStore,
+  orchestrator: &ScheduledRunOrchestrator,
+  shutdown: watch::Receiver<bool>,
+) -> Result<TickOutcome, StateError> {
+  if *shutdown.borrow() {
+    return Ok(TickOutcome::Cancelled);
+  }
+  if orchestrator.backend.readiness() != ExecutorReadiness::Ready {
+    return Ok(TickOutcome::Unavailable);
+  }
+  let now = orchestrator.clock.now();
+  let due_jobs = tokio::select! {
+    result = state.list_due_scheduled_jobs(now, MATERIALIZATION_BATCH_LIMIT) => result?,
+    () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
+  };
+  for job_id in due_jobs {
+    if *shutdown.borrow() {
+      return Ok(TickOutcome::Cancelled);
+    }
+    let job = tokio::select! {
+      result = state.get_scheduled_job(&job_id) => result?,
+      () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
+    };
+    let Some(job) = job else {
+      continue;
+    };
+    tokio::select! {
+      result = state.materialize_due_schedule(&job_id, job.generation, now) => {
+        result?;
+      },
+      () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
+    }
+  }
+  if *shutdown.borrow() {
+    return Ok(TickOutcome::Cancelled);
+  }
+
+  let supervisor = orchestrator.clone();
+  let (run_shutdown, run_shutdown_rx) = watch::channel(false);
+  let run = supervisor.run_supervised(run_shutdown_rx);
+  tokio::pin!(run);
+  tokio::select! {
+    result = &mut run => result,
+    () = cancellation_requested(shutdown) => {
+      let _ = run_shutdown.send(true);
+      run.await
+    }
+  }
+}
+
+async fn cancellation_requested(mut shutdown: watch::Receiver<bool>) {
+  while !*shutdown.borrow() {
+    if shutdown.changed().await.is_err() {
+      return;
+    }
+  }
+}
+
+fn bounded_log_error(error: &StateError) -> String {
+  let message = error.to_string();
+  if message.len() <= MAX_LOG_ERROR_BYTES {
+    return message;
+  }
+  let mut end = MAX_LOG_ERROR_BYTES;
+  while !message.is_char_boundary(end) {
+    end -= 1;
+  }
+  format!("{}…", &message[..end])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutorReadiness {
@@ -31,6 +229,7 @@ enum ExecutorReadiness {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TickOutcome {
+  Cancelled,
   Unavailable,
   Idle,
   Completed,
@@ -96,6 +295,10 @@ impl SchedulerClock for SystemClock {
   }
 }
 
+#[allow(
+  dead_code,
+  reason = "the production scheduled executor remains unavailable until the trusted issuer checkpoint"
+)]
 struct PrepareInput {
   task: AgentTask,
   authority: ScheduledPrepareAuthority,
@@ -203,6 +406,10 @@ impl PrepareFailure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+  dead_code,
+  reason = "production execution results become reachable with the trusted scheduled executor"
+)]
 enum ExecutionResult {
   Completed { summary: String },
   Interrupted { transport_converged: bool },
@@ -218,41 +425,56 @@ struct ScheduledRunOrchestrator {
   state: StateStore,
   backend: Arc<dyn ScheduledExecutionBackend>,
   clock: Arc<dyn SchedulerClock>,
-  semaphore: Arc<Semaphore>,
+  budget: GlobalTurnBudget,
   lease_owner: String,
   policy: ExecutionPolicy,
 }
 
 impl ScheduledRunOrchestrator {
-  fn unavailable(state: StateStore, parallelism: usize, lease_owner: impl Into<String>) -> Self {
+  fn unavailable(
+    state: StateStore,
+    budget: GlobalTurnBudget,
+    lease_owner: impl Into<String>,
+  ) -> Self {
     Self {
       state,
       backend: Arc::new(UnavailableScheduledExecutionBackend),
       clock: Arc::new(SystemClock),
-      semaphore: Arc::new(Semaphore::new(parallelism.max(1))),
+      budget,
       lease_owner: lease_owner.into(),
       policy: ExecutionPolicy::default(),
     }
   }
 
+  #[cfg(test)]
   async fn run_once(&self) -> Result<TickOutcome, StateError> {
-    let supervisor = self.clone();
-    tokio::spawn(async move { supervisor.run_supervised().await })
-      .await
-      .map_err(join_error)?
+    self.spawn_once().join().await
   }
 
-  async fn run_supervised(self) -> Result<TickOutcome, StateError> {
-    let mut permit = Some(
-      Arc::clone(&self.semaphore)
-        .acquire_owned()
-        .await
-        .map_err(|_| StateError::InvalidSchedulerState {
-          reason: "scheduled execution semaphore is closed".to_owned(),
-        })?,
-    );
+  #[cfg(test)]
+  fn spawn_once(&self) -> ScheduledRunHandle {
+    let supervisor = self.clone();
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let join = tokio::spawn(async move { supervisor.run_supervised(shutdown_rx).await });
+    ScheduledRunHandle {
+      _shutdown: shutdown,
+      join,
+    }
+  }
+
+  async fn run_supervised(
+    self,
+    shutdown: watch::Receiver<bool>,
+  ) -> Result<TickOutcome, StateError> {
+    let mut permit = Some(tokio::select! {
+      result = self.budget.acquire() => result?,
+      () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
+    });
     if self.backend.readiness() != ExecutorReadiness::Ready {
       return Ok(TickOutcome::Unavailable);
+    }
+    if *shutdown.borrow() {
+      return Ok(TickOutcome::Cancelled);
     }
     let total_deadline = tokio::time::Instant::now()
       .checked_add(self.policy.total_timeout)
@@ -272,11 +494,13 @@ impl ScheduledRunOrchestrator {
       })?;
     let now = self.clock.now();
     let lease_expires_at = checked_add(now, self.policy.lease_seconds, "lease expiry")?;
-    let Some(claim) = self
-      .state
-      .claim_next_scheduled_run(&self.lease_owner, now, lease_expires_at)
-      .await?
-    else {
+    let claim = tokio::select! {
+      result = self.state.claim_next_scheduled_run(&self.lease_owner, now, lease_expires_at) => {
+        result?
+      },
+      () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
+    };
+    let Some(claim) = claim else {
       return Ok(TickOutcome::Idle);
     };
 
@@ -315,6 +539,21 @@ impl ScheduledRunOrchestrator {
     let mut prepare = tokio::task::spawn_blocking(move || backend.prepare(input));
     let prepared = tokio::select! {
       biased;
+      () = cancellation_requested(shutdown.clone()) => {
+        cancellation.store(true, Ordering::Release);
+        if tokio::time::timeout(self.policy.prepare_grace, &mut prepare).await.is_err() {
+          let retained_permit = permit.take().expect("scheduled execution permit is held");
+          tokio::spawn(async move {
+            let _ = prepare.await;
+            drop(retained_permit);
+          });
+        }
+        let outcome = self
+          .record_shutdown_preflight(&claim, "scheduler_shutdown_during_prepare")
+          .await;
+        stop_heartbeat(&mut heartbeat).await;
+        return outcome;
+      },
       stop = &mut heartbeat_stop => {
         cancellation.store(true, Ordering::Release);
         if tokio::time::timeout(self.policy.prepare_grace, &mut prepare).await.is_err() {
@@ -368,15 +607,33 @@ impl ScheduledRunOrchestrator {
         }
       };
 
-    let mark_executing = tokio::time::timeout_at(
-      total_deadline,
-      self.state.mark_scheduled_run_executing(
-        &claim.binding,
-        &prepared.attested_profile,
-        self.clock.now(),
-      ),
-    )
-    .await;
+    if *shutdown.borrow() {
+      cancellation.store(true, Ordering::Release);
+      let outcome = self
+        .record_shutdown_preflight(&claim, "scheduler_shutdown_before_execution")
+        .await;
+      stop_heartbeat(&mut heartbeat).await;
+      return outcome;
+    }
+
+    let mark_executing = tokio::select! {
+      result = tokio::time::timeout_at(
+        total_deadline,
+        self.state.mark_scheduled_run_executing(
+          &claim.binding,
+          &prepared.attested_profile,
+          self.clock.now(),
+        ),
+      ) => result,
+      () = cancellation_requested(shutdown.clone()) => {
+        cancellation.store(true, Ordering::Release);
+        let outcome = self
+          .record_shutdown_preflight(&claim, "scheduler_shutdown_before_execution_commit")
+          .await;
+        stop_heartbeat(&mut heartbeat).await;
+        return outcome;
+      },
+    };
     let Ok(mark_executing) = mark_executing else {
       cancellation.store(true, Ordering::Release);
       let outcome = self
@@ -401,6 +658,44 @@ impl ScheduledRunOrchestrator {
       tokio::task::spawn_blocking(move || prepared.execute(execution_cancellation));
     let result = tokio::select! {
       biased;
+      () = cancellation_requested(shutdown) => {
+        cancellation.store(true, Ordering::Release);
+        let result = if let Ok(result) = tokio::time::timeout(
+          self.policy.cancellation_grace,
+          &mut execution,
+        ).await {
+          result.map_err(join_error)?
+        } else {
+          let retained_permit = permit.take().expect("scheduled execution permit is held");
+          tokio::spawn(async move {
+            let _ = execution.await;
+            drop(retained_permit);
+          });
+          ExecutionResult::Interrupted {
+            transport_converged: false,
+          }
+        };
+        let shutdown_terminal_deadline = tokio::time::Instant::now()
+          .checked_add(self.policy.finalization_grace)
+          .ok_or_else(|| StateError::InvalidSchedulerState {
+            reason: "scheduled shutdown terminal deadline overflow".to_owned(),
+          })?;
+        let shutdown_hard_stop_deadline = shutdown_terminal_deadline
+          .checked_add(self.policy.finalization_grace)
+          .ok_or_else(|| StateError::InvalidSchedulerState {
+            reason: "scheduled shutdown hard-stop deadline overflow".to_owned(),
+          })?;
+        let outcome = self
+          .commit_execution_result_bounded(
+            &claim,
+            result,
+            shutdown_terminal_deadline,
+            shutdown_hard_stop_deadline,
+          )
+          .await;
+        stop_heartbeat(&mut heartbeat).await;
+        return outcome;
+      },
       stop = &mut heartbeat_stop => {
         cancellation.store(true, Ordering::Release);
         if tokio::time::timeout(self.policy.cancellation_grace, &mut execution).await.is_err() {
@@ -543,6 +838,22 @@ impl ScheduledRunOrchestrator {
         Ok(TickOutcome::LostLease)
       }
       Err(error) => Err(error),
+    }
+  }
+
+  async fn record_shutdown_preflight(
+    &self,
+    claim: &ClaimedScheduledRun,
+    message: &'static str,
+  ) -> Result<TickOutcome, StateError> {
+    match tokio::time::timeout(
+      self.policy.finalization_grace,
+      self.record_preflight_failure(claim, PrepareFailure::fatal(message)),
+    )
+    .await
+    {
+      Ok(outcome) => outcome,
+      Err(_) => Ok(TickOutcome::Cancelled),
     }
   }
 
@@ -995,38 +1306,7 @@ mod tests {
       .await
       .expect("state");
     for (job_id, scheduled_for) in job_ids {
-      let principal = PrincipalKey::new("user", "test", "tenant", "owner").expect("principal");
-      store
-        .create_scheduled_job(&CreateScheduledJob {
-          job_id: (*job_id).to_owned(),
-          schedule_id: format!("schedule-{job_id}"),
-          definition: ScheduledJobDefinition::new(
-            1,
-            format!(
-              r#"{{"instruction":"execute {job_id}","previous_success":{{"kind":"none"}},"schema_version":1}}"#
-            ),
-          )
-          .expect("definition"),
-          creator: principal.clone(),
-          owner: principal,
-          capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("capability"),
-          targets: vec![DeliveryTargetSnapshot::new(
-            format!("target-{job_id}"),
-            "none",
-            "none",
-            "tenant",
-            "none",
-            "{}",
-            1,
-            "resolver-v1",
-            TARGET_IDENTITY,
-          )
-          .expect("target")],
-          schedule: ScheduleSpec::once(*scheduled_for),
-          now: 100,
-        })
-        .await
-        .expect("create job");
+      create_job(&store, job_id, *scheduled_for).await;
       assert!(matches!(
         store
           .materialize_due_schedule(job_id, 0, *scheduled_for)
@@ -1036,6 +1316,41 @@ mod tests {
       ));
     }
     (temp, store)
+  }
+
+  async fn create_job(store: &StateStore, job_id: &str, scheduled_for: i64) {
+    let principal = PrincipalKey::new("user", "test", "tenant", "owner").expect("principal");
+    store
+      .create_scheduled_job(&CreateScheduledJob {
+        job_id: job_id.to_owned(),
+        schedule_id: format!("schedule-{job_id}"),
+        definition: ScheduledJobDefinition::new(
+          1,
+          format!(
+            r#"{{"instruction":"execute {job_id}","previous_success":{{"kind":"none"}},"schema_version":1}}"#
+          ),
+        )
+        .expect("definition"),
+        creator: principal.clone(),
+        owner: principal,
+        capability: CapabilityProfileSnapshot::new(1, "profile", "{}").expect("capability"),
+        targets: vec![DeliveryTargetSnapshot::new(
+          format!("target-{job_id}"),
+          "none",
+          "none",
+          "tenant",
+          "none",
+          "{}",
+          1,
+          "resolver-v1",
+          TARGET_IDENTITY,
+        )
+        .expect("target")],
+        schedule: ScheduleSpec::once(scheduled_for),
+        now: 100,
+      })
+      .await
+      .expect("create job");
   }
 
   fn orchestrator(
@@ -1048,7 +1363,7 @@ mod tests {
       state,
       backend,
       clock,
-      semaphore: Arc::new(Semaphore::new(parallelism)),
+      budget: GlobalTurnBudget::new(parallelism),
       lease_owner: "runtime-test".to_owned(),
       policy: ExecutionPolicy {
         lease_seconds: 20,
@@ -1067,7 +1382,11 @@ mod tests {
   #[tokio::test]
   async fn test_unavailable_readiness_produces_zero_claims() {
     let (_temp, state) = fixture(&[("unavailable", 110)]).await;
-    let runtime = ScheduledRunOrchestrator::unavailable(state.clone(), 1, "runtime-test");
+    let runtime = ScheduledRunOrchestrator::unavailable(
+      state.clone(),
+      GlobalTurnBudget::new(1),
+      "runtime-test",
+    );
     assert_eq!(
       runtime.run_once().await.expect("tick"),
       TickOutcome::Unavailable
@@ -1078,6 +1397,174 @@ mod tests {
       .expect("claim proof")
       .expect("run remained pending");
     assert_eq!(claim.binding.attempt(), 1);
+  }
+
+  #[tokio::test]
+  async fn test_worker_disabled_and_unavailable_are_fail_closed_before_materialization() {
+    let temp = tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    create_job(&state, "fail-closed-worker", 110).await;
+
+    assert!(
+      spawn_scheduled_worker(
+        state.clone(),
+        GlobalTurnBudget::new(1),
+        ScheduledWorkerConfig::default(),
+      )
+      .is_none()
+    );
+    let worker = spawn_scheduled_worker(
+      state.clone(),
+      GlobalTurnBudget::new(1),
+      ScheduledWorkerConfig {
+        run_claims_enabled: true,
+      },
+    )
+    .expect("enabled worker");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    worker.shutdown().await;
+
+    assert_eq!(
+      state
+        .list_due_scheduled_jobs(111, 10)
+        .await
+        .expect("due jobs"),
+      ["fail-closed-worker"]
+    );
+    assert!(matches!(
+      state
+        .materialize_due_schedule("fail-closed-worker", 0, 111)
+        .await
+        .expect("materialize proof"),
+      MaterializationOutcome::Created(_)
+    ));
+    let claim = state
+      .claim_next_scheduled_run("proof", 111, 130)
+      .await
+      .expect("claim proof")
+      .expect("unavailable worker left run unclaimed");
+    assert_eq!(claim.binding.attempt(), 1);
+  }
+
+  #[tokio::test]
+  async fn test_worker_materializes_executes_and_drains_without_channel_context() {
+    let temp = tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    create_job(&state, "no-slack-worker", 110).await;
+    let backend = Arc::new(FakeBackend::new(ExecutionResult::Completed {
+      summary: "scheduled result".to_owned(),
+    }));
+    let runtime = orchestrator(
+      state.clone(),
+      backend.clone(),
+      Arc::new(TestClock(AtomicI64::new(111), 1)),
+      1,
+    );
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let worker = tokio::spawn(run_scheduled_worker(state, runtime, shutdown_rx));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+      while backend.seen.lock().expect("seen tasks").is_empty() {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("scheduled execution");
+    shutdown.send(true).expect("stop worker");
+    tokio::time::timeout(Duration::from_secs(1), worker)
+      .await
+      .expect("bounded drain")
+      .expect("worker join");
+
+    let tasks = backend.seen.lock().expect("seen tasks");
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].channel.is_none());
+    assert!(tasks[0].feedback_target.is_none());
+  }
+
+  #[tokio::test]
+  async fn test_worker_shutdown_cancels_active_run_before_any_new_materialization() {
+    let temp = tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    create_job(&state, "active-at-shutdown", 110).await;
+    let mut backend = FakeBackend::new(ExecutionResult::Interrupted {
+      transport_converged: false,
+    });
+    backend.execution_delay = Duration::from_secs(1);
+    let backend = Arc::new(backend);
+    let runtime = orchestrator(
+      state.clone(),
+      backend.clone(),
+      Arc::new(TestClock(AtomicI64::new(111), 1)),
+      1,
+    );
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let worker = tokio::spawn(run_scheduled_worker(state.clone(), runtime, shutdown_rx));
+    tokio::time::timeout(Duration::from_secs(1), async {
+      while backend.active.load(Ordering::Acquire) == 0 {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("active execution");
+
+    shutdown.send(true).expect("stop worker");
+    create_job(&state, "created-after-shutdown", 110).await;
+    tokio::time::timeout(Duration::from_secs(1), worker)
+      .await
+      .expect("bounded drain")
+      .expect("worker join");
+
+    assert_eq!(backend.active.load(Ordering::Acquire), 0);
+    assert_eq!(
+      state
+        .list_due_scheduled_jobs(111, 10)
+        .await
+        .expect("due jobs after shutdown"),
+      ["created-after-shutdown"]
+    );
+  }
+
+  #[tokio::test]
+  async fn test_shared_global_budget_blocks_scheduled_execution_behind_channel_turn() {
+    let (_temp, state) = fixture(&[("shared-budget", 110)]).await;
+    let backend = Arc::new(FakeBackend::new(ExecutionResult::Completed {
+      summary: "done".to_owned(),
+    }));
+    let budget = GlobalTurnBudget::new(1);
+    let channel_permit = budget.acquire().await.expect("channel permit");
+    let runtime = Arc::new(ScheduledRunOrchestrator {
+      state,
+      backend: backend.clone(),
+      clock: Arc::new(TestClock(AtomicI64::new(111), 1)),
+      budget: budget.clone(),
+      lease_owner: "runtime-test".to_owned(),
+      policy: ExecutionPolicy::default(),
+    });
+    let scheduled = {
+      let runtime = runtime.clone();
+      tokio::spawn(async move { runtime.run_once().await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(backend.seen.lock().expect("seen tasks").is_empty());
+    assert_eq!(budget.available_permits(), 0);
+
+    drop(channel_permit);
+    assert_eq!(
+      scheduled
+        .await
+        .expect("scheduled join")
+        .expect("scheduled tick"),
+      TickOutcome::Completed
+    );
+    assert_eq!(backend.max_active.load(Ordering::Acquire), 1);
+    assert_eq!(budget.available_permits(), 1);
   }
 
   #[tokio::test]
@@ -1414,9 +1901,9 @@ mod tests {
     runtime.policy.total_timeout = Duration::from_millis(50);
     runtime.policy.prepare_grace = Duration::from_millis(5);
     assert_eq!(runtime.run_once().await.expect("tick"), TickOutcome::Failed);
-    assert_eq!(runtime.semaphore.available_permits(), 0);
+    assert_eq!(runtime.budget.available_permits(), 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(runtime.semaphore.available_permits(), 1);
+    assert_eq!(runtime.budget.available_permits(), 1);
   }
 
   #[tokio::test]
@@ -1436,7 +1923,7 @@ mod tests {
     runtime.policy.total_timeout = Duration::from_millis(50);
     runtime.policy.cancellation_grace = Duration::from_millis(5);
     assert_eq!(runtime.run_once().await.expect("tick"), TickOutcome::Failed);
-    assert_eq!(runtime.semaphore.available_permits(), 0);
+    assert_eq!(runtime.budget.available_permits(), 0);
     assert!(
       state
         .claim_next_scheduled_run("proof", 112, 140)
@@ -1446,7 +1933,7 @@ mod tests {
       "unknown execution must not be retried"
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(runtime.semaphore.available_permits(), 1);
+    assert_eq!(runtime.budget.available_permits(), 1);
   }
 
   #[tokio::test]

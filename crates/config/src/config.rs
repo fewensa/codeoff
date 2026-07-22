@@ -62,11 +62,18 @@ pub struct CodeoffConfig {
   pub state: StateConfig,
   pub database: DatabaseConfig,
   pub data_retention: DataRetentionConfig,
+  pub scheduler: SchedulerRuntimeConfig,
   pub slack: SlackConfig,
   pub agent: AgentConfig,
   pub mcp: McpConfig,
   #[serde(skip)]
   database_driver: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct SchedulerRuntimeConfig {
+  pub run_claims_enabled: bool,
 }
 
 impl CodeoffConfig {

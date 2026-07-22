@@ -45,6 +45,7 @@ use codeoff_runtime::{
     VerifiedSlackTargetResolver,
   },
   schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler},
+  scheduled_execution::{GlobalTurnBudget, ScheduledWorkerConfig, spawn_scheduled_worker},
 };
 use codeoff_state::{RetentionPolicy, StateError, StateStore};
 
@@ -405,6 +406,14 @@ impl ChannelContextProvider for ServeDispatchContextProvider {
 
 async fn run_serve_loops(config: CodeoffConfig, state: StateStore) -> Result<(), Box<dyn Error>> {
   let tick_limit = serve_tick_limit();
+  let turn_budget = GlobalTurnBudget::new(config.agent.codex_app_server.max_parallel_turns);
+  let scheduled_worker = spawn_scheduled_worker(
+    state.clone(),
+    turn_budget.clone(),
+    ScheduledWorkerConfig {
+      run_claims_enabled: config.scheduler.run_claims_enabled,
+    },
+  );
   if tick_limit.is_none() {
     maybe_spawn_slack_intake_loop(&config, state.clone());
     maybe_spawn_retention_cleanup_loop(&config, state.clone());
@@ -435,43 +444,56 @@ async fn run_serve_loops(config: CodeoffConfig, state: StateStore) -> Result<(),
         state.clone(),
         processing_streams,
         channel_dispatch_worker_count(&config),
+        turn_budget,
       );
     }
-    return run_slack_delivery_loop(delivery.as_ref()).await;
+    let result = run_slack_delivery_loop(delivery.as_ref()).await;
+    if let Some(worker) = scheduled_worker {
+      worker.shutdown().await;
+    }
+    return result;
   }
 
-  let mut ticks = 0_u64;
+  let result: Result<(), Box<dyn Error>> = async {
+    let mut ticks = 0_u64;
 
-  loop {
-    if let Some(limit) = tick_limit {
-      if ticks >= limit {
-        break;
+    loop {
+      if let Some(limit) = tick_limit {
+        if ticks >= limit {
+          break;
+        }
+      }
+      ticks = ticks.saturating_add(1);
+      let dispatched = match backend.as_ref() {
+        Some(backend) => {
+          let _permit = turn_budget.acquire().await?;
+          run_channel_dispatch_tick(
+            &state,
+            backend,
+            &processing_streams,
+            &dispatch_context_provider,
+            config.slack.recent_message_limit,
+            None,
+          )
+          .await?
+        }
+        None => false,
+      };
+      let delivered = match delivery.as_ref() {
+        Some(delivery) => run_slack_delivery_tick(delivery).await?,
+        None => false,
+      };
+      if !dispatched && !delivered {
+        tokio::time::sleep(Duration::from_millis(250)).await;
       }
     }
-    ticks = ticks.saturating_add(1);
-    let dispatched = match backend.as_ref() {
-      Some(backend) => {
-        run_channel_dispatch_tick(
-          &state,
-          backend,
-          &processing_streams,
-          &dispatch_context_provider,
-          config.slack.recent_message_limit,
-          None,
-        )
-        .await?
-      }
-      None => false,
-    };
-    let delivered = match delivery.as_ref() {
-      Some(delivery) => run_slack_delivery_tick(delivery).await?,
-      None => false,
-    };
-    if !dispatched && !delivered {
-      tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+    Ok(())
   }
-  Ok(())
+  .await;
+  if let Some(worker) = scheduled_worker {
+    worker.shutdown().await;
+  }
+  result
 }
 
 fn should_spawn_background_dispatch_loop(tick_limit: Option<u64>, has_backend: bool) -> bool {
@@ -585,6 +607,7 @@ fn spawn_channel_dispatch_loops(
   state: StateStore,
   processing_streams: ServeProcessingStreamManager,
   worker_count: usize,
+  turn_budget: GlobalTurnBudget,
 ) {
   let locks = ConversationDispatchLocks::default();
   for _ in 0..worker_count.max(1) {
@@ -592,6 +615,7 @@ fn spawn_channel_dispatch_loops(
     let state = state.clone();
     let processing_streams = processing_streams.clone();
     let locks = locks.clone();
+    let turn_budget = turn_budget.clone();
     let assistant_status = build_assistant_status_controller(&config);
     let slack_streams = build_slack_codex_stream_controller(&config, assistant_status.clone());
     let Ok(backend) = build_serve_codex_app_server_backend(
@@ -619,6 +643,7 @@ fn spawn_channel_dispatch_loops(
           context_provider.clone(),
           context_limit,
           Some(locks.clone()),
+          turn_budget.clone(),
         )
         .await
         {
@@ -2235,12 +2260,18 @@ async fn run_channel_dispatch_tick_on_blocking_pool<B>(
   context_provider: ServeDispatchContextProvider,
   context_limit: u16,
   conversation_locks: Option<ConversationDispatchLocks>,
+  turn_budget: GlobalTurnBudget,
 ) -> Result<bool, Box<dyn Error + Send + Sync>>
 where
   B: codeoff_agent_contract::AgentBackend + Send + 'static,
 {
+  let permit = turn_budget
+    .acquire()
+    .await
+    .map_err(|error| -> Box<dyn Error + Send + Sync> { Box::new(error) })?;
   let handle = tokio::runtime::Handle::current();
   tokio::task::spawn_blocking(move || {
+    let _permit = permit;
     handle.block_on(async move {
       run_channel_dispatch_tick(
         &state,
@@ -3875,6 +3906,8 @@ mod tests {
       let processing_streams = ServeProcessingStreamManager::Unavailable {
         state_manager: StateProcessingStreamManager::new(state.clone()),
       };
+      let turn_budget = GlobalTurnBudget::new(1);
+      let scheduled_permit = turn_budget.acquire().await.expect("scheduled permit");
       let dispatch = run_channel_dispatch_tick_on_blocking_pool(
         state,
         SlowBackend {
@@ -3887,8 +3920,16 @@ mod tests {
         ),
         config.slack.recent_message_limit,
         None,
+        turn_budget,
       );
       tokio::pin!(dispatch);
+
+      tokio::select! {
+        () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        result = &mut dispatch => panic!("dispatch bypassed global budget: {result:?}"),
+      }
+      assert!(!started.load(Ordering::SeqCst));
+      drop(scheduled_permit);
 
       for _ in 0..20 {
         if started.load(Ordering::SeqCst) {

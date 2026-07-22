@@ -16,11 +16,7 @@ mod schedule_contract;
 mod schedule_resolution;
 pub mod schedule_service;
 pub mod schedule_tools;
-#[allow(
-  dead_code,
-  reason = "wired into the process lifecycle in the next scheduler checkpoint"
-)]
-mod scheduled_execution;
+pub mod scheduled_execution;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};

@@ -309,6 +309,9 @@ fn test_serve_non_check_reports_wired_loops_without_skeleton_status() {
 enabled = true
 transport = "tcp"
 bind = "127.0.0.1:0"
+
+[scheduler]
+run_claims_enabled = true
 "#,
   )
   .expect("write config");

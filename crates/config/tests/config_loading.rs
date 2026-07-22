@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use codeoff_config::{
   CodeoffConfig, ConfigError, ConfigLoadOptions, DataRetentionConfig, DatabaseConfig,
-  SlackDirectMessageFeedbackMode, SlackResponseFeedbackMode,
+  SchedulerRuntimeConfig, SlackDirectMessageFeedbackMode, SlackResponseFeedbackMode,
 };
 use tempfile::tempdir;
 
@@ -160,6 +160,32 @@ artifact_days = 10
       artifact_days: 10,
     }
   );
+}
+
+#[test]
+fn test_scheduler_run_claims_default_off_and_loads_explicit_opt_in() {
+  assert_eq!(
+    CodeoffConfig::default().scheduler,
+    SchedulerRuntimeConfig {
+      run_claims_enabled: false,
+    }
+  );
+
+  let dir = tempdir().expect("create tempdir");
+  let config_path = dir.path().join("codeoff.toml");
+  fs::write(
+    &config_path,
+    r"
+[scheduler]
+run_claims_enabled = true
+",
+  )
+  .expect("write config");
+
+  let loaded =
+    CodeoffConfig::load(ConfigLoadOptions::new().config_path(config_path)).expect("load config");
+
+  assert!(loaded.scheduler.run_claims_enabled);
 }
 
 #[test]

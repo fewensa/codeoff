@@ -4,6 +4,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use codeoff_agent_codex::{
+  BuiltScheduledCodexExecutor, PreparedScheduledCodexExecution, RequestedCapabilityProfile,
+  ScheduledCodexExecution, ScheduledCodexRequest, ScheduledExecutionResult, ScheduledFailure,
+  ScheduledFailureKind,
+};
 use codeoff_agent_contract::{
   AgentTask, InvocationPrincipal, InvocationSource, PreviousSuccessContext, SessionMode, ToolPolicy,
 };
@@ -116,6 +121,25 @@ pub enum ScheduledWorkerShutdown {
   NonClean,
 }
 
+#[derive(Clone)]
+pub struct ScheduledExecutor {
+  backend: Arc<dyn ScheduledExecutionBackend>,
+}
+
+impl ScheduledExecutor {
+  #[must_use]
+  pub fn codex(built: BuiltScheduledCodexExecutor, config: ScheduledWorkerConfig) -> Self {
+    Self {
+      backend: Arc::new(CodexScheduledExecutionBackend::new(built, config)),
+    }
+  }
+
+  #[must_use]
+  pub fn is_ready(&self) -> bool {
+    self.backend.readiness() == ExecutorReadiness::Ready
+  }
+}
+
 impl ScheduledWorkerHandle {
   /// Stops materialization and prevents new scheduled-run claims.
   pub fn request_shutdown(&self) {
@@ -154,20 +178,33 @@ impl Drop for ScheduledWorkerHandle {
   }
 }
 
-#[must_use]
 pub fn spawn_scheduled_worker(
   state: StateStore,
   budget: GlobalTurnBudget,
   config: ScheduledWorkerConfig,
+  executor: Option<ScheduledExecutor>,
   telemetry: Arc<dyn SchedulerTelemetry>,
-) -> Option<ScheduledWorkerHandle> {
+) -> Result<Option<ScheduledWorkerHandle>, StateError> {
   if !config.enabled {
-    return None;
+    return Ok(None);
+  }
+  if config.run_claims_enabled
+    && executor
+      .as_ref()
+      .is_none_or(|executor| !executor.is_ready())
+  {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled run claims require a validated executor".to_owned(),
+    });
   }
   let (shutdown, shutdown_rx) = watch::channel(false);
   let guardians = Arc::new(BlockingGuardianRegistry::default());
-  let mut orchestrator = ScheduledRunOrchestrator::unavailable(
+  let mut orchestrator = ScheduledRunOrchestrator::new(
     state.clone(),
+    executor.map_or_else(
+      || Arc::new(UnavailableScheduledExecutionBackend) as Arc<dyn ScheduledExecutionBackend>,
+      |executor| executor.backend,
+    ),
     budget,
     Arc::clone(&guardians),
     format!("codeoff-scheduler-{}", std::process::id()),
@@ -181,12 +218,12 @@ pub fn spawn_scheduled_worker(
     shutdown_rx,
     telemetry,
   ));
-  Some(ScheduledWorkerHandle {
+  Ok(Some(ScheduledWorkerHandle {
     shutdown,
     join: Some(join),
     guardians,
     worker_failed: false,
-  })
+  }))
 }
 
 #[derive(Default)]
@@ -558,6 +595,135 @@ impl ScheduledExecutionBackend for UnavailableScheduledExecutionBackend {
   }
 }
 
+struct CodexScheduledExecutionBackend {
+  executor: Arc<dyn ScheduledCodexExecution>,
+  profile: RequestedCapabilityProfile,
+  timeout: Duration,
+  interrupt_grace: Duration,
+  terminate_grace: Duration,
+  kill_grace: Duration,
+}
+
+impl CodexScheduledExecutionBackend {
+  fn new(built: BuiltScheduledCodexExecutor, config: ScheduledWorkerConfig) -> Self {
+    let cancellation_grace = Duration::from_millis(config.cancellation_grace_ms);
+    let third = cancellation_grace / 3;
+    Self {
+      executor: built.executor,
+      profile: built.profile,
+      timeout: Duration::from_secs(u64::from(config.total_timeout_seconds)),
+      interrupt_grace: third,
+      terminate_grace: third,
+      kill_grace: cancellation_grace
+        .saturating_sub(third)
+        .saturating_sub(third),
+    }
+  }
+}
+
+impl ScheduledExecutionBackend for CodexScheduledExecutionBackend {
+  fn readiness(&self) -> ExecutorReadiness {
+    ExecutorReadiness::Ready
+  }
+
+  fn prepare(&self, input: PrepareInput) -> Result<BackendPrepared, PrepareFailure> {
+    let authority = input.authority;
+    let request = ScheduledCodexRequest {
+      task: input.task,
+      profile: self.profile.clone(),
+      cancellation: input.cancellation,
+      timeout: self.timeout,
+      interrupt_grace: self.interrupt_grace,
+      terminate_grace: self.terminate_grace,
+      kill_grace: self.kill_grace,
+    };
+    let prepared = self.executor.prepare(request).map_err(prepare_failure)?;
+    let capability_profile = prepared.attested_profile().canonical_json();
+    let attested_profile_json = authority
+      .recovery_attestation_json(&capability_profile)
+      .map_err(|error| PrepareFailure::fatal(error.to_string()))?;
+    let attested_profile_digest = sha256_hex(attested_profile_json.as_bytes());
+    Ok(BackendPrepared {
+      authority_digest: authority.digest().to_owned(),
+      authority,
+      attested_profile_json,
+      attested_profile_digest,
+      execution: Box::new(CodexPreparedExecution(prepared)),
+    })
+  }
+}
+
+struct CodexPreparedExecution(Box<dyn PreparedScheduledCodexExecution>);
+
+impl PreparedExecution for CodexPreparedExecution {
+  fn execute(self: Box<Self>, _cancellation: Arc<AtomicBool>) -> ExecutionResult {
+    match self.0.execute() {
+      ScheduledExecutionResult::Completed { output, .. } => ExecutionResult::Completed {
+        summary: output.summary,
+      },
+      ScheduledExecutionResult::Interrupted { .. } => ExecutionResult::Interrupted {
+        transport_converged: true,
+      },
+      ScheduledExecutionResult::TransportLost(failure) => ExecutionResult::TransportLost {
+        message: failure.message,
+      },
+      ScheduledExecutionResult::Failed(failure)
+      | ScheduledExecutionResult::PreflightRejected(failure) => execution_failure(failure),
+    }
+  }
+}
+
+fn prepare_failure(result: ScheduledExecutionResult) -> PrepareFailure {
+  let failure = match result {
+    ScheduledExecutionResult::Failed(failure)
+    | ScheduledExecutionResult::TransportLost(failure)
+    | ScheduledExecutionResult::PreflightRejected(failure) => failure,
+    ScheduledExecutionResult::Interrupted { .. } => {
+      return PrepareFailure::fatal("scheduled_prepare_interrupted");
+    }
+    ScheduledExecutionResult::Completed { .. } => {
+      return PrepareFailure::fatal("scheduled_prepare_completed_without_execution");
+    }
+  };
+  PrepareFailure {
+    retryable: failure.kind == ScheduledFailureKind::Transport,
+    kind: scheduled_failure_kind(failure.kind).to_owned(),
+    message: failure.message,
+  }
+}
+
+fn execution_failure(failure: ScheduledFailure) -> ExecutionResult {
+  match failure.kind {
+    ScheduledFailureKind::TimedOut => ExecutionResult::TimedOut {
+      transport_converged: true,
+    },
+    ScheduledFailureKind::Interrupted => ExecutionResult::Interrupted {
+      transport_converged: true,
+    },
+    ScheduledFailureKind::Transport => ExecutionResult::TransportLost {
+      message: failure.message,
+    },
+    kind => ExecutionResult::Failed {
+      kind: scheduled_failure_kind(kind).to_owned(),
+      message: failure.message,
+    },
+  }
+}
+
+const fn scheduled_failure_kind(kind: ScheduledFailureKind) -> &'static str {
+  match kind {
+    ScheduledFailureKind::InvalidRequest => "invalid_request",
+    ScheduledFailureKind::ProtocolIncompatible => "protocol_incompatible",
+    ScheduledFailureKind::CapabilityMismatch => "capability_mismatch",
+    ScheduledFailureKind::CredentialIsolationUnproven => "credential_isolation_unproven",
+    ScheduledFailureKind::OutputSchemaViolation => "output_schema_violation",
+    ScheduledFailureKind::TurnFailed => "turn_failed",
+    ScheduledFailureKind::TimedOut => "timed_out",
+    ScheduledFailureKind::Interrupted => "interrupted",
+    ScheduledFailureKind::Transport => "transport",
+  }
+}
+
 struct PreparedRun {
   authority: ScheduledPrepareAuthority,
   attested_profile: AttestedExecutionProfileSnapshot,
@@ -573,20 +739,31 @@ impl PreparedRun {
       .map_err(|error| PrepareFailure::fatal(error.to_string()))?;
     let canonical_profile =
       serde_json::to_string(&profile).map_err(|error| PrepareFailure::fatal(error.to_string()))?;
-    if prepared.authority != *expected_authority
-      || prepared.authority_digest != expected_authority.digest()
-      || !expected_authority.attestation_matches(
+    let schema_version = profile
+      .get("schema_version")
+      .and_then(Value::as_u64)
+      .and_then(|value| u32::try_from(value).ok())
+      .ok_or_else(|| PrepareFailure::fatal("scheduled_attested_profile_schema_missing"))?;
+    let authority_matches = match schema_version {
+      1 => expected_authority.attestation_matches(
         &canonical_profile,
         &prepared.attested_profile_digest,
         false,
-      )
+      ),
+      2 => expected_authority
+        .recovery_attestation_matches(&canonical_profile, &prepared.attested_profile_digest),
+      _ => false,
+    };
+    if prepared.authority != *expected_authority
+      || prepared.authority_digest != expected_authority.digest()
+      || !authority_matches
     {
       return Err(PrepareFailure::fatal(
         "scheduled_attested_profile_authority_mismatch",
       ));
     }
     let attested_profile = AttestedExecutionProfileSnapshot::new(
-      1,
+      schema_version,
       canonical_profile,
       "sha256-v1",
       prepared.attested_profile_digest,
@@ -654,15 +831,16 @@ struct ScheduledRunOrchestrator {
 }
 
 impl ScheduledRunOrchestrator {
-  fn unavailable(
+  fn new(
     state: StateStore,
+    backend: Arc<dyn ScheduledExecutionBackend>,
     budget: GlobalTurnBudget,
     guardians: Arc<BlockingGuardianRegistry>,
     lease_owner: impl Into<String>,
   ) -> Self {
     Self {
       state,
-      backend: Arc::new(UnavailableScheduledExecutionBackend),
+      backend,
       clock: Arc::new(SystemClock),
       budget,
       guardians,
@@ -671,6 +849,22 @@ impl ScheduledRunOrchestrator {
       policy: ExecutionPolicy::default(),
       telemetry: Arc::new(NoopSchedulerTelemetry),
     }
+  }
+
+  #[cfg(test)]
+  fn unavailable(
+    state: StateStore,
+    budget: GlobalTurnBudget,
+    guardians: Arc<BlockingGuardianRegistry>,
+    lease_owner: impl Into<String>,
+  ) -> Self {
+    Self::new(
+      state,
+      Arc::new(UnavailableScheduledExecutionBackend),
+      budget,
+      guardians,
+      lease_owner,
+    )
   }
 
   #[cfg(test)]
@@ -1414,6 +1608,7 @@ fn sha256_hex(value: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+  use std::collections::BTreeSet;
   use std::sync::Barrier;
   use std::sync::Mutex;
   use std::sync::atomic::{AtomicI64, AtomicUsize};
@@ -1437,6 +1632,91 @@ mod tests {
     fn record(&self, event: SchedulerTelemetryEvent) {
       self.events.lock().expect("telemetry events").push(event);
     }
+  }
+
+  struct AttestingCodexExecutor {
+    seen: Arc<Mutex<Vec<AgentTask>>>,
+    profile: codeoff_agent_codex::AttestedCapabilityProfile,
+  }
+
+  impl ScheduledCodexExecution for AttestingCodexExecutor {
+    fn prepare(
+      &self,
+      request: ScheduledCodexRequest,
+    ) -> Result<Box<dyn PreparedScheduledCodexExecution>, ScheduledExecutionResult> {
+      self.seen.lock().expect("seen tasks").push(request.task);
+      Ok(Box::new(AttestingCodexPrepared(self.profile.clone())))
+    }
+  }
+
+  struct AttestingCodexPrepared(codeoff_agent_codex::AttestedCapabilityProfile);
+
+  impl PreparedScheduledCodexExecution for AttestingCodexPrepared {
+    fn attested_profile(&self) -> &codeoff_agent_codex::AttestedCapabilityProfile {
+      &self.0
+    }
+
+    fn execute(self: Box<Self>) -> ScheduledExecutionResult {
+      ScheduledExecutionResult::Completed {
+        output: codeoff_agent_codex::ScheduledFinalOutput {
+          schema_version: 1,
+          summary: "scheduled result".to_owned(),
+        },
+        thread_id: "thread-1".to_owned(),
+        turn_id: "turn-1".to_owned(),
+        usage: codeoff_agent_codex::ScheduledUsage::default(),
+        attested_profile: Box::new(self.0.clone()),
+      }
+    }
+  }
+
+  fn test_requested_codex_profile() -> RequestedCapabilityProfile {
+    RequestedCapabilityProfile {
+      codex_program: "/opt/codeoff/codex".into(),
+      codex_program_sha256: "a".repeat(64),
+      codex_home: "/var/lib/codeoff/codex-home".into(),
+      cwd: "/work/scheduled".into(),
+      github_mcp_url: "http://127.0.0.1:8090/mcp".to_owned(),
+      github_mcp_artifact_sha256: "b".repeat(64),
+      github_mcp_endpoint_identity: "github-readonly-sidecar".to_owned(),
+      credential_reference: "github-readonly-service-account".to_owned(),
+      permission_policy_revision: "scheduled-read-only-v1".to_owned(),
+      config_revision: "scheduled-codex-v1".to_owned(),
+      config_sha256: "c".repeat(64),
+    }
+  }
+
+  fn test_attested_codex_profile() -> codeoff_agent_codex::AttestedCapabilityProfile {
+    let mut profile = codeoff_agent_codex::AttestedCapabilityProfile {
+      codex_version: "0.144.6".to_owned(),
+      app_server_schema_sha256: "a".repeat(64),
+      codex_program_sha256: "b".repeat(64),
+      github_mcp_version: "1.0.0".to_owned(),
+      github_mcp_artifact_sha256: "c".repeat(64),
+      github_mcp_endpoint_identity: "github-readonly-sidecar".to_owned(),
+      github_tools: BTreeSet::from([
+        "issue_read".to_owned(),
+        "list_issues".to_owned(),
+        "search_issues".to_owned(),
+        "search_orgs".to_owned(),
+      ]),
+      credential_reference: "github-readonly-service-account".to_owned(),
+      permission_policy_revision: "scheduled-read-only-v1".to_owned(),
+      config_revision: "scheduled-codex-v1".to_owned(),
+      config_sha256: "d".repeat(64),
+      credential_isolation_revision: "deployment-isolation-v1".to_owned(),
+      credential_deny_policy_revision: "credential-deny-v1".to_owned(),
+      negative_test_revision: "negative-tests-v1".to_owned(),
+      output_schema_revision: "scheduled-output-v1".to_owned(),
+      attested_at_unix_seconds: 1,
+      profile_sha256: String::new(),
+    };
+    let value: Value = serde_json::from_str(&profile.canonical_json()).expect("profile json");
+    let mut digest_profile = value.as_object().expect("profile object").clone();
+    digest_profile.remove("attested_at_unix_seconds");
+    digest_profile.remove("profile_sha256");
+    profile.profile_sha256 = sha256_hex(Value::Object(digest_profile).to_string().as_bytes());
+    profile
   }
 
   #[test]
@@ -1662,6 +1942,59 @@ mod tests {
       .expect("create job");
   }
 
+  #[tokio::test]
+  async fn test_codex_adapter_prepares_v2_attestation_without_channel_context() {
+    let (_temp, state) = fixture(&[("codex-adapter", 110)]).await;
+    let claim = state
+      .claim_next_scheduled_run("codex-adapter-worker", 111, 130)
+      .await
+      .expect("claim")
+      .expect("scheduled run");
+    let authority =
+      ScheduledPrepareAuthority::for_claim(&claim, "a".repeat(64)).expect("prepare authority");
+    let task = task_from_claim(&claim, &authority).expect("scheduled task");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let backend = CodexScheduledExecutionBackend::new(
+      BuiltScheduledCodexExecutor {
+        profile: test_requested_codex_profile(),
+        executor: Arc::new(AttestingCodexExecutor {
+          seen: Arc::clone(&seen),
+          profile: test_attested_codex_profile(),
+        }),
+      },
+      ScheduledWorkerConfig::default(),
+    );
+    let prepared = backend
+      .prepare(PrepareInput {
+        task,
+        authority: authority.clone(),
+        definition_json: claim.definition_json.clone(),
+        capability_json: claim.capability_json.clone(),
+        capability_digest: claim.capability_digest.clone(),
+        targets_json: claim.targets_json.clone(),
+        cancellation: Arc::new(AtomicBool::new(false)),
+      })
+      .expect("prepare adapter");
+
+    let profile: Value =
+      serde_json::from_str(&prepared.attested_profile_json).expect("attestation json");
+    assert_eq!(profile["schema_version"], 2);
+    assert!(authority.recovery_attestation_matches(
+      &prepared.attested_profile_json,
+      &prepared.attested_profile_digest,
+    ));
+    let prepared = PreparedRun::from_backend(&authority, prepared).expect("validated prepared run");
+    assert!(matches!(
+      prepared.execute(Arc::new(AtomicBool::new(false))),
+      ExecutionResult::Completed { ref summary } if summary == "scheduled result"
+    ));
+    let tasks = seen.lock().expect("seen tasks");
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].channel.is_none());
+    assert!(tasks[0].feedback_target.is_none());
+    assert!(matches!(tasks[0].session, SessionMode::Fresh));
+  }
+
   fn orchestrator(
     state: StateStore,
     backend: Arc<dyn ScheduledExecutionBackend>,
@@ -1795,11 +2128,13 @@ mod tests {
         state.clone(),
         GlobalTurnBudget::new(1),
         ScheduledWorkerConfig::default(),
+        None,
         Arc::new(NoopSchedulerTelemetry),
       )
+      .expect("disabled worker")
       .is_none()
     );
-    let mut worker = spawn_scheduled_worker(
+    let worker = spawn_scheduled_worker(
       state.clone(),
       GlobalTurnBudget::new(1),
       ScheduledWorkerConfig {
@@ -1807,11 +2142,13 @@ mod tests {
         run_claims_enabled: true,
         ..ScheduledWorkerConfig::default()
       },
+      None,
       Arc::new(NoopSchedulerTelemetry),
-    )
-    .expect("enabled worker");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(worker.shutdown().await, ScheduledWorkerShutdown::Clean);
+    );
+    assert!(matches!(
+      worker,
+      Err(StateError::InvalidSchedulerState { .. })
+    ));
 
     assert_eq!(
       state

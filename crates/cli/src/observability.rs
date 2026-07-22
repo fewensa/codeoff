@@ -81,6 +81,7 @@ struct ReadinessState {
   run_claims: ComponentState,
   delivery_claims: ComponentState,
   delivery_provider: ComponentState,
+  scheduled_executor: ComponentState,
   execution_loop: LoopHealth,
   delivery_loop: LoopHealth,
   snapshot_last_success: Option<Instant>,
@@ -121,6 +122,7 @@ impl PrometheusSchedulerTelemetry {
   pub(crate) fn new(
     scheduler: &SchedulerRuntimeConfig,
     delivery_provider_available: bool,
+    scheduled_executor_available: bool,
   ) -> Arc<Self> {
     let events = Family::default();
     let durations = Family::new_with_constructor(scheduler_duration_histogram as fn() -> Histogram);
@@ -154,6 +156,7 @@ impl PrometheusSchedulerTelemetry {
         run_claims: component_state(scheduler.run_claims_enabled),
         delivery_claims: component_state(scheduler.delivery_claims_enabled),
         delivery_provider: availability_state(delivery_provider_available),
+        scheduled_executor: availability_state(scheduled_executor_available),
         execution_loop: if scheduler.enabled {
           LoopHealth::Starting
         } else {
@@ -251,7 +254,9 @@ impl PrometheusSchedulerTelemetry {
     if state.execution_loop != LoopHealth::Ready {
       return ("scheduler_loop_unavailable", false);
     }
-    if state.run_claims == ComponentState::Available {
+    if state.run_claims == ComponentState::Available
+      && state.scheduled_executor != ComponentState::Available
+    {
       return ("scheduler_executor_unavailable", false);
     }
     if state.delivery_claims == ComponentState::Available
@@ -860,7 +865,7 @@ mod tests {
 
   async fn assert_faulty_readiness_probe(outcome: ProbeOutcome) {
     let telemetry =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false, false);
     let readiness_probe = Arc::new(FaultReadinessProbe {
       calls: AtomicUsize::new(0),
       outcome,
@@ -904,7 +909,7 @@ mod tests {
   async fn test_readiness_reports_disabled_without_scheduler_dependencies() {
     let (_temp, state) = test_state().await;
     let telemetry =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false, false);
 
     let response = readiness_response(&state, &telemetry).await;
 
@@ -918,7 +923,8 @@ mod tests {
   #[tokio::test]
   async fn test_readiness_fails_closed_for_required_components() {
     let (_temp, state) = test_state().await;
-    let starting = PrometheusSchedulerTelemetry::new(&scheduler_config(true, false, false), false);
+    let starting =
+      PrometheusSchedulerTelemetry::new(&scheduler_config(true, false, false), false, false);
     starting.apply_snapshot(&empty_snapshot(0));
     let response = readiness_response(&state, &starting).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -929,7 +935,7 @@ mod tests {
     );
 
     let executor_missing =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(true, true, false), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(true, true, false), false, false);
     executor_missing.apply_snapshot(&empty_snapshot(0));
     record_loop_started(&executor_missing, SchedulerWorker::Execution);
     record_loop_started(&executor_missing, SchedulerWorker::DeliveryPreparation);
@@ -941,8 +947,20 @@ mod tests {
         .contains("scheduler_executor_unavailable")
     );
 
+    let executor_ready =
+      PrometheusSchedulerTelemetry::new(&scheduler_config(true, true, false), false, true);
+    executor_ready.apply_snapshot(&empty_snapshot(0));
+    record_loop_started(&executor_ready, SchedulerWorker::Execution);
+    record_loop_started(&executor_ready, SchedulerWorker::DeliveryPreparation);
+    let response = readiness_response(&state, &executor_ready).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+      response_body(response).await,
+      r#"{"ready":true,"reason":"ready"}"#
+    );
+
     let provider_missing =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(true, false, true), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(true, false, true), false, false);
     provider_missing.apply_snapshot(&empty_snapshot(0));
     record_loop_started(&provider_missing, SchedulerWorker::Execution);
     record_loop_started(&provider_missing, SchedulerWorker::DeliveryPreparation);
@@ -957,7 +975,8 @@ mod tests {
 
   #[tokio::test]
   async fn test_snapshot_timeout_preserves_cache_becomes_stale_and_recovers() {
-    let telemetry = PrometheusSchedulerTelemetry::new(&scheduler_config(true, false, false), false);
+    let telemetry =
+      PrometheusSchedulerTelemetry::new(&scheduler_config(true, false, false), false, false);
     let source = ControlledSnapshotSource {
       outcome: Mutex::new(SnapshotOutcome::Success(Box::new(empty_snapshot(7)))),
     };
@@ -1014,7 +1033,7 @@ mod tests {
   #[test]
   fn test_metrics_use_fixed_labels_and_numeric_attempt_gauge() {
     let telemetry =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false, false);
     telemetry.record(SchedulerTelemetryEvent {
       worker: SchedulerWorker::Delivery,
       operation: SchedulerOperation::Attempt,
@@ -1038,7 +1057,7 @@ mod tests {
   async fn test_operational_http_server_exposes_only_exact_bounded_get_routes() {
     let (_temp, state) = test_state().await;
     let telemetry =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false, false);
     refresh_scheduler_snapshot(&state, &telemetry).await;
     let readiness_probe = Arc::new(CountingReadinessProbe {
       calls: AtomicUsize::new(0),
@@ -1107,7 +1126,7 @@ mod tests {
   async fn test_operational_http_server_bind_collision_is_fatal() {
     let (_temp, state) = test_state().await;
     let telemetry =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false, false);
     let first = OperationalHttpServer::bind("127.0.0.1:0", telemetry.clone(), state.clone())
       .await
       .expect("first bind");
@@ -1125,7 +1144,7 @@ mod tests {
   async fn test_operational_http_connection_panic_is_fatal_without_later_traffic() {
     let (_temp, state) = test_state().await;
     let telemetry =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false, false);
     let server = OperationalHttpServer::bind("127.0.0.1:0", telemetry, state)
       .await
       .expect("bind server");
@@ -1150,7 +1169,7 @@ mod tests {
   async fn test_operational_http_connection_panic_is_not_starved_by_accept_pressure() {
     let (_temp, state) = test_state().await;
     let telemetry =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false, false);
     let server = OperationalHttpServer::bind("127.0.0.1:0", telemetry, state)
       .await
       .expect("bind server");
@@ -1203,7 +1222,7 @@ mod tests {
   async fn test_operational_http_shutdown_surfaces_completed_connection_panic() {
     let (_temp, state) = test_state().await;
     let telemetry =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false, false);
     let server = OperationalHttpServer::bind("127.0.0.1:0", telemetry, state)
       .await
       .expect("bind server");
@@ -1230,7 +1249,7 @@ mod tests {
   async fn test_operational_http_server_bounds_headers_connections_and_idle_time() {
     let (_temp, state) = test_state().await;
     let telemetry =
-      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false, false);
     let server = OperationalHttpServer::bind("127.0.0.1:0", telemetry, state)
       .await
       .expect("bind server");

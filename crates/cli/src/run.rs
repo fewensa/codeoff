@@ -13,6 +13,7 @@ use clap::Parser;
 use codeoff_agent_codex::{
   CodexAppServerBackend, CodexDynamicToolContext, CodexDynamicToolHandler, CodexTurnEvent,
   CodexTurnEventObserver, StdioCodexAppServerClient, build_codex_app_server_backend,
+  build_production_scheduled_codex_executor,
 };
 use codeoff_agent_contract::{
   AgentBackend, AgentTask, AgentTaskResult, ConversationKind, FeedbackTarget,
@@ -53,8 +54,8 @@ use codeoff_runtime::{
     run_scheduled_delivery_preparation_worker, run_scheduled_delivery_worker,
   },
   scheduled_execution::{
-    GlobalTurnBudget, ScheduledWorkerConfig, ScheduledWorkerHandle, ScheduledWorkerShutdown,
-    spawn_scheduled_worker,
+    GlobalTurnBudget, ScheduledExecutor, ScheduledWorkerConfig, ScheduledWorkerHandle,
+    ScheduledWorkerShutdown, spawn_scheduled_worker,
   },
 };
 use codeoff_state::{RetentionPolicy, StateError, StateStore};
@@ -637,8 +638,28 @@ async fn build_serve_lifecycle(
   mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
 ) -> Result<ServeLifecycle, Box<dyn Error>> {
   let scheduled_delivery = build_scheduled_delivery_provider(config)?;
-  let telemetry =
-    PrometheusSchedulerTelemetry::new(&config.scheduler, scheduled_delivery.is_some());
+  let scheduled_executor = if config.scheduler.run_claims_enabled {
+    Some(ScheduledExecutor::codex(
+      build_production_scheduled_codex_executor(&config.agent.scheduled_codex).map_err(
+        |failure| {
+          io::Error::other(format!(
+            "scheduled executor validation failed ({:?}): {}",
+            failure.kind, failure.message
+          ))
+        },
+      )?,
+      scheduled_worker_config(&config.scheduler),
+    ))
+  } else {
+    None
+  };
+  let telemetry = PrometheusSchedulerTelemetry::new(
+    &config.scheduler,
+    scheduled_delivery.is_some(),
+    scheduled_executor
+      .as_ref()
+      .is_some_and(ScheduledExecutor::is_ready),
+  );
   refresh_scheduler_snapshot(&state, &telemetry).await;
   let operational_server =
     OperationalHttpServer::bind(&config.server.bind, Arc::clone(&telemetry), state.clone()).await?;
@@ -646,11 +667,12 @@ async fn build_serve_lifecycle(
     state,
     turn_budget,
     &config.scheduler,
+    scheduled_executor,
     scheduled_delivery,
     telemetry,
     operational_server,
     mcp_server,
-  ))
+  )?)
 }
 
 async fn run_background_serve_loops<F>(
@@ -697,22 +719,28 @@ struct ServeLifecycle {
 }
 
 impl ServeLifecycle {
+  #[allow(
+    clippy::too_many_arguments,
+    reason = "serve startup passes independently owned runtime components into one lifecycle"
+  )]
   fn new(
     state: StateStore,
     turn_budget: GlobalTurnBudget,
     scheduler: &SchedulerRuntimeConfig,
+    scheduled_executor: Option<ScheduledExecutor>,
     scheduled_delivery: Option<Arc<dyn DeliveryProvider>>,
     telemetry: Arc<PrometheusSchedulerTelemetry>,
     operational_server: OperationalHttpServer,
     mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
-  ) -> Self {
+  ) -> Result<Self, StateError> {
     let mut lifecycle = Self {
       scheduled_worker: spawn_scheduled_worker(
         state.clone(),
         turn_budget,
         scheduled_worker_config(scheduler),
+        scheduled_executor,
         telemetry.clone(),
-      ),
+      )?,
       background_tasks: ServeTaskGroup::new(),
     };
     if scheduler.enabled {
@@ -727,7 +755,7 @@ impl ServeLifecycle {
     if let Some(server) = mcp_server {
       lifecycle.spawn_mcp_server(server);
     }
-    lifecycle
+    Ok(lifecycle)
   }
 
   fn spawn_scheduled_delivery_worker(
@@ -3649,7 +3677,7 @@ mod tests {
       .await
       .expect("state");
     let scheduler = SchedulerRuntimeConfig::default();
-    let telemetry = PrometheusSchedulerTelemetry::new(&scheduler, false);
+    let telemetry = PrometheusSchedulerTelemetry::new(&scheduler, false, false);
     let server = OperationalHttpServer::bind("127.0.0.1:0", telemetry, state)
       .await
       .expect("bind operational server");
@@ -3879,6 +3907,27 @@ mod tests {
 
     config.agent.codex_app_server.max_parallel_turns = 0;
     assert_eq!(channel_dispatch_worker_count(&config), 1);
+  }
+
+  #[tokio::test]
+  async fn build_serve_lifecycle_rejects_unvalidated_scheduled_executor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    let mut config = CodeoffConfig::default();
+    config.scheduler.enabled = true;
+    config.scheduler.run_claims_enabled = true;
+
+    let error = build_serve_lifecycle(&config, state, GlobalTurnBudget::new(1), None)
+      .await
+      .err()
+      .expect("invalid scheduled executor must fail startup");
+    assert!(
+      error
+        .to_string()
+        .contains("scheduled executor validation failed")
+    );
   }
 
   #[test]

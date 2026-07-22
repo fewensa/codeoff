@@ -290,8 +290,10 @@ dependencies = [
  "codeoff-agent-contract",
  "codeoff-config",
  "nix",
+ "ring",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]
@@ -392,6 +394,7 @@ name = "codeoff-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "codeoff-agent-codex",
  "codeoff-agent-contract",
  "codeoff-channel-contract",
  "codeoff-config",

@@ -223,6 +223,9 @@ impl CodeoffConfig {
     }
 
     self.scheduler.validate()?;
+    if self.scheduler.run_claims_enabled {
+      self.agent.scheduled_codex.validate()?;
+    }
     self.data_retention.validate()?;
 
     if self.mcp.enabled {
@@ -302,12 +305,17 @@ impl SchedulerRuntimeConfig {
     }
     for (field, value) in [
       ("prepare_grace_ms", self.prepare_grace_ms),
-      ("cancellation_grace_ms", self.cancellation_grace_ms),
       ("finalization_grace_ms", self.finalization_grace_ms),
     ] {
       if !(1..=60_000).contains(&value) {
         return Err(invalid(field, "must be between 1 and 60000"));
       }
+    }
+    if !(3..=60_000).contains(&self.cancellation_grace_ms) {
+      return Err(invalid(
+        "cancellation_grace_ms",
+        "must be between 3 and 60000",
+      ));
     }
     if !(1..=86_400).contains(&self.retry_delay_seconds) {
       return Err(invalid(
@@ -327,6 +335,103 @@ impl SchedulerRuntimeConfig {
     }
     Ok(())
   }
+}
+
+impl ScheduledCodexConfig {
+  fn validate(&self) -> Result<(), ConfigError> {
+    let invalid = |field, reason| ConfigError::InvalidScheduler { field, reason };
+    for (field, path) in [
+      ("scheduled_codex.codex_program", &self.codex_program),
+      ("scheduled_codex.codex_home", &self.codex_home),
+      ("scheduled_codex.cwd", &self.cwd),
+      (
+        "scheduled_codex.isolation_attestation_path",
+        &self.isolation_attestation_path,
+      ),
+    ] {
+      if !path.is_absolute() {
+        return Err(invalid(field, "must be an absolute path"));
+      }
+    }
+    if self.codex_home == self.cwd
+      || self.cwd.starts_with(&self.codex_home)
+      || self.codex_home.starts_with(&self.cwd)
+    {
+      return Err(invalid(
+        "scheduled_codex.cwd",
+        "must not overlap the dedicated CODEX_HOME",
+      ));
+    }
+    for (field, value) in [
+      (
+        "scheduled_codex.github_mcp_endpoint_identity",
+        self.github_mcp_endpoint_identity.as_str(),
+      ),
+      (
+        "scheduled_codex.credential_reference",
+        self.credential_reference.as_str(),
+      ),
+      (
+        "scheduled_codex.permission_policy_revision",
+        self.permission_policy_revision.as_str(),
+      ),
+      (
+        "scheduled_codex.config_revision",
+        self.config_revision.as_str(),
+      ),
+    ] {
+      if value.is_empty() || value != value.trim() {
+        return Err(invalid(field, "must be non-empty and trimmed"));
+      }
+    }
+    for (field, value) in [
+      (
+        "scheduled_codex.codex_program_sha256",
+        self.codex_program_sha256.as_str(),
+      ),
+      (
+        "scheduled_codex.github_mcp_artifact_sha256",
+        self.github_mcp_artifact_sha256.as_str(),
+      ),
+      ("scheduled_codex.config_sha256", self.config_sha256.as_str()),
+    ] {
+      if !is_lowercase_hex(value, 64) {
+        return Err(invalid(field, "must be a lowercase SHA-256 digest"));
+      }
+    }
+    if !is_lowercase_hex(&self.isolation_verifier_public_key, 64) {
+      return Err(invalid(
+        "scheduled_codex.isolation_verifier_public_key",
+        "must be a lowercase Ed25519 public key",
+      ));
+    }
+    if !is_loopback_mcp_url(&self.github_mcp_url) {
+      return Err(invalid(
+        "scheduled_codex.github_mcp_url",
+        "must be a credential-free loopback HTTP MCP URL",
+      ));
+    }
+    Ok(())
+  }
+}
+
+fn is_loopback_mcp_url(value: &str) -> bool {
+  if value.contains('@') {
+    return false;
+  }
+  ["http://127.0.0.1:", "http://[::1]:", "http://localhost:"]
+    .iter()
+    .find_map(|prefix| value.strip_prefix(prefix))
+    .and_then(|suffix| suffix.strip_suffix("/mcp"))
+    .and_then(|port| port.parse::<u16>().ok())
+    .is_some_and(|port| port != 0)
+}
+
+fn is_lowercase_hex(value: &str, expected_len: usize) -> bool {
+  value.len() == expected_len
+    && value
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl DataRetentionConfig {
@@ -529,6 +634,25 @@ pub struct SlackUserTokenConfig {
 #[serde(default)]
 pub struct AgentConfig {
   pub codex_app_server: CodexAppServerConfig,
+  pub scheduled_codex: ScheduledCodexConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScheduledCodexConfig {
+  pub codex_program: PathBuf,
+  pub codex_program_sha256: String,
+  pub codex_home: PathBuf,
+  pub cwd: PathBuf,
+  pub github_mcp_url: String,
+  pub github_mcp_artifact_sha256: String,
+  pub github_mcp_endpoint_identity: String,
+  pub credential_reference: String,
+  pub permission_policy_revision: String,
+  pub config_revision: String,
+  pub config_sha256: String,
+  pub isolation_attestation_path: PathBuf,
+  pub isolation_verifier_public_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

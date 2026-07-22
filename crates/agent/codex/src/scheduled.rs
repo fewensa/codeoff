@@ -10,7 +10,10 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Arc;
+#[cfg(test)]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 #[cfg(unix)]
@@ -18,6 +21,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use codeoff_agent_contract::{AgentTask, InvocationSource, SessionMode, ToolPolicy};
+use codeoff_config::ScheduledCodexConfig;
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -62,6 +67,8 @@ const MAX_RUN_TIMEOUT: Duration = Duration::from_hours(6);
 const MAX_INTERRUPT_GRACE: Duration = Duration::from_secs(30);
 const MAX_TERMINATE_GRACE: Duration = Duration::from_secs(30);
 const MAX_KILL_GRACE: Duration = Duration::from_secs(30);
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ISOLATION_ATTESTATION_SCHEMA_VERSION: u64 = 1;
 #[cfg(test)]
 const TEST_PERMIT_TTL: Duration = Duration::from_secs(30);
 #[cfg_attr(
@@ -168,6 +175,7 @@ pub struct ScheduledRuntimeEvidence {
 pub struct ScheduledCodexRequest {
   pub task: AgentTask,
   pub profile: RequestedCapabilityProfile,
+  pub cancellation: Arc<AtomicBool>,
   pub timeout: Duration,
   pub interrupt_grace: Duration,
   pub terminate_grace: Duration,
@@ -199,6 +207,33 @@ pub struct AttestedCapabilityProfile {
   pub output_schema_revision: String,
   pub attested_at_unix_seconds: u64,
   pub profile_sha256: String,
+}
+
+impl AttestedCapabilityProfile {
+  #[must_use]
+  pub fn canonical_json(&self) -> String {
+    let tools: Vec<_> = self.github_tools.iter().collect();
+    json!({
+      "app_server_schema_sha256": self.app_server_schema_sha256,
+      "attested_at_unix_seconds": self.attested_at_unix_seconds,
+      "codex_program_sha256": self.codex_program_sha256,
+      "codex_version": self.codex_version,
+      "config_revision": self.config_revision,
+      "config_sha256": self.config_sha256,
+      "credential_deny_policy_revision": self.credential_deny_policy_revision,
+      "credential_isolation_revision": self.credential_isolation_revision,
+      "credential_reference": self.credential_reference,
+      "github_mcp_artifact_sha256": self.github_mcp_artifact_sha256,
+      "github_mcp_endpoint_identity": self.github_mcp_endpoint_identity,
+      "github_mcp_version": self.github_mcp_version,
+      "github_tools": tools,
+      "negative_test_revision": self.negative_test_revision,
+      "output_schema_revision": self.output_schema_revision,
+      "permission_policy_revision": self.permission_policy_revision,
+      "profile_sha256": self.profile_sha256,
+    })
+    .to_string()
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -235,6 +270,7 @@ pub enum ScheduledFailureKind {
   OutputSchemaViolation,
   TurnFailed,
   TimedOut,
+  Interrupted,
   Transport,
 }
 
@@ -572,8 +608,32 @@ impl Drop for StdioScheduledJsonlTransport {
   }
 }
 
-pub trait ScheduledCodexExecution {
-  fn execute(&self, request: ScheduledCodexRequest) -> ScheduledExecutionResult;
+pub trait PreparedScheduledCodexExecution: Send {
+  fn attested_profile(&self) -> &AttestedCapabilityProfile;
+  fn execute(self: Box<Self>) -> ScheduledExecutionResult;
+}
+
+pub trait ScheduledCodexExecution: Send + Sync {
+  /// Performs runtime attestation and prepares an execution without starting the Agent turn.
+  ///
+  /// # Errors
+  /// Returns a typed fail-closed result when request validation, credential isolation, transport
+  /// startup, protocol negotiation, or capability attestation fails.
+  #[allow(
+    clippy::result_large_err,
+    reason = "the typed result is shared with execution and preserves failure context"
+  )]
+  fn prepare(
+    &self,
+    request: ScheduledCodexRequest,
+  ) -> Result<Box<dyn PreparedScheduledCodexExecution>, ScheduledExecutionResult>;
+
+  fn execute(&self, request: ScheduledCodexRequest) -> ScheduledExecutionResult {
+    match self.prepare(request) {
+      Ok(prepared) => prepared.execute(),
+      Err(result) => result,
+    }
+  }
 }
 
 #[derive(Debug)]
@@ -593,7 +653,7 @@ struct CredentialIsolationPermit {
 
 pub struct ScheduledCodexExecutor<F> {
   transport_factory: F,
-  isolation_permit: Mutex<Option<CredentialIsolationPermit>>,
+  isolation_verifier: Arc<dyn CredentialIsolationVerifier>,
 }
 
 impl<F> ScheduledCodexExecutor<F> {
@@ -602,10 +662,10 @@ impl<F> ScheduledCodexExecutor<F> {
   /// A deployment verifier in this crate must issue the opaque, single-use isolation permit before
   /// production execution can be enabled. Until that verifier exists, execution fails closed before
   /// the transport factory is called.
-  pub const fn new(transport_factory: F) -> Self {
+  pub fn new(transport_factory: F) -> Self {
     Self {
       transport_factory,
-      isolation_permit: Mutex::new(None),
+      isolation_verifier: Arc::new(DisabledIsolationVerifier),
     }
   }
 
@@ -613,30 +673,36 @@ impl<F> ScheduledCodexExecutor<F> {
   fn new_with_test_permit(transport_factory: F, request: &ScheduledCodexRequest) -> Self {
     Self {
       transport_factory,
-      isolation_permit: Mutex::new(Some(issue_test_isolation_permit(request))),
+      isolation_verifier: Arc::new(TestIsolationVerifier::new(request)),
     }
   }
 }
 
 impl<F, T> ScheduledCodexExecution for ScheduledCodexExecutor<F>
 where
-  F: Fn(RequestedCapabilityProfile) -> Result<T, String>,
-  T: ScheduledJsonlTransport,
+  F: Fn(RequestedCapabilityProfile) -> Result<T, String> + Send + Sync,
+  T: ScheduledJsonlTransport + Send + 'static,
 {
-  fn execute(&self, request: ScheduledCodexRequest) -> ScheduledExecutionResult {
+  #[allow(
+    clippy::result_large_err,
+    reason = "the trait returns the shared typed execution result on preparation failure"
+  )]
+  fn prepare(
+    &self,
+    request: ScheduledCodexRequest,
+  ) -> Result<Box<dyn PreparedScheduledCodexExecution>, ScheduledExecutionResult> {
     if let Err(failure) = validate_request(&request) {
-      return ScheduledExecutionResult::PreflightRejected(failure);
+      return Err(ScheduledExecutionResult::PreflightRejected(failure));
     }
-    let isolation_permit = match self.take_isolation_permit(&request) {
+    let isolation_permit = match self.isolation_verifier.verify(&request) {
       Ok(permit) => permit,
-      Err(failure) => return ScheduledExecutionResult::PreflightRejected(failure),
+      Err(failure) => return Err(ScheduledExecutionResult::PreflightRejected(failure)),
     };
     let mut transport = match (self.transport_factory)(request.profile.clone()) {
       Ok(transport) => transport,
       Err(error) => {
-        return ScheduledExecutionResult::PreflightRejected(ScheduledFailure::new(
-          ScheduledFailureKind::Transport,
-          error,
+        return Err(ScheduledExecutionResult::PreflightRejected(
+          ScheduledFailure::new(ScheduledFailureKind::Transport, error),
         ));
       }
     };
@@ -648,65 +714,220 @@ where
       Ok(profile) => profile,
       Err(failure) => {
         let _ = bounded_shutdown(&mut transport, &request);
-        return ScheduledExecutionResult::PreflightRejected(failure);
+        return Err(ScheduledExecutionResult::PreflightRejected(failure));
       }
     };
     let Some(deadline) = Instant::now().checked_add(request.timeout) else {
       let _ = bounded_shutdown(&mut transport, &request);
-      return ScheduledExecutionResult::PreflightRejected(preflight(
+      return Err(ScheduledExecutionResult::PreflightRejected(preflight(
         "scheduled_run_deadline_overflow",
-      ));
+      )));
     };
-    let result = execute_protocol(&mut transport, &request, attested_profile, deadline);
-    match bounded_shutdown(&mut transport, &request) {
-      Ok(()) => result,
-      Err(failure) => ScheduledExecutionResult::TransportLost(failure),
-    }
+    prepare_protocol(transport, request, attested_profile, deadline)
   }
 }
 
-impl<F> ScheduledCodexExecutor<F> {
-  fn take_isolation_permit(
+trait CredentialIsolationVerifier: Send + Sync {
+  fn verify(
+    &self,
+    request: &ScheduledCodexRequest,
+  ) -> Result<CredentialIsolationPermit, ScheduledFailure>;
+}
+
+struct DisabledIsolationVerifier;
+
+impl CredentialIsolationVerifier for DisabledIsolationVerifier {
+  fn verify(
+    &self,
+    _request: &ScheduledCodexRequest,
+  ) -> Result<CredentialIsolationPermit, ScheduledFailure> {
+    Err(ScheduledFailure::new(
+      ScheduledFailureKind::CredentialIsolationUnproven,
+      "credential_isolation_verifier_disabled",
+    ))
+  }
+}
+
+struct SignedIsolationVerifier {
+  profile_binding_digest: String,
+  isolation_revision: String,
+  expires_at_unix_seconds: u64,
+  next_nonce: AtomicU64,
+}
+
+impl CredentialIsolationVerifier for SignedIsolationVerifier {
+  fn verify(
     &self,
     request: &ScheduledCodexRequest,
   ) -> Result<CredentialIsolationPermit, ScheduledFailure> {
-    let mut slot = self.isolation_permit.lock().map_err(|_| {
-      ScheduledFailure::new(
-        ScheduledFailureKind::CredentialIsolationUnproven,
-        "credential_isolation_permit_state_unavailable",
-      )
-    })?;
-    let permit = slot.take().ok_or_else(|| {
-      ScheduledFailure::new(
-        ScheduledFailureKind::CredentialIsolationUnproven,
-        "credential_isolation_verifier_disabled",
-      )
-    })?;
     let run_id = scheduled_run_id(&request.task).ok_or_else(|| {
       ScheduledFailure::new(
         ScheduledFailureKind::CredentialIsolationUnproven,
         "credential_isolation_permit_missing_run_binding",
       )
     })?;
-    if permit.nonce == 0
-      || permit.expires_at <= Instant::now()
-      || permit.run_id != run_id
-      || permit.github_mcp_url != request.profile.github_mcp_url
-      || permit.endpoint_identity != request.profile.github_mcp_endpoint_identity
-      || permit.github_mcp_artifact_sha256 != request.profile.github_mcp_artifact_sha256
-      || permit.credential_reference != request.profile.credential_reference
-      || permit.codex_program_sha256 != request.profile.codex_program_sha256
-      || permit.config_sha256 != request.profile.config_sha256
-      || permit.permission_policy_revision != request.profile.permission_policy_revision
-      || permit.isolation_revision.trim().is_empty()
+    if self.expires_at_unix_seconds <= now_unix_seconds()
+      || isolation_profile_binding_digest(&request.profile).as_deref()
+        != Ok(self.profile_binding_digest.as_str())
     {
       return Err(ScheduledFailure::new(
         ScheduledFailureKind::CredentialIsolationUnproven,
-        "credential_isolation_permit_expired_or_mismatched",
+        "credential_isolation_attestation_expired_or_mismatched",
       ));
     }
-    Ok(permit)
+    let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
+    if nonce == 0 {
+      return Err(ScheduledFailure::new(
+        ScheduledFailureKind::CredentialIsolationUnproven,
+        "credential_isolation_permit_nonce_exhausted",
+      ));
+    }
+    let ttl = self
+      .expires_at_unix_seconds
+      .saturating_sub(now_unix_seconds());
+    let expires_at = Instant::now()
+      .checked_add(Duration::from_secs(ttl))
+      .ok_or_else(|| {
+        ScheduledFailure::new(
+          ScheduledFailureKind::CredentialIsolationUnproven,
+          "credential_isolation_permit_expiry_overflow",
+        )
+      })?;
+    validate_isolation_permit(
+      CredentialIsolationPermit {
+        run_id: run_id.to_owned(),
+        nonce,
+        github_mcp_url: request.profile.github_mcp_url.clone(),
+        endpoint_identity: request.profile.github_mcp_endpoint_identity.clone(),
+        github_mcp_artifact_sha256: request.profile.github_mcp_artifact_sha256.clone(),
+        credential_reference: request.profile.credential_reference.clone(),
+        codex_program_sha256: request.profile.codex_program_sha256.clone(),
+        config_sha256: request.profile.config_sha256.clone(),
+        permission_policy_revision: request.profile.permission_policy_revision.clone(),
+        isolation_revision: self.isolation_revision.clone(),
+        expires_at,
+      },
+      request,
+    )
   }
+}
+
+pub struct BuiltScheduledCodexExecutor {
+  pub profile: RequestedCapabilityProfile,
+  pub executor: Arc<dyn ScheduledCodexExecution>,
+}
+
+/// Verifies deployment-supplied scheduled execution authority and constructs the production
+/// process-owned Codex executor.
+///
+/// # Errors
+/// Returns a fail-closed preflight error when the binary, dedicated config, filesystem boundary,
+/// signed isolation attestation, or pinned runtime evidence is absent or mismatched.
+pub fn build_production_scheduled_codex_executor(
+  config: &ScheduledCodexConfig,
+) -> Result<BuiltScheduledCodexExecutor, ScheduledFailure> {
+  let profile = requested_profile(config);
+  profile.validate()?;
+  verify_production_profile_files(&profile, &config.isolation_attestation_path)?;
+  verify_codex_version(&profile.codex_program)?;
+  let isolation_verifier = Arc::new(load_signed_isolation_verifier(
+    &profile,
+    &config.isolation_attestation_path,
+    &config.isolation_verifier_public_key,
+  )?);
+  #[cfg(unix)]
+  let executor = ScheduledCodexExecutor {
+    transport_factory: spawn_production_transport
+      as fn(RequestedCapabilityProfile) -> Result<StdioScheduledJsonlTransport, String>,
+    isolation_verifier,
+  };
+  #[cfg(not(unix))]
+  return Err(preflight("scheduled_executor_requires_unix_process_groups"));
+  #[cfg(unix)]
+  Ok(BuiltScheduledCodexExecutor {
+    profile,
+    executor: Arc::new(executor),
+  })
+}
+
+fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfile {
+  RequestedCapabilityProfile {
+    codex_program: config.codex_program.clone(),
+    codex_program_sha256: config.codex_program_sha256.clone(),
+    codex_home: config.codex_home.clone(),
+    cwd: config.cwd.clone(),
+    github_mcp_url: config.github_mcp_url.clone(),
+    github_mcp_artifact_sha256: config.github_mcp_artifact_sha256.clone(),
+    github_mcp_endpoint_identity: config.github_mcp_endpoint_identity.clone(),
+    credential_reference: config.credential_reference.clone(),
+    permission_policy_revision: config.permission_policy_revision.clone(),
+    config_revision: config.config_revision.clone(),
+    config_sha256: config.config_sha256.clone(),
+  }
+}
+
+#[cfg(unix)]
+#[allow(
+  clippy::needless_pass_by_value,
+  reason = "the transport factory trait consumes an owned capability profile"
+)]
+fn spawn_production_transport(
+  profile: RequestedCapabilityProfile,
+) -> Result<StdioScheduledJsonlTransport, String> {
+  let runtime_evidence = ScheduledRuntimeEvidence {
+    codex_version: CODEX_CLI_VERSION.to_owned(),
+    app_server_schema_sha256: CODEX_APP_SERVER_SCHEMA_SHA256.to_owned(),
+    codex_program_sha256: profile.codex_program_sha256.clone(),
+    config_sha256: profile.config_sha256.clone(),
+  };
+  StdioScheduledJsonlTransport::spawn(&profile, runtime_evidence)
+}
+
+fn verify_production_profile_files(
+  profile: &RequestedCapabilityProfile,
+  isolation_attestation_path: &Path,
+) -> Result<(), ScheduledFailure> {
+  require_read_only_file(&profile.codex_program, false, "scheduled_codex_program")?;
+  require_read_only_directory(&profile.codex_home, "scheduled_codex_home")?;
+  require_read_only_directory(&profile.cwd, "scheduled_cwd")?;
+  require_read_only_file(
+    &profile.codex_home.join("config.toml"),
+    true,
+    "scheduled_config",
+  )?;
+  require_read_only_file(
+    isolation_attestation_path,
+    true,
+    "scheduled_isolation_attestation",
+  )?;
+  let actual_program_hash = sha256_file(&profile.codex_program)
+    .map_err(|error| preflight(format!("scheduled_codex_program_hash_failed:{error}")))?;
+  if actual_program_hash != profile.codex_program_sha256 {
+    return Err(preflight("codex_program_digest_mismatch_at_startup"));
+  }
+  let config_path = profile.codex_home.join("config.toml");
+  let config = fs::read_to_string(&config_path)
+    .map_err(|error| preflight(format!("read_scheduled_config:{error}")))?;
+  if config != profile.dedicated_config() || sha256_hex(config.as_bytes()) != profile.config_sha256
+  {
+    return Err(preflight("scheduled_config_content_mismatch_at_startup"));
+  }
+  Ok(())
+}
+
+fn verify_codex_version(program: &Path) -> Result<(), ScheduledFailure> {
+  let output = Command::new(program)
+    .arg("--version")
+    .env_clear()
+    .envs(fixed_child_environment())
+    .output()
+    .map_err(|error| preflight(format!("scheduled_codex_version_probe_failed:{error}")))?;
+  let version = String::from_utf8(output.stdout)
+    .map_err(|_| preflight("scheduled_codex_version_probe_not_utf8"))?;
+  if !output.status.success() || version.trim() != format!("codex-cli {CODEX_CLI_VERSION}") {
+    return Err(preflight("scheduled_codex_version_mismatch_at_startup"));
+  }
+  Ok(())
 }
 
 /// Creates a new dedicated `CODEX_HOME` containing only the pinned scheduled config.
@@ -858,20 +1079,61 @@ fn attest_runtime(
   })
 }
 
-fn execute_protocol<T: ScheduledJsonlTransport>(
-  transport: &mut T,
-  request: &ScheduledCodexRequest,
+struct PreparedCodexExecution<T> {
+  transport: T,
+  request: ScheduledCodexRequest,
+  attested_profile: AttestedCapabilityProfile,
+  thread_id: String,
+  deadline: Instant,
+}
+
+impl<T: ScheduledJsonlTransport + Send> PreparedScheduledCodexExecution
+  for PreparedCodexExecution<T>
+{
+  fn attested_profile(&self) -> &AttestedCapabilityProfile {
+    &self.attested_profile
+  }
+
+  fn execute(mut self: Box<Self>) -> ScheduledExecutionResult {
+    let result = execute_prepared_protocol(
+      &mut self.transport,
+      &self.request,
+      &self.thread_id,
+      self.attested_profile.clone(),
+      self.deadline,
+    );
+    match bounded_shutdown(&mut self.transport, &self.request) {
+      Ok(()) => result,
+      Err(failure) => ScheduledExecutionResult::TransportLost(failure),
+    }
+  }
+}
+
+#[allow(
+  clippy::result_large_err,
+  reason = "preparation preserves the shared typed execution failure without lossy conversion"
+)]
+fn prepare_protocol<T: ScheduledJsonlTransport + Send + 'static>(
+  mut transport: T,
+  request: ScheduledCodexRequest,
   mut attested_profile: AttestedCapabilityProfile,
   deadline: Instant,
-) -> ScheduledExecutionResult {
+) -> Result<Box<dyn PreparedScheduledCodexExecution>, ScheduledExecutionResult> {
   let initialize = json!({
     "clientInfo": {"name": "codeoff-scheduler", "version": env!("CARGO_PKG_VERSION")},
   });
-  if let Err(failure) = scheduled_request(transport, 1, "initialize", &initialize, deadline) {
-    return protocol_failure(failure);
+  if let Err(failure) = scheduled_request(
+    &mut transport,
+    1,
+    "initialize",
+    &initialize,
+    deadline,
+    &request.cancellation,
+  ) {
+    return reject_preparation(transport, &request, protocol_failure(failure));
   }
-  if let Err(error) = send_notification(transport, "initialized") {
-    return transport_failure(error);
+  if let Err(error) = send_notification(&mut transport, "initialized") {
+    return reject_preparation(transport, &request, transport_failure(error));
   }
   let thread_params = json!({
     "approvalPolicy": "never",
@@ -890,27 +1152,65 @@ fn execute_protocol<T: ScheduledJsonlTransport>(
       }
     }
   });
-  let thread = match scheduled_request(transport, 2, "thread/start", &thread_params, deadline) {
+  let thread = match scheduled_request(
+    &mut transport,
+    2,
+    "thread/start",
+    &thread_params,
+    deadline,
+    &request.cancellation,
+  ) {
     Ok(thread) => thread,
-    Err(failure) => return protocol_failure(failure),
+    Err(failure) => return reject_preparation(transport, &request, protocol_failure(failure)),
   };
   let Some(thread_id) = thread["thread"]["id"].as_str().map(str::to_owned) else {
-    return protocol_failure(capability("thread_start_missing_thread_id"));
+    return reject_preparation(
+      transport,
+      &request,
+      protocol_failure(capability("thread_start_missing_thread_id")),
+    );
   };
   let inventory = match scheduled_request(
-    transport,
+    &mut transport,
     3,
     "mcpServerStatus/list",
     &json!({"threadId": thread_id, "detail": "full", "limit": 100}),
     deadline,
+    &request.cancellation,
   ) {
     Ok(inventory) => inventory,
-    Err(failure) => return protocol_failure(failure),
+    Err(failure) => return reject_preparation(transport, &request, protocol_failure(failure)),
   };
   if let Err(failure) = attest_mcp_inventory(&inventory) {
-    return ScheduledExecutionResult::PreflightRejected(failure);
+    return reject_preparation(
+      transport,
+      &request,
+      ScheduledExecutionResult::PreflightRejected(failure),
+    );
   }
   attested_profile.profile_sha256 = profile_sha256(&attested_profile);
+  Ok(Box::new(PreparedCodexExecution {
+    transport,
+    request,
+    attested_profile,
+    thread_id,
+    deadline,
+  }))
+}
+
+fn execute_prepared_protocol<T: ScheduledJsonlTransport>(
+  transport: &mut T,
+  request: &ScheduledCodexRequest,
+  thread_id: &str,
+  attested_profile: AttestedCapabilityProfile,
+  deadline: Instant,
+) -> ScheduledExecutionResult {
+  if request.cancellation.load(Ordering::Acquire) {
+    return ScheduledExecutionResult::Interrupted {
+      thread_id: Some(thread_id.to_owned()),
+      turn_id: None,
+    };
+  }
   let turn_params = json!({
     "threadId": thread_id,
     "clientUserMessageId": request.task.task_id,
@@ -920,7 +1220,14 @@ fn execute_protocol<T: ScheduledJsonlTransport>(
     "outputSchema": fixed_output_schema(),
     "input": [{"type": "text", "text": request.task.instruction}],
   });
-  let turn = match scheduled_request(transport, 4, "turn/start", &turn_params, deadline) {
+  let turn = match scheduled_request(
+    transport,
+    4,
+    "turn/start",
+    &turn_params,
+    deadline,
+    &request.cancellation,
+  ) {
     Ok(turn) => turn,
     Err(failure) => return protocol_failure(failure),
   };
@@ -934,7 +1241,7 @@ fn execute_protocol<T: ScheduledJsonlTransport>(
   wait_for_scheduled_turn(
     transport,
     request,
-    &thread_id,
+    thread_id,
     &turn_id,
     attested_profile,
     deadline,
@@ -947,11 +1254,21 @@ fn scheduled_request<T: ScheduledJsonlTransport>(
   method: &str,
   params: &Value,
   deadline: Instant,
+  cancellation: &AtomicBool,
 ) -> Result<Value, ScheduledFailure> {
   send_request(transport, id, method, params)
     .map_err(|error| ScheduledFailure::new(ScheduledFailureKind::Transport, error))?;
   loop {
-    match transport.read_json_until(deadline) {
+    if cancellation.load(Ordering::Acquire) {
+      return Err(ScheduledFailure::new(
+        ScheduledFailureKind::Interrupted,
+        format!("{method}_cancelled"),
+      ));
+    }
+    let poll_deadline = Instant::now()
+      .checked_add(CANCELLATION_POLL_INTERVAL)
+      .map_or(deadline, |candidate| candidate.min(deadline));
+    match transport.read_json_until(poll_deadline) {
       Ok(TimedRead::Message(response)) => {
         if response.get("id").is_none() && response["method"].is_string() {
           continue;
@@ -970,6 +1287,7 @@ fn scheduled_request<T: ScheduledJsonlTransport>(
         }
         return Ok(response.get("result").cloned().unwrap_or_else(|| json!({})));
       }
+      Ok(TimedRead::TimedOut) if Instant::now() < deadline => {}
       Ok(TimedRead::TimedOut) => {
         return Err(ScheduledFailure::new(
           ScheduledFailureKind::TimedOut,
@@ -989,6 +1307,21 @@ fn scheduled_request<T: ScheduledJsonlTransport>(
         ));
       }
     }
+  }
+}
+
+#[allow(
+  clippy::result_large_err,
+  reason = "preparation preserves the shared typed execution failure without lossy conversion"
+)]
+fn reject_preparation<T: ScheduledJsonlTransport>(
+  mut transport: T,
+  request: &ScheduledCodexRequest,
+  result: ScheduledExecutionResult,
+) -> Result<Box<dyn PreparedScheduledCodexExecution>, ScheduledExecutionResult> {
+  match bounded_shutdown(&mut transport, request) {
+    Ok(()) => Err(result),
+    Err(failure) => Err(ScheduledExecutionResult::TransportLost(failure)),
   }
 }
 
@@ -1038,6 +1371,10 @@ fn attest_mcp_inventory(inventory: &Value) -> Result<(), ScheduledFailure> {
   Ok(())
 }
 
+#[allow(
+  clippy::too_many_lines,
+  reason = "the bounded protocol loop keeps terminal handling and output accumulation atomic"
+)]
 fn wait_for_scheduled_turn<T: ScheduledJsonlTransport>(
   transport: &mut T,
   request: &ScheduledCodexRequest,
@@ -1050,7 +1387,13 @@ fn wait_for_scheduled_turn<T: ScheduledJsonlTransport>(
   let mut final_item_ids = BTreeSet::new();
   let mut final_delta_bytes = 0_usize;
   loop {
-    match transport.read_json_until(deadline) {
+    if request.cancellation.load(Ordering::Acquire) {
+      return interrupt_scheduled_turn(transport, request, thread_id, turn_id);
+    }
+    let poll_deadline = Instant::now()
+      .checked_add(CANCELLATION_POLL_INTERVAL)
+      .map_or(deadline, |candidate| candidate.min(deadline));
+    match transport.read_json_until(poll_deadline) {
       Ok(TimedRead::Message(message)) => {
         let params = &message["params"];
         if let Err(failure) = observe_final_stream_event(
@@ -1128,8 +1471,9 @@ fn wait_for_scheduled_turn<T: ScheduledJsonlTransport>(
           _ => {}
         }
       }
+      Ok(TimedRead::TimedOut) if Instant::now() < deadline => {}
       Ok(TimedRead::TimedOut) => {
-        return interrupt_timed_out_turn(transport, request, thread_id, turn_id);
+        return interrupt_scheduled_turn(transport, request, thread_id, turn_id);
       }
       Ok(TimedRead::Eof) => {
         return ScheduledExecutionResult::TransportLost(ScheduledFailure::new(
@@ -1187,7 +1531,7 @@ fn observe_final_stream_event(
   Ok(())
 }
 
-fn interrupt_timed_out_turn<T: ScheduledJsonlTransport>(
+fn interrupt_scheduled_turn<T: ScheduledJsonlTransport>(
   transport: &mut T,
   request: &ScheduledCodexRequest,
   thread_id: &str,
@@ -1405,6 +1749,208 @@ fn profile_sha256(profile: &AttestedCapabilityProfile) -> String {
   sha256_hex(canonical.to_string().as_bytes())
 }
 
+fn load_signed_isolation_verifier(
+  profile: &RequestedCapabilityProfile,
+  path: &Path,
+  public_key_hex: &str,
+) -> Result<SignedIsolationVerifier, ScheduledFailure> {
+  let contents = fs::read_to_string(path)
+    .map_err(|error| preflight(format!("read_scheduled_isolation_attestation:{error}")))?;
+  let document: Value = serde_json::from_str(&contents)
+    .map_err(|_| preflight("scheduled_isolation_attestation_invalid_json"))?;
+  let document = document
+    .as_object()
+    .filter(|object| object.len() == 3)
+    .ok_or_else(|| preflight("scheduled_isolation_attestation_fields_mismatch"))?;
+  if document.get("signature_algorithm").and_then(Value::as_str) != Some("ed25519") {
+    return Err(preflight(
+      "scheduled_isolation_attestation_signature_algorithm_mismatch",
+    ));
+  }
+  let payload = document
+    .get("payload")
+    .and_then(Value::as_object)
+    .filter(|object| object.len() == 7)
+    .ok_or_else(|| preflight("scheduled_isolation_attestation_payload_fields_mismatch"))?;
+  let canonical_payload = Value::Object(payload.clone()).to_string();
+  let signature = decode_lowercase_hex(
+    document
+      .get("signature")
+      .and_then(Value::as_str)
+      .ok_or_else(|| preflight("scheduled_isolation_attestation_signature_missing"))?,
+    64,
+    "scheduled_isolation_attestation_signature_invalid",
+  )?;
+  let public_key = decode_lowercase_hex(
+    public_key_hex,
+    32,
+    "scheduled_isolation_verifier_public_key_invalid",
+  )?;
+  UnparsedPublicKey::new(&ED25519, public_key)
+    .verify(canonical_payload.as_bytes(), &signature)
+    .map_err(|_| preflight("scheduled_isolation_attestation_signature_invalid"))?;
+  let schema_version = payload
+    .get("schema_version")
+    .and_then(Value::as_u64)
+    .filter(|version| *version == ISOLATION_ATTESTATION_SCHEMA_VERSION)
+    .ok_or_else(|| preflight("scheduled_isolation_attestation_version_mismatch"))?;
+  let _ = schema_version;
+  let attestation_id = payload
+    .get("attestation_id")
+    .and_then(Value::as_str)
+    .ok_or_else(|| preflight("scheduled_isolation_attestation_id_missing"))?;
+  decode_lowercase_hex(
+    attestation_id,
+    32,
+    "scheduled_isolation_attestation_id_invalid",
+  )?;
+  let issued_at = payload
+    .get("issued_at_unix_seconds")
+    .and_then(Value::as_u64)
+    .ok_or_else(|| preflight("scheduled_isolation_attestation_issued_at_invalid"))?;
+  let expires_at = payload
+    .get("expires_at_unix_seconds")
+    .and_then(Value::as_u64)
+    .ok_or_else(|| preflight("scheduled_isolation_attestation_expires_at_invalid"))?;
+  let now = now_unix_seconds();
+  if issued_at > now.saturating_add(300) || expires_at <= now || expires_at <= issued_at {
+    return Err(preflight("scheduled_isolation_attestation_not_current"));
+  }
+  let profile_binding_digest = payload
+    .get("profile_binding_digest")
+    .and_then(Value::as_str)
+    .ok_or_else(|| preflight("scheduled_isolation_profile_binding_missing"))?;
+  if profile_binding_digest != isolation_profile_binding_digest(profile)? {
+    return Err(preflight("scheduled_isolation_profile_binding_mismatch"));
+  }
+  let isolation_revision = payload
+    .get("credential_isolation_revision")
+    .and_then(Value::as_str)
+    .filter(|value| !value.is_empty() && *value == value.trim())
+    .ok_or_else(|| preflight("scheduled_isolation_revision_invalid"))?;
+  if payload
+    .get("negative_test_revision")
+    .and_then(Value::as_str)
+    != Some(NEGATIVE_TEST_REVISION)
+  {
+    return Err(preflight(
+      "scheduled_isolation_negative_test_revision_mismatch",
+    ));
+  }
+  Ok(SignedIsolationVerifier {
+    profile_binding_digest: profile_binding_digest.to_owned(),
+    isolation_revision: isolation_revision.to_owned(),
+    expires_at_unix_seconds: expires_at,
+    next_nonce: AtomicU64::new(1),
+  })
+}
+
+fn isolation_profile_binding_digest(
+  profile: &RequestedCapabilityProfile,
+) -> Result<String, ScheduledFailure> {
+  let path = |field: &'static str, value: &Path| {
+    value
+      .to_str()
+      .map(str::to_owned)
+      .ok_or_else(|| preflight(format!("{field}_must_be_utf8")))
+  };
+  let binding = json!({
+    "app_server_schema_sha256": CODEX_APP_SERVER_SCHEMA_SHA256,
+    "child_environment": {
+      "LANG": CHILD_LOCALE,
+      "LC_ALL": CHILD_LOCALE,
+      "PATH": CHILD_PATH,
+    },
+    "codex_home": path("scheduled_codex_home", &profile.codex_home)?,
+    "codex_program": path("scheduled_codex_program", &profile.codex_program)?,
+    "codex_program_sha256": profile.codex_program_sha256,
+    "codex_version": CODEX_CLI_VERSION,
+    "config_revision": profile.config_revision,
+    "config_sha256": profile.config_sha256,
+    "credential_reference": profile.credential_reference,
+    "cwd": path("scheduled_cwd", &profile.cwd)?,
+    "execution_surface": {
+      "approval_policy": "never",
+      "dynamic_tools": false,
+      "network_access": false,
+      "sandbox": "read-only",
+      "web_search": "disabled",
+    },
+    "github_mcp_artifact_sha256": profile.github_mcp_artifact_sha256,
+    "github_mcp_endpoint_identity": profile.github_mcp_endpoint_identity,
+    "github_mcp_url": profile.github_mcp_url,
+    "github_mcp_version": GITHUB_MCP_SERVER_VERSION,
+    "github_tools": EXPECTED_GITHUB_TOOLS,
+    "negative_test_revision": NEGATIVE_TEST_REVISION,
+    "permission_policy_revision": profile.permission_policy_revision,
+  });
+  Ok(sha256_hex(binding.to_string().as_bytes()))
+}
+
+fn decode_lowercase_hex(
+  value: &str,
+  expected_bytes: usize,
+  error: &'static str,
+) -> Result<Vec<u8>, ScheduledFailure> {
+  if value.len() != expected_bytes.saturating_mul(2)
+    || !value
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+  {
+    return Err(preflight(error));
+  }
+  value
+    .as_bytes()
+    .chunks_exact(2)
+    .map(|pair| {
+      let nibble = |byte| match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("validated lowercase hex"),
+      };
+      Ok((nibble(pair[0]) << 4) | nibble(pair[1]))
+    })
+    .collect()
+}
+
+fn require_read_only_file(
+  path: &Path,
+  require_read_only: bool,
+  field: &'static str,
+) -> Result<(), ScheduledFailure> {
+  let metadata =
+    fs::metadata(path).map_err(|error| preflight(format!("{field}_missing:{error}")))?;
+  if !metadata.is_file() {
+    return Err(preflight(format!("{field}_must_be_a_file")));
+  }
+  #[cfg(unix)]
+  {
+    let mode = metadata.permissions().mode() & 0o777;
+    if require_read_only && mode != 0o400 {
+      return Err(preflight(format!("{field}_must_have_mode_0400")));
+    }
+    if !require_read_only && (mode & 0o111 == 0 || mode & 0o022 != 0) {
+      return Err(preflight(format!(
+        "{field}_must_be_executable_and_not_group_or_world_writable"
+      )));
+    }
+  }
+  Ok(())
+}
+
+fn require_read_only_directory(path: &Path, field: &'static str) -> Result<(), ScheduledFailure> {
+  let metadata =
+    fs::metadata(path).map_err(|error| preflight(format!("{field}_missing:{error}")))?;
+  if !metadata.is_dir() {
+    return Err(preflight(format!("{field}_must_be_a_directory")));
+  }
+  #[cfg(unix)]
+  if metadata.permissions().mode() & 0o777 != 0o500 {
+    return Err(preflight(format!("{field}_must_have_mode_0500")));
+  }
+  Ok(())
+}
+
 fn is_loopback_http_url(url: &str) -> bool {
   ["http://127.0.0.1:", "http://[::1]:", "http://localhost:"]
     .iter()
@@ -1458,10 +2004,13 @@ fn scheduled_run_id(task: &AgentTask) -> Option<&str> {
 }
 
 fn protocol_failure(failure: ScheduledFailure) -> ScheduledExecutionResult {
-  if failure.kind == ScheduledFailureKind::TimedOut {
-    ScheduledExecutionResult::TransportLost(failure)
-  } else {
-    ScheduledExecutionResult::PreflightRejected(failure)
+  match failure.kind {
+    ScheduledFailureKind::Interrupted => ScheduledExecutionResult::Interrupted {
+      thread_id: None,
+      turn_id: None,
+    },
+    ScheduledFailureKind::TimedOut => ScheduledExecutionResult::TransportLost(failure),
+    _ => ScheduledExecutionResult::PreflightRejected(failure),
   }
 }
 
@@ -1526,8 +2075,6 @@ fn now_unix_seconds() -> u64 {
 
 #[cfg(test)]
 fn issue_test_isolation_permit(request: &ScheduledCodexRequest) -> CredentialIsolationPermit {
-  use std::sync::atomic::{AtomicU64, Ordering};
-
   static NEXT_TEST_NONCE: AtomicU64 = AtomicU64::new(1);
   CredentialIsolationPermit {
     run_id: scheduled_run_id(&request.task)
@@ -1549,11 +2096,84 @@ fn issue_test_isolation_permit(request: &ScheduledCodexRequest) -> CredentialIso
 }
 
 #[cfg(test)]
+struct TestIsolationVerifier {
+  permit: Mutex<Option<CredentialIsolationPermit>>,
+}
+
+#[cfg(test)]
+impl TestIsolationVerifier {
+  fn new(request: &ScheduledCodexRequest) -> Self {
+    Self {
+      permit: Mutex::new(Some(issue_test_isolation_permit(request))),
+    }
+  }
+}
+
+#[cfg(test)]
+impl CredentialIsolationVerifier for TestIsolationVerifier {
+  fn verify(
+    &self,
+    request: &ScheduledCodexRequest,
+  ) -> Result<CredentialIsolationPermit, ScheduledFailure> {
+    let permit = self
+      .permit
+      .lock()
+      .map_err(|_| {
+        ScheduledFailure::new(
+          ScheduledFailureKind::CredentialIsolationUnproven,
+          "credential_isolation_permit_state_unavailable",
+        )
+      })?
+      .take()
+      .ok_or_else(|| {
+        ScheduledFailure::new(
+          ScheduledFailureKind::CredentialIsolationUnproven,
+          "credential_isolation_verifier_disabled",
+        )
+      })?;
+    validate_isolation_permit(permit, request)
+  }
+}
+
+fn validate_isolation_permit(
+  permit: CredentialIsolationPermit,
+  request: &ScheduledCodexRequest,
+) -> Result<CredentialIsolationPermit, ScheduledFailure> {
+  let run_id = scheduled_run_id(&request.task).ok_or_else(|| {
+    ScheduledFailure::new(
+      ScheduledFailureKind::CredentialIsolationUnproven,
+      "credential_isolation_permit_missing_run_binding",
+    )
+  })?;
+  if permit.nonce == 0
+    || permit.expires_at <= Instant::now()
+    || permit.run_id != run_id
+    || permit.github_mcp_url != request.profile.github_mcp_url
+    || permit.endpoint_identity != request.profile.github_mcp_endpoint_identity
+    || permit.github_mcp_artifact_sha256 != request.profile.github_mcp_artifact_sha256
+    || permit.credential_reference != request.profile.credential_reference
+    || permit.codex_program_sha256 != request.profile.codex_program_sha256
+    || permit.config_sha256 != request.profile.config_sha256
+    || permit.permission_policy_revision != request.profile.permission_policy_revision
+    || permit.isolation_revision.trim().is_empty()
+  {
+    return Err(ScheduledFailure::new(
+      ScheduledFailureKind::CredentialIsolationUnproven,
+      "credential_isolation_permit_expired_or_mismatched",
+    ));
+  }
+  Ok(permit)
+}
+
+#[cfg(test)]
 mod tests {
   use std::collections::VecDeque;
   use std::sync::{Arc, Mutex};
 
   use codeoff_agent_contract::{InvocationPrincipal, SessionMode};
+  use ring::rand::SystemRandom;
+  use ring::signature::{Ed25519KeyPair, KeyPair};
+  use tempfile::TempDir;
 
   use super::*;
 
@@ -1686,6 +2306,7 @@ mod tests {
     ScheduledCodexRequest {
       task: task(),
       profile,
+      cancellation: Arc::new(AtomicBool::new(false)),
       timeout: Duration::from_secs(30),
       interrupt_grace: Duration::from_secs(2),
       terminate_grace: Duration::from_secs(2),
@@ -1697,6 +2318,44 @@ mod tests {
     let mut message = json!({"jsonrpc": "2.0", "id": id});
     message["result"] = result;
     TimedRead::Message(message)
+  }
+
+  fn signing_key() -> Ed25519KeyPair {
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("generate signing key");
+    Ed25519KeyPair::from_pkcs8(key.as_ref()).expect("parse signing key")
+  }
+
+  fn lowercase_hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut output, byte| {
+      use std::fmt::Write as _;
+      write!(output, "{byte:02x}").expect("write hex");
+      output
+    })
+  }
+
+  fn isolation_payload(profile: &RequestedCapabilityProfile) -> Value {
+    let now = now_unix_seconds();
+    json!({
+      "schema_version": ISOLATION_ATTESTATION_SCHEMA_VERSION,
+      "attestation_id": "ab".repeat(32),
+      "issued_at_unix_seconds": now.saturating_sub(1),
+      "expires_at_unix_seconds": now.saturating_add(300),
+      "profile_binding_digest": isolation_profile_binding_digest(profile).expect("binding"),
+      "credential_isolation_revision": "deployment-isolation-v1",
+      "negative_test_revision": NEGATIVE_TEST_REVISION,
+    })
+  }
+
+  fn write_signed_attestation(temp: &TempDir, key: &Ed25519KeyPair, payload: &Value) -> PathBuf {
+    let canonical_payload = payload.to_string();
+    let document = json!({
+      "payload": payload,
+      "signature_algorithm": "ed25519",
+      "signature": lowercase_hex(key.sign(canonical_payload.as_bytes()).as_ref()),
+    });
+    let path = temp.path().join("isolation-attestation.json");
+    fs::write(&path, document.to_string()).expect("write attestation");
+    path
   }
 
   fn inventory() -> Value {
@@ -1928,7 +2587,9 @@ mod tests {
       transport_factory: |_: RequestedCapabilityProfile| -> Result<MockTransport, String> {
         panic!("expired permit must not start transport")
       },
-      isolation_permit: Mutex::new(Some(expired_permit)),
+      isolation_verifier: Arc::new(TestIsolationVerifier {
+        permit: Mutex::new(Some(expired_permit)),
+      }),
     };
     assert!(matches!(
       executor.execute(expired_request),
@@ -1937,6 +2598,105 @@ mod tests {
         ..
       })
     ));
+  }
+
+  #[test]
+  fn signed_isolation_attestation_accepts_only_current_exact_profile() {
+    let profile = profile();
+    let key = signing_key();
+    let public_key = lowercase_hex(key.public_key().as_ref());
+    let temp = TempDir::new().expect("tempdir");
+
+    let path = write_signed_attestation(&temp, &key, &isolation_payload(&profile));
+    let verifier = load_signed_isolation_verifier(&profile, &path, &public_key)
+      .expect("valid signed attestation");
+    assert!(verifier.verify(&request(profile.clone())).is_ok());
+
+    let mut other_profile = profile.clone();
+    other_profile.github_mcp_endpoint_identity = "different-endpoint".to_owned();
+    let path = write_signed_attestation(&temp, &key, &isolation_payload(&other_profile));
+    let failure = load_signed_isolation_verifier(&profile, &path, &public_key)
+      .err()
+      .expect("mismatched profile must fail");
+    assert_eq!(
+      failure.message,
+      "scheduled_isolation_profile_binding_mismatch"
+    );
+
+    let now = now_unix_seconds();
+    let mut expired = isolation_payload(&profile);
+    expired["issued_at_unix_seconds"] = json!(now.saturating_sub(10));
+    expired["expires_at_unix_seconds"] = json!(now.saturating_sub(1));
+    let path = write_signed_attestation(&temp, &key, &expired);
+    assert!(load_signed_isolation_verifier(&profile, &path, &public_key).is_err());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn production_builder_accepts_exact_protected_signed_profile() {
+    let temp = TempDir::new().expect("tempdir");
+    let codex_program = temp.path().join("codex");
+    fs::write(&codex_program, "#!/bin/sh\nprintf 'codex-cli 0.144.6\\n'\n")
+      .expect("write codex probe");
+    fs::set_permissions(&codex_program, fs::Permissions::from_mode(0o500))
+      .expect("protect codex probe");
+    let codex_home = temp.path().join("codex-home");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir(&cwd).expect("create workspace");
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o500)).expect("protect workspace");
+    let attestation_path = temp.path().join("isolation-attestation.json");
+    let key = signing_key();
+    let mut config = ScheduledCodexConfig {
+      codex_program: codex_program.clone(),
+      codex_program_sha256: sha256_file(&codex_program).expect("program digest"),
+      codex_home: codex_home.clone(),
+      cwd,
+      github_mcp_url: "http://127.0.0.1:18081/mcp".to_owned(),
+      github_mcp_artifact_sha256: GITHUB_MCP_ARTIFACT_SHA256_X86_64.to_owned(),
+      github_mcp_endpoint_identity: "github-readonly-sidecar".to_owned(),
+      credential_reference: "github-readonly-service-account".to_owned(),
+      permission_policy_revision: "github-issues-read-v1".to_owned(),
+      config_revision: "scheduled-codex-v1".to_owned(),
+      config_sha256: String::new(),
+      isolation_attestation_path: attestation_path.clone(),
+      isolation_verifier_public_key: lowercase_hex(key.public_key().as_ref()),
+    };
+    let mut requested = requested_profile(&config);
+    config.config_sha256 = sha256_hex(requested.dedicated_config().as_bytes());
+    requested.config_sha256.clone_from(&config.config_sha256);
+    prepare_scheduled_codex_home(&requested).expect("prepare codex home");
+    write_signed_attestation(&temp, &key, &isolation_payload(&requested));
+    fs::set_permissions(&attestation_path, fs::Permissions::from_mode(0o400))
+      .expect("protect attestation");
+
+    let built = build_production_scheduled_codex_executor(&config).expect("production executor");
+    assert_eq!(built.profile, requested);
+  }
+
+  #[test]
+  fn signed_isolation_attestation_rejects_bad_signature_and_legacy_or_unknown_shapes() {
+    let profile = profile();
+    let key = signing_key();
+    let public_key = lowercase_hex(key.public_key().as_ref());
+    let temp = TempDir::new().expect("tempdir");
+
+    let path = write_signed_attestation(&temp, &key, &isolation_payload(&profile));
+    let mut bad_signature: Value =
+      serde_json::from_str(&fs::read_to_string(&path).expect("read attestation"))
+        .expect("parse attestation");
+    bad_signature["signature"] = json!("00".repeat(64));
+    fs::write(&path, bad_signature.to_string()).expect("write bad signature");
+    assert!(load_signed_isolation_verifier(&profile, &path, &public_key).is_err());
+
+    let mut legacy = isolation_payload(&profile);
+    legacy["schema_version"] = json!(0);
+    let path = write_signed_attestation(&temp, &key, &legacy);
+    assert!(load_signed_isolation_verifier(&profile, &path, &public_key).is_err());
+
+    let mut unknown = isolation_payload(&profile);
+    unknown["unexpected"] = json!(true);
+    let path = write_signed_attestation(&temp, &key, &unknown);
+    assert!(load_signed_isolation_verifier(&profile, &path, &public_key).is_err());
   }
 
   #[test]
@@ -2130,10 +2890,13 @@ mod tests {
       reads,
       actions: Arc::clone(&actions),
     };
-    let request = request(profile);
+    let mut request = request(profile);
+    request.timeout = Duration::from_millis(10);
     let executor = executor_for(transport, &request);
+    let prepared = executor.prepare(request).expect("prepare execution");
+    std::thread::sleep(Duration::from_millis(15));
     assert!(matches!(
-      executor.execute(request),
+      prepared.execute(),
       ScheduledExecutionResult::TransportLost(ScheduledFailure {
         kind: ScheduledFailureKind::TimedOut,
         ..
@@ -2341,9 +3104,14 @@ mod tests {
       reads,
       actions: Arc::clone(&actions),
     };
-    let request = request(profile);
+    let mut request = request(profile);
+    request.timeout = Duration::from_millis(10);
+    let prepared = executor_for(transport, &request)
+      .prepare(request)
+      .expect("prepare execution");
+    std::thread::sleep(Duration::from_millis(15));
     assert!(matches!(
-      executor_for(transport, &request).execute(request),
+      prepared.execute(),
       ScheduledExecutionResult::Interrupted { .. }
     ));
     assert_eq!(

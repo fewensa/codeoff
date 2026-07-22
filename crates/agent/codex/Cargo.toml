@@ -12,8 +12,12 @@ path = "src/lib.rs"
 codeoff-agent-contract = { path = "../contract" }
 codeoff-config = { path = "../../config" }
 nix.workspace = true
+ring.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

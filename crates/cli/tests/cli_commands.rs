@@ -502,7 +502,7 @@ bind = "127.0.0.1:0"
 
 [scheduler]
 enabled = true
-run_claims_enabled = true
+run_claims_enabled = false
 "#,
   )
   .expect("write config");

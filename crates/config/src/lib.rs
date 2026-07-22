@@ -5,7 +5,8 @@ mod error;
 
 pub use config::{
   AgentConfig, CodeoffConfig, ConfigLoadOptions, DataRetentionConfig, DatabaseConfig,
-  SchedulerRuntimeConfig, ServerConfig, SlackConfig, SlackDirectMessageFeedbackMode,
-  SlackResponseFeedbackConfig, SlackResponseFeedbackMode, SlackUserTokenConfig, StateConfig,
+  ScheduledCodexConfig, SchedulerRuntimeConfig, ServerConfig, SlackConfig,
+  SlackDirectMessageFeedbackMode, SlackResponseFeedbackConfig, SlackResponseFeedbackMode,
+  SlackUserTokenConfig, StateConfig,
 };
 pub use error::ConfigError;

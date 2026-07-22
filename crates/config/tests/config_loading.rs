@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use codeoff_config::{
   CodeoffConfig, ConfigError, ConfigLoadOptions, DataRetentionConfig, DatabaseConfig,
-  SchedulerRuntimeConfig, SlackDirectMessageFeedbackMode, SlackResponseFeedbackMode,
+  ScheduledCodexConfig, SchedulerRuntimeConfig, SlackDirectMessageFeedbackMode,
+  SlackResponseFeedbackMode,
 };
 use tempfile::tempdir;
 
@@ -234,7 +235,7 @@ fn test_scheduler_run_claims_default_off_and_loads_explicit_opt_in() {
   let config_path = dir.path().join("codeoff.toml");
   fs::write(
     &config_path,
-    r"
+    r#"
 [scheduler]
 enabled = true
 run_claims_enabled = true
@@ -242,7 +243,22 @@ delivery_claims_enabled = true
 recovery_batch_limit = 64
 retry_delay_seconds = 60
 max_attempts = 5
-",
+
+[agent.scheduled_codex]
+codex_program = "/opt/codeoff/bin/codex"
+codex_program_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+codex_home = "/var/lib/codeoff/scheduled-codex"
+cwd = "/work/codeoff-scheduled"
+github_mcp_url = "http://127.0.0.1:8090/mcp"
+github_mcp_artifact_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+github_mcp_endpoint_identity = "github-mcp-scheduled-v1"
+credential_reference = "kubernetes:codeoff/github-mcp"
+permission_policy_revision = "scheduled-read-only-v1"
+config_revision = "scheduled-codex-v1"
+config_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+isolation_attestation_path = "/var/run/codeoff/isolation-attestation.json"
+isolation_verifier_public_key = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+"#,
   )
   .expect("write config");
 
@@ -287,6 +303,85 @@ fn test_scheduler_config_rejects_claims_without_lifecycle_and_unsafe_limits() {
     config.validate(),
     Err(ConfigError::InvalidScheduler {
       field: "max_attempts",
+      ..
+    })
+  ));
+}
+
+fn valid_scheduled_codex_config() -> ScheduledCodexConfig {
+  ScheduledCodexConfig {
+    codex_program: "/opt/codeoff/bin/codex".into(),
+    codex_program_sha256: "a".repeat(64),
+    codex_home: "/var/lib/codeoff/scheduled-codex".into(),
+    cwd: "/work/codeoff-scheduled".into(),
+    github_mcp_url: "http://127.0.0.1:8090/mcp".to_owned(),
+    github_mcp_artifact_sha256: "b".repeat(64),
+    github_mcp_endpoint_identity: "github-mcp-scheduled-v1".to_owned(),
+    credential_reference: "kubernetes:codeoff/github-mcp".to_owned(),
+    permission_policy_revision: "scheduled-read-only-v1".to_owned(),
+    config_revision: "scheduled-codex-v1".to_owned(),
+    config_sha256: "c".repeat(64),
+    isolation_attestation_path: "/var/run/codeoff/isolation-attestation.json".into(),
+    isolation_verifier_public_key: "d".repeat(64),
+  }
+}
+
+fn scheduler_with_valid_scheduled_codex() -> CodeoffConfig {
+  let mut config = CodeoffConfig::default();
+  config.scheduler.enabled = true;
+  config.scheduler.run_claims_enabled = true;
+  config.agent.scheduled_codex = valid_scheduled_codex_config();
+  config
+}
+
+#[test]
+fn test_scheduled_codex_rejects_unsafe_paths_digests_keys_and_urls() {
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.codex_program = "relative/codex".into();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.codex_program",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.cwd = config.agent.scheduled_codex.codex_home.join("workspace");
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.cwd",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.config_sha256 = "A".repeat(64);
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.config_sha256",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.isolation_verifier_public_key = "short".to_owned();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.isolation_verifier_public_key",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.github_mcp_url = "http://token@127.0.0.1:8090/mcp".to_owned();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.github_mcp_url",
       ..
     })
   ));

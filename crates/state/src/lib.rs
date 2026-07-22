@@ -11,10 +11,11 @@ pub use scheduler::{
   IdempotencyDecision, LateEvidenceAppendOutcome, MaterializationOutcome, OccurrenceError,
   OccurrenceWindow, PreflightFailureDisposition, PrincipalKey, RunLeaseBinding,
   ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec,
-  ScheduledDeliveryState, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
-  ScheduledJobMutation, ScheduledJobStatus, ScheduledRun, ScheduledRunLateEvidenceKind,
-  ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome, StateValueError,
-  TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
+  ScheduledDeliveryState, ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob,
+  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
+  ScheduledRun, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunResult,
+  ScheduledRunState, ScheduledRunSuccessOutcome, StateValueError, TransactionalMutationOutcome,
+  TransportConvergence, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
   UpdateScheduledJob,
 };
 #[cfg(any(test, feature = "test-support"))]

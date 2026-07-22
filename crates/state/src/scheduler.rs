@@ -626,6 +626,31 @@ pub enum PreflightFailureDisposition {
   Fail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledExecutionTerminal {
+  Failed,
+  TimedOut,
+  Cancelled,
+  OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportConvergence {
+  Converged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledExecutionDisposition {
+  RetryAt {
+    retry_at: i64,
+    deadline_at: i64,
+    max_attempts: i64,
+    transport: TransportConvergence,
+    exhausted: ScheduledExecutionTerminal,
+  },
+  Terminal(ScheduledExecutionTerminal),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpiredRunReclaimOutcome {
   Idle,
@@ -703,6 +728,13 @@ impl ScheduledRunResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledRunSuccessOutcome {
   Committed,
+  LateEvidence(LateEvidenceAppendOutcome),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledRunExecutionOutcome {
+  Retried,
+  Terminal(ScheduledExecutionTerminal),
   LateEvidence(LateEvidenceAppendOutcome),
 }
 

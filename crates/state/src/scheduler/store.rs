@@ -10,12 +10,13 @@ use super::{
   ExpiredRunReclaimOutcome, IdempotencyDecision, LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES,
   MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES, MaterializationOutcome, PreflightFailureDisposition,
   PrincipalKey, RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit,
-  ScheduleMutationIdempotency, ScheduleSpec, ScheduledJob, ScheduledJobDefinition,
-  ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus, ScheduledRunLateEvidenceKind,
-  ScheduledRunResult, ScheduledRunSuccessOutcome, StateError, TransactionalMutationOutcome,
-  UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json,
-  invalid_occurrence, invalid_value, materialized_run, positive_u32, scheduler_error,
-  validate_text,
+  ScheduleMutationIdempotency, ScheduleSpec, ScheduledExecutionDisposition,
+  ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
+  ScheduledJobMutation, ScheduledJobStatus, ScheduledRunExecutionOutcome,
+  ScheduledRunLateEvidenceKind, ScheduledRunResult, ScheduledRunSuccessOutcome, StateError,
+  TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
+  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
+  positive_u32, scheduler_error, validate_text,
 };
 use crate::StateStore;
 
@@ -992,6 +993,119 @@ impl StateStore {
       return Err(StateError::ScheduledRunLostLease);
     }
     transaction.commit().await.map_err(scheduler_error)
+  }
+
+  /// Records a fenced execution failure, retry, or terminal uncertainty atomically.
+  ///
+  /// Post-dispatch retries require a current, hash-valid, version-one side-effect-free attestation.
+  /// A stale binding can only append diagnostic late evidence.
+  ///
+  /// # Errors
+  /// Returns an error for invalid policy data, malformed persisted authority, or storage failure.
+  pub async fn record_scheduled_run_execution_outcome(
+    &self,
+    binding: &RunLeaseBinding,
+    disposition: ScheduledExecutionDisposition,
+    error_kind: &str,
+    error_message: &str,
+    now: i64,
+  ) -> Result<ScheduledRunExecutionOutcome, StateError> {
+    validate_lease_binding(binding)?;
+    validate_text("scheduled execution error kind", error_kind).map_err(invalid_value)?;
+    if error_message.len() > MAX_CONTEXT_BYTES {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled execution error exceeds its storage bound".to_owned(),
+      });
+    }
+    if let ScheduledExecutionDisposition::RetryAt {
+      retry_at,
+      max_attempts,
+      ..
+    } = disposition
+      && (retry_at <= now || max_attempts <= 0)
+    {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "invalid scheduled execution retry policy".to_owned(),
+      });
+    }
+
+    let evidence_sha256 = sha256_hex(
+      format!(
+        "scheduled-execution-outcome-v1\n{}\n{}\n{}\n{}",
+        binding.run_id(),
+        binding.attempt(),
+        error_kind,
+        error_message
+      )
+      .as_bytes(),
+    );
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let row = sqlx::query(
+      "select a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner where r.run_id = ?1 and r.job_id = ?2 and r.attempt = ?3 and r.fence = ?4 and r.lease_owner = ?5 and r.state = 'executing' and a.state = 'executing' and r.lease_expires_at > ?6 and a.lease_expires_at > ?6",
+    )
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .bind(now)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(row) = row else {
+      let evidence = append_late_evidence_in_transaction(
+        &mut transaction,
+        binding,
+        ScheduledRunLateEvidenceKind::CompletionAfterLeaseLoss,
+        &evidence_sha256,
+        now,
+      )
+      .await?;
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ScheduledRunExecutionOutcome::LateEvidence(evidence));
+    };
+
+    let transition = execution_outcome_transition(binding, disposition, &row, now)?;
+    let run = sqlx::query(
+      "update scheduled_runs set state = ?1, next_attempt_at = ?2, lease_owner = null, lease_expires_at = null, overlap_slot = ?3, error_kind = case when ?1 = 'pending' then null else ?4 end, error_message = case when ?1 = 'pending' then null else ?5 end, updated_at = ?6 where run_id = ?7 and job_id = ?8 and attempt = ?9 and fence = ?10 and lease_owner = ?11 and state = 'executing' and lease_expires_at > ?6",
+    )
+    .bind(transition.run_state)
+    .bind(transition.retry_at)
+    .bind(transition.overlap_slot)
+    .bind(error_kind)
+    .bind(error_message)
+    .bind(now)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if run.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunLostLease);
+    }
+    let attempt = sqlx::query(
+      "update scheduled_run_attempts set state = ?1, completed_at = ?2, error_kind = ?3, error_message = ?4 where run_id = ?5 and job_id = ?6 and attempt = ?7 and fence = ?8 and lease_owner = ?9 and state = 'executing' and lease_expires_at > ?2",
+    )
+    .bind(transition.attempt_state)
+    .bind(now)
+    .bind(error_kind)
+    .bind(error_message)
+    .bind(binding.run_id())
+    .bind(binding.job_id())
+    .bind(binding.attempt())
+    .bind(binding.fence())
+    .bind(binding.lease_owner())
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if attempt.rows_affected() != 1 {
+      return Err(StateError::ScheduledRunLostLease);
+    }
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(transition.outcome)
   }
 
   /// Reclaims one expired lease without retrying an execution of unknown convergence.
@@ -2505,6 +2619,89 @@ fn required_due(next_run_at: Option<i64>) -> Result<i64, StateError> {
   next_run_at.ok_or_else(|| StateError::InvalidSchedulerState {
     reason: "due schedule has no next occurrence".to_owned(),
   })
+}
+
+struct ExecutionOutcomeTransition {
+  run_state: &'static str,
+  attempt_state: &'static str,
+  retry_at: Option<i64>,
+  overlap_slot: Option<i64>,
+  outcome: ScheduledRunExecutionOutcome,
+}
+
+fn execution_outcome_transition(
+  binding: &RunLeaseBinding,
+  disposition: ScheduledExecutionDisposition,
+  row: &sqlx::sqlite::SqliteRow,
+  now: i64,
+) -> Result<ExecutionOutcomeTransition, StateError> {
+  let terminal = match disposition {
+    ScheduledExecutionDisposition::Terminal(terminal) => terminal,
+    ScheduledExecutionDisposition::RetryAt {
+      retry_at,
+      deadline_at,
+      max_attempts,
+      transport: super::TransportConvergence::Converged,
+      exhausted,
+    } => {
+      if !persisted_profile_allows_retry(row)? {
+        ScheduledExecutionTerminal::OutcomeUnknown
+      } else if binding.attempt() >= max_attempts || now >= deadline_at || retry_at > deadline_at {
+        exhausted
+      } else {
+        return Ok(ExecutionOutcomeTransition {
+          run_state: "pending",
+          attempt_state: "retry_scheduled",
+          retry_at: Some(retry_at),
+          overlap_slot: Some(1),
+          outcome: ScheduledRunExecutionOutcome::Retried,
+        });
+      }
+    }
+  };
+  let (run_state, attempt_state) = match terminal {
+    ScheduledExecutionTerminal::Failed => ("failed", "failed"),
+    ScheduledExecutionTerminal::TimedOut => ("timed_out", "timed_out"),
+    ScheduledExecutionTerminal::Cancelled => ("cancelled", "cancelled"),
+    ScheduledExecutionTerminal::OutcomeUnknown => ("outcome_unknown", "outcome_unknown"),
+  };
+  let overlap_slot = (terminal == ScheduledExecutionTerminal::OutcomeUnknown).then_some(1_i64);
+  Ok(ExecutionOutcomeTransition {
+    run_state,
+    attempt_state,
+    retry_at: None,
+    overlap_slot,
+    outcome: ScheduledRunExecutionOutcome::Terminal(terminal),
+  })
+}
+
+fn persisted_profile_allows_retry(row: &sqlx::sqlite::SqliteRow) -> Result<bool, StateError> {
+  let schema_version = row
+    .try_get::<Option<i64>, _>("attested_profile_schema_version")
+    .map_err(scheduler_error)?;
+  let canonical_json = row
+    .try_get::<Option<String>, _>("attested_profile_json")
+    .map_err(scheduler_error)?;
+  let hash_algorithm = row
+    .try_get::<Option<String>, _>("attested_profile_hash_algorithm")
+    .map_err(scheduler_error)?;
+  let digest = row
+    .try_get::<Option<String>, _>("attested_profile_digest")
+    .map_err(scheduler_error)?;
+  let (Some(canonical_json), Some(digest)) = (canonical_json, digest) else {
+    return Ok(false);
+  };
+  if schema_version != Some(1)
+    || hash_algorithm.as_deref() != Some("sha256-v1")
+    || sha256_hex(canonical_json.as_bytes()) != digest
+  {
+    return Ok(false);
+  }
+  let profile: Value = serde_json::from_str(&canonical_json).map_err(invalid_json)?;
+  Ok(
+    profile.get("schema_version").and_then(Value::as_u64) == Some(1)
+      && profile.get("side_effect_free").and_then(Value::as_bool) == Some(true),
+  )
 }
 
 #[cfg(test)]

@@ -8,11 +8,12 @@ use codeoff_state::{
   AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot, ClaimedScheduledRun,
   CreateScheduledJob, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome, LateEvidenceAppendOutcome,
   MaterializationOutcome, OccurrenceError, PreflightFailureDisposition, PrincipalKey,
-  ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryState, ScheduledJobDefinition,
-  ScheduledJobMutation, ScheduledJobStatus, ScheduledRunLateEvidenceKind, ScheduledRunResult,
+  ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryState, ScheduledExecutionDisposition,
+  ScheduledExecutionTerminal, ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus,
+  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunResult,
   ScheduledRunSuccessOutcome, StateError, StateStore, StateValueError,
-  TransactionalMutationOutcome, UpdateAcceptedDeliveryBaseline, UpdateExecutionBaseline,
-  UpdateScheduledJob,
+  TransactionalMutationOutcome, TransportConvergence, UpdateAcceptedDeliveryBaseline,
+  UpdateExecutionBaseline, UpdateScheduledJob,
 };
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -1809,6 +1810,144 @@ async fn test_claim_increments_attempt_and_fence_independently_and_attests_befor
   .await
   .expect("read unchanged expiries");
   assert_eq!(expiries, (160, 160));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_execution_retry_requires_persisted_side_effect_free_attestation_and_live_fence() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize state store");
+  for (job, scheduled_for) in [
+    ("safe-retry", 110),
+    ("unsafe-retry", 111),
+    ("late-retry", 112),
+  ] {
+    store
+      .create_scheduled_job(&create_request(job, ScheduleSpec::once(scheduled_for), 100))
+      .await
+      .expect("create job");
+    store
+      .materialize_due_schedule(job, 0, scheduled_for)
+      .await
+      .expect("materialize");
+  }
+  let profile_json = r#"{"schema_version":1,"side_effect_free":true}"#;
+  let profile = AttestedExecutionProfileSnapshot::new(
+    1,
+    profile_json,
+    "sha256-v1",
+    test_sha256_hex(profile_json),
+  )
+  .expect("safe profile");
+
+  let safe = store
+    .claim_next_scheduled_run("worker", 113, 150)
+    .await
+    .expect("claim safe")
+    .expect("safe run");
+  store
+    .mark_scheduled_run_executing(&safe.binding, &profile, 114)
+    .await
+    .expect("execute safe");
+  assert_eq!(
+    store
+      .record_scheduled_run_execution_outcome(
+        &safe.binding,
+        ScheduledExecutionDisposition::RetryAt {
+          retry_at: 120,
+          deadline_at: 140,
+          max_attempts: 3,
+          transport: TransportConvergence::Converged,
+          exhausted: ScheduledExecutionTerminal::Failed,
+        },
+        "interrupted",
+        "known cancelled transport",
+        115,
+      )
+      .await
+      .expect("schedule safe retry"),
+    ScheduledRunExecutionOutcome::Retried
+  );
+
+  let unsafe_claim = store
+    .claim_next_scheduled_run("worker", 116, 150)
+    .await
+    .expect("claim unsafe")
+    .expect("unsafe run");
+  let unsafe_profile =
+    AttestedExecutionProfileSnapshot::new(1, profile_json, "sha256-v1", "not-the-hash")
+      .expect("persistable unsafe profile");
+  store
+    .mark_scheduled_run_executing(&unsafe_claim.binding, &unsafe_profile, 117)
+    .await
+    .expect("execute unsafe");
+  assert_eq!(
+    store
+      .record_scheduled_run_execution_outcome(
+        &unsafe_claim.binding,
+        ScheduledExecutionDisposition::RetryAt {
+          retry_at: 121,
+          deadline_at: 140,
+          max_attempts: 3,
+          transport: TransportConvergence::Converged,
+          exhausted: ScheduledExecutionTerminal::Failed,
+        },
+        "interrupted",
+        "untrusted attestation",
+        118,
+      )
+      .await
+      .expect("refuse unsafe retry"),
+    ScheduledRunExecutionOutcome::Terminal(ScheduledExecutionTerminal::OutcomeUnknown)
+  );
+
+  let late = store
+    .claim_next_scheduled_run("worker", 119, 130)
+    .await
+    .expect("claim late")
+    .expect("late run");
+  store
+    .mark_scheduled_run_executing(&late.binding, &profile, 120)
+    .await
+    .expect("execute late");
+  assert!(matches!(
+    store
+      .record_scheduled_run_execution_outcome(
+        &late.binding,
+        ScheduledExecutionDisposition::Terminal(ScheduledExecutionTerminal::Failed),
+        "turn_failed",
+        "finished after lease loss",
+        130,
+      )
+      .await
+      .expect("append late evidence"),
+    ScheduledRunExecutionOutcome::LateEvidence(LateEvidenceAppendOutcome::Recorded)
+  ));
+
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let states: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+    "select job_id, state, overlap_slot from scheduled_runs where job_id in ('safe-retry', 'unsafe-retry', 'late-retry') order by job_id",
+  )
+  .fetch_all(&pool)
+  .await
+  .expect("read states");
+  assert_eq!(
+    states,
+    vec![
+      ("late-retry".to_owned(), "executing".to_owned(), Some(1)),
+      ("safe-retry".to_owned(), "pending".to_owned(), Some(1)),
+      (
+        "unsafe-retry".to_owned(),
+        "outcome_unknown".to_owned(),
+        Some(1),
+      ),
+    ]
+  );
 }
 
 #[tokio::test]

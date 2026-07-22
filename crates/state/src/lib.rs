@@ -13,13 +13,16 @@ pub use scheduler::{
   MaterializationOutcome, OccurrenceError, OccurrenceWindow, PreflightFailureDisposition,
   PreparedScheduledDelivery, PrincipalKey, RunLeaseBinding, ScheduleAuditSummary,
   ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryAuthority,
-  ScheduledDeliveryBinding, ScheduledDeliveryFailure, ScheduledDeliveryRenderInput,
-  ScheduledDeliveryRetentionReport, ScheduledDeliveryState, ScheduledDeliveryWork,
-  ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition,
-  ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
-  ScheduledRun, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunResult,
-  ScheduledRunState, ScheduledRunSuccessOutcome, SkippedNoneBaselinePolicy, StateValueError,
-  TransactionalMutationOutcome, TransportConvergence, UpdateExecutionBaseline, UpdateScheduledJob,
+  ScheduledDeliveryBinding, ScheduledDeliveryFailure, ScheduledDeliveryOperatorProjection,
+  ScheduledDeliveryRenderInput, ScheduledDeliveryRetentionReport, ScheduledDeliveryState,
+  ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
+  ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
+  ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority, ScheduledRun,
+  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
+  ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
+  SkippedNoneBaselinePolicy, StateValueError, TransactionalMutationOutcome, TransportConvergence,
+  UpdateExecutionBaseline, UpdateScheduledJob,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::StateStoreTestLock;

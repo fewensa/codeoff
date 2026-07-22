@@ -10,11 +10,13 @@ use codeoff_state::{
   ExpiredRunReclaimOutcome, LateEvidenceAppendOutcome, MaterializationOutcome, OccurrenceError,
   PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey,
   ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryFailure, ScheduledDeliveryState,
-  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
-  ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
-  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunResult,
-  ScheduledRunSuccessOutcome, SkippedNoneBaselinePolicy, StateError, StateStore, StateValueError,
-  TransactionalMutationOutcome, TransportConvergence, UpdateScheduledJob,
+  ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
+  ScheduledExecutionTerminal, ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus,
+  ScheduledPrepareAuthority, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind,
+  ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
+  StateError, StateStore, StateValueError, TransactionalMutationOutcome, TransportConvergence,
+  UpdateScheduledJob,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -102,6 +104,58 @@ fn test_sha256_hex(value: &str) -> String {
     write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
   }
   encoded
+}
+
+fn operator_provider_receipt(
+  provider: &str,
+  tenant: &str,
+  target_kind: &str,
+  conversation_id: &str,
+  message_id: &str,
+) -> String {
+  json!({
+    "conversation_id": conversation_id,
+    "message_id": message_id,
+    "provider": provider,
+    "receipt_version": 1,
+    "target_kind": target_kind,
+    "tenant": tenant,
+    "thread_id": null,
+  })
+  .to_string()
+}
+
+fn operator_delivery_evidence(
+  kind: &str,
+  evidence_id: &str,
+  provider: &str,
+  tenant: &str,
+  target_kind: &str,
+  provider_receipt: Option<&str>,
+) -> (String, String) {
+  let evidence = if let Some(provider_receipt) = provider_receipt {
+    json!({
+      "evidence_id": evidence_id,
+      "evidence_version": 1,
+      "kind": kind,
+      "provider": provider,
+      "receipt_digest": test_sha256_hex(provider_receipt),
+      "target_kind": target_kind,
+      "tenant": tenant,
+    })
+  } else {
+    json!({
+      "evidence_id": evidence_id,
+      "evidence_version": 1,
+      "kind": kind,
+      "provider": provider,
+      "target_kind": target_kind,
+      "tenant": tenant,
+    })
+  }
+  .to_string();
+  let digest = test_sha256_hex(&evidence);
+  (evidence, digest)
 }
 
 fn recovery_capability_profile_json() -> String {
@@ -677,6 +731,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
           | "20260721040000_scheduler_delivery_intents.sql"
           | "20260722000000_scheduler_delivery_authority.sql"
           | "20260722010000_scheduler_delivery_readiness.sql"
+          | "20260722020000_scheduler_operator.sql"
       )
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
@@ -997,6 +1052,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
       && entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
+      && entry.file_name() != "20260722020000_scheduler_operator.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1076,6 +1132,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       && entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
+      && entry.file_name() != "20260722020000_scheduler_operator.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1153,6 +1210,7 @@ async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_pay
     let entry = entry.expect("migration entry");
     if entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
+      && entry.file_name() != "20260722020000_scheduler_operator.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy issue-06 migration");
@@ -1327,6 +1385,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
     if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
+      && entry.file_name() != "20260722020000_scheduler_operator.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1569,6 +1628,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
     if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
+      && entry.file_name() != "20260722020000_scheduler_operator.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1638,6 +1698,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
     if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
+      && entry.file_name() != "20260722020000_scheduler_operator.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1720,6 +1781,7 @@ async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_ident
     if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
+      && entry.file_name() != "20260722020000_scheduler_operator.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -3858,6 +3920,234 @@ async fn test_expired_safe_executing_run_has_one_reclaimer_and_stale_completion_
   .await
   .expect("read outcome counts");
   assert_eq!(counts, (1, 1, 1));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  store
+    .create_scheduled_job(&create_request(
+      "operator-run-retry",
+      ScheduleSpec::once(110),
+      100,
+    ))
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule("operator-run-retry", 0, 110)
+    .await
+    .expect("materialize");
+  let claim = store
+    .claim_next_scheduled_run("worker", 111, 150)
+    .await
+    .expect("claim")
+    .expect("run");
+  store
+    .record_scheduled_run_preflight_failure(
+      &claim.binding,
+      PreflightFailureDisposition::Fail,
+      "preflight_failed",
+      "preflight failed",
+      112,
+    )
+    .await
+    .expect("terminal failure");
+  let bypass_pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect bypass database");
+  assert!(
+    sqlx::query(
+      "update scheduled_runs set state = 'pending', next_attempt_at = 120, updated_at = 113 where run_id = ?1 and state = 'failed'",
+    )
+    .bind(claim.binding.run_id())
+    .execute(&bypass_pool)
+    .await
+    .is_err(),
+    "direct SQL must not bypass run operator authority"
+  );
+  let request = SchedulerOperatorRequest::for_run_retry(
+    owner(),
+    "retry-request",
+    claim.binding.run_id(),
+    claim.binding.attempt(),
+    claim.binding.fence(),
+    ScheduledRunState::Failed,
+    120,
+    113,
+  )
+  .expect("operator request");
+  let stale_request = SchedulerOperatorRequest::for_run_retry(
+    owner(),
+    "stale-retry-request",
+    claim.binding.run_id(),
+    claim.binding.attempt(),
+    claim.binding.fence() + 1,
+    ScheduledRunState::Failed,
+    120,
+    113,
+  )
+  .expect("stale operator request");
+  assert_eq!(
+    store
+      .operator_retry_scheduled_run(
+        &stale_request,
+        claim.binding.run_id(),
+        claim.binding.attempt(),
+        claim.binding.fence() + 1,
+        120,
+      )
+      .await
+      .expect("reject stale retry"),
+    SchedulerOperatorMutationOutcome::Conflict
+  );
+  assert_eq!(
+    store
+      .operator_retry_scheduled_run(
+        &request,
+        claim.binding.run_id(),
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        120,
+      )
+      .await
+      .expect("apply retry"),
+    SchedulerOperatorMutationOutcome::Applied
+  );
+  assert_eq!(
+    store
+      .operator_retry_scheduled_run(
+        &request,
+        claim.binding.run_id(),
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        120,
+      )
+      .await
+      .expect("replay retry"),
+    SchedulerOperatorMutationOutcome::Replay
+  );
+  let actions = store
+    .list_scheduler_operator_actions("run", claim.binding.run_id(), 10)
+    .await
+    .expect("list audit");
+  assert_eq!(actions.len(), 1);
+  assert!(actions[0].consumed);
+  let mut conflicting_request = request.clone();
+  conflicting_request.request_digest = "f".repeat(64);
+  assert_eq!(
+    store
+      .operator_retry_scheduled_run(
+        &conflicting_request,
+        claim.binding.run_id(),
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        120,
+      )
+      .await
+      .expect("conflicting replay"),
+    SchedulerOperatorMutationOutcome::Conflict
+  );
+  let projections = store
+    .list_scheduled_run_operator_projections(None, 10)
+    .await
+    .expect("list runs");
+  assert_eq!(projections.len(), 1);
+  assert_eq!(projections[0].state, ScheduledRunState::Pending);
+  assert_eq!(projections[0].next_attempt_at, Some(120));
+  assert!(
+    store
+      .list_scheduled_run_operator_projections(None, 101)
+      .await
+      .is_err()
+  );
+
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  assert!(
+    sqlx::query("update scheduler_operator_actions set action = 'retry_run'")
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  assert!(
+    sqlx::query("delete from scheduler_operator_actions")
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  assert!(
+    sqlx::query("update scheduler_operator_action_consumptions set consumed_at = consumed_at")
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  assert!(
+    sqlx::query("delete from scheduler_operator_action_consumptions")
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+
+  store
+    .create_scheduled_job(&create_request(
+      "operator-run-unknown",
+      ScheduleSpec::once(130),
+      100,
+    ))
+    .await
+    .expect("create unknown job");
+  store
+    .materialize_due_schedule("operator-run-unknown", 0, 130)
+    .await
+    .expect("materialize unknown");
+  let unknown = store
+    .claim_next_scheduled_run("unknown-worker", 131, 140)
+    .await
+    .expect("claim unknown")
+    .expect("unknown run");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&unknown.binding, &profile, 132)
+    .await
+    .expect("execute unknown");
+  assert!(matches!(
+    store
+      .reclaim_next_expired_scheduled_run(141, 3, 150)
+      .await
+      .expect("reclaim unknown"),
+    ExpiredRunReclaimOutcome::OutcomeUnknown { .. }
+  ));
+  let invalid_unknown_request = SchedulerOperatorRequest::for_run_retry(
+    owner(),
+    "retry-unknown",
+    unknown.binding.run_id(),
+    unknown.binding.attempt(),
+    unknown.binding.fence(),
+    ScheduledRunState::Failed,
+    150,
+    142,
+  )
+  .expect("syntactically valid retry request");
+  assert_eq!(
+    store
+      .operator_retry_scheduled_run(
+        &invalid_unknown_request,
+        unknown.binding.run_id(),
+        unknown.binding.attempt(),
+        unknown.binding.fence(),
+        150,
+      )
+      .await
+      .expect("reject unknown retry"),
+    SchedulerOperatorMutationOutcome::Conflict
+  );
 }
 
 #[tokio::test]
@@ -6243,6 +6533,701 @@ async fn test_ambiguous_post_write_becomes_unknown_without_retry_or_baseline() {
   .expect("baseline foreign keys");
   assert_eq!(baseline_foreign_keys, vec!["scheduled_jobs"]);
   assert_eq!(claim.payload.digest(), payload.digest());
+}
+
+async fn prepare_operator_unknown_delivery(
+  store: &StateStore,
+  job_id: &str,
+  scheduled_for: i64,
+) -> ClaimedScheduledDelivery {
+  let mut request = create_request(job_id, ScheduleSpec::once(scheduled_for), 100);
+  request.targets = vec![second_target(job_id)];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule(job_id, 0, scheduled_for)
+    .await
+    .expect("materialize");
+  let run = store
+    .claim_next_scheduled_run(
+      "operator-run-worker",
+      scheduled_for + 1,
+      scheduled_for + 100,
+    )
+    .await
+    .expect("claim run")
+    .expect("run");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&run.binding, &profile, scheduled_for + 2)
+    .await
+    .expect("execute run");
+  store
+    .complete_scheduled_run_success(
+      &run.binding,
+      &ScheduledRunResult::new(format!("payload-{job_id}"), "").expect("result"),
+      scheduled_for + 3,
+    )
+    .await
+    .expect("complete run");
+  let delivery_id = store
+    .list_scheduled_delivery_operator_projections(None, 100)
+    .await
+    .expect("list deliveries")
+    .into_iter()
+    .find(|delivery| delivery.job_id == job_id)
+    .expect("delivery")
+    .delivery_id;
+  let PreparedScheduledDelivery::Pending(_) = store
+    .prepare_scheduled_delivery(
+      &delivery_id,
+      "text/plain; charset=utf-8",
+      &format!("payload-{job_id}"),
+      1,
+      scheduled_for + 4,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare delivery")
+  else {
+    panic!("Slack delivery must remain pending");
+  };
+  let claim = store
+    .claim_next_scheduled_delivery(
+      "operator-delivery-worker",
+      scheduled_for + 5,
+      scheduled_for + 100,
+    )
+    .await
+    .expect("claim delivery")
+    .expect("delivery");
+  store
+    .complete_scheduled_delivery_failure(
+      &claim.binding,
+      &ScheduledDeliveryFailure::AmbiguousPostWrite {
+        error_kind: "ambiguous".to_owned(),
+        redacted_message: Some("provider evidence required".to_owned()),
+      },
+      scheduled_for + 6,
+    )
+    .await
+    .expect("record ambiguity");
+  claim
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_operator_delivery_evidence_is_canonical_versioned_and_target_bound() {
+  let malformed_receipt = "not-json".to_owned();
+  let (evidence_json, evidence_digest) = operator_delivery_evidence(
+    "provider_confirmed_delivered",
+    "malformed-receipt",
+    "slack",
+    "workspace",
+    "channel",
+    Some(&malformed_receipt),
+  );
+  let malformed_action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+    provider_receipt: malformed_receipt,
+    evidence_json,
+    evidence_digest,
+  };
+  assert!(matches!(
+    SchedulerOperatorRequest::for_delivery_action(
+      owner(),
+      "malformed-receipt",
+      "delivery",
+      1,
+      1,
+      &malformed_action,
+      100,
+    ),
+    Err(StateValueError::InvalidJson { .. })
+  ));
+
+  let extra_key_receipt = json!({
+    "conversation_id": "C1",
+    "extra": "forbidden",
+    "message_id": "provider-message",
+    "provider": "slack",
+    "receipt_version": 1,
+    "target_kind": "channel",
+    "tenant": "workspace",
+    "thread_id": null,
+  })
+  .to_string();
+  let (evidence_json, evidence_digest) = operator_delivery_evidence(
+    "provider_confirmed_delivered",
+    "extra-key-receipt",
+    "slack",
+    "workspace",
+    "channel",
+    Some(&extra_key_receipt),
+  );
+  let extra_key_action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+    provider_receipt: extra_key_receipt,
+    evidence_json,
+    evidence_digest,
+  };
+  assert!(matches!(
+    SchedulerOperatorRequest::for_delivery_action(
+      owner(),
+      "extra-key-receipt",
+      "delivery",
+      1,
+      1,
+      &extra_key_action,
+      100,
+    ),
+    Err(StateValueError::InvalidJson { .. })
+  ));
+
+  let (evidence_json, _) = operator_delivery_evidence(
+    "provider_confirmed_no_write",
+    "digest-mismatch",
+    "slack",
+    "workspace",
+    "channel",
+    None,
+  );
+  let digest_mismatch_action = ScheduledDeliveryUnknownAction::ConfirmNoWriteTerminal {
+    evidence_json,
+    evidence_digest: "f".repeat(64),
+  };
+  assert!(matches!(
+    SchedulerOperatorRequest::for_delivery_action(
+      owner(),
+      "digest-mismatch",
+      "delivery",
+      1,
+      1,
+      &digest_mismatch_action,
+      100,
+    ),
+    Err(StateValueError::InvalidSha256 { .. })
+  ));
+
+  let (evidence_json, evidence_digest) = operator_delivery_evidence(
+    "provider_confirmed_delivered",
+    "masquerading-no-write",
+    "slack",
+    "workspace",
+    "channel",
+    None,
+  );
+  let masquerading_action = ScheduledDeliveryUnknownAction::ConfirmNoWriteTerminal {
+    evidence_json,
+    evidence_digest,
+  };
+  assert!(matches!(
+    SchedulerOperatorRequest::for_delivery_action(
+      owner(),
+      "masquerading-no-write",
+      "delivery",
+      1,
+      1,
+      &masquerading_action,
+      100,
+    ),
+    Err(StateValueError::InvalidVersion)
+  ));
+
+  let temp = tempdir().expect("create tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("initialize store");
+  let unknown = prepare_operator_unknown_delivery(&store, "operator-target-binding", 110).await;
+  for (request_id, provider, tenant, target_kind, conversation_id) in [
+    ("provider-mismatch", "github", "workspace", "channel", "C1"),
+    (
+      "tenant-mismatch",
+      "slack",
+      "other-workspace",
+      "channel",
+      "C1",
+    ),
+    ("kind-mismatch", "slack", "workspace", "dm", "C1"),
+    (
+      "conversation-mismatch",
+      "slack",
+      "workspace",
+      "channel",
+      "C2",
+    ),
+  ] {
+    let receipt =
+      operator_provider_receipt(provider, tenant, target_kind, conversation_id, "message-1");
+    let (evidence_json, evidence_digest) = operator_delivery_evidence(
+      "provider_confirmed_delivered",
+      request_id,
+      provider,
+      tenant,
+      target_kind,
+      Some(&receipt),
+    );
+    let action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+      provider_receipt: receipt,
+      evidence_json,
+      evidence_digest,
+    };
+    let request = SchedulerOperatorRequest::for_delivery_action(
+      owner(),
+      request_id,
+      unknown.binding.delivery_id(),
+      unknown.binding.attempt(),
+      unknown.binding.fence(),
+      &action,
+      120,
+    )
+    .expect("well-formed mismatched authority");
+    assert!(matches!(
+      store
+        .operator_act_on_unknown_delivery(
+          &request,
+          unknown.binding.delivery_id(),
+          unknown.binding.attempt(),
+          unknown.binding.fence(),
+          &action,
+        )
+        .await,
+      Err(StateError::InvalidSchedulerState { .. })
+    ));
+  }
+}
+
+async fn operator_delivery_action_after_barrier(
+  store: StateStore,
+  barrier: Arc<Barrier>,
+  request: SchedulerOperatorRequest,
+  delivery_id: String,
+  expected_attempt: i64,
+  expected_fence: i64,
+  action: ScheduledDeliveryUnknownAction,
+) -> Result<SchedulerOperatorMutationOutcome, StateError> {
+  barrier.wait().await;
+  for _ in 0..20 {
+    match store
+      .operator_act_on_unknown_delivery(
+        &request,
+        &delivery_id,
+        expected_attempt,
+        expected_fence,
+        &action,
+      )
+      .await
+    {
+      Err(error) if error.is_transient_storage_contention() => {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      result => return result,
+    }
+  }
+  store
+    .operator_act_on_unknown_delivery(
+      &request,
+      &delivery_id,
+      expected_attempt,
+      expected_fence,
+      &action,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_operator_delivery_exact_request_has_one_transition_across_two_stores() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let first = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize first store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  let unknown = prepare_operator_unknown_delivery(&first, "operator-delivery-race", 110).await;
+  let receipt = operator_provider_receipt("slack", "workspace", "channel", "C1", "provider-race-1");
+  let (evidence_json, evidence_digest) = operator_delivery_evidence(
+    "provider_confirmed_delivered",
+    "provider-race-case",
+    "slack",
+    "workspace",
+    "channel",
+    Some(&receipt),
+  );
+  let action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+    provider_receipt: receipt,
+    evidence_json,
+    evidence_digest,
+  };
+  let request = SchedulerOperatorRequest::for_delivery_action(
+    owner(),
+    "delivery-race-request",
+    unknown.binding.delivery_id(),
+    unknown.binding.attempt(),
+    unknown.binding.fence(),
+    &action,
+    120,
+  )
+  .expect("operator request");
+  let barrier = Arc::new(Barrier::new(3));
+  let first_task = tokio::spawn(operator_delivery_action_after_barrier(
+    first,
+    Arc::clone(&barrier),
+    request.clone(),
+    unknown.binding.delivery_id().to_owned(),
+    unknown.binding.attempt(),
+    unknown.binding.fence(),
+    action.clone(),
+  ));
+  let second_task = tokio::spawn(operator_delivery_action_after_barrier(
+    second,
+    Arc::clone(&barrier),
+    request,
+    unknown.binding.delivery_id().to_owned(),
+    unknown.binding.attempt(),
+    unknown.binding.fence(),
+    action,
+  ));
+  barrier.wait().await;
+  let outcomes = [
+    first_task.await.expect("first task").expect("first action"),
+    second_task
+      .await
+      .expect("second task")
+      .expect("second action"),
+  ];
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| **outcome == SchedulerOperatorMutationOutcome::Applied)
+      .count(),
+    1
+  );
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| **outcome == SchedulerOperatorMutationOutcome::Replay)
+      .count(),
+    1
+  );
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let counts: (i64, i64, i64, String) = sqlx::query_as(
+    "select (select count(*) from scheduler_operator_actions where target_id = ?1), (select count(*) from scheduler_operator_action_consumptions where target_id = ?1), (select count(*) from scheduled_delivery_baselines where job_id = 'operator-delivery-race'), (select state from scheduled_run_deliveries where delivery_id = ?1)",
+  )
+  .bind(unknown.binding.delivery_id())
+  .fetch_one(&pool)
+  .await
+  .expect("operator race authority");
+  assert_eq!(counts, (1, 1, 1, "delivered".to_owned()));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_operator_delivery_unknown_actions_preserve_authority_and_baselines() {
+  let temp = tempdir().expect("create tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("initialize store");
+
+  let delivered = prepare_operator_unknown_delivery(&store, "operator-delivered", 110).await;
+  let bypass_pool = SqlitePool::connect(&database_url(&temp.path().join("state")))
+    .await
+    .expect("connect bypass database");
+  assert!(
+    sqlx::query(
+      "update scheduled_run_deliveries set state = 'delivered', provider_receipt = 'bypass', provider_outcome = 'confirmed_success', error_kind = null, error_message = null, updated_at = 119 where delivery_id = ?1 and state = 'delivery_unknown'",
+    )
+    .bind(delivered.binding.delivery_id())
+    .execute(&bypass_pool)
+    .await
+    .is_err(),
+    "direct SQL must not bypass operator authority"
+  );
+  let provider_receipt =
+    operator_provider_receipt("slack", "workspace", "channel", "C1", "provider-message-1");
+  let (delivered_evidence, delivered_evidence_digest) = operator_delivery_evidence(
+    "provider_confirmed_delivered",
+    "provider-case-delivered",
+    "slack",
+    "workspace",
+    "channel",
+    Some(&provider_receipt),
+  );
+  let delivered_action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+    provider_receipt,
+    evidence_json: delivered_evidence,
+    evidence_digest: delivered_evidence_digest,
+  };
+  let delivered_request = SchedulerOperatorRequest::for_delivery_action(
+    owner(),
+    "confirm-delivered",
+    delivered.binding.delivery_id(),
+    delivered.binding.attempt(),
+    delivered.binding.fence(),
+    &delivered_action,
+    120,
+  )
+  .expect("delivered authority");
+  assert_eq!(
+    store
+      .operator_act_on_unknown_delivery(
+        &delivered_request,
+        delivered.binding.delivery_id(),
+        delivered.binding.attempt(),
+        delivered.binding.fence(),
+        &delivered_action,
+      )
+      .await
+      .expect("confirm delivered"),
+    SchedulerOperatorMutationOutcome::Applied
+  );
+  assert_eq!(
+    store
+      .operator_act_on_unknown_delivery(
+        &delivered_request,
+        delivered.binding.delivery_id(),
+        delivered.binding.attempt(),
+        delivered.binding.fence(),
+        &delivered_action,
+      )
+      .await
+      .expect("replay delivered"),
+    SchedulerOperatorMutationOutcome::Replay
+  );
+  let (conflicting_evidence, conflicting_evidence_digest) = operator_delivery_evidence(
+    "operator_acknowledged_unknown",
+    "conflicting-delivery-request",
+    "slack",
+    "workspace",
+    "channel",
+    None,
+  );
+  let conflicting_action = ScheduledDeliveryUnknownAction::AcknowledgeUnknown {
+    evidence_json: conflicting_evidence,
+    evidence_digest: conflicting_evidence_digest,
+  };
+  let conflicting_request = SchedulerOperatorRequest::for_delivery_action(
+    owner(),
+    "confirm-delivered",
+    delivered.binding.delivery_id(),
+    delivered.binding.attempt(),
+    delivered.binding.fence(),
+    &conflicting_action,
+    120,
+  )
+  .expect("conflicting delivery request");
+  assert_eq!(
+    store
+      .operator_act_on_unknown_delivery(
+        &conflicting_request,
+        delivered.binding.delivery_id(),
+        delivered.binding.attempt(),
+        delivered.binding.fence(),
+        &conflicting_action,
+      )
+      .await
+      .expect("conflicting delivery replay"),
+    SchedulerOperatorMutationOutcome::Conflict
+  );
+
+  let no_write = prepare_operator_unknown_delivery(&store, "operator-no-write", 130).await;
+  let (no_write_evidence, no_write_evidence_digest) = operator_delivery_evidence(
+    "provider_confirmed_no_write",
+    "provider-case-no-write",
+    "slack",
+    "workspace",
+    "channel",
+    None,
+  );
+  let no_write_action = ScheduledDeliveryUnknownAction::ConfirmNoWriteTerminal {
+    evidence_json: no_write_evidence,
+    evidence_digest: no_write_evidence_digest,
+  };
+  let no_write_request = SchedulerOperatorRequest::for_delivery_action(
+    owner(),
+    "confirm-no-write",
+    no_write.binding.delivery_id(),
+    no_write.binding.attempt(),
+    no_write.binding.fence(),
+    &no_write_action,
+    140,
+  )
+  .expect("no-write authority");
+  let stale_no_write_request = SchedulerOperatorRequest::for_delivery_action(
+    owner(),
+    "stale-no-write",
+    no_write.binding.delivery_id(),
+    no_write.binding.attempt(),
+    no_write.binding.fence() + 1,
+    &no_write_action,
+    140,
+  )
+  .expect("stale no-write authority");
+  assert_eq!(
+    store
+      .operator_act_on_unknown_delivery(
+        &stale_no_write_request,
+        no_write.binding.delivery_id(),
+        no_write.binding.attempt(),
+        no_write.binding.fence() + 1,
+        &no_write_action,
+      )
+      .await
+      .expect("stale no write"),
+    SchedulerOperatorMutationOutcome::Conflict
+  );
+  assert_eq!(
+    store
+      .operator_act_on_unknown_delivery(
+        &no_write_request,
+        no_write.binding.delivery_id(),
+        no_write.binding.attempt(),
+        no_write.binding.fence(),
+        &no_write_action,
+      )
+      .await
+      .expect("confirm no write"),
+    SchedulerOperatorMutationOutcome::Applied
+  );
+
+  let acknowledged = prepare_operator_unknown_delivery(&store, "operator-ack", 150).await;
+  let (ack_evidence, ack_evidence_digest) = operator_delivery_evidence(
+    "operator_acknowledged_unknown",
+    "operator-case-ack",
+    "slack",
+    "workspace",
+    "channel",
+    None,
+  );
+  let ack_action = ScheduledDeliveryUnknownAction::AcknowledgeUnknown {
+    evidence_json: ack_evidence,
+    evidence_digest: ack_evidence_digest,
+  };
+  let ack_request = SchedulerOperatorRequest::for_delivery_action(
+    owner(),
+    "acknowledge-unknown",
+    acknowledged.binding.delivery_id(),
+    acknowledged.binding.attempt(),
+    acknowledged.binding.fence(),
+    &ack_action,
+    160,
+  )
+  .expect("ack authority");
+  assert_eq!(
+    store
+      .operator_act_on_unknown_delivery(
+        &ack_request,
+        acknowledged.binding.delivery_id(),
+        acknowledged.binding.attempt(),
+        acknowledged.binding.fence(),
+        &ack_action,
+      )
+      .await
+      .expect("acknowledge"),
+    SchedulerOperatorMutationOutcome::Applied
+  );
+
+  let resend = prepare_operator_unknown_delivery(&store, "operator-resend", 170).await;
+  let (resend_evidence, resend_evidence_digest) = operator_delivery_evidence(
+    "operator_force_resend",
+    "operator-case-resend",
+    "slack",
+    "workspace",
+    "channel",
+    None,
+  );
+  let resend_action = ScheduledDeliveryUnknownAction::ForceResend {
+    evidence_json: resend_evidence,
+    evidence_digest: resend_evidence_digest,
+    duplicate_risk_acknowledged: true,
+  };
+  let resend_request = SchedulerOperatorRequest::for_delivery_action(
+    owner(),
+    "force-resend",
+    resend.binding.delivery_id(),
+    resend.binding.attempt(),
+    resend.binding.fence(),
+    &resend_action,
+    180,
+  )
+  .expect("resend authority");
+  assert_eq!(
+    store
+      .operator_act_on_unknown_delivery(
+        &resend_request,
+        resend.binding.delivery_id(),
+        resend.binding.attempt(),
+        resend.binding.fence(),
+        &resend_action,
+      )
+      .await
+      .expect("force resend"),
+    SchedulerOperatorMutationOutcome::Applied
+  );
+  let claimed_resend = store
+    .claim_next_scheduled_delivery("resend-worker", 181, 220)
+    .await
+    .expect("claim resend")
+    .expect("resent delivery");
+  assert_eq!(
+    claimed_resend.binding.delivery_id(),
+    resend.binding.delivery_id()
+  );
+  assert_eq!(
+    claimed_resend.binding.attempt(),
+    resend.binding.attempt() + 1
+  );
+
+  let pool = SqlitePool::connect(&database_url(&temp.path().join("state")))
+    .await
+    .expect("connect database");
+  let baselines: (i64, i64, i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduled_delivery_baselines where job_id = 'operator-delivered'), (select count(*) from scheduled_delivery_baselines where job_id = 'operator-no-write'), (select count(*) from scheduled_delivery_baselines where job_id = 'operator-ack'), (select count(*) from scheduled_delivery_baselines where job_id = 'operator-resend')",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("baseline counts");
+  assert_eq!(baselines, (1, 0, 0, 0));
+
+  let projections = store
+    .list_scheduled_delivery_operator_projections(None, 100)
+    .await
+    .expect("delivery projections");
+  let state_for = |job_id: &str| {
+    projections
+      .iter()
+      .find(|delivery| delivery.job_id == job_id)
+      .expect("projected delivery")
+      .state
+  };
+  assert_eq!(
+    state_for("operator-delivered"),
+    ScheduledDeliveryState::Delivered
+  );
+  assert_eq!(
+    state_for("operator-no-write"),
+    ScheduledDeliveryState::FailedTerminal
+  );
+  assert_eq!(
+    state_for("operator-ack"),
+    ScheduledDeliveryState::DeliveryUnknown
+  );
+  let delivered_audit = store
+    .list_scheduler_operator_actions("delivery", delivered.binding.delivery_id(), 10)
+    .await
+    .expect("delivery audit");
+  assert_eq!(delivered_audit.len(), 1);
+  assert!(delivered_audit[0].consumed);
+  let ack_audit = store
+    .list_scheduler_operator_actions("delivery", acknowledged.binding.delivery_id(), 10)
+    .await
+    .expect("ack audit");
+  assert_eq!(ack_audit.len(), 1);
+  assert!(!ack_audit[0].consumed);
 }
 
 #[tokio::test]

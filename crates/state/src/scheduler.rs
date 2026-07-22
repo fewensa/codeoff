@@ -1402,6 +1402,487 @@ pub struct ScheduledRun {
   pub state: ScheduledRunState,
 }
 
+#[derive(Debug, Clone)]
+pub struct SchedulerOperatorRequest {
+  pub principal: PrincipalKey,
+  pub request_id: String,
+  pub request_digest: String,
+  pub occurred_at: i64,
+}
+
+impl SchedulerOperatorRequest {
+  /// Builds authority for one exact manual run retry.
+  ///
+  /// # Errors
+  /// Returns an error for invalid principal, request, target, or counters.
+  #[allow(clippy::too_many_arguments)]
+  pub fn for_run_retry(
+    principal: PrincipalKey,
+    request_id: impl Into<String>,
+    run_id: &str,
+    expected_attempt: i64,
+    expected_fence: i64,
+    expected_state: ScheduledRunState,
+    next_attempt_at: i64,
+    occurred_at: i64,
+  ) -> Result<Self, StateValueError> {
+    principal.validate()?;
+    let request_id = request_id.into();
+    validate_text("operator request id", &request_id)?;
+    validate_text("operator run id", run_id)?;
+    if expected_attempt <= 0
+      || expected_fence <= 0
+      || next_attempt_at < occurred_at
+      || !matches!(
+        expected_state,
+        ScheduledRunState::Failed | ScheduledRunState::TimedOut | ScheduledRunState::Cancelled
+      )
+    {
+      return Err(StateValueError::InvalidVersion);
+    }
+    Ok(Self {
+      principal,
+      request_id,
+      request_digest: operator_action_request_digest(
+        "retry_run",
+        "run",
+        run_id,
+        expected_attempt,
+        expected_fence,
+        expected_state.as_str(),
+        "pending",
+        None,
+        None,
+        None,
+        false,
+        next_attempt_at,
+      ),
+      occurred_at,
+    })
+  }
+
+  /// Builds authority for one exact ambiguous-delivery operator action.
+  ///
+  /// # Errors
+  /// Returns an error for invalid principal, request, target, evidence, or counters.
+  pub fn for_delivery_action(
+    principal: PrincipalKey,
+    request_id: impl Into<String>,
+    delivery_id: &str,
+    expected_attempt: i64,
+    expected_fence: i64,
+    action: &ScheduledDeliveryUnknownAction,
+    occurred_at: i64,
+  ) -> Result<Self, StateValueError> {
+    principal.validate()?;
+    let request_id = request_id.into();
+    validate_text("operator request id", &request_id)?;
+    validate_text("operator delivery id", delivery_id)?;
+    if expected_attempt <= 0 || expected_fence <= 0 {
+      return Err(StateValueError::InvalidVersion);
+    }
+    let (action_name, after_state, evidence_json, evidence_digest, receipt, duplicate_ack) =
+      action.authority_parts()?;
+    Ok(Self {
+      principal,
+      request_id,
+      request_digest: operator_action_request_digest(
+        action_name,
+        "delivery",
+        delivery_id,
+        expected_attempt,
+        expected_fence,
+        "delivery_unknown",
+        after_state,
+        Some(evidence_json),
+        Some(evidence_digest),
+        receipt,
+        duplicate_ack,
+        occurred_at,
+      ),
+      occurred_at,
+    })
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerOperatorMutationOutcome {
+  Applied,
+  Replay,
+  Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduledDeliveryUnknownAction {
+  ConfirmDelivered {
+    provider_receipt: String,
+    evidence_json: String,
+    evidence_digest: String,
+  },
+  ConfirmNoWriteTerminal {
+    evidence_json: String,
+    evidence_digest: String,
+  },
+  ForceResend {
+    evidence_json: String,
+    evidence_digest: String,
+    duplicate_risk_acknowledged: bool,
+  },
+  AcknowledgeUnknown {
+    evidence_json: String,
+    evidence_digest: String,
+  },
+}
+
+type DeliveryUnknownAuthorityParts<'a> = (
+  &'static str,
+  &'static str,
+  &'a str,
+  &'a str,
+  Option<&'a str>,
+  bool,
+);
+
+impl ScheduledDeliveryUnknownAction {
+  fn authority_parts(&self) -> Result<DeliveryUnknownAuthorityParts<'_>, StateValueError> {
+    let parts = match self {
+      Self::ConfirmDelivered {
+        provider_receipt,
+        evidence_json,
+        evidence_digest,
+      } => {
+        validate_operator_provider_receipt(provider_receipt)?;
+        validate_operator_delivery_evidence(
+          evidence_json,
+          evidence_digest,
+          "provider_confirmed_delivered",
+          Some(provider_receipt),
+        )?;
+        (
+          "confirm_delivery_delivered",
+          "delivered",
+          evidence_json.as_str(),
+          evidence_digest.as_str(),
+          Some(provider_receipt.as_str()),
+          false,
+        )
+      }
+      Self::ConfirmNoWriteTerminal {
+        evidence_json,
+        evidence_digest,
+      } => {
+        validate_operator_delivery_evidence(
+          evidence_json,
+          evidence_digest,
+          "provider_confirmed_no_write",
+          None,
+        )?;
+        (
+          "confirm_delivery_no_write",
+          "failed_terminal",
+          evidence_json.as_str(),
+          evidence_digest.as_str(),
+          None,
+          false,
+        )
+      }
+      Self::ForceResend {
+        evidence_json,
+        evidence_digest,
+        duplicate_risk_acknowledged,
+      } => {
+        if !duplicate_risk_acknowledged {
+          return Err(StateValueError::InvalidVersion);
+        }
+        validate_operator_delivery_evidence(
+          evidence_json,
+          evidence_digest,
+          "operator_force_resend",
+          None,
+        )?;
+        (
+          "force_delivery_resend",
+          "pending",
+          evidence_json.as_str(),
+          evidence_digest.as_str(),
+          None,
+          true,
+        )
+      }
+      Self::AcknowledgeUnknown {
+        evidence_json,
+        evidence_digest,
+      } => {
+        validate_operator_delivery_evidence(
+          evidence_json,
+          evidence_digest,
+          "operator_acknowledged_unknown",
+          None,
+        )?;
+        (
+          "acknowledge_delivery_unknown",
+          "delivery_unknown",
+          evidence_json.as_str(),
+          evidence_digest.as_str(),
+          None,
+          false,
+        )
+      }
+    };
+    Ok(parts)
+  }
+}
+
+fn validate_operator_provider_receipt(provider_receipt: &str) -> Result<(), StateValueError> {
+  let receipt: Value =
+    serde_json::from_str(provider_receipt).map_err(|_| StateValueError::InvalidJson {
+      field: "operator provider receipt",
+    })?;
+  let Some(object) = receipt.as_object() else {
+    return Err(StateValueError::InvalidJson {
+      field: "operator provider receipt",
+    });
+  };
+  let exact_keys = [
+    "conversation_id",
+    "message_id",
+    "provider",
+    "receipt_version",
+    "target_kind",
+    "tenant",
+    "thread_id",
+  ];
+  if object.len() != exact_keys.len() || exact_keys.iter().any(|key| !object.contains_key(*key)) {
+    return Err(StateValueError::InvalidJson {
+      field: "operator provider receipt",
+    });
+  }
+  if object.get("receipt_version").and_then(Value::as_u64) != Some(1) {
+    return Err(StateValueError::InvalidVersion);
+  }
+  for key in [
+    "provider",
+    "tenant",
+    "target_kind",
+    "conversation_id",
+    "message_id",
+  ] {
+    let value = object
+      .get(key)
+      .and_then(Value::as_str)
+      .ok_or(StateValueError::InvalidJson {
+        field: "operator provider receipt",
+      })?;
+    validate_text("operator provider receipt identity", value)?;
+  }
+  if let Some(thread_id) = object.get("thread_id").and_then(Value::as_str) {
+    validate_text("operator provider receipt thread id", thread_id)?;
+  } else if !object.get("thread_id").is_some_and(Value::is_null) {
+    return Err(StateValueError::InvalidJson {
+      field: "operator provider receipt",
+    });
+  }
+  if serde_json::to_string(&receipt).map_err(|_| StateValueError::InvalidJson {
+    field: "operator provider receipt",
+  })?
+    != provider_receipt
+  {
+    return Err(StateValueError::NonCanonicalJson {
+      field: "operator provider receipt",
+    });
+  }
+  Ok(())
+}
+
+fn validate_operator_delivery_evidence(
+  evidence_json: &str,
+  evidence_digest: &str,
+  expected_kind: &str,
+  provider_receipt: Option<&str>,
+) -> Result<(), StateValueError> {
+  validate_lowercase_sha256("operator evidence digest", evidence_digest)?;
+  let evidence: Value =
+    serde_json::from_str(evidence_json).map_err(|_| StateValueError::InvalidJson {
+      field: "operator delivery evidence",
+    })?;
+  let Some(object) = evidence.as_object() else {
+    return Err(StateValueError::InvalidJson {
+      field: "operator delivery evidence",
+    });
+  };
+  let mut exact_keys = vec![
+    "evidence_id",
+    "evidence_version",
+    "kind",
+    "provider",
+    "target_kind",
+    "tenant",
+  ];
+  if provider_receipt.is_some() {
+    exact_keys.push("receipt_digest");
+  }
+  if object.len() != exact_keys.len() || exact_keys.iter().any(|key| !object.contains_key(*key)) {
+    return Err(StateValueError::InvalidJson {
+      field: "operator delivery evidence",
+    });
+  }
+  if object.get("evidence_version").and_then(Value::as_u64) != Some(1)
+    || object.get("kind").and_then(Value::as_str) != Some(expected_kind)
+  {
+    return Err(StateValueError::InvalidVersion);
+  }
+  for key in ["evidence_id", "provider", "tenant", "target_kind"] {
+    let value = object
+      .get(key)
+      .and_then(Value::as_str)
+      .ok_or(StateValueError::InvalidJson {
+        field: "operator delivery evidence",
+      })?;
+    validate_text("operator delivery evidence identity", value)?;
+  }
+  if let Some(provider_receipt) = provider_receipt {
+    let receipt_digest =
+      object
+        .get("receipt_digest")
+        .and_then(Value::as_str)
+        .ok_or(StateValueError::InvalidJson {
+          field: "operator delivery evidence",
+        })?;
+    validate_lowercase_sha256("operator receipt digest", receipt_digest)?;
+    if sha256_hex(provider_receipt.as_bytes()) != receipt_digest {
+      return Err(StateValueError::InvalidSha256 {
+        field: "operator receipt digest",
+      });
+    }
+  }
+  if serde_json::to_string(&evidence).map_err(|_| StateValueError::InvalidJson {
+    field: "operator delivery evidence",
+  })?
+    != evidence_json
+  {
+    return Err(StateValueError::NonCanonicalJson {
+      field: "operator delivery evidence",
+    });
+  }
+  if sha256_hex(evidence_json.as_bytes()) != evidence_digest {
+    return Err(StateValueError::InvalidSha256 {
+      field: "operator evidence digest",
+    });
+  }
+  Ok(())
+}
+
+pub(crate) fn operator_delivery_evidence_binding(
+  action: &ScheduledDeliveryUnknownAction,
+) -> Result<(String, String, String), StateValueError> {
+  let (_, _, evidence_json, _, _, _) = action.authority_parts()?;
+  let evidence: Value =
+    serde_json::from_str(evidence_json).map_err(|_| StateValueError::InvalidJson {
+      field: "operator delivery evidence",
+    })?;
+  let object = evidence.as_object().ok_or(StateValueError::InvalidJson {
+    field: "operator delivery evidence",
+  })?;
+  Ok((
+    object
+      .get("provider")
+      .and_then(Value::as_str)
+      .ok_or(StateValueError::InvalidJson {
+        field: "operator delivery evidence",
+      })?
+      .to_owned(),
+    object
+      .get("tenant")
+      .and_then(Value::as_str)
+      .ok_or(StateValueError::InvalidJson {
+        field: "operator delivery evidence",
+      })?
+      .to_owned(),
+    object
+      .get("target_kind")
+      .and_then(Value::as_str)
+      .ok_or(StateValueError::InvalidJson {
+        field: "operator delivery evidence",
+      })?
+      .to_owned(),
+  ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn operator_action_request_digest(
+  action: &str,
+  target_kind: &str,
+  target_id: &str,
+  expected_attempt: i64,
+  expected_fence: i64,
+  before_state: &str,
+  after_state: &str,
+  evidence_json: Option<&str>,
+  evidence_digest: Option<&str>,
+  provider_receipt: Option<&str>,
+  duplicate_risk_acknowledged: bool,
+  effective_at: i64,
+) -> String {
+  sha256_hex(
+    json!({
+      "action": action,
+      "after_state": after_state,
+      "before_state": before_state,
+      "duplicate_risk_acknowledged": duplicate_risk_acknowledged,
+      "effective_at": effective_at,
+      "evidence_json": evidence_json,
+      "evidence_digest": evidence_digest,
+      "expected_attempt": expected_attempt,
+      "expected_fence": expected_fence,
+      "provider_receipt": provider_receipt,
+      "target_id": target_id,
+      "target_kind": target_kind,
+    })
+    .to_string()
+    .as_bytes(),
+  )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledRunOperatorProjection {
+  pub run_id: String,
+  pub job_id: String,
+  pub state: ScheduledRunState,
+  pub attempt: i64,
+  pub fence: i64,
+  pub next_attempt_at: Option<i64>,
+  pub lease_expires_at: Option<i64>,
+  pub error_kind: Option<String>,
+  pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledDeliveryOperatorProjection {
+  pub delivery_id: String,
+  pub run_id: String,
+  pub job_id: String,
+  pub state: ScheduledDeliveryState,
+  pub attempt: i64,
+  pub fence: i64,
+  pub next_attempt_at: Option<i64>,
+  pub lease_expires_at: Option<i64>,
+  pub provider_outcome: Option<String>,
+  pub error_kind: Option<String>,
+  pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerOperatorActionSummary {
+  pub action_id: String,
+  pub action: String,
+  pub target_kind: String,
+  pub target_id: String,
+  pub before_state: String,
+  pub after_state: String,
+  pub occurred_at: i64,
+  pub consumed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaterializationOutcome {
   Created(ScheduledRun),

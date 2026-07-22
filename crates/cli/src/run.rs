@@ -53,7 +53,7 @@ use codeoff_runtime::{
 };
 use codeoff_state::{RetentionPolicy, StateError, StateStore};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 use crate::command::{Cli, Command, ConfigCommand, SchedulerCommand, WorkerCommand};
 use crate::scheduler::{SchedulerCommandError, SchedulerOperatorConfig, execute_scheduler_command};
@@ -122,13 +122,14 @@ fn run_serve(
     return Ok(());
   }
 
-  let mcp_server_started = runtime.block_on(maybe_spawn_mcp_tcp_server(&config, state.clone()))?;
+  let mcp_server = runtime.block_on(maybe_build_mcp_tcp_server(&config, state.clone()))?;
+  let mcp_server_started = mcp_server.is_some();
   let status = ServeStatus::from_config(&config, check, mcp_server_started);
   println!("serve started");
   for line in status.status_lines() {
     println!("{line}");
   }
-  runtime.block_on(run_serve_loops(config, state))
+  runtime.block_on(run_serve_loops(config, state, mcp_server))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,60 +237,46 @@ fn mcp_status(config: &CodeoffConfig, check: bool, server_started: bool) -> Stri
   }
 }
 
-async fn maybe_spawn_mcp_tcp_server(
+async fn maybe_build_mcp_tcp_server(
   config: &CodeoffConfig,
   state: StateStore,
-) -> Result<bool, Box<dyn Error>> {
+) -> Result<Option<McpTcpServer<ServeChannelContextProvider>>, Box<dyn Error>> {
   if !config.mcp.enabled || config.mcp.transport != "tcp" {
-    return Ok(false);
+    return Ok(None);
   }
 
-  let server_started = match build_channel_resource_provider(config) {
-    Some(resource_provider) => {
-      let server = match build_channel_address_provider(config) {
-        Some(address_provider) => {
-          McpTcpServer::bind_with_resource_and_address_provider(
-            config.mcp.bind.as_str(),
-            state,
-            build_channel_context_provider(config),
-            resource_provider,
-            address_provider,
-          )
-          .await?
-        }
-        None => {
-          McpTcpServer::bind_with_resource_provider(
-            config.mcp.bind.as_str(),
-            state,
-            build_channel_context_provider(config),
-            resource_provider,
-          )
-          .await?
-        }
-      };
-      tokio::spawn(async move {
-        if let Err(error) = server.run().await {
-          eprintln!("MCP TCP server loop stopped: {error}");
-        }
-      });
-      true
-    }
+  let server = match build_channel_resource_provider(config) {
+    Some(resource_provider) => match build_channel_address_provider(config) {
+      Some(address_provider) => {
+        McpTcpServer::bind_with_resource_and_address_provider(
+          config.mcp.bind.as_str(),
+          state,
+          build_channel_context_provider(config),
+          resource_provider,
+          address_provider,
+        )
+        .await?
+      }
+      None => {
+        McpTcpServer::bind_with_resource_provider(
+          config.mcp.bind.as_str(),
+          state,
+          build_channel_context_provider(config),
+          resource_provider,
+        )
+        .await?
+      }
+    },
     None => {
-      let server = McpTcpServer::bind(
+      McpTcpServer::bind(
         config.mcp.bind.as_str(),
         state,
         build_channel_context_provider(config),
       )
-      .await?;
-      tokio::spawn(async move {
-        if let Err(error) = server.run().await {
-          eprintln!("MCP TCP server loop stopped: {error}");
-        }
-      });
-      true
+      .await?
     }
   };
-  Ok(server_started)
+  Ok(Some(server))
 }
 
 fn build_channel_context_provider(config: &CodeoffConfig) -> ServeChannelContextProvider {
@@ -410,13 +397,18 @@ impl ChannelContextProvider for ServeDispatchContextProvider {
   }
 }
 
-async fn run_serve_loops(config: CodeoffConfig, state: StateStore) -> Result<(), Box<dyn Error>> {
-  run_serve_loops_until(config, state, shutdown_signal()).await
+async fn run_serve_loops(
+  config: CodeoffConfig,
+  state: StateStore,
+  mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
+) -> Result<(), Box<dyn Error>> {
+  run_serve_loops_until(config, state, mcp_server, shutdown_signal()).await
 }
 
 async fn run_serve_loops_until<F>(
   config: CodeoffConfig,
   state: StateStore,
+  mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
   shutdown_signal: F,
 ) -> Result<(), Box<dyn Error>>
 where
@@ -424,16 +416,12 @@ where
 {
   let tick_limit = serve_tick_limit();
   let turn_budget = GlobalTurnBudget::new(config.agent.codex_app_server.max_parallel_turns);
-  let mut lifecycle = ServeLifecycle {
-    scheduled_worker: spawn_scheduled_worker(
-      state.clone(),
-      turn_budget.clone(),
-      ScheduledWorkerConfig {
-        run_claims_enabled: config.scheduler.run_claims_enabled,
-      },
-    ),
-    background_tasks: ServeTaskGroup::new(),
-  };
+  let mut lifecycle = ServeLifecycle::new(
+    state.clone(),
+    turn_budget.clone(),
+    config.scheduler.run_claims_enabled,
+    mcp_server,
+  );
   if tick_limit.is_none() {
     maybe_spawn_slack_intake_loop(&config, state.clone(), &mut lifecycle.background_tasks);
     maybe_spawn_retention_cleanup_loop(&config, state.clone(), &mut lifecycle.background_tasks);
@@ -513,6 +501,7 @@ where
             signal.map_err(|error| Box::new(error) as Box<dyn Error>)?;
             break;
           }
+          error = lifecycle.background_tasks.wait_for_failure() => return Err(error),
           result = tick => result?,
         }
       } else {
@@ -553,9 +542,10 @@ where
       signal.map_err(|error| Box::new(error) as Box<dyn Error>),
       false,
     ),
+    error = lifecycle.background_tasks.wait_for_failure() => (Err(error), false),
     result = &mut delivery_loop => (result, true),
   };
-  lifecycle.request_shutdown();
+  lifecycle.request_shutdown().await;
   if !delivery_finished {
     record_serve_error(&mut result, delivery_loop.await);
   }
@@ -568,15 +558,46 @@ struct ServeLifecycle {
 }
 
 impl ServeLifecycle {
-  fn request_shutdown(&self) {
-    self.background_tasks.request_shutdown();
+  fn new(
+    state: StateStore,
+    turn_budget: GlobalTurnBudget,
+    run_claims_enabled: bool,
+    mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
+  ) -> Self {
+    let mut lifecycle = Self {
+      scheduled_worker: spawn_scheduled_worker(
+        state,
+        turn_budget,
+        ScheduledWorkerConfig { run_claims_enabled },
+      ),
+      background_tasks: ServeTaskGroup::new(),
+    };
+    if let Some(server) = mcp_server {
+      lifecycle.spawn_mcp_server(server);
+    }
+    lifecycle
+  }
+
+  fn spawn_mcp_server(&mut self, server: McpTcpServer<ServeChannelContextProvider>) {
+    let shutdown = self.background_tasks.subscribe();
+    self.background_tasks.spawn("MCP TCP server", async move {
+      server
+        .run_until(shutdown)
+        .await
+        .map_err(|error| Box::new(error) as ServeTaskError)?;
+      Ok(ServeTaskExit::Cancelled)
+    });
+  }
+
+  async fn request_shutdown(&self) {
     if let Some(worker) = &self.scheduled_worker {
       worker.request_shutdown();
     }
+    self.background_tasks.request_shutdown().await;
   }
 
   async fn finish(&mut self, mut result: Result<(), Box<dyn Error>>) -> Result<(), Box<dyn Error>> {
-    self.request_shutdown();
+    self.request_shutdown().await;
     if let Some(worker) = &mut self.scheduled_worker {
       if worker.shutdown().await == ScheduledWorkerShutdown::NonClean {
         record_serve_error(
@@ -601,9 +622,19 @@ fn record_serve_error(
   }
 }
 
+type ServeTaskError = Box<dyn Error + Send + Sync>;
+type NamedServeTaskResult = (&'static str, Result<ServeTaskExit, ServeTaskError>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeTaskExit {
+  Cancelled,
+  Completed,
+}
+
 struct ServeTaskGroup {
   shutdown: watch::Sender<bool>,
-  joins: Vec<JoinHandle<()>>,
+  tasks: JoinSet<NamedServeTaskResult>,
+  retention_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ServeTaskGroup {
@@ -611,7 +642,8 @@ impl ServeTaskGroup {
     let (shutdown, _) = watch::channel(false);
     Self {
       shutdown,
-      joins: Vec::new(),
+      tasks: JoinSet::new(),
+      retention_gate: Arc::new(tokio::sync::Mutex::new(())),
     }
   }
 
@@ -619,22 +651,64 @@ impl ServeTaskGroup {
     self.shutdown.subscribe()
   }
 
-  fn spawn(&mut self, task: impl Future<Output = ()> + Send + 'static) {
-    self.joins.push(tokio::spawn(task));
+  fn spawn(
+    &mut self,
+    name: &'static str,
+    task: impl Future<Output = Result<ServeTaskExit, ServeTaskError>> + Send + 'static,
+  ) {
+    self.tasks.spawn(async move { (name, task.await) });
   }
 
-  fn request_shutdown(&self) {
+  async fn request_shutdown(&self) {
     let _ = self.shutdown.send(true);
+    let _retention = self.retention_gate.lock().await;
+  }
+
+  fn retention_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+    Arc::clone(&self.retention_gate)
+  }
+
+  async fn wait_for_failure(&mut self) -> Box<dyn Error> {
+    let Some(joined) = self.tasks.join_next().await else {
+      return std::future::pending().await;
+    };
+    serve_task_result(joined, false).expect_err("a background task exit before shutdown is fatal")
   }
 
   async fn join(&mut self) -> Result<(), Box<dyn Error>> {
     let mut result = Ok(());
-    for join in self.joins.drain(..) {
-      if let Err(error) = join.await {
-        record_serve_error(&mut result, Err(Box::new(error)));
-      }
+    while let Some(joined) = self.tasks.join_next().await {
+      record_serve_error(&mut result, serve_task_result(joined, true));
     }
     result
+  }
+}
+
+fn serve_task_result(
+  joined: Result<NamedServeTaskResult, tokio::task::JoinError>,
+  shutting_down: bool,
+) -> Result<(), Box<dyn Error>> {
+  let (name, outcome) = joined.map_err(|error| {
+    let failure = if error.is_panic() {
+      "panicked"
+    } else {
+      "was cancelled"
+    };
+    Box::new(io::Error::other(format!(
+      "serve background task {failure}: {error}"
+    ))) as Box<dyn Error>
+  })?;
+  match outcome {
+    Ok(ServeTaskExit::Cancelled) if shutting_down => Ok(()),
+    Ok(ServeTaskExit::Cancelled) => Err(Box::new(io::Error::other(format!(
+      "{name} exited before serve shutdown"
+    )))),
+    Ok(ServeTaskExit::Completed) => Err(Box::new(io::Error::other(format!(
+      "{name} completed unexpectedly"
+    )))),
+    Err(error) => Err(Box::new(io::Error::other(format!(
+      "{name} failed: {error}"
+    )))),
   }
 }
 
@@ -694,12 +768,12 @@ fn maybe_spawn_slack_intake_loop(
   };
   let slack = config.slack.clone();
   let shutdown = background_tasks.subscribe();
-  background_tasks.spawn(async move {
+  background_tasks.spawn("Slack intake", async move {
     let intake = SlackIntake::with_slack_config(state, "slack-default", &slack);
     let mut restart_count = 0_u32;
     loop {
       if *shutdown.borrow() {
-        return;
+        return Ok(ServeTaskExit::Cancelled);
       }
       let mut transport = SlackSocketClient::new();
       let worker = run_socket_worker(
@@ -728,11 +802,11 @@ fn maybe_spawn_slack_intake_loop(
       tokio::pin!(worker);
       let result = tokio::select! {
         biased;
-        () = wait_for_serve_shutdown(shutdown.clone()) => return,
+        () = wait_for_serve_shutdown(shutdown.clone()) => return Ok(ServeTaskExit::Cancelled),
         result = &mut worker => result,
       };
       match result {
-        Ok(_) => return,
+        Ok(_) => return Ok(ServeTaskExit::Completed),
         Err(error) => {
           let delay = slack_intake_restart_delay(restart_count);
           restart_count = restart_count.saturating_add(1);
@@ -741,7 +815,7 @@ fn maybe_spawn_slack_intake_loop(
             delay.as_secs()
           );
           if sleep_until_serve_shutdown(delay, shutdown.clone()).await {
-            return;
+            return Ok(ServeTaskExit::Cancelled);
           }
         }
       }
@@ -767,22 +841,58 @@ fn maybe_spawn_retention_cleanup_loop(
   }
   let workspace_id = config.slack.workspace_id.clone();
   let shutdown = background_tasks.subscribe();
-  background_tasks.spawn(async move {
+  let retention_gate = background_tasks.retention_gate();
+  background_tasks.spawn("retention cleanup", async move {
     loop {
-      if *shutdown.borrow() {
-        return;
-      }
-      if let Err(error) = state
-        .cleanup_retained_data(Some(&workspace_id), now_unix_seconds(), &policy)
-        .await
+      match run_retention_cleanup_once(
+        &state,
+        &workspace_id,
+        &policy,
+        now_unix_seconds(),
+        shutdown.clone(),
+        Arc::clone(&retention_gate),
+      )
+      .await
       {
-        eprintln!("retention cleanup failed: {error}");
+        Ok(RetentionCleanupStep::Cancelled) => return Ok(ServeTaskExit::Cancelled),
+        Ok(RetentionCleanupStep::Completed) => {}
+        Err(error) => eprintln!("retention cleanup failed: {error}"),
       }
       if sleep_until_serve_shutdown(Duration::from_secs(24 * 60 * 60), shutdown.clone()).await {
-        return;
+        return Ok(ServeTaskExit::Cancelled);
       }
     }
   });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionCleanupStep {
+  Cancelled,
+  Completed,
+}
+
+async fn run_retention_cleanup_once(
+  state: &StateStore,
+  workspace_id: &str,
+  policy: &RetentionPolicy,
+  now: u64,
+  shutdown: watch::Receiver<bool>,
+  retention_gate: Arc<tokio::sync::Mutex<()>>,
+) -> Result<RetentionCleanupStep, StateError> {
+  let _gate = tokio::select! {
+    biased;
+    () = wait_for_serve_shutdown(shutdown.clone()) => {
+      return Ok(RetentionCleanupStep::Cancelled);
+    }
+    gate = retention_gate.lock_owned() => gate,
+  };
+  if *shutdown.borrow() {
+    return Ok(RetentionCleanupStep::Cancelled);
+  }
+  state
+    .cleanup_retained_data(Some(workspace_id), now, policy)
+    .await?;
+  Ok(RetentionCleanupStep::Completed)
 }
 
 fn retention_policy_from_config(config: &CodeoffConfig) -> RetentionPolicy {
@@ -830,15 +940,14 @@ fn spawn_channel_dispatch_loops(
     );
     let context_limit = config.slack.recent_message_limit;
     let shutdown = background_tasks.subscribe();
-    background_tasks.spawn(async move {
+    background_tasks.spawn("channel dispatch", async move {
       loop {
         let permit = match acquire_serve_turn_before_shutdown(&turn_budget, shutdown.clone()).await
         {
           Ok(Some(permit)) => permit,
-          Ok(None) => return,
+          Ok(None) => return Ok(ServeTaskExit::Cancelled),
           Err(error) => {
-            eprintln!("channel dispatch turn budget failed: {error}");
-            return;
+            return Err(Box::new(error) as ServeTaskError);
           }
         };
         match run_channel_dispatch_tick_on_blocking_pool_with_permit(
@@ -855,13 +964,13 @@ fn spawn_channel_dispatch_loops(
           Ok(true) => {}
           Ok(false) => {
             if sleep_until_serve_shutdown(Duration::from_millis(250), shutdown.clone()).await {
-              return;
+              return Ok(ServeTaskExit::Cancelled);
             }
           }
           Err(error) => {
             eprintln!("channel dispatch tick failed: {error}");
             if sleep_until_serve_shutdown(Duration::from_secs(1), shutdown.clone()).await {
-              return;
+              return Ok(ServeTaskExit::Cancelled);
             }
           }
         }
@@ -3038,11 +3147,63 @@ mod tests {
 
     tokio::time::timeout(
       Duration::from_secs(1),
-      run_serve_loops_until(config, state, async { Ok(()) }),
+      run_serve_loops_until(config, state, None, async { Ok(()) }),
     )
     .await
     .expect("serve shutdown deadline")
     .expect("clean serve shutdown");
+  }
+
+  #[tokio::test]
+  async fn serve_lifecycle_owns_mcp_listener_and_active_connection() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    let server = McpTcpServer::bind(
+      "127.0.0.1:0",
+      state.clone(),
+      ServeChannelContextProvider::Unavailable,
+    )
+    .await
+    .expect("bind MCP server");
+    let address = server.local_addr().expect("MCP address");
+    let mut config = CodeoffConfig::default();
+    config.scheduler.run_claims_enabled = false;
+    config.data_retention.enabled = false;
+    let (request_shutdown, shutdown_requested) = tokio::sync::oneshot::channel();
+    let serve = run_serve_loops_until(config, state, Some(server), async move {
+      shutdown_requested
+        .await
+        .map_err(|_| io::Error::other("shutdown sender dropped"))
+    });
+    let client = async move {
+      let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect MCP server");
+      stream
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+        .await
+        .expect("write initialize");
+      let mut reader = BufReader::new(stream);
+      let mut response = String::new();
+      reader
+        .read_line(&mut response)
+        .await
+        .expect("read initialize response");
+      assert!(!response.is_empty());
+      request_shutdown.send(()).expect("request shutdown");
+      let mut trailing = String::new();
+      tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut trailing))
+        .await
+        .expect("MCP connection close deadline")
+        .expect("MCP connection close")
+    };
+    let (serve_result, closed) = tokio::join!(serve, client);
+    assert_eq!(closed, 0);
+    serve_result.expect("serve shutdown");
   }
 
   #[tokio::test]
@@ -3051,14 +3212,14 @@ mod tests {
     let mut tasks = ServeTaskGroup::new();
     let shutdown = tasks.subscribe();
     let task_mutations = Arc::clone(&mutations);
-    tasks.spawn(async move {
+    tasks.spawn("test mutation loop", async move {
       loop {
         if *shutdown.borrow() {
-          return;
+          return Ok(ServeTaskExit::Cancelled);
         }
         task_mutations.fetch_add(1, Ordering::AcqRel);
         if sleep_until_serve_shutdown(Duration::from_millis(1), shutdown.clone()).await {
-          return;
+          return Ok(ServeTaskExit::Cancelled);
         }
       }
     });
@@ -3070,7 +3231,7 @@ mod tests {
     .await
     .expect("background task started");
 
-    tasks.request_shutdown();
+    tasks.request_shutdown().await;
     tokio::time::timeout(Duration::from_secs(1), tasks.join())
       .await
       .expect("task group drain deadline")
@@ -3078,6 +3239,121 @@ mod tests {
     let stopped_at = mutations.load(Ordering::Acquire);
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(mutations.load(Ordering::Acquire), stopped_at);
+  }
+
+  #[tokio::test]
+  async fn serve_task_group_propagates_error_and_early_exit() {
+    let mut failed = ServeTaskGroup::new();
+    failed.spawn("MCP TCP server", async {
+      Err(Box::new(io::Error::other("listener failed")) as ServeTaskError)
+    });
+    let error = tokio::time::timeout(Duration::from_secs(1), failed.wait_for_failure())
+      .await
+      .expect("failure deadline");
+    assert!(error.to_string().contains("MCP TCP server failed"));
+
+    let mut completed = ServeTaskGroup::new();
+    completed.spawn("test background loop", async {
+      Ok(ServeTaskExit::Completed)
+    });
+    let error = tokio::time::timeout(Duration::from_secs(1), completed.wait_for_failure())
+      .await
+      .expect("completion deadline");
+    assert!(
+      error
+        .to_string()
+        .contains("test background loop completed unexpectedly")
+    );
+
+    let mut panicked = ServeTaskGroup::new();
+    panicked.spawn("test panic", async {
+      panic!("background panic");
+    });
+    let error = tokio::time::timeout(Duration::from_secs(1), panicked.wait_for_failure())
+      .await
+      .expect("panic deadline");
+    assert!(error.to_string().contains("background task panicked"));
+  }
+
+  #[tokio::test]
+  async fn mcp_server_failure_reaches_serve_result() {
+    let mut lifecycle = ServeLifecycle {
+      scheduled_worker: None,
+      background_tasks: ServeTaskGroup::new(),
+    };
+    lifecycle.background_tasks.spawn("MCP TCP server", async {
+      Err(Box::new(io::Error::other("accept failed")) as ServeTaskError)
+    });
+
+    let failure = tokio::time::timeout(
+      Duration::from_secs(1),
+      lifecycle.background_tasks.wait_for_failure(),
+    )
+    .await
+    .expect("MCP failure deadline");
+    let error = lifecycle
+      .finish(Err(failure))
+      .await
+      .expect_err("serve must fail");
+    assert!(error.to_string().contains("MCP TCP server failed"));
+  }
+
+  #[tokio::test]
+  async fn retention_shutdown_while_waiting_for_durable_gate_prevents_cleanup() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    queue_test_mention(&state).await;
+    let claimed = state
+      .claim_next_channel_event()
+      .await
+      .expect("claim event")
+      .expect("queued event");
+    state
+      .complete_channel_event(claimed.id)
+      .await
+      .expect("complete event");
+    assert_eq!(state.channel_event_queue_count().await.expect("count"), 1);
+    let tasks = ServeTaskGroup::new();
+    let retention_gate = tasks.retention_gate();
+    let held_gate = Arc::clone(&retention_gate).lock_owned().await;
+    let shutdown_rx = tasks.subscribe();
+    let policy = RetentionPolicy {
+      enabled: true,
+      inbound_payload_days: 1,
+      delivery_days: 1,
+      context_attempt_days: 1,
+      conversation_summary_days: 1,
+      artifact_days: 1,
+    };
+    let cleanup = run_retention_cleanup_once(
+      &state,
+      "workspace-1",
+      &policy,
+      u64::MAX,
+      shutdown_rx,
+      retention_gate,
+    );
+    tokio::pin!(cleanup);
+    tokio::select! {
+      () = tokio::time::sleep(Duration::from_millis(10)) => {}
+      result = &mut cleanup => panic!("cleanup bypassed durable gate: {result:?}"),
+    }
+
+    let shutdown = tasks.request_shutdown();
+    tokio::pin!(shutdown);
+    tokio::select! {
+      () = tokio::time::sleep(Duration::from_millis(10)) => {}
+      () = &mut shutdown => panic!("shutdown bypassed durable retention gate"),
+    }
+    assert_eq!(
+      cleanup.await.expect("cleanup result"),
+      RetentionCleanupStep::Cancelled
+    );
+    drop(held_gate);
+    shutdown.await;
+    assert_eq!(state.channel_event_queue_count().await.expect("count"), 1);
   }
 
   #[tokio::test]

@@ -10,6 +10,8 @@ use codeoff_state::StateStore;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use crate::{ChannelToolDispatcher, JsonRpcDispatcher, JsonRpcRequest};
 
@@ -167,27 +169,75 @@ where
   ///
   /// Returns an I/O error when accepting a TCP connection fails.
   pub async fn run(self) -> io::Result<()> {
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    self.run_until(shutdown_rx).await
+  }
+
+  /// Accepts TCP clients until shutdown, then closes and joins every accepted connection.
+  ///
+  /// # Errors
+  ///
+  /// Returns an I/O error when accepting or serving a TCP connection fails.
+  pub async fn run_until(self, mut shutdown: watch::Receiver<bool>) -> io::Result<()> {
+    let (connection_shutdown, _) = watch::channel(false);
+    let mut connections = JoinSet::new();
+    let mut result = Ok(());
     loop {
-      let (stream, _) = self.listener.accept().await?;
+      let accepted = tokio::select! {
+        biased;
+        () = cancellation_requested(&mut shutdown) => break,
+        joined = connections.join_next(), if !connections.is_empty() => {
+          let Some(joined) = joined else {
+            continue;
+          };
+          if let Err(error) = connection_result(joined) {
+            result = Err(error);
+            break;
+          }
+          continue;
+        }
+        accepted = self.listener.accept() => accepted,
+      };
+      let (stream, _) = match accepted {
+        Ok(accepted) => accepted,
+        Err(error) => {
+          result = Err(error);
+          break;
+        }
+      };
       let state = self.state.clone();
       let context_provider = Arc::clone(&self.context_provider);
       let resource_provider = self.resource_provider.as_ref().map(Arc::clone);
       let address_providers = self.address_providers.clone();
-      tokio::spawn(async move {
-        if let Err(error) = handle_connection(
+      let connection_shutdown = connection_shutdown.subscribe();
+      connections.spawn(async move {
+        handle_connection(
           stream,
           state,
           context_provider,
           resource_provider,
           address_providers,
+          connection_shutdown,
         )
         .await
-        {
-          eprintln!("MCP TCP client connection stopped: {error}");
-        }
       });
     }
+    let _ = connection_shutdown.send(true);
+    while let Some(joined) = connections.join_next().await {
+      if result.is_ok() {
+        result = connection_result(joined);
+      }
+    }
+    result
   }
+}
+
+fn connection_result(joined: Result<io::Result<()>, tokio::task::JoinError>) -> io::Result<()> {
+  joined.map_err(|error| io::Error::other(format!("MCP TCP connection task failed: {error}")))?
+}
+
+async fn cancellation_requested(shutdown: &mut watch::Receiver<bool>) {
+  while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
 }
 
 async fn handle_connection<P>(
@@ -196,6 +246,7 @@ async fn handle_connection<P>(
   context_provider: Arc<P>,
   resource_provider: Option<Arc<dyn ChannelResourceProvider>>,
   address_providers: Option<ChannelAddressProviders>,
+  mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()>
 where
   P: ChannelContextProvider + Send + Sync + 'static,
@@ -204,7 +255,12 @@ where
   let mut line = String::new();
   loop {
     line.clear();
-    if reader.read_line(&mut line).await? == 0 {
+    let read = tokio::select! {
+      biased;
+      () = cancellation_requested(&mut shutdown) => return Ok(()),
+      read = reader.read_line(&mut line) => read?,
+    };
+    if read == 0 {
       return Ok(());
     }
     let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
@@ -252,11 +308,15 @@ where
       Err(error) => Some(parse_error(error.to_string())),
     };
     if let Some(response) = response {
-      reader
-        .get_mut()
-        .write_all(response.to_string().as_bytes())
-        .await?;
-      reader.get_mut().write_all(b"\n").await?;
+      let response = response.to_string();
+      tokio::select! {
+        biased;
+        () = cancellation_requested(&mut shutdown) => return Ok(()),
+        result = async {
+          reader.get_mut().write_all(response.as_bytes()).await?;
+          reader.get_mut().write_all(b"\n").await
+        } => result?,
+      }
     }
   }
 }

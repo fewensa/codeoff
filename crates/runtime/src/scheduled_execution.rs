@@ -2238,7 +2238,7 @@ mod tests {
     let mut backend = FakeBackend::new(ExecutionResult::Completed {
       summary: "must not block shutdown".to_owned(),
     });
-    backend.execution_delay = Duration::from_millis(15);
+    backend.execution_delay = Duration::from_millis(200);
     let backend = Arc::new(backend);
     let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
     let mut runtime = orchestrator(state.clone(), backend.clone(), clock.clone(), 1);
@@ -2259,7 +2259,7 @@ mod tests {
     }
 
     shutdown.send(true).expect("request shutdown");
-    let outcome = tokio::time::timeout(Duration::from_millis(150), caller)
+    let outcome = tokio::time::timeout(Duration::from_millis(250), caller)
       .await
       .expect("shutdown terminal deadline")
       .expect("caller task")

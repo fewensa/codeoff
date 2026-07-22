@@ -672,18 +672,24 @@ async fn build_serve_lifecycle(
       CodexScheduledExecutionBackend::new(
         state.clone(),
         built,
+        config.agent.scheduled_codex.clone(),
         scheduled_worker_config(&config.scheduler),
       ),
     )))
   } else {
     None
   };
-  let telemetry = PrometheusSchedulerTelemetry::new(
+  let scheduled_executor_probe = scheduled_executor.as_ref().map(|executor| {
+    let executor = executor.clone();
+    Arc::new(move || executor.is_ready()) as Arc<dyn Fn() -> bool + Send + Sync>
+  });
+  let telemetry = PrometheusSchedulerTelemetry::new_with_scheduled_executor_probe(
     &config.scheduler,
     scheduled_delivery.is_some(),
     scheduled_executor
       .as_ref()
       .is_some_and(ScheduledExecutor::is_ready),
+    scheduled_executor_probe,
   );
   refresh_scheduler_snapshot(&state, &telemetry).await;
   let operational_server =
@@ -1192,6 +1198,7 @@ async fn run_retention_cleanup_once(
     scheduled_runs_scanned = report.scheduled_runs_scanned,
     scheduled_runs_deleted = report.scheduled_runs_deleted,
     scheduled_runs_protected = report.scheduled_runs_protected,
+    scheduled_permit_consumptions_deleted = report.scheduled_permit_consumptions_deleted,
     scheduled_rows_deleted = report.scheduled_rows_deleted,
     scheduled_duration_milliseconds = report.scheduled_duration_milliseconds
   );

@@ -12,7 +12,8 @@ pub use scheduled::{
   ScheduledCodexRequest, ScheduledDeploymentAuthority, ScheduledExecutionIdentity,
   ScheduledExecutionResult, ScheduledFailure, ScheduledFailureKind, ScheduledFinalOutput,
   ScheduledIsolationPermit, ScheduledJsonlTransport, ScheduledRuntimeEvidence, ScheduledUsage,
-  TimedRead, build_production_scheduled_codex_executor, prepare_scheduled_codex_home,
+  TimedRead, build_production_scheduled_codex_executor,
+  load_current_scheduled_deployment_authority, prepare_scheduled_codex_home,
 };
 
 use std::collections::{HashMap, HashSet};

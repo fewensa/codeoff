@@ -339,6 +339,7 @@ pub struct RetentionCleanupReport {
   pub scheduled_runs_scanned: u64,
   pub scheduled_runs_deleted: u64,
   pub scheduled_runs_protected: u64,
+  pub scheduled_permit_consumptions_deleted: u64,
   pub scheduled_rows_deleted: u64,
   pub scheduled_duration_milliseconds: u64,
 }
@@ -1778,6 +1779,7 @@ do update set summary = excluded.summary, updated_at = datetime('now')
       scheduled_runs_scanned: scheduled.scanned,
       scheduled_runs_deleted: scheduled.runs_deleted,
       scheduled_runs_protected: scheduled.protected,
+      scheduled_permit_consumptions_deleted: scheduled.permit_consumptions_deleted,
       scheduled_rows_deleted: scheduled.rows_deleted,
       scheduled_duration_milliseconds,
     })

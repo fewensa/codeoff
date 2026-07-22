@@ -115,14 +115,30 @@ pub(crate) struct PrometheusSchedulerTelemetry {
   last_attempt: Family<WorkerLabels, Gauge>,
   state_metrics: StateMetrics,
   readiness: RwLock<ReadinessState>,
+  scheduled_executor_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
   tracing: TracingSchedulerTelemetry,
 }
 
 impl PrometheusSchedulerTelemetry {
+  #[cfg(test)]
   pub(crate) fn new(
     scheduler: &SchedulerRuntimeConfig,
     delivery_provider_available: bool,
     scheduled_executor_available: bool,
+  ) -> Arc<Self> {
+    Self::new_with_scheduled_executor_probe(
+      scheduler,
+      delivery_provider_available,
+      scheduled_executor_available,
+      None,
+    )
+  }
+
+  pub(crate) fn new_with_scheduled_executor_probe(
+    scheduler: &SchedulerRuntimeConfig,
+    delivery_provider_available: bool,
+    scheduled_executor_available: bool,
+    scheduled_executor_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
   ) -> Arc<Self> {
     let events = Family::default();
     let durations = Family::new_with_constructor(scheduler_duration_histogram as fn() -> Histogram);
@@ -170,6 +186,7 @@ impl PrometheusSchedulerTelemetry {
         snapshot_last_success: None,
         snapshot_error: None,
       }),
+      scheduled_executor_probe,
       tracing: TracingSchedulerTelemetry,
     })
   }
@@ -254,9 +271,11 @@ impl PrometheusSchedulerTelemetry {
     if state.execution_loop != LoopHealth::Ready {
       return ("scheduler_loop_unavailable", false);
     }
-    if state.run_claims == ComponentState::Available
-      && state.scheduled_executor != ComponentState::Available
-    {
+    let scheduled_executor_available = self.scheduled_executor_probe.as_ref().map_or(
+      state.scheduled_executor == ComponentState::Available,
+      |probe| probe(),
+    );
+    if state.run_claims == ComponentState::Available && !scheduled_executor_available {
       return ("scheduler_executor_unavailable", false);
     }
     if state.delivery_claims == ComponentState::Available
@@ -706,7 +725,7 @@ pub(crate) fn init_scheduler_tracing() {
 mod tests {
   use std::net::SocketAddr;
   use std::sync::Mutex;
-  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
   use codeoff_runtime::scheduler_observability::SchedulerTelemetryErrorKind;
   use http_body_util::BodyExt as _;
@@ -971,6 +990,32 @@ mod tests {
         .await
         .contains("delivery_provider_unavailable")
     );
+  }
+
+  #[test]
+  fn test_readiness_tracks_live_scheduled_executor_rotation() {
+    let available = Arc::new(AtomicBool::new(true));
+    let probe_state = Arc::clone(&available);
+    let probe: Arc<dyn Fn() -> bool + Send + Sync> =
+      Arc::new(move || probe_state.load(Ordering::Acquire));
+    let telemetry = PrometheusSchedulerTelemetry::new_with_scheduled_executor_probe(
+      &scheduler_config(true, true, false),
+      false,
+      true,
+      Some(probe),
+    );
+    telemetry.apply_snapshot(&empty_snapshot(0));
+    record_loop_started(&telemetry, SchedulerWorker::Execution);
+    record_loop_started(&telemetry, SchedulerWorker::DeliveryPreparation);
+
+    assert_eq!(telemetry.readiness_reason(), ("ready", true));
+    available.store(false, Ordering::Release);
+    assert_eq!(
+      telemetry.readiness_reason(),
+      ("scheduler_executor_unavailable", false)
+    );
+    available.store(true, Ordering::Release);
+    assert_eq!(telemetry.readiness_reason(), ("ready", true));
   }
 
   #[tokio::test]

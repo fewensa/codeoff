@@ -64,18 +64,30 @@ fn executor_epoch(epoch: i64, marker: char) -> ScheduledExecutorEpochAuthority {
 fn execution_permit(
   authority: &ScheduledExecutorEpochAuthority,
 ) -> ConsumeScheduledExecutionPermit {
+  execution_permit_for(authority, "run-1", "job-1", 1, 1, 1, 110)
+}
+
+fn execution_permit_for(
+  authority: &ScheduledExecutorEpochAuthority,
+  run_id: &str,
+  job_id: &str,
+  attempt: i64,
+  fence: i64,
+  ordinal: u64,
+  consumed_at: i64,
+) -> ConsumeScheduledExecutionPermit {
   ConsumeScheduledExecutionPermit {
     deployment_epoch: authority.deployment_epoch,
     attestation_id: authority.attestation_id.clone(),
     profile_digest: authority.profile_digest.clone(),
-    run_id: "run-1".to_owned(),
-    job_id: "job-1".to_owned(),
-    attempt: 1,
-    fence: 1,
+    run_id: run_id.to_owned(),
+    job_id: job_id.to_owned(),
+    attempt,
+    fence,
     authority_digest: "d".repeat(64),
-    nonce: "e".repeat(64),
-    permit_id: "f".repeat(64),
-    consumed_at: 110,
+    nonce: format!("{ordinal:064x}"),
+    permit_id: format!("{:064x}", ordinal.saturating_add(1_000)),
+    consumed_at,
   }
 }
 
@@ -161,6 +173,174 @@ async fn scheduled_execution_permit_is_consumed_once_across_restart() {
   assert!(
     restarted
       .consume_scheduled_execution_permit(&permit)
+      .await
+      .is_err()
+  );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn scheduled_execution_permit_retention_is_bounded_and_preserves_authority() {
+  let temp = tempdir().expect("tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("state");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let job_id = "permit-retention-active";
+  store
+    .create_scheduled_job(&create_request(job_id, ScheduleSpec::once(110), 100))
+    .await
+    .expect("create job");
+  let run = match store
+    .materialize_due_schedule(job_id, 0, 110)
+    .await
+    .expect("materialize")
+  {
+    MaterializationOutcome::Created(run) => run,
+    other => panic!("expected materialized run, got {other:?}"),
+  };
+  let claim = store
+    .claim_next_scheduled_run("permit-retention", 111, 180)
+    .await
+    .expect("claim")
+    .expect("claimed run");
+  assert_eq!(claim.binding.run_id(), run.run_id);
+
+  let epoch_one = executor_epoch(1, 'a');
+  store
+    .register_scheduled_executor_epoch(&epoch_one, 110)
+    .await
+    .expect("epoch one");
+  let active_old = execution_permit_for(
+    &epoch_one,
+    claim.binding.run_id(),
+    claim.binding.job_id(),
+    claim.binding.attempt(),
+    claim.binding.fence(),
+    1,
+    112,
+  );
+  store
+    .consume_scheduled_execution_permit(&active_old)
+    .await
+    .expect("active old permit");
+  let mut old_absent = Vec::new();
+  for ordinal in 2..=6 {
+    let permit = execution_permit_for(
+      &epoch_one,
+      &format!("absent-run-{ordinal}"),
+      &format!("absent-job-{ordinal}"),
+      1,
+      1,
+      ordinal,
+      112,
+    );
+    store
+      .consume_scheduled_execution_permit(&permit)
+      .await
+      .expect("old absent permit");
+    old_absent.push(permit);
+  }
+
+  let epoch_two = executor_epoch(2, '4');
+  store
+    .register_scheduled_executor_epoch(&epoch_two, 113)
+    .await
+    .expect("epoch two");
+  let current = execution_permit_for(&epoch_two, "current-run", "current-job", 1, 1, 7, 114);
+  store
+    .consume_scheduled_execution_permit(&current)
+    .await
+    .expect("current permit");
+
+  let policy = RetentionPolicy {
+    scheduled_retention_batch_limit: 2,
+    ..RetentionPolicy::default()
+  };
+  for expected in [2, 2, 1, 0] {
+    let report = store
+      .cleanup_retained_data(None, 300, &policy)
+      .await
+      .expect("permit cleanup");
+    assert_eq!(report.scheduled_permit_consumptions_deleted, expected);
+  }
+  let retained: i64 =
+    sqlx::query_scalar("select count(*) from scheduled_execution_permit_consumptions")
+      .fetch_one(&pool)
+      .await
+      .expect("retained permits");
+  assert_eq!(
+    retained, 2,
+    "active old and current evidence stay protected"
+  );
+  assert!(
+    sqlx::query("delete from scheduled_execution_permit_consumptions where permit_id = ?1")
+      .bind(&current.permit_id)
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+  assert!(
+    sqlx::query("delete from scheduled_execution_permit_retention_guard where singleton = 1")
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+
+  store
+    .record_scheduled_run_preflight_failure(
+      &claim.binding,
+      PreflightFailureDisposition::Fail,
+      "test",
+      "terminal",
+      115,
+    )
+    .await
+    .expect("terminal run");
+  let report = store
+    .cleanup_retained_data(None, 300, &policy)
+    .await
+    .expect("terminal permit cleanup");
+  assert_eq!(report.scheduled_permit_consumptions_deleted, 1);
+  let retained: i64 =
+    sqlx::query_scalar("select count(*) from scheduled_execution_permit_consumptions")
+      .fetch_one(&pool)
+      .await
+      .expect("current permit remains");
+  assert_eq!(retained, 1);
+
+  assert!(
+    store
+      .consume_scheduled_execution_permit(&old_absent[0])
+      .await
+      .is_err(),
+    "the retained epoch high-water mark rejects a cleaned old permit"
+  );
+  assert!(
+    store
+      .consume_scheduled_execution_permit(&current)
+      .await
+      .is_err(),
+    "the current duplicate remains rejected"
+  );
+  drop(pool);
+  drop(store);
+
+  let restarted = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("restart state");
+  assert!(
+    restarted
+      .consume_scheduled_execution_permit(&old_absent[0])
+      .await
+      .is_err()
+  );
+  assert!(
+    restarted
+      .consume_scheduled_execution_permit(&current)
       .await
       .is_err()
   );

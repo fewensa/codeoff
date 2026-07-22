@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -7,21 +8,144 @@ use codeoff_agent_codex::{
   BuiltScheduledCodexExecutor, PreparedScheduledCodexExecution, RequestedCapabilityProfile,
   ScheduledCodexExecution, ScheduledCodexRequest, ScheduledDeploymentAuthority,
   ScheduledExecutionIdentity, ScheduledExecutionResult, ScheduledFailure, ScheduledFailureKind,
-  ScheduledIsolationPermit,
+  ScheduledIsolationPermit, load_current_scheduled_deployment_authority,
 };
+use codeoff_config::ScheduledCodexConfig;
 use codeoff_runtime::scheduled_execution::{
   BackendAuthorization, BackendPrepared, ExecutionResult, ExecutorReadiness, PrepareFailure,
   PrepareInput, PreparedExecution, ScheduledExecutionBackend, ScheduledWorkerConfig,
 };
-use codeoff_state::{ConsumeScheduledExecutionPermit, StateStore};
+use codeoff_state::{
+  ConsumeScheduledExecutionPermit, ScheduledExecutorEpochAuthority, StateError, StateStore,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+
+const CLAIM_MIN_REMAINING_SECONDS: i64 = 30;
+
+type AuthoritySource =
+  dyn Fn() -> Result<ScheduledDeploymentAuthority, ScheduledFailure> + Send + Sync;
+type AuthorityClock = dyn Fn() -> Option<i64> + Send + Sync;
+
+struct ScheduledAuthorityManager {
+  state: StateStore,
+  cached: RwLock<ScheduledDeploymentAuthority>,
+  source: Arc<AuthoritySource>,
+  clock: Arc<AuthorityClock>,
+}
+
+impl ScheduledAuthorityManager {
+  fn production(
+    state: StateStore,
+    initial: ScheduledDeploymentAuthority,
+    deployment: ScheduledCodexConfig,
+    profile: RequestedCapabilityProfile,
+  ) -> Self {
+    let source =
+      Arc::new(move || load_current_scheduled_deployment_authority(&deployment, &profile));
+    Self {
+      state,
+      cached: RwLock::new(initial),
+      source,
+      clock: Arc::new(|| now_unix_seconds().ok()),
+    }
+  }
+
+  #[cfg(test)]
+  fn with_source_and_clock(
+    state: StateStore,
+    initial: ScheduledDeploymentAuthority,
+    source: Arc<AuthoritySource>,
+    clock: Arc<AuthorityClock>,
+  ) -> Self {
+    Self {
+      state,
+      cached: RwLock::new(initial),
+      source,
+      clock,
+    }
+  }
+
+  fn readiness(&self) -> ExecutorReadiness {
+    if self.current().is_some() {
+      ExecutorReadiness::Ready
+    } else {
+      ExecutorReadiness::Unavailable
+    }
+  }
+
+  fn current(&self) -> Option<ScheduledDeploymentAuthority> {
+    let now = (self.clock)()?;
+    self
+      .cached
+      .read()
+      .ok()
+      .filter(|authority| authority_is_claimable(authority, now))
+      .map(|authority| authority.clone())
+  }
+
+  async fn refresh(&self) -> ExecutorReadiness {
+    let Some(now) = (self.clock)() else {
+      return ExecutorReadiness::Unavailable;
+    };
+    let Ok(candidate) = (self.source)() else {
+      return self.readiness();
+    };
+    if !authority_is_claimable(&candidate, now) {
+      return self.readiness();
+    }
+    let Some(cached) = self.cached.read().ok().map(|authority| authority.clone()) else {
+      return ExecutorReadiness::Unavailable;
+    };
+    if candidate == cached {
+      return ExecutorReadiness::Ready;
+    }
+    if candidate.deployment_epoch <= cached.deployment_epoch {
+      return self.readiness();
+    }
+    if self
+      .state
+      .register_scheduled_executor_epoch(&epoch_authority(&candidate), now)
+      .await
+      .is_err()
+    {
+      return self.readiness();
+    }
+    let Ok(mut current) = self.cached.write() else {
+      return ExecutorReadiness::Unavailable;
+    };
+    if candidate.deployment_epoch > current.deployment_epoch {
+      *current = candidate;
+    }
+    drop(current);
+    self.readiness()
+  }
+}
+
+fn authority_is_claimable(authority: &ScheduledDeploymentAuthority, now: i64) -> bool {
+  let Ok(expires_at) = i64::try_from(authority.expires_at_unix_seconds) else {
+    return false;
+  };
+  now > 0 && expires_at.saturating_sub(now) > CLAIM_MIN_REMAINING_SECONDS
+}
+
+fn epoch_authority(authority: &ScheduledDeploymentAuthority) -> ScheduledExecutorEpochAuthority {
+  ScheduledExecutorEpochAuthority {
+    schema_version: authority.schema_version,
+    deployment_epoch: authority.deployment_epoch,
+    attestation_id: authority.attestation_id.clone(),
+    attestation_digest: authority.attestation_digest.clone(),
+    profile_digest: authority.profile_digest.clone(),
+    issued_at: i64::try_from(authority.issued_at_unix_seconds).unwrap_or(i64::MAX),
+    expires_at: i64::try_from(authority.expires_at_unix_seconds).unwrap_or(i64::MAX),
+  }
+}
 
 pub(crate) struct CodexScheduledExecutionBackend {
   state: StateStore,
   executor: Arc<dyn ScheduledCodexExecution>,
   profile: RequestedCapabilityProfile,
-  authority: ScheduledDeploymentAuthority,
+  authority: ScheduledAuthorityManager,
   timeout: Duration,
   interrupt_grace: Duration,
   terminate_grace: Duration,
@@ -32,15 +156,21 @@ impl CodexScheduledExecutionBackend {
   pub(crate) fn new(
     state: StateStore,
     built: BuiltScheduledCodexExecutor,
+    deployment: ScheduledCodexConfig,
     config: ScheduledWorkerConfig,
   ) -> Self {
     let cancellation_grace = Duration::from_millis(config.cancellation_grace_ms);
     let third = cancellation_grace / 3;
     Self {
-      state,
+      state: state.clone(),
       executor: built.executor,
-      profile: built.profile,
-      authority: built.authority,
+      profile: built.profile.clone(),
+      authority: ScheduledAuthorityManager::production(
+        state,
+        built.authority,
+        deployment,
+        built.profile,
+      ),
       timeout: Duration::from_secs(u64::from(config.total_timeout_seconds)),
       interrupt_grace: third,
       terminate_grace: third,
@@ -57,15 +187,20 @@ struct ConsumedCodexAuthorization(ScheduledIsolationPermit);
 #[async_trait]
 impl ScheduledExecutionBackend for CodexScheduledExecutionBackend {
   fn readiness(&self) -> ExecutorReadiness {
-    ExecutorReadiness::Ready
+    self.authority.readiness()
+  }
+
+  async fn refresh_readiness(&self) -> ExecutorReadiness {
+    self.authority.refresh().await
   }
 
   async fn authorize(&self, input: &PrepareInput) -> Result<BackendAuthorization, PrepareFailure> {
     let identity = scheduled_identity(input);
     let consumed_at = now_unix_seconds()?;
+    let authority = self.authority.current().ok_or_else(authority_unavailable)?;
     let permit = consume_authorization(
       &self.state,
-      &self.authority,
+      &authority,
       &identity,
       input.authority.digest(),
       consumed_at,
@@ -180,7 +315,7 @@ async fn consume_authorization(
       consumed_at,
     })
     .await
-    .map_err(|error| PrepareFailure::fatal(error.to_string()))?;
+    .map_err(permit_consumption_failure)?;
   ScheduledIsolationPermit::from_consumed(
     authority,
     identity.clone(),
@@ -189,6 +324,17 @@ async fn consume_authorization(
     permit_id,
   )
   .map_err(scheduled_failure)
+}
+
+fn permit_consumption_failure(error: StateError) -> PrepareFailure {
+  if matches!(
+    &error,
+    StateError::InvalidSchedulerState { reason }
+      if reason == "scheduled execution permit deployment epoch is not current"
+  ) {
+    return authority_unavailable();
+  }
+  PrepareFailure::fatal(error.to_string())
 }
 
 struct CodexPreparedExecution(Box<dyn PreparedScheduledCodexExecution>);
@@ -235,6 +381,14 @@ fn scheduled_failure(failure: ScheduledFailure) -> PrepareFailure {
     retryable: false,
     kind: scheduled_failure_kind(failure.kind).to_owned(),
     message: failure.message,
+  }
+}
+
+fn authority_unavailable() -> PrepareFailure {
+  PrepareFailure {
+    retryable: true,
+    kind: "scheduled_executor_unavailable".to_owned(),
+    message: "scheduled_executor_authority_unavailable".to_owned(),
   }
 }
 
@@ -285,10 +439,119 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+  use std::sync::atomic::{AtomicI64, Ordering};
+
   use codeoff_state::ScheduledExecutorEpochAuthority;
   use tempfile::TempDir;
 
   use super::*;
+
+  fn authority(
+    deployment_epoch: i64,
+    issued_at: i64,
+    expires_at: i64,
+    attestation_digit: char,
+  ) -> ScheduledDeploymentAuthority {
+    ScheduledDeploymentAuthority {
+      schema_version: 1,
+      deployment_epoch,
+      attestation_id: attestation_digit.to_string().repeat(64),
+      attestation_digest: "b".repeat(64),
+      profile_digest: "c".repeat(64),
+      isolation_revision: "deployment-isolation-v1".to_owned(),
+      issued_at_unix_seconds: u64::try_from(issued_at).expect("issued at"),
+      expires_at_unix_seconds: u64::try_from(expires_at).expect("expires at"),
+    }
+  }
+
+  async fn register_authority(
+    state: &StateStore,
+    authority: &ScheduledDeploymentAuthority,
+    now: i64,
+  ) {
+    state
+      .register_scheduled_executor_epoch(&epoch_authority(authority), now)
+      .await
+      .expect("register authority");
+  }
+
+  #[tokio::test]
+  async fn live_authority_expires_fail_closed_and_recovers_on_higher_epoch() {
+    let temp = TempDir::new().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("initialize state");
+    let initial = authority(7, 900, 1_040, 'a');
+    register_authority(&state, &initial, 1_000).await;
+    let loaded = Arc::new(RwLock::new(Ok(initial.clone())));
+    let source_state = Arc::clone(&loaded);
+    let source: Arc<AuthoritySource> =
+      Arc::new(move || source_state.read().expect("authority source").clone());
+    let now = Arc::new(AtomicI64::new(1_009));
+    let clock_state = Arc::clone(&now);
+    let clock: Arc<AuthorityClock> = Arc::new(move || Some(clock_state.load(Ordering::Acquire)));
+    let manager = ScheduledAuthorityManager::with_source_and_clock(state, initial, source, clock);
+
+    assert_eq!(manager.readiness(), ExecutorReadiness::Ready);
+    now.store(1_010, Ordering::Release);
+    assert_eq!(manager.readiness(), ExecutorReadiness::Unavailable);
+    assert_eq!(manager.refresh().await, ExecutorReadiness::Unavailable);
+
+    let rotated = authority(8, 1_005, 1_300, 'd');
+    *loaded.write().expect("authority source") = Ok(rotated.clone());
+    assert_eq!(manager.refresh().await, ExecutorReadiness::Ready);
+    assert_eq!(manager.current(), Some(rotated));
+  }
+
+  #[tokio::test]
+  async fn invalid_reload_preserves_only_a_still_claimable_cached_authority() {
+    let temp = TempDir::new().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    let state = StateStore::initialize(&state_dir, None)
+      .await
+      .expect("initialize state");
+    let current = authority(8, 1_000, 1_300, 'd');
+    register_authority(&state, &current, 1_010).await;
+    let loaded = Arc::new(RwLock::new(Ok(current.clone())));
+    let source_state = Arc::clone(&loaded);
+    let source: Arc<AuthoritySource> =
+      Arc::new(move || source_state.read().expect("authority source").clone());
+    let now = Arc::new(AtomicI64::new(1_020));
+    let clock_state = Arc::clone(&now);
+    let clock: Arc<AuthorityClock> = Arc::new(move || Some(clock_state.load(Ordering::Acquire)));
+    let manager = ScheduledAuthorityManager::with_source_and_clock(
+      state.clone(),
+      current.clone(),
+      Arc::clone(&source),
+      Arc::clone(&clock),
+    );
+
+    *loaded.write().expect("authority source") = Ok(authority(7, 1_000, 1_300, 'a'));
+    assert_eq!(manager.refresh().await, ExecutorReadiness::Ready);
+    *loaded.write().expect("authority source") = Ok(authority(8, 1_000, 1_300, 'e'));
+    assert_eq!(manager.refresh().await, ExecutorReadiness::Ready);
+    *loaded.write().expect("authority source") = Err(ScheduledFailure {
+      kind: ScheduledFailureKind::CredentialIsolationUnproven,
+      message: "malformed rotation".to_owned(),
+    });
+    assert_eq!(manager.refresh().await, ExecutorReadiness::Ready);
+    assert_eq!(manager.current(), Some(current.clone()));
+
+    now.store(1_270, Ordering::Release);
+    assert_eq!(manager.refresh().await, ExecutorReadiness::Unavailable);
+    drop(manager);
+    drop(state);
+
+    let reopened = StateStore::initialize(&state_dir, None)
+      .await
+      .expect("reopen state");
+    register_authority(&reopened, &current, 1_020).await;
+    *loaded.write().expect("authority source") = Ok(current.clone());
+    now.store(1_020, Ordering::Release);
+    let restarted =
+      ScheduledAuthorityManager::with_source_and_clock(reopened, current, source, clock);
+    assert_eq!(restarted.refresh().await, ExecutorReadiness::Ready);
+  }
 
   #[tokio::test]
   async fn consumed_permit_cannot_be_replayed_after_restart() {
@@ -342,5 +605,20 @@ mod tests {
         .await
         .is_err()
     );
+  }
+
+  #[test]
+  fn epoch_rotation_race_is_retryable_but_permit_replay_is_fatal() {
+    let rotated = permit_consumption_failure(StateError::InvalidSchedulerState {
+      reason: "scheduled execution permit deployment epoch is not current".to_owned(),
+    });
+    assert!(rotated.retryable);
+    assert_eq!(rotated.kind, "scheduled_executor_unavailable");
+
+    let replay = permit_consumption_failure(StateError::InvalidSchedulerState {
+      reason: "scheduled execution permit was already consumed or replayed".to_owned(),
+    });
+    assert!(!replay.retryable);
+    assert_eq!(replay.kind, "preflight_rejected");
   }
 }

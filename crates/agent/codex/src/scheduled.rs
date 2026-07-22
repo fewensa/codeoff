@@ -38,7 +38,9 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
 #[cfg(unix)]
-use crate::scheduled_artifacts::{VerifiedScheduledArtifacts, verify_scheduled_artifacts};
+use crate::scheduled_artifacts::{
+  VerifiedScheduledArtifacts, read_verified_scheduled_attestation, verify_scheduled_artifacts,
+};
 #[cfg(all(unix, test))]
 use crate::scheduled_artifacts::{test_artifacts, verify_scheduled_artifacts_for_test};
 use crate::{JsonlTransport, send_notification, send_request};
@@ -823,6 +825,24 @@ pub fn build_production_scheduled_codex_executor(
     authority,
     executor: Arc::new(executor),
   })
+}
+
+/// Reloads and verifies the currently deployed signed execution authority from its trusted path.
+///
+/// # Errors
+/// Returns a fail-closed preflight error when the rotated artifact, signature, freshness window,
+/// or exact profile binding is invalid.
+pub fn load_current_scheduled_deployment_authority(
+  config: &ScheduledCodexConfig,
+  profile: &RequestedCapabilityProfile,
+) -> Result<ScheduledDeploymentAuthority, ScheduledFailure> {
+  let contents = read_verified_scheduled_attestation(config)
+    .map_err(|error| preflight(format!("scheduled_attestation_reload_failed:{error}")))?;
+  load_signed_isolation_authority_contents(
+    profile,
+    &contents,
+    &config.isolation_verifier_public_key,
+  )
 }
 
 fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfile {

@@ -371,7 +371,7 @@ async fn run_scheduled_worker_tick(
   if !orchestrator.run_claims_enabled {
     return Ok(TickOutcome::Unavailable);
   }
-  if orchestrator.backend.readiness() != ExecutorReadiness::Ready {
+  if orchestrator.backend.refresh_readiness().await != ExecutorReadiness::Ready {
     return Ok(TickOutcome::Unavailable);
   }
   let due_jobs = tokio::select! {
@@ -615,6 +615,9 @@ impl BackendAuthorization {
 #[async_trait]
 pub trait ScheduledExecutionBackend: Send + Sync {
   fn readiness(&self) -> ExecutorReadiness;
+  async fn refresh_readiness(&self) -> ExecutorReadiness {
+    self.readiness()
+  }
   async fn authorize(&self, _input: &PrepareInput) -> Result<BackendAuthorization, PrepareFailure> {
     Ok(BackendAuthorization::new(()))
   }
@@ -846,7 +849,7 @@ impl ScheduledRunOrchestrator {
     if !self.run_claims_enabled {
       return Ok(TickOutcome::Unavailable);
     }
-    if self.backend.readiness() != ExecutorReadiness::Ready {
+    if self.backend.refresh_readiness().await != ExecutorReadiness::Ready {
       return Ok(TickOutcome::Unavailable);
     }
     if *shutdown.borrow() {
@@ -1576,7 +1579,7 @@ fn sha256_hex(value: &[u8]) -> String {
 mod tests {
   use std::sync::Barrier;
   use std::sync::Mutex;
-  use std::sync::atomic::{AtomicI64, AtomicUsize};
+  use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize};
 
   use codeoff_agent_contract::{InvocationPrincipalRef, InvocationSource};
   use codeoff_state::{
@@ -1695,6 +1698,34 @@ mod tests {
           max_active: Arc::clone(&self.max_active),
         }),
       })
+    }
+  }
+
+  struct SwitchableBackend {
+    available: Arc<AtomicBool>,
+    inner: FakeBackend,
+  }
+
+  #[async_trait]
+  impl ScheduledExecutionBackend for SwitchableBackend {
+    fn readiness(&self) -> ExecutorReadiness {
+      if self.available.load(Ordering::Acquire) {
+        ExecutorReadiness::Ready
+      } else {
+        ExecutorReadiness::Unavailable
+      }
+    }
+
+    async fn refresh_readiness(&self) -> ExecutorReadiness {
+      self.readiness()
+    }
+
+    fn prepare(
+      &self,
+      input: PrepareInput,
+      authorization: BackendAuthorization,
+    ) -> Result<BackendPrepared, PrepareFailure> {
+      self.inner.prepare(input, authorization)
     }
   }
 
@@ -1902,6 +1933,55 @@ mod tests {
       .expect("claim proof")
       .expect("run remained pending");
     assert_eq!(claim.binding.attempt(), 1);
+  }
+
+  #[tokio::test]
+  async fn test_live_readiness_gap_has_zero_materialization_or_claim_delta_and_recovers() {
+    let temp = tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    create_job(&state, "authority-gap", 110).await;
+    let available = Arc::new(AtomicBool::new(false));
+    let backend = Arc::new(SwitchableBackend {
+      available: Arc::clone(&available),
+      inner: FakeBackend::new(ExecutionResult::Completed {
+        summary: "rotated".to_owned(),
+      }),
+    });
+    let runtime = orchestrator(
+      state.clone(),
+      backend,
+      Arc::new(TestClock(AtomicI64::new(111), 1)),
+      1,
+    );
+    let before = state
+      .scheduler_observability_snapshot(111, 100, 1_000)
+      .await
+      .expect("snapshot before gap");
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+
+    assert_eq!(
+      run_scheduled_worker_tick(&state, &runtime, shutdown_rx.clone())
+        .await
+        .expect("gap tick"),
+      TickOutcome::Unavailable
+    );
+    assert_eq!(
+      state
+        .scheduler_observability_snapshot(111, 100, 1_000)
+        .await
+        .expect("snapshot during gap"),
+      before
+    );
+
+    available.store(true, Ordering::Release);
+    assert_eq!(
+      run_scheduled_worker_tick(&state, &runtime, shutdown_rx)
+        .await
+        .expect("recovery tick"),
+      TickOutcome::Completed
+    );
   }
 
   #[tokio::test]

@@ -56,11 +56,31 @@ pub(super) fn verify_scheduled_artifacts(
   config: &ScheduledCodexConfig,
   profile: &RequestedCapabilityProfile,
 ) -> Result<VerifiedScheduledArtifacts, String> {
+  let policy = observed_trust_policy(config)?;
+  verify_scheduled_artifacts_with_policy(config, profile, policy)
+}
+
+pub(super) fn read_verified_scheduled_attestation(
+  config: &ScheduledCodexConfig,
+) -> Result<String, String> {
+  let policy = observed_trust_policy(config)?;
+  let attestation = open_verified(
+    &config.isolation_attestation_path,
+    ArtifactKind::ReadOnlyFile,
+    policy,
+  )?;
+  read_utf8(
+    &attestation,
+    MAX_ATTESTATION_BYTES,
+    "scheduled_isolation_attestation",
+  )
+}
+
+fn observed_trust_policy(config: &ScheduledCodexConfig) -> Result<ArtifactTrustPolicy, String> {
   let supplementary_groups =
     getgroups().map_err(|error| format!("read scheduled runtime supplementary groups: {error}"))?;
-  verify_scheduled_artifacts_for_identity(
+  trust_policy_for_identity(
     config,
-    profile,
     geteuid().as_raw(),
     getegid().as_raw(),
     &supplementary_groups
@@ -74,13 +94,12 @@ pub(super) fn verify_scheduled_artifacts(
   clippy::similar_names,
   reason = "uid and gid are distinct security identities checked together"
 )]
-fn verify_scheduled_artifacts_for_identity(
+fn trust_policy_for_identity(
   config: &ScheduledCodexConfig,
-  profile: &RequestedCapabilityProfile,
   observed_uid: u32,
   observed_gid: u32,
   supplementary_gids: &[u32],
-) -> Result<VerifiedScheduledArtifacts, String> {
+) -> Result<ArtifactTrustPolicy, String> {
   if observed_uid != config.runtime_uid || observed_gid != config.runtime_gid {
     return Err("scheduled_runtime_identity_mismatch".to_owned());
   }
@@ -90,12 +109,19 @@ fn verify_scheduled_artifacts_for_identity(
   {
     return Err("scheduled_runtime_must_not_own_trusted_artifacts".to_owned());
   }
-  let policy = ArtifactTrustPolicy {
+  Ok(ArtifactTrustPolicy {
     trusted_uid: config.trusted_owner_uid,
     trusted_gid: config.trusted_owner_gid,
     runtime_uid: config.runtime_uid,
     runtime_gid: config.runtime_gid,
-  };
+  })
+}
+
+fn verify_scheduled_artifacts_with_policy(
+  config: &ScheduledCodexConfig,
+  profile: &RequestedCapabilityProfile,
+  policy: ArtifactTrustPolicy,
+) -> Result<VerifiedScheduledArtifacts, String> {
   let program = open_verified(&profile.codex_program, ArtifactKind::Executable, policy)?;
   verify_digest(
     &program,
@@ -159,13 +185,8 @@ pub(super) fn verify_scheduled_artifacts_for_test(
   config: &ScheduledCodexConfig,
   profile: &RequestedCapabilityProfile,
 ) -> Result<VerifiedScheduledArtifacts, String> {
-  verify_scheduled_artifacts_for_identity(
-    config,
-    profile,
-    config.runtime_uid,
-    config.runtime_gid,
-    &[],
-  )
+  let policy = trust_policy_for_identity(config, config.runtime_uid, config.runtime_gid, &[])?;
+  verify_scheduled_artifacts_with_policy(config, profile, policy)
 }
 
 #[cfg(test)]
@@ -470,26 +491,12 @@ mod tests {
       runtime_gid: 65_534,
       ..ScheduledCodexConfig::default()
     };
-    let profile = RequestedCapabilityProfile {
-      codex_program: "/does/not/matter".into(),
-      codex_program_sha256: "a".repeat(64),
-      codex_home: "/does/not/matter-home".into(),
-      cwd: "/does/not/matter-cwd".into(),
-      github_mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
-      github_mcp_artifact_sha256: "b".repeat(64),
-      github_mcp_endpoint_identity: "test".to_owned(),
-      credential_reference: "test".to_owned(),
-      permission_policy_revision: "test".to_owned(),
-      config_revision: "test".to_owned(),
-      config_sha256: "c".repeat(64),
-    };
-    let Err(error) = verify_scheduled_artifacts_for_identity(&config, &profile, 0, 0, &[]) else {
+    let Err(error) = trust_policy_for_identity(&config, 0, 0, &[]) else {
       panic!("identity mismatch must fail");
     };
     assert_eq!(error, "scheduled_runtime_identity_mismatch");
-    let Err(error) = verify_scheduled_artifacts_for_identity(
+    let Err(error) = trust_policy_for_identity(
       &config,
-      &profile,
       config.runtime_uid,
       config.runtime_gid,
       &[config.trusted_owner_gid],

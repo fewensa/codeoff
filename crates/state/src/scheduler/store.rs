@@ -48,6 +48,7 @@ pub(crate) struct ScheduledHistoryCleanup {
   pub(crate) runs_deleted: u64,
   pub(crate) protected: u64,
   pub(crate) rows_deleted: u64,
+  pub(crate) permit_consumptions_deleted: u64,
 }
 const SCHEDULER_OBSERVABILITY_QUERY: &str = r"
 select
@@ -269,7 +270,7 @@ impl StateStore {
   ) -> Result<(), StateError> {
     permit.validate().map_err(invalid_value)?;
     let result = sqlx::query(
-      "insert into scheduled_execution_permit_consumptions (permit_id, schema_version, authority_key, deployment_epoch, attestation_id, profile_digest, run_id, job_id, attempt, fence, authority_digest, nonce, consumed_at) select ?1, 1, 'scheduled-codex-v1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 where exists (select 1 from scheduled_executor_epochs where authority_key = 'scheduled-codex-v1' and deployment_epoch = ?2 and attestation_id = ?3 and profile_digest = ?4 and expires_at > ?11)",
+      "insert into scheduled_execution_permit_consumptions (permit_id, schema_version, authority_key, deployment_epoch, attestation_id, profile_digest, run_id, job_id, attempt, fence, authority_digest, nonce, consumed_at, authority_expires_at) select ?1, 1, 'scheduled-codex-v1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, expires_at from scheduled_executor_epochs where authority_key = 'scheduled-codex-v1' and deployment_epoch = ?2 and attestation_id = ?3 and profile_digest = ?4 and expires_at > ?11",
     )
     .bind(&permit.permit_id)
     .bind(permit.deployment_epoch)
@@ -2236,6 +2237,7 @@ limit ?3
       runs_deleted: 0,
       protected: 0,
       rows_deleted: 0,
+      permit_consumptions_deleted: 0,
     };
     for candidate in candidates {
       let run_id = candidate
@@ -2309,7 +2311,90 @@ limit ?3
         Err(error) => return Err(error),
       }
     }
+    cleanup.permit_consumptions_deleted =
+      self.cleanup_scheduled_execution_permits(now, limit).await?;
+    cleanup.rows_deleted = cleanup
+      .rows_deleted
+      .saturating_add(cleanup.permit_consumptions_deleted);
     Ok(cleanup)
+  }
+
+  async fn cleanup_scheduled_execution_permits(
+    &self,
+    now: i64,
+    limit: u32,
+  ) -> Result<u64, StateError> {
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let guard = sqlx::query(
+      "update scheduled_execution_permit_retention_guard set enabled = 1 where singleton = 1 and enabled = 0",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if guard.rows_affected() != 1 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled execution permit retention authority is unavailable".to_owned(),
+      });
+    }
+    let deleted = sqlx::query(
+      r"
+delete from scheduled_execution_permit_consumptions
+where permit_id in (
+  select permit.permit_id
+  from scheduled_execution_permit_consumptions permit
+  where permit.authority_expires_at is not null
+    and permit.authority_expires_at <= ?1
+    and permit.deployment_epoch != (
+      select deployment_epoch
+      from scheduled_executor_epochs
+      where authority_key = 'scheduled-codex-v1'
+    )
+    and (
+      not exists (
+        select 1 from scheduled_runs run where run.run_id = permit.run_id
+      )
+      or exists (
+        select 1
+        from scheduled_runs run
+        where run.run_id = permit.run_id
+          and run.state in ('succeeded', 'failed', 'timed_out', 'cancelled', 'outcome_unknown')
+      )
+      or exists (
+        select 1
+        from scheduled_run_attempts attempt
+        where attempt.run_id = permit.run_id
+          and attempt.attempt = permit.attempt
+          and attempt.fence = permit.fence
+          and attempt.state in (
+            'retry_scheduled', 'preflight_rejected', 'lease_expired', 'succeeded',
+            'failed', 'timed_out', 'cancelled', 'outcome_unknown'
+          )
+      )
+    )
+  order by permit.authority_expires_at, permit.consumed_at, permit.permit_id
+  limit ?2
+)
+",
+    )
+    .bind(now)
+    .bind(i64::from(limit))
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?
+    .rows_affected();
+    let guard = sqlx::query(
+      "update scheduled_execution_permit_retention_guard set enabled = 0 where singleton = 1 and enabled = 1",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if guard.rows_affected() != 1 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled execution permit retention authority did not close".to_owned(),
+      });
+    }
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(deleted)
   }
 
   #[allow(

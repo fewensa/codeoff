@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use codeoff_runtime::scheduled_delivery::{
-  DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderRequest, ProviderMessageIdentity,
+  DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderReadiness,
+  DeliveryProviderReadinessRequest, DeliveryProviderRequest, ProviderMessageIdentity,
 };
 use serde::Deserialize;
 
@@ -43,10 +44,33 @@ impl<H: SlackHttpClient + Sync> SlackScheduledDeliveryProvider<H> {
     }
     Ok(())
   }
+
+  /// Verifies a persisted target against this connector and workspace without provider I/O.
+  ///
+  /// # Errors
+  /// Returns a stable classification when the target is malformed or outside this authority.
+  pub fn verify_target_authority(&self, target_json: &str) -> Result<(), &'static str> {
+    parse_target(target_json, &self.connector_id, &self.workspace_id).map(|_| ())
+  }
 }
 
 #[async_trait]
 impl<H: SlackHttpClient + Sync + Send> DeliveryProvider for SlackScheduledDeliveryProvider<H> {
+  async fn readiness(
+    &self,
+    request: DeliveryProviderReadinessRequest<'_>,
+  ) -> DeliveryProviderReadiness {
+    if let Err(error_kind) = self.verify_target_authority(request.target_json) {
+      return DeliveryProviderReadiness::Permanent {
+        error_kind: error_kind.to_owned(),
+      };
+    }
+    match self.verify_authority().await {
+      Ok(()) => DeliveryProviderReadiness::Ready,
+      Err(error) => classify_readiness_error(error),
+    }
+  }
+
   async fn send(&self, request: DeliveryProviderRequest<'_>) -> DeliveryProviderOutcome {
     let target = match parse_target(request.target_json, &self.connector_id, &self.workspace_id) {
       Ok(target) => target,
@@ -65,12 +89,12 @@ impl<H: SlackHttpClient + Sync + Send> DeliveryProvider for SlackScheduledDelive
       )
       .await
     {
-      Ok(posted) if posted.channel_id == target.channel_id => {
+      Ok(posted) if valid_posted_route(&posted, &target, &self.workspace_id) => {
         DeliveryProviderOutcome::ConfirmedSuccess(ProviderMessageIdentity {
           provider: "slack".to_owned(),
           tenant: self.workspace_id.clone(),
           conversation_id: posted.channel_id,
-          thread_id: target.thread_ts,
+          thread_id: posted.thread_ts,
           message_id: posted.message_ts,
         })
       }
@@ -82,9 +106,56 @@ impl<H: SlackHttpClient + Sync + Send> DeliveryProvider for SlackScheduledDelive
   }
 }
 
+fn classify_readiness_error(error: SlackWebApiError) -> DeliveryProviderReadiness {
+  match error {
+    SlackWebApiError::RateLimited {
+      retry_after_seconds,
+    } => DeliveryProviderReadiness::Retryable {
+      retry_after_seconds,
+      error_kind: "slack_authority_rate_limited".to_owned(),
+    },
+    SlackWebApiError::Request { .. }
+    | SlackWebApiError::InvalidResponse { .. }
+    | SlackWebApiError::Provider { .. }
+    | SlackWebApiError::Deferred { .. }
+    | SlackWebApiError::Api {
+      classification: SlackApiErrorClass::Transient,
+    } => DeliveryProviderReadiness::Retryable {
+      retry_after_seconds: None,
+      error_kind: "slack_authority_unavailable".to_owned(),
+    },
+    SlackWebApiError::Api {
+      classification:
+        SlackApiErrorClass::Invalid
+        | SlackApiErrorClass::Unauthorized
+        | SlackApiErrorClass::TargetUnavailable,
+    }
+    | SlackWebApiError::Unavailable
+    | SlackWebApiError::UnsupportedTarget => DeliveryProviderReadiness::Permanent {
+      error_kind: "slack_authority_rejected".to_owned(),
+    },
+  }
+}
+
 struct SlackCanonicalTarget {
   channel_id: String,
   thread_ts: Option<String>,
+}
+
+fn valid_posted_route(
+  posted: &crate::SlackPostedMessage,
+  target: &SlackCanonicalTarget,
+  workspace_id: &str,
+) -> bool {
+  posted.channel_id == target.channel_id
+    && valid_slack_id(&posted.channel_id)
+    && valid_slack_timestamp(&posted.message_ts)
+    && posted.response_message_ts.as_deref() == Some(posted.message_ts.as_str())
+    && posted.thread_ts == target.thread_ts
+    && posted
+      .response_team_id
+      .as_deref()
+      .is_none_or(|team_id| team_id == workspace_id)
 }
 
 fn parse_target(

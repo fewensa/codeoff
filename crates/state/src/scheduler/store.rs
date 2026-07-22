@@ -14,13 +14,13 @@ use super::{
   MaterializationOutcome, PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey,
   RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency,
   ScheduleSpec, ScheduledDeliveryBinding, ScheduledDeliveryFailure,
-  ScheduledDeliveryRetentionReport, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
-  ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation,
-  ScheduledJobStatus, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind,
-  ScheduledRunResult, ScheduledRunSuccessOutcome, SkippedNoneBaselinePolicy, StateError,
-  TransactionalMutationOutcome, UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json,
-  invalid_occurrence, invalid_value, materialized_run, positive_u32, scheduler_error,
-  validate_text,
+  ScheduledDeliveryRetentionReport, ScheduledDeliveryWork, ScheduledExecutionDisposition,
+  ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
+  ScheduledJobMutation, ScheduledJobStatus, ScheduledRunExecutionOutcome,
+  ScheduledRunLateEvidenceKind, ScheduledRunResult, ScheduledRunSuccessOutcome,
+  SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome, UpdateExecutionBaseline,
+  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
+  positive_u32, scheduler_error, validate_text,
 };
 use crate::StateStore;
 
@@ -31,6 +31,42 @@ const MAX_DELIVERY_INTENT_ID_BYTES: usize = "intent:".len() + MAX_DELIVERY_INTEN
 const MAX_DELIVERY_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
 
 impl StateStore {
+  /// Reads delivery authority for runtime lifecycle tests.
+  ///
+  /// # Errors
+  /// Returns an error when `SQLite` cannot read the delivery rows.
+  #[cfg(any(test, feature = "test-support"))]
+  pub async fn scheduled_delivery_authority_for_tests(
+    &self,
+    delivery_id: &str,
+  ) -> Result<(String, i64, i64, i64), StateError> {
+    sqlx::query_as(
+      "select state, attempt, fence, (select count(*) from scheduled_delivery_attempts where delivery_id = ?1) from scheduled_run_deliveries where delivery_id = ?1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&self.pool)
+    .await
+    .map_err(scheduler_error)
+  }
+
+  /// Reads the active delivery lease expiry for heartbeat tests.
+  ///
+  /// # Errors
+  /// Returns an error when `SQLite` cannot read the delivery row.
+  #[cfg(any(test, feature = "test-support"))]
+  pub async fn scheduled_delivery_lease_for_tests(
+    &self,
+    delivery_id: &str,
+  ) -> Result<Option<i64>, StateError> {
+    sqlx::query_scalar(
+      "select lease_expires_at from scheduled_run_deliveries where delivery_id = ?1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&self.pool)
+    .await
+    .map_err(scheduler_error)
+  }
+
   /// Reads scheduler authority counts for cross-pool lifecycle tests.
   ///
   /// # Errors
@@ -773,6 +809,72 @@ impl StateStore {
     } else {
       Ok(PreparedScheduledDelivery::Pending(snapshot))
     }
+  }
+
+  /// Identifies whether due delivery work needs provider readiness without mutating authority.
+  ///
+  /// # Errors
+  /// Returns an error for invalid time or storage failure.
+  pub async fn peek_scheduled_delivery_work(
+    &self,
+    now: i64,
+  ) -> Result<ScheduledDeliveryWork, StateError> {
+    if now < 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled delivery readiness time must be nonnegative".to_owned(),
+      });
+    }
+    let maintenance_target = sqlx::query_scalar::<_, String>(
+      "select target_json from (select target_json, 0 as priority, lease_expires_at as due_at, delivery_id from scheduled_run_deliveries where state = 'sending' and authority_kind = 'intent_v1' and payload_snapshot is not null and lease_expires_at <= ?1 and updated_at <= ?1 union all select target_json, 1 as priority, next_attempt_at as due_at, delivery_id from scheduled_run_deliveries where state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null and next_attempt_at <= ?1 and updated_at <= ?1) order by priority, due_at, delivery_id limit 1",
+    )
+    .bind(now)
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    if let Some(target_json) = maintenance_target {
+      return Ok(ScheduledDeliveryWork::ProviderRequired { target_json });
+    }
+    let pending = sqlx::query(
+      "select candidate.target_json, exists(select 1 from scheduled_delivery_baselines baseline where baseline.job_id = candidate.job_id and baseline.target_identity_digest = candidate.target_identity_digest and baseline.target_snapshot_digest_algorithm = candidate.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = candidate.target_snapshot_digest and baseline.delivery_policy_version = candidate.delivery_policy_version and baseline.render_version = candidate.render_version and baseline.hash_algorithm = candidate.hash_algorithm and baseline.accepted_payload_digest = candidate.payload_digest) as unchanged from scheduled_run_deliveries candidate where candidate.state = 'pending' and candidate.authority_kind = 'intent_v1' and candidate.payload_snapshot is not null and candidate.updated_at <= ?1 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.job_id = candidate.job_id and active.target_identity_digest = candidate.target_identity_digest and active.target_snapshot_digest = candidate.target_snapshot_digest and active.delivery_policy_version = candidate.delivery_policy_version and active.render_version = candidate.render_version and active.hash_algorithm = candidate.hash_algorithm) order by candidate.created_at, candidate.delivery_id limit 1",
+    )
+    .bind(now)
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(pending) = pending else {
+      return Ok(ScheduledDeliveryWork::Idle);
+    };
+    if pending
+      .try_get::<i64, _>("unchanged")
+      .map_err(scheduler_error)?
+      != 0
+    {
+      Ok(ScheduledDeliveryWork::SkipUnchanged)
+    } else {
+      Ok(ScheduledDeliveryWork::ProviderRequired {
+        target_json: pending.try_get("target_json").map_err(scheduler_error)?,
+      })
+    }
+  }
+
+  /// Atomically skips the oldest pending payload only when it exactly matches its accepted baseline.
+  ///
+  /// # Errors
+  /// Returns an error for invalid time or storage failure.
+  pub async fn skip_next_unchanged_scheduled_delivery(&self, now: i64) -> Result<bool, StateError> {
+    if now < 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled delivery skip time must be nonnegative".to_owned(),
+      });
+    }
+    sqlx::query_scalar::<_, String>(
+      "update scheduled_run_deliveries set state = 'skipped_unchanged', claimed_baseline_version = (select baseline.baseline_version from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest), provider_outcome = 'skipped_unchanged', updated_at = ?1 where delivery_id = (select candidate.delivery_id from scheduled_run_deliveries candidate where candidate.state = 'pending' and candidate.authority_kind = 'intent_v1' and candidate.payload_snapshot is not null and candidate.updated_at <= ?1 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.job_id = candidate.job_id and active.target_identity_digest = candidate.target_identity_digest and active.target_snapshot_digest = candidate.target_snapshot_digest and active.delivery_policy_version = candidate.delivery_policy_version and active.render_version = candidate.render_version and active.hash_algorithm = candidate.hash_algorithm) order by candidate.created_at, candidate.delivery_id limit 1) and state = 'pending' and updated_at <= ?1 and exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest) returning delivery_id",
+    )
+    .bind(now)
+    .fetch_optional(&self.pool)
+    .await
+    .map(|delivery| delivery.is_some())
+    .map_err(scheduler_error)
   }
 
   /// Atomically rechecks the accepted baseline, then either skips an exact match without an

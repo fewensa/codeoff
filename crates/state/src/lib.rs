@@ -14,11 +14,12 @@ pub use scheduler::{
   PreparedScheduledDelivery, PrincipalKey, RunLeaseBinding, ScheduleAuditSummary,
   ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryBinding,
   ScheduledDeliveryFailure, ScheduledDeliveryRetentionReport, ScheduledDeliveryState,
-  ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition,
-  ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
-  ScheduledRun, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunResult,
-  ScheduledRunState, ScheduledRunSuccessOutcome, SkippedNoneBaselinePolicy, StateValueError,
-  TransactionalMutationOutcome, TransportConvergence, UpdateExecutionBaseline, UpdateScheduledJob,
+  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob,
+  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
+  ScheduledPrepareAuthority, ScheduledRun, ScheduledRunExecutionOutcome,
+  ScheduledRunLateEvidenceKind, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  SkippedNoneBaselinePolicy, StateValueError, TransactionalMutationOutcome, TransportConvergence,
+  UpdateExecutionBaseline, UpdateScheduledJob,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::StateStoreTestLock;

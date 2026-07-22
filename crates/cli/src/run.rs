@@ -48,8 +48,8 @@ use codeoff_runtime::{
   },
   schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler},
   scheduled_delivery::{
-    DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderRequest,
-    run_scheduled_delivery_worker,
+    DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderReadiness,
+    DeliveryProviderReadinessRequest, DeliveryProviderRequest, run_scheduled_delivery_worker,
   },
   scheduled_execution::{
     GlobalTurnBudget, ScheduledWorkerConfig, ScheduledWorkerHandle, ScheduledWorkerShutdown,
@@ -354,21 +354,24 @@ impl LazySlackScheduledDeliveryProvider {
     }
   }
 
+  fn configured_provider(&self) -> SlackScheduledDeliveryProvider<SlackReqwestWebApiClient> {
+    SlackScheduledDeliveryProvider::new(SlackWebApiClient::new_with_artifact_root(
+      SlackReqwestWebApiClient::new(),
+      "slack-default",
+      self.bot_token.clone(),
+      self.slack.clone(),
+      now_unix_seconds(),
+      self.state_dir.clone(),
+    ))
+  }
+
   async fn provider(
     &self,
   ) -> Result<&SlackScheduledDeliveryProvider<SlackReqwestWebApiClient>, SlackWebApiError> {
     self
       .provider
       .get_or_try_init(|| async {
-        let provider =
-          SlackScheduledDeliveryProvider::new(SlackWebApiClient::new_with_artifact_root(
-            SlackReqwestWebApiClient::new(),
-            "slack-default",
-            self.bot_token.clone(),
-            self.slack.clone(),
-            now_unix_seconds(),
-            self.state_dir.clone(),
-          ));
+        let provider = self.configured_provider();
         provider.verify_authority().await?;
         Ok(provider)
       })
@@ -378,19 +381,37 @@ impl LazySlackScheduledDeliveryProvider {
 
 #[async_trait]
 impl DeliveryProvider for LazySlackScheduledDeliveryProvider {
+  async fn readiness(
+    &self,
+    request: DeliveryProviderReadinessRequest<'_>,
+  ) -> DeliveryProviderReadiness {
+    if let Err(error_kind) = self
+      .configured_provider()
+      .verify_target_authority(request.target_json)
+    {
+      return DeliveryProviderReadiness::Permanent {
+        error_kind: error_kind.to_owned(),
+      };
+    }
+    match self.provider().await {
+      Ok(_) => DeliveryProviderReadiness::Ready,
+      Err(error) => classify_slack_authority_error(error),
+    }
+  }
+
   async fn send(&self, request: DeliveryProviderRequest<'_>) -> DeliveryProviderOutcome {
     match self.provider().await {
       Ok(provider) => provider.send(request).await,
-      Err(error) => classify_slack_authority_error(error),
+      Err(error) => readiness_as_delivery_outcome(classify_slack_authority_error(error)),
     }
   }
 }
 
-fn classify_slack_authority_error(error: SlackWebApiError) -> DeliveryProviderOutcome {
+fn classify_slack_authority_error(error: SlackWebApiError) -> DeliveryProviderReadiness {
   match error {
     SlackWebApiError::RateLimited {
       retry_after_seconds,
-    } => DeliveryProviderOutcome::ConfirmedNoWriteRetryable {
+    } => DeliveryProviderReadiness::Retryable {
       retry_after_seconds,
       error_kind: "slack_authority_rate_limited".to_owned(),
     },
@@ -400,7 +421,7 @@ fn classify_slack_authority_error(error: SlackWebApiError) -> DeliveryProviderOu
     | SlackWebApiError::Deferred { .. }
     | SlackWebApiError::Api {
       classification: SlackApiErrorClass::Transient,
-    } => DeliveryProviderOutcome::ConfirmedNoWriteRetryable {
+    } => DeliveryProviderReadiness::Retryable {
       retry_after_seconds: None,
       error_kind: "slack_authority_unavailable".to_owned(),
     },
@@ -411,9 +432,27 @@ fn classify_slack_authority_error(error: SlackWebApiError) -> DeliveryProviderOu
         | SlackApiErrorClass::TargetUnavailable,
     }
     | SlackWebApiError::Unavailable
-    | SlackWebApiError::UnsupportedTarget => DeliveryProviderOutcome::ConfirmedNoWriteTerminal {
+    | SlackWebApiError::UnsupportedTarget => DeliveryProviderReadiness::Permanent {
       error_kind: "slack_authority_rejected".to_owned(),
     },
+  }
+}
+
+fn readiness_as_delivery_outcome(readiness: DeliveryProviderReadiness) -> DeliveryProviderOutcome {
+  match readiness {
+    DeliveryProviderReadiness::Ready => DeliveryProviderOutcome::AmbiguousPostWrite {
+      error_kind: "slack_authority_state_changed".to_owned(),
+    },
+    DeliveryProviderReadiness::Retryable {
+      retry_after_seconds,
+      error_kind,
+    } => DeliveryProviderOutcome::ConfirmedNoWriteRetryable {
+      retry_after_seconds,
+      error_kind,
+    },
+    DeliveryProviderReadiness::Permanent { error_kind } => {
+      DeliveryProviderOutcome::ConfirmedNoWriteTerminal { error_kind }
+    }
   }
 }
 

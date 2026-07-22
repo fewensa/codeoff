@@ -9,7 +9,8 @@ use codeoff_channel_slack::{
 };
 use codeoff_config::SlackConfig;
 use codeoff_runtime::scheduled_delivery::{
-  DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderRequest,
+  DeliveryProvider, DeliveryProviderOutcome, DeliveryProviderReadiness,
+  DeliveryProviderReadinessRequest, DeliveryProviderRequest,
 };
 use codeoff_state::{
   AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot, ClaimedScheduledDelivery,
@@ -203,7 +204,8 @@ async fn sends_exact_channel_thread_and_dm_routes_and_returns_provider_identity(
         "ok": true,
         "channel": channel_id,
         "ts": "200.000001",
-        "message": {"thread_ts": thread_ts},
+        "team_id": "T00000000",
+        "message": {"ts": "200.000001", "thread_ts": thread_ts},
       })
       .to_string(),
     )]);
@@ -255,6 +257,68 @@ async fn sends_exact_channel_thread_and_dm_routes_and_returns_provider_identity(
       vec!["channel".to_owned(), "text".to_owned()]
     };
     assert_eq!(requests[0].json_keys(), Some(expected_keys));
+  }
+}
+
+#[tokio::test]
+async fn success_requires_exact_canonical_message_and_thread_identity() {
+  for (kind, requested_thread, response_body) in [
+    (
+      "channel",
+      None,
+      json!({"ok":true,"channel":"C999","ts":"200.000001","message":{"ts":"200.000001"}}),
+    ),
+    (
+      "channel",
+      None,
+      json!({"ok":true,"channel":"C123","ts":"malformed","message":{"ts":"malformed"}}),
+    ),
+    (
+      "channel",
+      None,
+      json!({"ok":true,"channel":"C123","ts":"200.000001","message":{}}),
+    ),
+    (
+      "channel",
+      None,
+      json!({"ok":true,"channel":"C123","ts":"200.000001","message":{"ts":"200.000001","thread_ts":"100.000001"}}),
+    ),
+    (
+      "thread",
+      Some("100.000001"),
+      json!({"ok":true,"channel":"C123","ts":"200.000001","message":{"ts":"200.000001"}}),
+    ),
+    (
+      "thread",
+      Some("100.000001"),
+      json!({"ok":true,"channel":"C123","ts":"200.000001","message":{"ts":"200.000001","thread_ts":"100.000002"}}),
+    ),
+    (
+      "thread",
+      Some("100.000001"),
+      json!({"ok":true,"channel":"C123","ts":"200.000001","team_id":"T99999999","message":{"ts":"200.000001","thread_ts":"100.000001"}}),
+    ),
+  ] {
+    let (_temp, _store, claim) = claimed_delivery(kind, "C123", requested_thread).await;
+    let provider = SlackScheduledDeliveryProvider::new(SlackWebApiClient::new(
+      FakeHttp::new([response(200, response_body.to_string())]),
+      "slack-default",
+      "xoxb-secret",
+      SlackConfig::default(),
+      100,
+    ));
+    assert_eq!(
+      provider
+        .send(DeliveryProviderRequest {
+          payload: &claim.payload,
+          target_json: &claim.target_json,
+          idempotency_key: claim.binding.idempotency_key(),
+        })
+        .await,
+      DeliveryProviderOutcome::AmbiguousPostWrite {
+        error_kind: "slack_response_route_mismatch".to_owned(),
+      }
+    );
   }
 }
 
@@ -388,4 +452,47 @@ async fn authority_preflight_accepts_only_the_configured_workspace() {
       .iter()
       .any(|request| request.path() == "chat.postMessage")
   );
+}
+
+#[tokio::test]
+async fn readiness_validates_target_before_auth_and_classifies_auth_availability() {
+  let (_temp, _store, claim) = claimed_delivery("channel", "C123", None).await;
+  let invalid = SlackScheduledDeliveryProvider::new(SlackWebApiClient::new(
+    FakeHttp::new([]),
+    "slack-default",
+    "xoxb-secret",
+    SlackConfig::default(),
+    100,
+  ));
+  assert_eq!(
+    invalid
+      .readiness(DeliveryProviderReadinessRequest {
+        target_json: r#"{"provider":"email"}"#,
+      })
+      .await,
+    DeliveryProviderReadiness::Permanent {
+      error_kind: "invalid_slack_target".to_owned(),
+    }
+  );
+  assert!(invalid.http_client().requests().is_empty());
+
+  let transient = SlackScheduledDeliveryProvider::new(SlackWebApiClient::new(
+    FakeHttp::new([response(503, "private response")]),
+    "slack-default",
+    "xoxb-secret",
+    SlackConfig::default(),
+    100,
+  ));
+  assert_eq!(
+    transient
+      .readiness(DeliveryProviderReadinessRequest {
+        target_json: &claim.target_json,
+      })
+      .await,
+    DeliveryProviderReadiness::Retryable {
+      retry_after_seconds: None,
+      error_kind: "slack_authority_unavailable".to_owned(),
+    }
+  );
+  assert_eq!(transient.http_client().requests()[0].path(), "auth.test");
 }

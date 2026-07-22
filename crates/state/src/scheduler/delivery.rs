@@ -244,6 +244,13 @@ pub struct ClaimedScheduledDelivery {
   pub target_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduledDeliveryWork {
+  Idle,
+  SkipUnchanged,
+  ProviderRequired { target_json: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkippedNoneBaselinePolicy {
   DoNotAdvance,

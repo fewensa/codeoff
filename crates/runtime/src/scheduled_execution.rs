@@ -2086,17 +2086,33 @@ mod tests {
     let mut backend = FakeBackend::new(ExecutionResult::Completed {
       summary: "late completion must not win".to_owned(),
     });
-    backend.execution_delay = Duration::from_millis(80);
+    let completion_barrier = Arc::new(Barrier::new(2));
+    backend.completion_barrier = Some(Arc::clone(&completion_barrier));
     backend.honor_execution_cancellation = false;
-    let mut runtime = orchestrator(
+    let mut configured = orchestrator(
       state.clone(),
-      Arc::new(backend),
+      Arc::new(backend.clone()),
       Arc::new(TestClock(AtomicI64::new(111), 1)),
       1,
     );
-    runtime.policy.total_timeout = Duration::from_millis(50);
-    runtime.policy.cancellation_grace = Duration::from_millis(5);
-    assert_eq!(runtime.run_once().await.expect("tick"), TickOutcome::Failed);
+    configured.policy.total_timeout = Duration::from_millis(50);
+    configured.policy.cancellation_grace = Duration::from_millis(5);
+    let runtime = Arc::new(configured);
+    let caller = {
+      let runtime = Arc::clone(&runtime);
+      tokio::spawn(async move { runtime.run_once().await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+      while backend.active.load(Ordering::Acquire) == 0 {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("execution start");
+    assert_eq!(
+      caller.await.expect("caller").expect("tick"),
+      TickOutcome::Failed
+    );
     assert_eq!(runtime.budget.available_permits(), 0);
     assert!(
       state
@@ -2106,7 +2122,14 @@ mod tests {
         .is_none(),
       "unknown execution must not be retried"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    completion_barrier.wait();
+    tokio::time::timeout(Duration::from_secs(1), async {
+      while runtime.budget.available_permits() == 0 {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("guardian permit release");
     assert_eq!(runtime.budget.available_permits(), 1);
   }
 

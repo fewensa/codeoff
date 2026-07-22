@@ -1726,6 +1726,11 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
         .message
         .as_ref()
         .and_then(|message| message.thread_ts.clone()),
+      response_message_ts: parsed
+        .message
+        .as_ref()
+        .and_then(|message| message.ts.clone()),
+      response_team_id: parsed.team_id.clone(),
       message_ts,
       response_body: response.body,
     })
@@ -1803,6 +1808,11 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
         .message
         .as_ref()
         .and_then(|message| message.thread_ts.clone()),
+      response_message_ts: parsed
+        .message
+        .as_ref()
+        .and_then(|message| message.ts.clone()),
+      response_team_id: parsed.team_id.clone(),
       message_ts,
       response_body: response.body,
     })
@@ -1882,6 +1892,8 @@ struct SlackUpdateMessageBody<'a> {
 pub struct SlackPostedMessage {
   pub channel_id: String,
   pub thread_ts: Option<String>,
+  pub response_message_ts: Option<String>,
+  pub response_team_id: Option<String>,
   pub message_ts: String,
   pub response_body: String,
 }

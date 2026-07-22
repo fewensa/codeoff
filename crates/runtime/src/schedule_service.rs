@@ -873,21 +873,18 @@ fn mutation_semantics(
       "digest": capability.digest(),
       "snapshot": serde_json::from_str::<Value>(capability.canonical_json()).map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?,
     },
-    "targets": targets.iter().map(target_json).collect::<Result<Vec<_>, _>>()?,
+    "targets": targets.iter().map(target_semantic_json).collect::<Vec<_>>(),
   }))
 }
 
-fn target_json(target: &DeliveryTargetSnapshot) -> Result<Value, ScheduleServiceError> {
-  Ok(json!({
+fn target_semantic_json(target: &DeliveryTargetSnapshot) -> Value {
+  json!({
     "provider": target.provider(),
     "connector": target.connector(),
     "tenant": target.tenant(),
     "kind": target.kind(),
-    "address": serde_json::from_str::<Value>(target.address_json()).map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?,
-    "resolver_version": target.resolver_version(),
-    "resolver_digest": target.resolver_digest(),
     "identity_digest": target.identity_digest(),
-  }))
+  })
 }
 
 fn next_generation(generation: i64) -> Result<i64, ScheduleServiceError> {

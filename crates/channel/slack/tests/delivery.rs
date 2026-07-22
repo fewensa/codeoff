@@ -746,8 +746,8 @@ async fn provider_errors_are_reported_without_exposing_the_token() {
 
   assert_eq!(
     error,
-    SlackWebApiError::Provider {
-      message: "invalid_auth <redacted>".to_owned()
+    SlackWebApiError::Api {
+      classification: codeoff_channel_slack::SlackApiErrorClass::Unauthorized,
     }
   );
   assert!(!error.to_string().contains("xoxb-secret-token"));

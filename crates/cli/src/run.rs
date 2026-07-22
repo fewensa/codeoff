@@ -365,6 +365,9 @@ fn channel_context_provider_error(error: SlackWebApiError) -> ChannelContextProv
       ChannelContextProviderError::InvalidResponse { message }
     }
     SlackWebApiError::Provider { message } => ChannelContextProviderError::Provider { message },
+    SlackWebApiError::Api { classification } => ChannelContextProviderError::Provider {
+      message: classification.to_string(),
+    },
     SlackWebApiError::UnsupportedTarget => ChannelContextProviderError::UnsupportedTarget,
     SlackWebApiError::Deferred { available_at } => {
       ChannelContextProviderError::Deferred { available_at }

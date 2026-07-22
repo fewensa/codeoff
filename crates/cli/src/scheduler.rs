@@ -564,17 +564,127 @@ fn parse_rfc3339(value: &str) -> Result<i64, SchedulerInputError> {
 mod tests {
   use super::*;
   use async_trait::async_trait;
-  use codeoff_runtime::schedule_service::{
-    ChannelTargetVerifier, SlackTargetResolutionRequest, TargetVerificationError,
-    VerifiedSlackTarget, VerifiedSlackTargetResolver,
+  use codeoff_agent_contract::{
+    ChannelReplyStrategy, ChannelTaskContext, ConversationKind, InvocationPrincipal,
+    InvocationSource,
   };
+  use codeoff_channel_slack::{
+    SlackHttpClient, SlackHttpRequest, SlackHttpResponse, SlackScheduleTargetVerifier,
+    SlackWebApiClient,
+  };
+  use codeoff_config::SlackConfig;
+  use codeoff_runtime::schedule_service::{
+    ChannelTargetVerifier, DefaultCapabilityRegistry, OwnerOnlyAuthorizationPolicy,
+    SlackTargetResolutionRequest, TargetVerificationError, VerifiedSlackTarget,
+    VerifiedSlackTargetResolver,
+  };
+  use codeoff_runtime::schedule_tools::ScheduleDynamicToolHandler;
   use codeoff_state::PrincipalKey;
   use std::io::Cursor;
-  use std::sync::Arc;
   use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::sync::{Arc, Mutex};
   use std::time::Duration;
 
   struct CountingSlackVerifier(Arc<AtomicUsize>);
+
+  #[derive(Clone, Default)]
+  struct FakeSlackHttp {
+    responses: Arc<Mutex<Vec<SlackHttpResponse>>>,
+    requests: Arc<Mutex<Vec<SlackHttpRequest>>>,
+  }
+
+  impl FakeSlackHttp {
+    fn new(responses: Vec<SlackHttpResponse>) -> Self {
+      Self {
+        responses: Arc::new(Mutex::new(responses.into_iter().rev().collect())),
+        requests: Arc::new(Mutex::default()),
+      }
+    }
+
+    fn respond(&self, request: SlackHttpRequest) -> Result<SlackHttpResponse, String> {
+      self.requests.lock().expect("requests").push(request);
+      self
+        .responses
+        .lock()
+        .expect("responses")
+        .pop()
+        .ok_or_else(|| "unexpected Slack request".to_owned())
+    }
+  }
+
+  #[async_trait]
+  impl SlackHttpClient for FakeSlackHttp {
+    async fn get(&self, request: SlackHttpRequest) -> Result<SlackHttpResponse, String> {
+      self.respond(request)
+    }
+
+    async fn post(&self, request: SlackHttpRequest) -> Result<SlackHttpResponse, String> {
+      self.respond(request)
+    }
+  }
+
+  fn slack_response(body: impl Into<String>) -> SlackHttpResponse {
+    SlackHttpResponse::new(200, Vec::<(&str, &str)>::new(), body)
+  }
+
+  fn slack_auth() -> SlackHttpResponse {
+    slack_response(
+      r#"{"ok":true,"team_id":"T00000000","enterprise_id":"E00000000","user_id":"U0BOT","bot_id":"B0BOT"}"#,
+    )
+  }
+
+  fn slack_user(user_id: &str) -> SlackHttpResponse {
+    slack_response(
+      json!({
+        "ok": true,
+        "user": {
+          "id": user_id,
+          "team_id": "T00000000",
+          "profile": {},
+        }
+      })
+      .to_string(),
+    )
+  }
+
+  fn slack_channel(channel_id: &str, is_im: bool) -> SlackHttpResponse {
+    slack_response(
+      json!({
+        "ok": true,
+        "channel": {
+          "id": channel_id,
+          "is_im": is_im,
+          "is_private": is_im,
+          "is_member": true,
+          "context_team_id": "T00000000",
+          "enterprise_id": "E00000000",
+          "conversation_host_id": "T00000000",
+          "shared_team_ids": ["T00000000"],
+        }
+      })
+      .to_string(),
+    )
+  }
+
+  fn slack_members() -> SlackHttpResponse {
+    slack_response(r#"{"ok":true,"members":["U1"],"response_metadata":{"next_cursor":""}}"#)
+  }
+
+  fn real_slack_resolvers(responses: Vec<SlackHttpResponse>) -> Arc<TargetResolverRegistry> {
+    let provider = Arc::new(SlackWebApiClient::new(
+      FakeSlackHttp::new(responses),
+      "slack-default",
+      "xoxb-test-secret",
+      SlackConfig::default(),
+      100,
+    ));
+    let mut resolvers = TargetResolverRegistry::with_defaults();
+    resolvers.register(VerifiedSlackTargetResolver::registration(
+      Arc::new(SlackScheduleTargetVerifier::new(provider)),
+      Duration::from_millis(100),
+    ));
+    Arc::new(resolvers)
+  }
 
   #[async_trait]
   impl ChannelTargetVerifier for CountingSlackVerifier {
@@ -592,6 +702,10 @@ mod tests {
       };
       Ok(VerifiedSlackTarget {
         workspace_id: "T00000000".to_owned(),
+        team_id: "T00000000".to_owned(),
+        enterprise_id: None,
+        context_team_id: "T00000000".to_owned(),
+        conversation_host_id: "T00000000".to_owned(),
         kind: "channel".to_owned(),
         channel_id: channel_id.clone(),
         thread_ts: None,
@@ -1044,5 +1158,237 @@ kind = "none"
     assert_eq!(targets[0].provider(), "slack");
     assert_eq!(targets[0].tenant(), "T00000000");
     assert!(targets[0].address_json().contains("\"channel_id\":\"C2\""));
+  }
+
+  fn slack_channel_invocation(kind: ConversationKind, channel_id: &str) -> ScheduleInvocation {
+    let is_thread = kind == ConversationKind::Thread;
+    ScheduleInvocation {
+      source: InvocationSource::ChannelEvent {
+        provider: "slack".to_owned(),
+        workspace_id: "T00000000".to_owned(),
+        event_id: "Ev-must-not-persist".to_owned(),
+        dedupe_key: "dedupe-must-not-persist".to_owned(),
+        source_reference: Some("slack://must-not-persist".to_owned()),
+      },
+      principal: InvocationPrincipal::channel_actor("slack", "T00000000", "U1"),
+      channel: Some(ChannelTaskContext {
+        provider: "slack".to_owned(),
+        workspace_id: "T00000000".to_owned(),
+        conversation_key: "event-pointer-must-not-persist".to_owned(),
+        conversation_kind: kind,
+        reply_strategy: ChannelReplyStrategy::DynamicTool,
+        message_text: None,
+        channel_id: Some(channel_id.to_owned()),
+        thread_id: is_thread.then(|| "100.000000".to_owned()),
+        message_ts: Some("999.000000".to_owned()),
+        user_id: Some("U1".to_owned()),
+        recent_context: None,
+        conversation_summary: None,
+      }),
+    }
+  }
+
+  #[tokio::test]
+  #[allow(clippy::too_many_lines)]
+  async fn real_slack_adapter_origins_persist_exact_canonical_target_json_without_event_pointer() {
+    for (kind, channel_id, responses, expected_kind, thread_ts, evidence_digest, request_digest) in [
+      (
+        ConversationKind::Channel,
+        "C1",
+        vec![
+          slack_auth(),
+          slack_user("U1"),
+          slack_channel("C1", false),
+          slack_members(),
+        ],
+        "channel",
+        None,
+        "a01e5610e60cec8e844b2bd06615abab3ef240a2ae09ada6a15e712ed697215e",
+        "80688bb01e165963cc3560507fcc3680ee5bd1312d9ac4aee722895186b50074",
+      ),
+      (
+        ConversationKind::DirectMessage,
+        "D1",
+        vec![slack_auth(), slack_user("U1"), slack_channel("D1", true)],
+        "direct_message",
+        None,
+        "ce3da6525a8390ff7c25872b37c08e700d773ba0e6d8dd55e926cabc8d5762cd",
+        "1ace3e7c55c7b1f14d4e8cb7340c4931bf37c58930d4d89a953dc7361821a29a",
+      ),
+      (
+        ConversationKind::Thread,
+        "C1",
+        vec![
+          slack_auth(),
+          slack_user("U1"),
+          slack_channel("C1", false),
+          slack_members(),
+          slack_response(
+            r#"{"ok":true,"messages":[{"ts":"100.000000","thread_ts":"100.000000"}]}"#,
+          ),
+        ],
+        "thread",
+        Some("100.000000"),
+        "ae95fe1a437f6a5195961596598fa41246dce29e1b4637d29a063f18d54d6677",
+        "4c609f534a9d55e4efcbe7aea85e3f54e8a8d92a7da10c4547d080368b6dc137",
+      ),
+    ] {
+      let temp = tempfile::tempdir().expect("tempdir");
+      let state = StateStore::initialize(&temp.path().join("state"), None)
+        .await
+        .expect("state");
+      let inspection = state.clone();
+      let service = ScheduleService::with_components(
+        state,
+        real_slack_resolvers(responses),
+        Arc::new(DefaultCapabilityRegistry),
+        Arc::new(OwnerOnlyAuthorizationPolicy),
+        Duration::from_millis(100),
+      );
+      let output = service
+        .create(
+          &slack_channel_invocation(kind, channel_id),
+          CreateScheduleRequest {
+            request_id: format!("origin-{expected_kind}"),
+            instruction: "Resolve real Slack origin.".to_owned(),
+            previous_success: PreviousSuccessPolicy::None,
+            schedule: ScheduleSpec::once(500),
+            target: DeliveryTargetRequest::Origin,
+            capability: "none".to_owned(),
+            now: 100,
+          },
+        )
+        .await
+        .expect("create");
+      let job_id = output["data"]["job_id"].as_str().expect("job id");
+      let target = inspection
+        .get_scheduled_job_delivery_targets(job_id)
+        .await
+        .expect("target")
+        .remove(0);
+      let coordinates = thread_ts.map_or_else(
+        || json!({"channel_id": channel_id}),
+        |thread_ts| json!({"channel_id": channel_id, "thread_ts": thread_ts}),
+      );
+      assert_eq!(
+        serde_json::from_str::<Value>(target.address_json()).expect("address"),
+        json!({
+          "schema_version": 1,
+          "workspace_id": "T00000000",
+          "routing_authority": {
+            "team_id": "T00000000",
+            "enterprise_id": "E00000000",
+            "context_team_id": "T00000000",
+            "conversation_host_id": "T00000000",
+          },
+          "coordinates": coordinates,
+          "authorization_evidence": {"version": 2, "digest": evidence_digest},
+          "requested_identity_digest": request_digest,
+          "created_at": 100,
+        })
+      );
+      assert_eq!(target.kind(), expected_kind);
+      for forbidden in [
+        "Ev-must-not-persist",
+        "dedupe-must-not-persist",
+        "slack://must-not-persist",
+        "event-pointer-must-not-persist",
+        "999.000000",
+      ] {
+        assert!(!target.address_json().contains(forbidden));
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn slack_dynamic_tool_and_cli_share_real_provider_canonical_identity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cli_file = temp.path().join("slack-cli.json");
+    std::fs::write(
+      &cli_file,
+      VALID_JSON.replace(
+        r#""delivery": {"kind": "none"}"#,
+        r#""delivery": {"kind": "slack_channel", "channel_id": "C2"}"#,
+      ),
+    )
+    .expect("fixture");
+    let cli_state = StateStore::initialize(&temp.path().join("cli"), None)
+      .await
+      .expect("CLI state");
+    let cli_inspection = cli_state.clone();
+    let cli_output = execute_scheduler_command_with_resolvers(
+      SchedulerCommand::Create {
+        file: cli_file,
+        format: None,
+      },
+      cli_state,
+      SchedulerOperatorConfig::new("ops-a".to_owned(), "realm-a".to_owned()).expect("operator"),
+      real_slack_resolvers(vec![slack_auth(), slack_channel("C2", false)]),
+      100,
+    )
+    .await
+    .expect("CLI");
+    let cli_target = cli_inspection
+      .get_scheduled_job_delivery_targets(cli_output["data"]["job_id"].as_str().expect("job"))
+      .await
+      .expect("CLI target")
+      .remove(0);
+
+    let tool_state = StateStore::initialize(&temp.path().join("tool"), None)
+      .await
+      .expect("tool state");
+    let tool_inspection = tool_state.clone();
+    let tool_service = ScheduleService::with_components(
+      tool_state,
+      real_slack_resolvers(vec![
+        slack_auth(),
+        slack_user("U1"),
+        slack_channel("C2", false),
+        slack_members(),
+      ]),
+      Arc::new(DefaultCapabilityRegistry),
+      Arc::new(OwnerOnlyAuthorizationPolicy),
+      Duration::from_millis(100),
+    );
+    let handler = ScheduleDynamicToolHandler::from_service(tool_service, Some(100));
+    let output = handler
+      .handle_tool_call_async(
+        &slack_channel_invocation(ConversationKind::Channel, "C1"),
+        "schedule_create",
+        json!({
+          "request_id": "tool-create",
+          "instruction": "Compare canonical providers.",
+          "schedule": {"kind": "once", "at": 500},
+          "target": {"kind": "channel", "channel_id": "C2"},
+          "capability": "none",
+        }),
+      )
+      .await;
+    assert_eq!(output["success"], true, "{output}");
+    let envelope: Value =
+      serde_json::from_str(output["contentItems"][0]["text"].as_str().expect("content"))
+        .expect("envelope");
+    let tool_target = tool_inspection
+      .get_scheduled_job_delivery_targets(envelope["data"]["job_id"].as_str().expect("tool job"))
+      .await
+      .expect("tool target")
+      .remove(0);
+    assert_eq!(cli_target.identity_digest(), tool_target.identity_digest());
+    assert_eq!(cli_target.provider(), tool_target.provider());
+    assert_eq!(cli_target.connector(), tool_target.connector());
+    assert_eq!(cli_target.tenant(), tool_target.tenant());
+    assert_eq!(cli_target.kind(), tool_target.kind());
+    let stable_projection = |target: &codeoff_state::DeliveryTargetSnapshot| {
+      let address: Value = serde_json::from_str(target.address_json()).expect("address");
+      json!({
+        "workspace_id": address["workspace_id"],
+        "routing_authority": address["routing_authority"],
+        "coordinates": address["coordinates"],
+      })
+    };
+    assert_eq!(
+      stable_projection(&cli_target),
+      stable_projection(&tool_target)
+    );
   }
 }

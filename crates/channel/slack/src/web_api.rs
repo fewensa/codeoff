@@ -130,6 +130,20 @@ impl SlackHttpRequest {
   }
 
   #[must_use]
+  pub fn json_boolean_value(&self, key: &str) -> Option<bool> {
+    let body: serde_json::Value = serde_json::from_str(self.json_body.as_deref()?).ok()?;
+    body.get(key)?.as_bool()
+  }
+
+  #[must_use]
+  pub fn json_keys(&self) -> Option<Vec<String>> {
+    let body: serde_json::Value = serde_json::from_str(self.json_body.as_deref()?).ok()?;
+    let mut keys = body.as_object()?.keys().cloned().collect::<Vec<_>>();
+    keys.sort_unstable();
+    Some(keys)
+  }
+
+  #[must_use]
   pub fn authorization_is_bearer_token(&self, token: &str) -> bool {
     self.authorization == format!("Bearer {token}")
   }
@@ -503,6 +517,9 @@ pub enum SlackWebApiError {
   #[error("slack web api provider error: {message}")]
   Provider { message: String },
 
+  #[error("slack web api rejected the request: {classification}")]
+  Api { classification: SlackApiErrorClass },
+
   #[error("slack context target is unsupported")]
   UnsupportedTarget,
 
@@ -513,8 +530,43 @@ pub enum SlackWebApiError {
 impl SlackWebApiError {
   #[must_use]
   pub const fn is_retryable(&self) -> bool {
-    matches!(self, Self::RateLimited { .. })
+    matches!(
+      self,
+      Self::Request { .. }
+        | Self::RateLimited { .. }
+        | Self::Api {
+          classification: SlackApiErrorClass::Transient
+        }
+    )
   }
+}
+
+/// Resolver-relevant classification for a Slack Web API rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlackApiErrorClass {
+  Invalid,
+  Unauthorized,
+  TargetUnavailable,
+  Transient,
+}
+
+impl fmt::Display for SlackApiErrorClass {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str(match self {
+      Self::Invalid => "invalid request",
+      Self::Unauthorized => "unauthorized",
+      Self::TargetUnavailable => "target unavailable",
+      Self::Transient => "transient failure",
+    })
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackAuthIdentity {
+  pub team_id: String,
+  pub enterprise_id: Option<String>,
+  pub user_id: String,
+  pub bot_id: String,
 }
 
 /// Fetches bounded Slack channel and thread context through a supplied HTTP client.
@@ -786,6 +838,32 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
     Ok(self.to_channel_address(&channel))
   }
 
+  /// Verifies the configured bot token and returns its provider-issued routing identity.
+  ///
+  /// # Errors
+  /// Returns an error when the token is rejected or Slack omits required bot identity fields.
+  pub async fn authenticate_bot(&self) -> Result<SlackAuthIdentity, SlackWebApiError> {
+    let response = self
+      .post_json("auth.test", "{}".to_owned(), &self.bot_token)
+      .await?;
+    let parsed = self.parse_api_response(&response)?;
+    let identity = SlackAuthIdentity {
+      team_id: required_identifier(parsed.team_id.as_deref(), "auth.test team_id")?,
+      enterprise_id: optional_identifier(parsed.enterprise_id.as_deref(), 'E')?,
+      user_id: required_identifier(parsed.user_id.as_deref(), "auth.test user_id")?,
+      bot_id: required_identifier(parsed.bot_id.as_deref(), "auth.test bot_id")?,
+    };
+    if !identity.team_id.starts_with('T')
+      || !(identity.user_id.starts_with('U') || identity.user_id.starts_with('W'))
+      || !identity.bot_id.starts_with('B')
+    {
+      return Err(SlackWebApiError::InvalidResponse {
+        message: "auth.test returned invalid bot identity".to_owned(),
+      });
+    }
+    Ok(identity)
+  }
+
   /// Opens or looks up the canonical one-to-one Slack conversation for a user.
   ///
   /// # Errors
@@ -794,21 +872,34 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
     &self,
     user_id: &str,
   ) -> Result<SlackChannelAddress, SlackWebApiError> {
-    let body = serde_json::to_string(&serde_json::json!({"users": user_id})).map_err(|source| {
-      SlackWebApiError::InvalidResponse {
-        message: self.redact(&source.to_string()),
-      }
+    let body = serde_json::to_string(&serde_json::json!({
+      "return_im": true,
+      "users": user_id,
+    }))
+    .map_err(|source| SlackWebApiError::InvalidResponse {
+      message: self.redact(&source.to_string()),
     })?;
     let response = self
       .post_json("conversations.open", body, &self.bot_token)
       .await?;
     let parsed = self.parse_api_response(&response)?;
-    let channel = parsed
+    let opened = parsed
       .channel_object()
       .ok_or_else(|| SlackWebApiError::InvalidResponse {
-        message: "conversations.open response is missing channel".to_owned(),
+        message: "conversations.open response is missing channel id".to_owned(),
       })?;
-    Ok(self.to_channel_address(&channel))
+    if !looks_like_slack_dm_id(&opened.id) {
+      return Err(SlackWebApiError::Api {
+        classification: SlackApiErrorClass::Invalid,
+      });
+    }
+    let canonical = self.get_channel(&opened.id).await?;
+    if canonical.channel_id != opened.id {
+      return Err(SlackWebApiError::InvalidResponse {
+        message: "conversations.open returned an unstable conversation id".to_owned(),
+      });
+    }
+    Ok(canonical)
   }
 
   /// Proves that a Slack actor belongs to a target conversation.
@@ -903,7 +994,11 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
       .await?;
     let parsed = self.parse_api_response(&response)?;
     Ok(parsed.messages.first().is_some_and(|message| {
-      message.ts.as_deref() == Some(thread_ts) && message.thread_ts.is_none()
+      message.ts.as_deref() == Some(thread_ts)
+        && message
+          .thread_ts
+          .as_deref()
+          .is_none_or(|parent| parent == thread_ts)
     }))
   }
 
@@ -1044,8 +1139,8 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
       });
     }
     if !(200..300).contains(&response.status) {
-      return Err(SlackWebApiError::Provider {
-        message: format!("http status {}", response.status),
+      return Err(SlackWebApiError::Api {
+        classification: classify_http_status(response.status),
       });
     }
     Ok(response)
@@ -1085,11 +1180,9 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
       })?;
     if parsed.ok {
       Ok(parsed)
-    } else if parsed.error.as_deref().is_some_and(is_unavailable_error) {
-      Err(SlackWebApiError::Unavailable)
     } else {
-      Err(SlackWebApiError::Provider {
-        message: self.redact(parsed.error.as_deref().unwrap_or("unknown error")),
+      Err(SlackWebApiError::Api {
+        classification: classify_slack_api_error(parsed.error.as_deref()),
       })
     }
   }
@@ -1104,11 +1197,9 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
       })?;
     if parsed.ok {
       Ok(parsed)
-    } else if parsed.error.as_deref().is_some_and(is_unavailable_error) {
-      Err(SlackWebApiError::Unavailable)
     } else {
-      Err(SlackWebApiError::Provider {
-        message: self.redact(parsed.error.as_deref().unwrap_or("unknown error")),
+      Err(SlackWebApiError::Api {
+        classification: classify_slack_api_error(parsed.error.as_deref()),
       })
     }
   }
@@ -1151,7 +1242,21 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
         .or_else(|| non_empty_string(user.profile.real_name.as_deref()))
         .map(ToOwned::to_owned),
       email: non_empty_string(user.profile.email.as_deref()).map(ToOwned::to_owned),
+      team_id: non_empty_string(user.team_id.as_deref()).map(ToOwned::to_owned),
+      enterprise_id: user
+        .enterprise_user
+        .as_ref()
+        .and_then(|enterprise| non_empty_string(enterprise.enterprise_id.as_deref()))
+        .map(ToOwned::to_owned),
+      enterprise_team_ids: user
+        .enterprise_user
+        .as_ref()
+        .map_or_else(Vec::new, |enterprise| enterprise.teams.clone()),
+      deleted: user.deleted,
       is_bot: user.is_bot,
+      is_app_user: user.is_app_user,
+      is_restricted: user.is_restricted,
+      is_ultra_restricted: user.is_ultra_restricted,
     })
   }
 
@@ -1166,6 +1271,14 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
       is_mpim: channel.is_mpim,
       is_archived: channel.is_archived,
       is_member: channel.is_member,
+      context_team_id: channel.context_team_id.clone(),
+      enterprise_id: channel.enterprise_id.clone(),
+      conversation_host_id: channel.conversation_host_id.clone(),
+      shared_team_ids: channel.shared_team_ids.clone(),
+      connected_team_ids: channel.connected_team_ids.clone(),
+      is_shared: channel.is_shared,
+      is_ext_shared: channel.is_ext_shared,
+      is_org_shared: channel.is_org_shared,
     }
   }
 
@@ -1719,8 +1832,8 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
       });
     }
     if !(200..300).contains(&response.status) {
-      return Err(SlackWebApiError::Provider {
-        message: format!("http status {}", response.status),
+      return Err(SlackWebApiError::Api {
+        classification: classify_http_status(response.status),
       });
     }
     Ok(response)
@@ -1797,7 +1910,14 @@ pub struct SlackUserAddress {
   pub display_name: Option<String>,
   pub real_name: Option<String>,
   pub email: Option<String>,
+  pub team_id: Option<String>,
+  pub enterprise_id: Option<String>,
+  pub enterprise_team_ids: Vec<String>,
+  pub deleted: bool,
   pub is_bot: bool,
+  pub is_app_user: bool,
+  pub is_restricted: bool,
+  pub is_ultra_restricted: bool,
 }
 
 impl SlackUserAddress {
@@ -1841,6 +1961,14 @@ pub struct SlackChannelAddress {
   pub is_mpim: bool,
   pub is_archived: bool,
   pub is_member: bool,
+  pub context_team_id: Option<String>,
+  pub enterprise_id: Option<String>,
+  pub conversation_host_id: Option<String>,
+  pub shared_team_ids: Vec<String>,
+  pub connected_team_ids: Vec<String>,
+  pub is_shared: bool,
+  pub is_ext_shared: bool,
+  pub is_org_shared: bool,
 }
 
 impl SlackChannelAddress {
@@ -1883,11 +2011,100 @@ pub struct SlackConnectorStatus {
   pub senders: Vec<SlackConfiguredSender>,
 }
 
-fn is_unavailable_error(error: &str) -> bool {
-  matches!(
-    error,
-    "channel_not_found" | "missing_scope" | "not_in_channel" | "is_archived"
-  )
+#[allow(clippy::match_same_arms)]
+fn classify_slack_api_error(error: Option<&str>) -> SlackApiErrorClass {
+  let code = error
+    .and_then(|error| error.split_ascii_whitespace().next())
+    .unwrap_or("unknown_error");
+  match code {
+    "invalid_arg_name"
+    | "invalid_arguments"
+    | "invalid_array_arg"
+    | "invalid_charset"
+    | "invalid_cursor"
+    | "invalid_form_data"
+    | "invalid_post_type"
+    | "invalid_ts_latest"
+    | "invalid_ts_oldest"
+    | "method_not_supported_for_channel_type"
+    | "missing_post_type"
+    | "not_enough_users"
+    | "too_many_users"
+    | "users_list_not_supplied"
+    | "user_not_found"
+    | "channel_not_found"
+    | "thread_not_found" => SlackApiErrorClass::Invalid,
+    "access_denied"
+    | "account_inactive"
+    | "enterprise_is_restricted"
+    | "invalid_auth"
+    | "missing_scope"
+    | "no_permission"
+    | "not_allowed_token_type"
+    | "not_authed"
+    | "not_in_channel"
+    | "restricted_action"
+    | "team_access_not_granted"
+    | "token_expired"
+    | "token_revoked"
+    | "two_factor_setup_required"
+    | "user_disabled"
+    | "user_not_visible" => SlackApiErrorClass::Unauthorized,
+    "fatal_error"
+    | "internal_error"
+    | "ratelimited"
+    | "request_timeout"
+    | "service_unavailable"
+    | "team_added_to_org" => SlackApiErrorClass::Transient,
+    "accesslimited"
+    | "deprecated_endpoint"
+    | "ekm_access_denied"
+    | "is_archived"
+    | "method_deprecated"
+    | "org_login_required"
+    | "unknown_error" => SlackApiErrorClass::TargetUnavailable,
+    _ => SlackApiErrorClass::TargetUnavailable,
+  }
+}
+
+const fn classify_http_status(status: u16) -> SlackApiErrorClass {
+  match status {
+    401 | 403 => SlackApiErrorClass::Unauthorized,
+    400 | 404 | 405 | 409 | 422 => SlackApiErrorClass::Invalid,
+    408 | 425 | 500..=599 => SlackApiErrorClass::Transient,
+    _ => SlackApiErrorClass::TargetUnavailable,
+  }
+}
+
+fn required_identifier(value: Option<&str>, field: &str) -> Result<String, SlackWebApiError> {
+  non_empty_string(value)
+    .map(ToOwned::to_owned)
+    .ok_or_else(|| SlackWebApiError::InvalidResponse {
+      message: format!("{field} is missing"),
+    })
+}
+
+fn optional_identifier(
+  value: Option<&str>,
+  prefix: char,
+) -> Result<Option<String>, SlackWebApiError> {
+  let Some(value) = non_empty_string(value) else {
+    return Ok(None);
+  };
+  if !value.starts_with(prefix) {
+    return Err(SlackWebApiError::InvalidResponse {
+      message: "Slack response contains an invalid provider identifier".to_owned(),
+    });
+  }
+  Ok(Some(value.to_owned()))
+}
+
+fn looks_like_slack_dm_id(value: &str) -> bool {
+  value.starts_with('D')
+    && value.len() > 1
+    && value
+      .bytes()
+      .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1913,6 +2130,14 @@ struct SlackApiResponse {
   message: Option<SlackPostedResponseMessage>,
   #[serde(default)]
   file: Option<Value>,
+  #[serde(default)]
+  team_id: Option<String>,
+  #[serde(default)]
+  enterprise_id: Option<String>,
+  #[serde(default)]
+  user_id: Option<String>,
+  #[serde(default)]
+  bot_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1941,6 +2166,22 @@ struct SlackChannel {
   is_archived: bool,
   #[serde(default)]
   is_member: bool,
+  #[serde(default)]
+  context_team_id: Option<String>,
+  #[serde(default)]
+  enterprise_id: Option<String>,
+  #[serde(default)]
+  conversation_host_id: Option<String>,
+  #[serde(default)]
+  shared_team_ids: Vec<String>,
+  #[serde(default)]
+  connected_team_ids: Vec<String>,
+  #[serde(default)]
+  is_shared: bool,
+  #[serde(default)]
+  is_ext_shared: bool,
+  #[serde(default)]
+  is_org_shared: bool,
 }
 
 impl SlackApiResponse {
@@ -1967,9 +2208,27 @@ struct SlackUser {
   #[serde(default)]
   deleted: bool,
   #[serde(default)]
+  team_id: Option<String>,
+  #[serde(default)]
   is_bot: bool,
   #[serde(default)]
+  is_app_user: bool,
+  #[serde(default)]
+  is_restricted: bool,
+  #[serde(default)]
+  is_ultra_restricted: bool,
+  #[serde(default)]
+  enterprise_user: Option<SlackEnterpriseUser>,
+  #[serde(default)]
   profile: SlackUserProfile,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackEnterpriseUser {
+  #[serde(default)]
+  enterprise_id: Option<String>,
+  #[serde(default)]
+  teams: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2298,6 +2557,9 @@ fn channel_resource_provider_error(error: SlackWebApiError) -> ChannelResourcePr
       ChannelResourceProviderError::InvalidResponse { message }
     }
     SlackWebApiError::Provider { message } => ChannelResourceProviderError::Provider { message },
+    SlackWebApiError::Api { classification } => ChannelResourceProviderError::Provider {
+      message: classification.to_string(),
+    },
     SlackWebApiError::UnsupportedTarget => ChannelResourceProviderError::UnsupportedResource,
     SlackWebApiError::Deferred { available_at } => {
       ChannelResourceProviderError::Deferred { available_at }
@@ -2318,6 +2580,9 @@ fn channel_context_provider_error(error: SlackWebApiError) -> ChannelContextProv
       ChannelContextProviderError::InvalidResponse { message }
     }
     SlackWebApiError::Provider { message } => ChannelContextProviderError::Provider { message },
+    SlackWebApiError::Api { classification } => ChannelContextProviderError::Provider {
+      message: classification.to_string(),
+    },
     SlackWebApiError::UnsupportedTarget => ChannelContextProviderError::UnsupportedTarget,
     SlackWebApiError::Deferred { available_at } => {
       ChannelContextProviderError::Deferred { available_at }

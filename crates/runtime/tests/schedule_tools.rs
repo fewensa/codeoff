@@ -8,8 +8,8 @@ use codeoff_runtime::schedule_service::{
   CreateScheduleRequest, DefaultCapabilityRegistry, DeliveryTargetRequest,
   OperatorAuthorizationPolicy, OwnerOnlyAuthorizationPolicy, PreviousSuccessPolicy,
   ScheduleService, ScheduleServiceError, SlackTargetResolutionRequest, TargetResolver,
-  TargetResolverRegistration, TargetResolverRegistry, TargetVerificationError, VerifiedSlackTarget,
-  VerifiedSlackTargetResolver,
+  TargetResolverRegistration, TargetResolverRegistry, TargetVerificationError,
+  UpdateScheduleRequest, VerifiedSlackTarget, VerifiedSlackTargetResolver,
 };
 use codeoff_runtime::schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler};
 use codeoff_state::{
@@ -18,6 +18,7 @@ use codeoff_state::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -30,6 +31,50 @@ enum VerifyMode {
 }
 
 struct FakeVerifier(VerifyMode);
+
+struct RotatingVerifier {
+  calls: AtomicUsize,
+  fail_on_call: Option<usize>,
+}
+
+#[async_trait]
+impl ChannelTargetVerifier for RotatingVerifier {
+  async fn resolve_target(
+    &self,
+    workspace_id: Option<&str>,
+    _actor_id: Option<&str>,
+    target: &SlackTargetResolutionRequest,
+  ) -> Result<VerifiedSlackTarget, TargetVerificationError> {
+    let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+    if self.fail_on_call == Some(call) {
+      return Err(TargetVerificationError::Transient);
+    }
+    let (kind, channel_id, thread_ts) = match target {
+      SlackTargetResolutionRequest::Channel { channel_id } => ("channel", channel_id.clone(), None),
+      SlackTargetResolutionRequest::DirectMessageUser { .. }
+      | SlackTargetResolutionRequest::DirectMessageConversation { .. } => {
+        ("direct_message", "D1".to_owned(), None)
+      }
+      SlackTargetResolutionRequest::Thread {
+        channel_id,
+        thread_ts,
+      } => ("thread", channel_id.clone(), Some(thread_ts.clone())),
+    };
+    let workspace_id = workspace_id.unwrap_or("T1").to_owned();
+    Ok(VerifiedSlackTarget {
+      workspace_id: workspace_id.clone(),
+      team_id: workspace_id.clone(),
+      enterprise_id: None,
+      context_team_id: workspace_id.clone(),
+      conversation_host_id: workspace_id,
+      kind: kind.to_owned(),
+      channel_id,
+      thread_ts,
+      authorization_evidence_version: u32::try_from(call).expect("test call count"),
+      authorization_evidence_digest: format!("{call:064x}"),
+    })
+  }
+}
 
 struct InvocationCapabilityRegistry {
   malicious_digest: bool,
@@ -148,8 +193,13 @@ impl ChannelTargetVerifier for FakeVerifier {
         thread_ts,
       } => ("thread", channel_id.clone(), Some(thread_ts.clone())),
     };
+    let workspace_id = workspace_id.unwrap_or("T1").to_owned();
     Ok(VerifiedSlackTarget {
-      workspace_id: workspace_id.unwrap_or("W1").to_owned(),
+      team_id: workspace_id.clone(),
+      enterprise_id: None,
+      context_team_id: workspace_id.clone(),
+      conversation_host_id: workspace_id.clone(),
+      workspace_id,
       kind: kind.to_owned(),
       channel_id,
       thread_ts,
@@ -209,7 +259,7 @@ fn invocation_for(provider: &str, workspace_id: &str, actor: &str) -> ScheduleIn
 }
 
 fn invocation(actor: &str) -> ScheduleInvocation {
-  invocation_for("slack", "W1", actor)
+  invocation_for("slack", "T1", actor)
 }
 
 fn create_arguments(request_id: &str) -> Value {
@@ -916,7 +966,7 @@ async fn test_slack_resolution_is_canonical_stable_and_precedes_schedule_mutatio
     .handle_tool_call_async(&actor, "schedule_create", invalid)
     .await;
   assert!(rejected.to_string().contains("canonical Slack"));
-  let owner = PrincipalKey::new("user", "slack", "W1", "U1").expect("owner");
+  let owner = PrincipalKey::new("user", "slack", "T1", "U1").expect("owner");
   assert!(
     inspection
       .list_scheduled_jobs_by_owner(&owner, codeoff_state::ScheduledJobStatus::Active, None, 10,)
@@ -969,6 +1019,379 @@ async fn test_slack_resolution_is_canonical_stable_and_precedes_schedule_mutatio
     .remove(0);
   assert_eq!(before.identity_digest(), after.identity_digest());
   assert_eq!(before.address_json(), after.address_json());
+}
+
+fn service_with_verifier(
+  store: StateStore,
+  verifier: Arc<dyn ChannelTargetVerifier>,
+) -> ScheduleService {
+  let mut targets = TargetResolverRegistry::with_defaults();
+  targets.register(VerifiedSlackTargetResolver::registration(
+    verifier,
+    Duration::from_millis(100),
+  ));
+  ScheduleService::with_components(
+    store,
+    Arc::new(targets),
+    Arc::new(DefaultCapabilityRegistry),
+    Arc::new(OwnerOnlyAuthorizationPolicy),
+    Duration::from_millis(100),
+  )
+}
+
+fn slack_create(
+  request_id: &str,
+  target: DeliveryTargetRequest,
+  now: i64,
+) -> CreateScheduleRequest {
+  CreateScheduleRequest {
+    request_id: request_id.to_owned(),
+    instruction: "Check canonical target semantics.".to_owned(),
+    previous_success: PreviousSuccessPolicy::None,
+    schedule: ScheduleSpec::once(500),
+    target,
+    capability: "none".to_owned(),
+    now,
+  }
+}
+
+async fn resolve_snapshot(
+  resolver: &VerifiedSlackTargetResolver,
+  invocation: &ScheduleInvocation,
+  owner: &PrincipalKey,
+  target: DeliveryTargetRequest,
+  now: i64,
+) -> DeliveryTargetSnapshot {
+  resolver
+    .resolve(invocation, owner, &target, now)
+    .await
+    .expect("resolved")
+    .remove(0)
+}
+
+#[tokio::test]
+async fn test_delayed_create_and_update_replay_ignore_evidence_time_and_request_binding() {
+  let temp = tempdir().expect("tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("state");
+  let inspection = store.clone();
+  let verifier = Arc::new(RotatingVerifier {
+    calls: AtomicUsize::new(0),
+    fail_on_call: None,
+  });
+  let service = service_with_verifier(store, verifier.clone());
+  let actor = invocation("U1");
+  let target = DeliveryTargetRequest::DirectMessage {
+    user_id: "U2".to_owned(),
+  };
+  let first = service
+    .create(&actor, slack_create("delayed-create", target.clone(), 100))
+    .await
+    .expect("first create");
+  let replay = service
+    .create(&actor, slack_create("delayed-create", target.clone(), 150))
+    .await
+    .expect("delayed replay");
+  assert_eq!(first, replay);
+  let job_id = first["data"]["job_id"].as_str().expect("job id");
+  let original_target = inspection
+    .get_scheduled_job_delivery_targets(job_id)
+    .await
+    .expect("targets")
+    .remove(0);
+  let original_address: Value =
+    serde_json::from_str(original_target.address_json()).expect("address");
+  assert_eq!(original_address["created_at"], 100);
+  assert_eq!(original_address["authorization_evidence"]["version"], 1);
+  assert!(
+    original_target
+      .address_json()
+      .contains("\"channel_id\":\"D1\"")
+  );
+  assert!(!original_target.address_json().contains("U2"));
+
+  let update = |target: DeliveryTargetRequest, now| UpdateScheduleRequest {
+    request_id: "delayed-update".to_owned(),
+    job_id: job_id.to_owned(),
+    expected_generation: 0,
+    instruction: "Update canonical target semantics.".to_owned(),
+    previous_success: PreviousSuccessPolicy::None,
+    schedule: ScheduleSpec::once(600),
+    target,
+    capability: "none".to_owned(),
+    now,
+  };
+  let updated = service
+    .update(&actor, update(target.clone(), 200))
+    .await
+    .expect("update");
+  let update_replay = service
+    .update(
+      &actor,
+      update(
+        DeliveryTargetRequest::DirectMessage {
+          user_id: "U3".to_owned(),
+        },
+        250,
+      ),
+    )
+    .await
+    .expect("canonical DM indirection replay");
+  assert_eq!(updated, update_replay);
+  let persisted = inspection
+    .get_scheduled_job(job_id)
+    .await
+    .expect("job")
+    .expect("persisted job");
+  assert_eq!(persisted.generation, 1);
+  let updated_target = inspection
+    .get_scheduled_job_delivery_targets(job_id)
+    .await
+    .expect("updated targets")
+    .remove(0);
+  let updated_address: Value =
+    serde_json::from_str(updated_target.address_json()).expect("updated address");
+  assert_eq!(updated_address["created_at"], 200);
+  assert_eq!(updated_address["authorization_evidence"]["version"], 3);
+
+  let conflict = service
+    .update(
+      &actor,
+      update(
+        DeliveryTargetRequest::Channel {
+          channel_id: "C9".to_owned(),
+        },
+        300,
+      ),
+    )
+    .await
+    .expect_err("different routing target conflicts");
+  assert!(matches!(
+    conflict,
+    ScheduleServiceError::IdempotencyConflict
+  ));
+  assert_eq!(verifier.calls.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn test_failed_update_and_resolver_registration_cardinality_leave_job_unchanged() {
+  let temp = tempdir().expect("tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("state");
+  let base = ScheduleService::new(store.clone());
+  let actor = invocation("U1");
+  let created = base
+    .create(
+      &actor,
+      slack_create("registration-base", DeliveryTargetRequest::None, 100),
+    )
+    .await
+    .expect("base create");
+  let job_id = created["data"]["job_id"]
+    .as_str()
+    .expect("job id")
+    .to_owned();
+
+  let no_resolver = ScheduleService::new(store.clone());
+  let update_request = |request_id: &str| UpdateScheduleRequest {
+    request_id: request_id.to_owned(),
+    job_id: job_id.clone(),
+    expected_generation: 0,
+    instruction: "Resolver cardinality must fail closed.".to_owned(),
+    previous_success: PreviousSuccessPolicy::None,
+    schedule: ScheduleSpec::once(600),
+    target: DeliveryTargetRequest::Channel {
+      channel_id: "C2".to_owned(),
+    },
+    capability: "none".to_owned(),
+    now: 200,
+  };
+  assert!(matches!(
+    no_resolver
+      .update(&actor, update_request("zero-resolvers"))
+      .await,
+    Err(ScheduleServiceError::ResolverNotAllowed)
+  ));
+
+  let mut duplicate = TargetResolverRegistry::with_defaults();
+  duplicate.register(VerifiedSlackTargetResolver::registration(
+    Arc::new(FakeVerifier(VerifyMode::Allow)),
+    Duration::from_millis(100),
+  ));
+  duplicate.register(VerifiedSlackTargetResolver::registration(
+    Arc::new(FakeVerifier(VerifyMode::Allow)),
+    Duration::from_millis(100),
+  ));
+  let duplicate_service = ScheduleService::with_components(
+    store.clone(),
+    Arc::new(duplicate),
+    Arc::new(DefaultCapabilityRegistry),
+    Arc::new(OwnerOnlyAuthorizationPolicy),
+    Duration::from_millis(100),
+  );
+  assert!(matches!(
+    duplicate_service
+      .update(&actor, update_request("duplicate-resolvers"))
+      .await,
+    Err(ScheduleServiceError::ResolverNotAllowed)
+  ));
+
+  let failed = service_with_verifier(
+    store.clone(),
+    Arc::new(RotatingVerifier {
+      calls: AtomicUsize::new(0),
+      fail_on_call: Some(1),
+    }),
+  );
+  assert!(matches!(
+    failed
+      .update(&actor, update_request("transient-update"))
+      .await,
+    Err(ScheduleServiceError::ResolverUnavailable)
+  ));
+  let job = store
+    .get_scheduled_job(&job_id)
+    .await
+    .expect("job")
+    .expect("persisted");
+  assert_eq!(job.generation, 0);
+  let targets = store
+    .get_scheduled_job_delivery_targets(&job_id)
+    .await
+    .expect("targets");
+  assert_eq!(targets.len(), 1);
+  assert_eq!(targets[0].kind(), "none");
+
+  let repaired = service_with_verifier(
+    store.clone(),
+    Arc::new(RotatingVerifier {
+      calls: AtomicUsize::new(0),
+      fail_on_call: None,
+    }),
+  );
+  let applied = repaired
+    .update(&actor, update_request("transient-update"))
+    .await
+    .expect("failed resolution did not claim idempotency");
+  assert_eq!(applied["data"]["generation"], 1);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_slack_identity_digest_is_parameterized_only_by_canonical_routing_identity() {
+  let resolver = VerifiedSlackTargetResolver::new(
+    Arc::new(RotatingVerifier {
+      calls: AtomicUsize::new(0),
+      fail_on_call: None,
+    }),
+    Duration::from_millis(100),
+  );
+  let actor_t1 = invocation_for("slack", "T1", "U1");
+  let owner_t1 = PrincipalKey::new("user", "slack", "T1", "U1").expect("owner T1");
+  let channel = resolve_snapshot(
+    &resolver,
+    &actor_t1,
+    &owner_t1,
+    DeliveryTargetRequest::Channel {
+      channel_id: "C2".to_owned(),
+    },
+    100,
+  )
+  .await;
+  let channel_later = resolve_snapshot(
+    &resolver,
+    &actor_t1,
+    &owner_t1,
+    DeliveryTargetRequest::Channel {
+      channel_id: "C2".to_owned(),
+    },
+    200,
+  )
+  .await;
+  assert_eq!(channel.identity_digest(), channel_later.identity_digest());
+  assert_ne!(channel.address_json(), channel_later.address_json());
+
+  let dm_u2 = resolve_snapshot(
+    &resolver,
+    &actor_t1,
+    &owner_t1,
+    DeliveryTargetRequest::DirectMessage {
+      user_id: "U2".to_owned(),
+    },
+    300,
+  )
+  .await;
+  let dm_u3 = resolve_snapshot(
+    &resolver,
+    &actor_t1,
+    &owner_t1,
+    DeliveryTargetRequest::DirectMessage {
+      user_id: "U3".to_owned(),
+    },
+    400,
+  )
+  .await;
+  assert_eq!(dm_u2.identity_digest(), dm_u3.identity_digest());
+  assert_ne!(dm_u2.address_json(), dm_u3.address_json());
+
+  let other_channel = resolve_snapshot(
+    &resolver,
+    &actor_t1,
+    &owner_t1,
+    DeliveryTargetRequest::Channel {
+      channel_id: "C3".to_owned(),
+    },
+    500,
+  )
+  .await;
+  let thread = resolve_snapshot(
+    &resolver,
+    &actor_t1,
+    &owner_t1,
+    DeliveryTargetRequest::Thread {
+      channel_id: "C2".to_owned(),
+      thread_id: "100.000000".to_owned(),
+    },
+    600,
+  )
+  .await;
+  let other_thread = resolve_snapshot(
+    &resolver,
+    &actor_t1,
+    &owner_t1,
+    DeliveryTargetRequest::Thread {
+      channel_id: "C2".to_owned(),
+      thread_id: "101.000000".to_owned(),
+    },
+    700,
+  )
+  .await;
+  let actor_t2 = invocation_for("slack", "T2", "U1");
+  let owner_t2 = PrincipalKey::new("user", "slack", "T2", "U1").expect("owner T2");
+  let other_workspace = resolve_snapshot(
+    &resolver,
+    &actor_t2,
+    &owner_t2,
+    DeliveryTargetRequest::Channel {
+      channel_id: "C2".to_owned(),
+    },
+    800,
+  )
+  .await;
+  for different in [&other_channel, &thread, &other_thread, &other_workspace] {
+    assert_ne!(channel.identity_digest(), different.identity_digest());
+  }
+  assert_ne!(thread.identity_digest(), other_thread.identity_digest());
+
+  for target in [channel, dm_u2, thread, other_workspace] {
+    let address: Value = serde_json::from_str(target.address_json()).expect("address");
+    assert!(address.get("event_id").is_none());
+    assert!(address.get("source_reference").is_none());
+    assert!(address.get("message_ts").is_none());
+    assert!(address.get("routing_authority").is_some());
+  }
 }
 
 #[test]

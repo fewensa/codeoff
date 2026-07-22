@@ -2,8 +2,8 @@ use std::sync::Mutex;
 
 use codeoff_channel_contract::{ChannelContextRequest, ChannelReplyTarget};
 use codeoff_channel_slack::{
-  SlackHttpClient, SlackHttpRequest, SlackHttpResponse, SlackReqwestWebApiClient,
-  SlackWebApiClient, SlackWebApiError,
+  SlackApiErrorClass, SlackHttpClient, SlackHttpRequest, SlackHttpResponse,
+  SlackReqwestWebApiClient, SlackWebApiClient, SlackWebApiError,
 };
 use codeoff_config::SlackConfig;
 
@@ -393,7 +393,7 @@ async fn thread_context_passes_cursor_to_replies_request() {
 }
 
 #[tokio::test]
-async fn unavailable_or_missing_scope_channel_is_a_safe_unavailable_result() {
+async fn missing_scope_channel_is_a_typed_non_retryable_authorization_error() {
   let http = FakeHttpClient::with_responses(vec![response(
     200,
     r#"{"ok":false,"error":"missing_scope"}"#,
@@ -411,7 +411,9 @@ async fn unavailable_or_missing_scope_channel_is_a_safe_unavailable_result() {
 
   assert!(matches!(
     connector.fetch_context(&request).await,
-    Err(SlackWebApiError::Unavailable)
+    Err(SlackWebApiError::Api {
+      classification: SlackApiErrorClass::Unauthorized
+    })
   ));
 }
 

@@ -12,7 +12,7 @@ use crate::schedule_service::{
 };
 
 const SLACK_CONNECTOR: &str = "slack-default";
-const SLACK_RESOLVER_DIGEST: &str = "slack-web-api-v1";
+const SLACK_RESOLVER_DIGEST: &str = "slack-web-api-v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryTargetRequest {
@@ -267,6 +267,10 @@ pub enum SlackTargetResolutionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedSlackTarget {
   pub workspace_id: String,
+  pub team_id: String,
+  pub enterprise_id: Option<String>,
+  pub context_team_id: String,
+  pub conversation_host_id: String,
   pub kind: String,
   pub channel_id: String,
   pub thread_ts: Option<String>,
@@ -399,6 +403,12 @@ impl TargetResolver for VerifiedSlackTargetResolver {
     let address = json!({
       "schema_version": SNAPSHOT_VERSION,
       "workspace_id": verified.workspace_id,
+      "routing_authority": {
+        "team_id": verified.team_id,
+        "enterprise_id": verified.enterprise_id,
+        "context_team_id": verified.context_team_id,
+        "conversation_host_id": verified.conversation_host_id,
+      },
       "coordinates": coordinates,
       "authorization_evidence": {
         "version": verified.authorization_evidence_version,
@@ -691,8 +701,20 @@ fn validate_verified_slack_target(
   expected_workspace_id: Option<&str>,
 ) -> Result<(), ScheduleServiceError> {
   bounded("workspace_id", &target.workspace_id)?;
+  bounded("team_id", &target.team_id)?;
+  bounded("context_team_id", &target.context_team_id)?;
+  bounded("conversation_host_id", &target.conversation_host_id)?;
   strict_channel_id(&target.channel_id, target.kind == "direct_message")?;
   if expected_workspace_id.is_some_and(|workspace_id| workspace_id != target.workspace_id)
+    || target.workspace_id != target.team_id
+    || target.context_team_id != target.team_id
+    || !target.team_id.starts_with('T')
+    || !(target.conversation_host_id.starts_with('T')
+      || target.conversation_host_id.starts_with('E'))
+    || target
+      .enterprise_id
+      .as_deref()
+      .is_some_and(|enterprise_id| !enterprise_id.starts_with('E'))
     || !matches!(
       target.kind.as_str(),
       "channel" | "direct_message" | "thread"
@@ -747,10 +769,20 @@ fn validate_verified_target_matches_request(
 
 fn identity_address(address: &Value) -> Result<Value, ScheduleServiceError> {
   if address.get("schema_version").is_some() {
-    address
-      .get("coordinates")
-      .cloned()
-      .ok_or(ScheduleServiceError::ResolverUnavailable)
+    Ok(json!({
+      "workspace_id": address
+        .get("workspace_id")
+        .cloned()
+        .ok_or(ScheduleServiceError::ResolverUnavailable)?,
+      "routing_authority": address
+        .get("routing_authority")
+        .cloned()
+        .ok_or(ScheduleServiceError::ResolverUnavailable)?,
+      "coordinates": address
+        .get("coordinates")
+        .cloned()
+        .ok_or(ScheduleServiceError::ResolverUnavailable)?,
+    }))
   } else {
     Ok(address.clone())
   }
@@ -770,9 +802,27 @@ fn validate_address_against_request(
   let object = address
     .as_object()
     .ok_or(ScheduleServiceError::ResolverUnavailable)?;
-  if object.len() != 6
+  if object.len() != 7
     || object.get("schema_version").and_then(Value::as_u64) != Some(u64::from(SNAPSHOT_VERSION))
     || object.get("workspace_id").and_then(Value::as_str) != Some(target.tenant())
+    || object
+      .get("routing_authority")
+      .and_then(Value::as_object)
+      .is_none_or(|authority| {
+        authority.len() != 4
+          || authority.get("team_id").and_then(Value::as_str) != Some(target.tenant())
+          || authority.get("context_team_id").and_then(Value::as_str) != Some(target.tenant())
+          || authority
+            .get("conversation_host_id")
+            .and_then(Value::as_str)
+            .is_none_or(|host| !(host.starts_with('T') || host.starts_with('E')))
+          || authority.get("enterprise_id").is_none_or(|value| {
+            !value.is_null()
+              && value
+                .as_str()
+                .is_none_or(|enterprise_id| !enterprise_id.starts_with('E'))
+          })
+      })
     || object
       .get("created_at")
       .and_then(Value::as_i64)

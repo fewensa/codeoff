@@ -32,9 +32,9 @@ pub use normalize::{
 pub use schedule_target::SlackScheduleTargetVerifier;
 pub use socket_mode::{SlackSocketTransport, SocketModeEnvelope, TransportReceive};
 pub use web_api::{
-  SlackChannelAddress, SlackConfiguredSender, SlackConnectorStatus, SlackHttpClient,
-  SlackHttpDownloadRequest, SlackHttpRequest, SlackHttpResponse, SlackPostedMessage,
-  SlackReqwestWebApiClient, SlackStreamMessage, SlackStreamStatus, SlackUserAddress,
-  SlackWebApiClient, SlackWebApiError,
+  SlackApiErrorClass, SlackAuthIdentity, SlackChannelAddress, SlackConfiguredSender,
+  SlackConnectorStatus, SlackHttpClient, SlackHttpDownloadRequest, SlackHttpRequest,
+  SlackHttpResponse, SlackPostedMessage, SlackReqwestWebApiClient, SlackStreamMessage,
+  SlackStreamStatus, SlackUserAddress, SlackWebApiClient, SlackWebApiError,
 };
 pub use worker::{SocketWorkerAction, SocketWorkerOptions, check_slack_worker, run_socket_worker};

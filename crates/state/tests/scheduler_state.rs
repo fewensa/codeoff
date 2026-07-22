@@ -6,15 +6,15 @@ use std::time::Duration;
 
 use codeoff_state::{
   AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
-  ClaimedScheduledDelivery, ClaimedScheduledRun, CreateScheduledJob, DeliveryTargetSnapshot,
-  ExpiredRunReclaimOutcome, LateEvidenceAppendOutcome, MaterializationOutcome, OccurrenceError,
-  PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey, RetentionPolicy,
-  ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryFailure,
-  ScheduledDeliveryReconcileOutcome, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
-  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
-  ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
-  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunReconcileOutcome,
-  ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  ClaimedScheduledDelivery, ClaimedScheduledRun, CreateScheduledJob, DeliveryPayloadSnapshot,
+  DeliveryTargetSnapshot, ExpiredRunReclaimOutcome, LateEvidenceAppendOutcome,
+  MaterializationOutcome, OccurrenceError, PreflightFailureDisposition, PreparedScheduledDelivery,
+  PrincipalKey, RetentionPolicy, ScheduleMutationIdempotency, ScheduleSpec,
+  ScheduledDeliveryFailure, ScheduledDeliveryReconcileOutcome, ScheduledDeliveryState,
+  ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
+  ScheduledExecutionTerminal, ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus,
+  ScheduledPrepareAuthority, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind,
+  ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
   SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
   StateError, StateStore, StateValueError, TransactionalMutationOutcome, TransportConvergence,
   UpdateScheduledJob,
@@ -4749,6 +4749,50 @@ fn scheduler_retention_policy() -> RetentionPolicy {
   }
 }
 
+type AgentAuthoritySnapshot = (i64, i64, i64, String);
+
+async fn agent_authority_snapshot(pool: &SqlitePool, job_id: &str) -> AgentAuthoritySnapshot {
+  sqlx::query_as(
+    "select (select count(*) from scheduled_run_attempts where job_id = ?1), (select count(*) from scheduled_run_result_artifacts where job_id = ?1), baseline_version, source_run_id from scheduled_execution_baselines where job_id = ?1",
+  )
+  .bind(job_id)
+  .fetch_one(pool)
+  .await
+  .expect("read Agent authority snapshot")
+}
+
+async fn prepare_long_lifecycle_delivery(
+  store: &StateStore,
+  pool: &SqlitePool,
+  job_id: &str,
+  due_at: i64,
+  completed_at: i64,
+  body: &str,
+) -> (ClaimedScheduledRun, String, DeliveryPayloadSnapshot) {
+  let run = complete_due_run_with_summary(store, job_id, due_at, completed_at, body).await;
+  let delivery_id: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(run.binding.run_id())
+      .fetch_one(pool)
+      .await
+      .expect("read long-lifecycle delivery");
+  let PreparedScheduledDelivery::Pending(payload) = store
+    .prepare_scheduled_delivery(
+      &delivery_id,
+      "text/plain; charset=utf-8",
+      body,
+      1,
+      completed_at + 1,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare long-lifecycle delivery")
+  else {
+    panic!("preparation remains advisory before claim-time baseline comparison");
+  };
+  (run, delivery_id, payload)
+}
+
 async fn prepare_succeeded_retention_candidate(
   store: &StateStore,
   pool: &SqlitePool,
@@ -7423,6 +7467,403 @@ async fn test_exact_unchanged_payload_skips_and_survives_audited_history_retenti
   .await
   .expect("read baseline after failure");
   assert_eq!(baseline_after_failure, 1);
+}
+
+#[tokio::test]
+#[allow(clippy::similar_names, clippy::too_many_lines)]
+async fn test_long_on_change_lifecycle_survives_recovery_restarts_and_retention() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let mut store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let job_id = "long-on-change-lifecycle";
+  let mut request = create_request(
+    job_id,
+    ScheduleSpec::fixed_interval(110, 10).expect("interval"),
+    100,
+  );
+  request.targets = vec![resolved_slack_target(job_id, "channel", "C1", None)];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create long lifecycle job");
+
+  let (run_a, delivery_a, payload_a) =
+    prepare_long_lifecycle_delivery(&store, &pool, job_id, 110, 120, "payload-A").await;
+  let agent_a = agent_authority_snapshot(&pool, job_id).await;
+  assert_eq!(agent_a, (1, 1, 1, run_a.binding.run_id().to_owned()));
+  let claim_a = store
+    .claim_next_scheduled_delivery("provider-a", 122, 200)
+    .await
+    .expect("claim A")
+    .expect("provider sends A");
+  assert_eq!(claim_a.payload, payload_a);
+  store
+    .complete_scheduled_delivery_delivered(&claim_a.binding, "receipt-A", 123)
+    .await
+    .expect("deliver A");
+  assert_eq!(agent_authority_snapshot(&pool, job_id).await, agent_a);
+  let identity = AcceptedDeliveryBaselineIdentity {
+    job_id: job_id.to_owned(),
+    target_identity_digest: payload_a.target_identity_digest().to_owned(),
+    target_snapshot_digest_algorithm: "sha256-v1".to_owned(),
+    target_snapshot_digest: payload_a.target_snapshot_digest().to_owned(),
+    delivery_policy_version: 1,
+    render_version: 1,
+    hash_algorithm: "sha256-utf8-exact-v1".to_owned(),
+  };
+  let baseline_a = store
+    .get_accepted_delivery_baseline(&identity)
+    .await
+    .expect("read A baseline")
+    .expect("A baseline");
+  assert_eq!(baseline_a.baseline_version, 1);
+  assert_eq!(baseline_a.source_delivery_id, delivery_a);
+
+  let (run_a_unchanged, delivery_a_unchanged, payload_a_unchanged) =
+    prepare_long_lifecycle_delivery(&store, &pool, job_id, 120, 130, "payload-A").await;
+  assert_eq!(payload_a_unchanged.digest(), payload_a.digest());
+  assert!(
+    store
+      .claim_next_scheduled_delivery("must-skip-a", 132, 200)
+      .await
+      .expect("claim-time A comparison")
+      .is_none()
+  );
+  let agent_a_unchanged = agent_authority_snapshot(&pool, job_id).await;
+  assert_eq!(
+    agent_a_unchanged,
+    (2, 2, 2, run_a_unchanged.binding.run_id().to_owned())
+  );
+  let skipped_a: (String, i64) = sqlx::query_as(
+    "select state, (select count(*) from scheduled_delivery_attempts where delivery_id = ?1) from scheduled_run_deliveries where delivery_id = ?1",
+  )
+  .bind(&delivery_a_unchanged)
+  .fetch_one(&pool)
+  .await
+  .expect("read skipped A");
+  assert_eq!(skipped_a, ("skipped_unchanged".to_owned(), 0));
+  assert_eq!(
+    store
+      .get_accepted_delivery_baseline(&identity)
+      .await
+      .expect("read unchanged A baseline")
+      .expect("unchanged A baseline"),
+    baseline_a
+  );
+
+  drop(store);
+  store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("first lifecycle restart");
+
+  let (run_b, delivery_b, payload_b) =
+    prepare_long_lifecycle_delivery(&store, &pool, job_id, 130, 140, "payload-B").await;
+  let agent_b = agent_authority_snapshot(&pool, job_id).await;
+  assert_eq!(agent_b, (3, 3, 3, run_b.binding.run_id().to_owned()));
+  let first_b = store
+    .claim_next_scheduled_delivery("provider-b-1", 142, 200)
+    .await
+    .expect("claim first B")
+    .expect("first B provider attempt");
+  let b_idempotency = first_b.binding.idempotency_key().to_owned();
+  let b_target = first_b.target_json.clone();
+  assert_eq!(first_b.payload, payload_b);
+  store
+    .complete_scheduled_delivery_failure(
+      &first_b.binding,
+      &ScheduledDeliveryFailure::ConfirmedNoWriteRetryable {
+        error_kind: "temporary_provider_failure".to_owned(),
+        redacted_message: None,
+        next_attempt_at: 150,
+      },
+      143,
+    )
+    .await
+    .expect("record retryable B");
+  assert_eq!(agent_authority_snapshot(&pool, job_id).await, agent_b);
+  assert_eq!(
+    store
+      .get_accepted_delivery_baseline(&identity)
+      .await
+      .expect("baseline after retryable B")
+      .expect("A remains accepted"),
+    baseline_a
+  );
+  assert_eq!(
+    store
+      .requeue_due_scheduled_deliveries(150, 1)
+      .await
+      .expect("requeue due B"),
+    1
+  );
+  assert_eq!(agent_authority_snapshot(&pool, job_id).await, agent_b);
+  let second_b = store
+    .claim_next_scheduled_delivery("provider-b-2", 151, 220)
+    .await
+    .expect("claim second B")
+    .expect("second B provider attempt");
+  assert_eq!(second_b.binding.attempt(), first_b.binding.attempt() + 1);
+  assert_eq!(second_b.binding.idempotency_key(), b_idempotency);
+  assert_eq!(second_b.payload, first_b.payload);
+  assert_eq!(second_b.target_json, b_target);
+  store
+    .complete_scheduled_delivery_delivered(&second_b.binding, "receipt-B", 152)
+    .await
+    .expect("deliver recovered B");
+  assert_eq!(agent_authority_snapshot(&pool, job_id).await, agent_b);
+  let baseline_b = store
+    .get_accepted_delivery_baseline(&identity)
+    .await
+    .expect("read B baseline")
+    .expect("B baseline");
+  assert_eq!(baseline_b.baseline_version, 2);
+  assert_eq!(baseline_b.source_delivery_id, delivery_b);
+  assert_eq!(baseline_b.accepted_payload_digest, payload_b.digest());
+  let b_attempts: Vec<String> = sqlx::query_scalar(
+    "select state from scheduled_delivery_attempts where delivery_id = ?1 order by attempt",
+  )
+  .bind(&delivery_b)
+  .fetch_all(&pool)
+  .await
+  .expect("read B provider attempts");
+  assert_eq!(
+    b_attempts,
+    vec!["failed_retryable".to_owned(), "delivered".to_owned()]
+  );
+
+  let (run_b_unchanged, delivery_b_unchanged, payload_b_unchanged) =
+    prepare_long_lifecycle_delivery(&store, &pool, job_id, 140, 160, "payload-B").await;
+  assert_eq!(payload_b_unchanged.digest(), payload_b.digest());
+  assert!(
+    store
+      .claim_next_scheduled_delivery("must-skip-b", 162, 230)
+      .await
+      .expect("claim-time B comparison")
+      .is_none()
+  );
+  assert_eq!(
+    agent_authority_snapshot(&pool, job_id).await,
+    (4, 4, 4, run_b_unchanged.binding.run_id().to_owned())
+  );
+  let skipped_b_attempts: i64 =
+    sqlx::query_scalar("select count(*) from scheduled_delivery_attempts where delivery_id = ?1")
+      .bind(&delivery_b_unchanged)
+      .fetch_one(&pool)
+      .await
+      .expect("count skipped B attempts");
+  assert_eq!(skipped_b_attempts, 0);
+
+  let (run_c, delivery_c, payload_c) =
+    prepare_long_lifecycle_delivery(&store, &pool, job_id, 150, 170, "payload-C").await;
+  let agent_c = agent_authority_snapshot(&pool, job_id).await;
+  assert_eq!(agent_c, (5, 5, 5, run_c.binding.run_id().to_owned()));
+  let claim_c = store
+    .claim_next_scheduled_delivery("provider-c", 172, 240)
+    .await
+    .expect("claim C")
+    .expect("C provider attempt");
+  store
+    .complete_scheduled_delivery_failure(
+      &claim_c.binding,
+      &ScheduledDeliveryFailure::AmbiguousPostWrite {
+        error_kind: "provider_timeout_after_write".to_owned(),
+        redacted_message: None,
+      },
+      173,
+    )
+    .await
+    .expect("record unknown C");
+  assert_eq!(agent_authority_snapshot(&pool, job_id).await, agent_c);
+  assert_eq!(
+    store
+      .get_accepted_delivery_baseline(&identity)
+      .await
+      .expect("baseline before unknown resolution")
+      .expect("B remains accepted"),
+    baseline_b
+  );
+  let provider_receipt =
+    operator_provider_receipt("slack", "workspace", "channel", "C1", "provider-message-C");
+  let (evidence_json, evidence_digest) = operator_delivery_evidence(
+    "provider_confirmed_delivered",
+    "long-lifecycle-C",
+    "slack",
+    "workspace",
+    "channel",
+    Some(&provider_receipt),
+  );
+  let action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
+    provider_receipt,
+    evidence_json,
+    evidence_digest,
+  };
+  let operator_request = SchedulerOperatorRequest::for_delivery_action(
+    owner(),
+    "long-lifecycle-confirm-C",
+    &delivery_c,
+    claim_c.binding.attempt(),
+    claim_c.binding.fence(),
+    &action,
+    174,
+  )
+  .expect("build C operator authority");
+  assert_eq!(
+    store
+      .operator_act_on_unknown_delivery(
+        &operator_request,
+        &delivery_c,
+        claim_c.binding.attempt(),
+        claim_c.binding.fence(),
+        &action,
+      )
+      .await
+      .expect("confirm delivered C"),
+    SchedulerOperatorMutationOutcome::Applied
+  );
+  assert_eq!(agent_authority_snapshot(&pool, job_id).await, agent_c);
+  let baseline_c = store
+    .get_accepted_delivery_baseline(&identity)
+    .await
+    .expect("read C baseline")
+    .expect("C baseline");
+  assert_eq!(baseline_c.baseline_version, 3);
+  assert_eq!(baseline_c.source_delivery_id, delivery_c);
+  assert_eq!(baseline_c.accepted_payload_digest, payload_c.digest());
+  let c_provider_attempts: (i64, String) = sqlx::query_as(
+    "select count(*), max(state) from scheduled_delivery_attempts where delivery_id = ?1",
+  )
+  .bind(&delivery_c)
+  .fetch_one(&pool)
+  .await
+  .expect("read C provider attempt count");
+  assert_eq!(c_provider_attempts, (1, "delivered".to_owned()));
+
+  let (run_c_unchanged, delivery_c_unchanged, payload_c_unchanged) =
+    prepare_long_lifecycle_delivery(&store, &pool, job_id, 160, 180, "payload-C").await;
+  assert_eq!(payload_c_unchanged.digest(), payload_c.digest());
+  assert!(
+    store
+      .claim_next_scheduled_delivery("must-skip-c", 182, 250)
+      .await
+      .expect("claim-time C comparison")
+      .is_none()
+  );
+  assert_eq!(
+    agent_authority_snapshot(&pool, job_id).await,
+    (6, 6, 6, run_c_unchanged.binding.run_id().to_owned())
+  );
+  let skipped_c_attempts: i64 =
+    sqlx::query_scalar("select count(*) from scheduled_delivery_attempts where delivery_id = ?1")
+      .bind(&delivery_c_unchanged)
+      .fetch_one(&pool)
+      .await
+      .expect("count skipped C attempts");
+  assert_eq!(skipped_c_attempts, 0);
+
+  let retention = RetentionPolicy {
+    scheduled_run_days: 1,
+    scheduled_delivery_days: 1,
+    scheduled_retention_batch_limit: 2,
+    ..RetentionPolicy::default()
+  };
+  let first_cleanup = store
+    .cleanup_retained_data(None, 1_000_000, &retention)
+    .await
+    .expect("first lifecycle cleanup");
+  assert_eq!(first_cleanup.scheduled_runs_deleted, 2);
+  drop(store);
+  store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("second lifecycle restart");
+  let second_cleanup = store
+    .cleanup_retained_data(None, 1_000_000, &retention)
+    .await
+    .expect("second lifecycle cleanup");
+  let third_cleanup = store
+    .cleanup_retained_data(None, 1_000_000, &retention)
+    .await
+    .expect("third lifecycle cleanup");
+  assert_eq!(second_cleanup.scheduled_runs_deleted, 2);
+  assert_eq!(third_cleanup.scheduled_runs_deleted, 1);
+  let retained_graphs: (i64, i64, i64, i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduled_runs where run_id in (?1, ?2, ?3, ?4, ?5)), (select count(*) from scheduled_runs where run_id = ?6), (select count(*) from scheduled_run_result_artifacts where run_id = ?6), (select count(*) from scheduled_run_deliveries where delivery_id = ?7), (select count(*) from scheduled_delivery_retention_audit where job_id = ?8 and completed_at is not null)",
+  )
+  .bind(run_a.binding.run_id())
+  .bind(run_a_unchanged.binding.run_id())
+  .bind(run_b.binding.run_id())
+  .bind(run_b_unchanged.binding.run_id())
+  .bind(run_c.binding.run_id())
+  .bind(run_c_unchanged.binding.run_id())
+  .bind(&delivery_c)
+  .bind(job_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read lifecycle retention graph");
+  assert_eq!(retained_graphs, (0, 1, 1, 0, 5));
+  assert_eq!(
+    store
+      .get_accepted_delivery_baseline(&identity)
+      .await
+      .expect("read C baseline after source cleanup")
+      .expect("C baseline survives source cleanup"),
+    baseline_c
+  );
+  assert_eq!(
+    agent_authority_snapshot(&pool, job_id).await,
+    (1, 1, 6, run_c_unchanged.binding.run_id().to_owned())
+  );
+
+  let (run_c_after_cleanup, delivery_c_after_cleanup, payload_c_after_cleanup) =
+    prepare_long_lifecycle_delivery(&store, &pool, job_id, 170, 190, "payload-C").await;
+  assert_eq!(payload_c_after_cleanup.digest(), payload_c.digest());
+  assert!(
+    store
+      .claim_next_scheduled_delivery("must-skip-c-after-cleanup", 192, 260)
+      .await
+      .expect("claim C after source cleanup")
+      .is_none()
+  );
+  assert_eq!(
+    agent_authority_snapshot(&pool, job_id).await,
+    (2, 2, 7, run_c_after_cleanup.binding.run_id().to_owned())
+  );
+  let c_after_cleanup_attempts: i64 =
+    sqlx::query_scalar("select count(*) from scheduled_delivery_attempts where delivery_id = ?1")
+      .bind(&delivery_c_after_cleanup)
+      .fetch_one(&pool)
+      .await
+      .expect("count C attempts after cleanup");
+  assert_eq!(c_after_cleanup_attempts, 0);
+
+  let (run_d, delivery_d, payload_d) =
+    prepare_long_lifecycle_delivery(&store, &pool, job_id, 180, 200, "payload-D").await;
+  assert_ne!(payload_d.digest(), payload_c.digest());
+  let agent_d = agent_authority_snapshot(&pool, job_id).await;
+  assert_eq!(agent_d, (3, 3, 8, run_d.binding.run_id().to_owned()));
+  let claim_d = store
+    .claim_next_scheduled_delivery("provider-d", 202, 270)
+    .await
+    .expect("claim D")
+    .expect("changed D reaches provider");
+  assert_eq!(claim_d.payload, payload_d);
+  store
+    .complete_scheduled_delivery_delivered(&claim_d.binding, "receipt-D", 203)
+    .await
+    .expect("deliver D");
+  assert_eq!(agent_authority_snapshot(&pool, job_id).await, agent_d);
+  let baseline_d = store
+    .get_accepted_delivery_baseline(&identity)
+    .await
+    .expect("read D baseline")
+    .expect("D baseline");
+  assert_eq!(baseline_d.baseline_version, 4);
+  assert_eq!(baseline_d.source_delivery_id, delivery_d);
+  assert_eq!(baseline_d.accepted_payload_digest, payload_d.digest());
 }
 
 #[tokio::test]

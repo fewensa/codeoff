@@ -379,7 +379,11 @@ async fn execute_scheduler_operator_command(
   match command {
     SchedulerCommand::Status { .. } => Ok(success(json!({
       "scheduler": "reachable",
-      "recovery_batch_limit": policy.recovery_batch_limit.min(100),
+      "enabled": policy.enabled,
+      "run_claims_enabled": policy.run_claims_enabled,
+      "delivery_claims_enabled": policy.delivery_claims_enabled,
+      "recovery_batch_limit": policy.recovery_batch_limit,
+      "materialization_batch_limit": policy.materialization_batch_limit,
     }))),
     SchedulerCommand::Runs { command } => match command {
       SchedulerRunsCommand::List { status, limit, .. } => {
@@ -1380,6 +1384,58 @@ mod tests {
         .push(action_digest.to_owned());
       PrincipalKey::new("service", "codeoff", "ops", "verified-operator")
         .map_err(value_command_error)
+    }
+  }
+
+  #[tokio::test]
+  async fn scheduler_status_reports_sanitized_runtime_switches_and_batch_limits() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("initialize state");
+    let policy = SchedulerRuntimeConfig {
+      enabled: true,
+      run_claims_enabled: true,
+      delivery_claims_enabled: false,
+      recovery_batch_limit: 37,
+      materialization_batch_limit: 41,
+      ..SchedulerRuntimeConfig::default()
+    };
+    let output = execute_scheduler_command_with_policy_and_verifier(
+      SchedulerCommand::Status { json: true },
+      state,
+      SchedulerOperatorConfig::diagnostic(),
+      Arc::new(TargetResolverRegistry::with_defaults()),
+      &policy,
+      &AcceptingAuthorityVerifier::default(),
+      100,
+    )
+    .await
+    .expect("scheduler status");
+    assert_eq!(
+      output,
+      json!({
+        "data": {
+          "scheduler": "reachable",
+          "enabled": true,
+          "run_claims_enabled": true,
+          "delivery_claims_enabled": false,
+          "recovery_batch_limit": 37,
+          "materialization_batch_limit": 41,
+        },
+        "ok": true,
+        "schema_version": 1,
+      })
+    );
+    let human = render_scheduler_human(&output);
+    for claim in [
+      "enabled: true",
+      "run_claims_enabled: true",
+      "delivery_claims_enabled: false",
+      "recovery_batch_limit: 37",
+      "materialization_batch_limit: 41",
+    ] {
+      assert!(human.contains(claim), "missing status claim {claim}");
     }
   }
 

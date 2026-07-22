@@ -1,7 +1,7 @@
 # Runtime
 
-Purpose: define Codeoff's daemon runtime, state, and configuration shape.
-Read this before changing process startup, SQLite state, dispatch loops, or MCP startup.
+Purpose: define Codeoff's daemon runtime, scheduler, state, and configuration shape.
+Read this before changing process startup, SQLite state, scheduler/dispatch loops, operational HTTP, or MCP startup.
 This does not define Slack App setup details or Codex prompt behavior.
 
 ## Process Shape
@@ -26,6 +26,10 @@ codeoff config check
 - SQLite state store.
 - Inbound channel event dispatch to Codex App Server.
 - Outbound Slack delivery drain.
+- Scheduler materialization, recovery, and optional Agent execution claims.
+- Scheduler delivery preparation and optional provider delivery claims.
+- Five-second bounded scheduler observability snapshots.
+- Operational HTTP server on `[server].bind` with `GET /healthz`, `/readyz`, and `/metrics`.
 - Loopback TCP MCP server when `[mcp] enabled = true` and `transport = "tcp"`.
 
 `serve --check` loads config, validates it, initializes SQLite state, and prints sanitized status. It does not start Slack, Codex, delivery, or MCP live loops.
@@ -43,12 +47,17 @@ SQLite stores local gateway state:
 - Slack delivery receipts.
 - Channel throttles and rate-limit cooldowns.
 - Retention metadata for payloads, deliveries, context attempts, summaries, and artifacts.
+- Scheduled jobs, immutable occurrence snapshots, run leases/attempts/results, delivery intents/attempts, execution and accepted-delivery baselines, operator actions, and append-only retention audits.
 
 ## Configuration
 
 Minimal local configuration:
 
 ```toml
+[server]
+bind = "127.0.0.1:7788"
+allow_non_loopback = false
+
 [state]
 dir = "${CODEOFF_STATE_DIR:-./.codeoff}"
 
@@ -62,6 +71,27 @@ delivery_days = 30
 context_attempt_days = 14
 conversation_summary_days = 90
 artifact_days = 7
+scheduled_run_days = 30
+scheduled_delivery_days = 30
+scheduled_retention_batch_limit = 100
+
+[scheduler]
+enabled = false
+run_claims_enabled = false
+delivery_claims_enabled = false
+recovery_batch_limit = 32
+materialization_batch_limit = 32
+tick_interval_ms = 250
+error_backoff_ms = 1000
+lease_seconds = 60
+heartbeat_interval_ms = 15000
+total_timeout_seconds = 1800
+prepare_grace_ms = 5000
+cancellation_grace_ms = 5000
+finalization_grace_ms = 5000
+retry_delay_seconds = 30
+run_deadline_seconds = 3600
+max_attempts = 3
 
 [slack]
 workspace_id = "T00000000"
@@ -102,6 +132,12 @@ bind = "127.0.0.1:7789"
 ```
 
 Secrets must come from environment variables or a secret manager, not checked-in config files.
+
+`scheduler.enabled` is the global scheduler switch. `run_claims_enabled` and `delivery_claims_enabled` are independent fail-closed kill switches: disabled run claims do not consume pending Agent work; disabled delivery claims still allow payload preparation but do not send to the provider. Enabling delivery claims requires the configured provider credentials. Scheduler state remains durable across restarts, and delivery retry or unknown-resolution operations never rerun the Agent occurrence.
+
+Automatic retention uses separate run and delivery age cutoffs and deletes at most `scheduled_retention_batch_limit` candidate runs per cleanup call. Accepted delivery baseline identity/digest authority and append-only audit evidence survive source-history cleanup; the latest execution-success source remains protected. The limits validate as 1–3650 days and 1–1024 candidates.
+
+The operational HTTP server is always started by `serve`. Keep the default loopback bind unless the deployment deliberately enables non-loopback exposure and supplies its own network/authentication boundary. Scheduler-disabled readiness is healthy after SQLite passes; enabled scheduler readiness fails closed for unavailable loops, required claim dependencies, or missing/stale scheduler snapshots.
 
 `mention_user_ids` matches Slack text such as `<@U00000000>`. `allowed_dm_user_ids` restricts which Slack users can drive DM intake. `[slack.user_tokens.<key>]` allows channel tools to send with `send_as = "user:<key>"`; omitted `send_as` uses the bot token.
 

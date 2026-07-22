@@ -1,7 +1,7 @@
 # Runtime
 
-目的：定義 Codeoff daemon runtime、state 與 config shape。
-閱讀時機：修改 process startup、SQLite state、dispatch loop 或 MCP startup 前。
+目的：定義 Codeoff daemon runtime、scheduler、state 與 config shape。
+閱讀時機：修改 process startup、SQLite state、scheduler/dispatch loops、operational HTTP 或 MCP startup 前。
 不涵蓋：Slack App 點選設定或 Codex prompt 行為。
 
 ## Process Shape
@@ -26,6 +26,10 @@ codeoff config check
 - SQLite state store。
 - inbound channel event dispatch to Codex App Server。
 - outbound Slack delivery drain。
+- scheduler materialization、recovery 與 optional Agent execution claims。
+- scheduler delivery preparation 與 optional provider delivery claims。
+- 每五秒一次的 bounded scheduler observability snapshot。
+- 在 `[server].bind` 啟動 operational HTTP server，提供 `GET /healthz`、`/readyz` 與 `/metrics`。
 - `[mcp] enabled = true` 且 `transport = "tcp"` 時啟動 loopback TCP MCP server。
 
 `serve --check` 會載入 config、驗證 config、初始化 SQLite state，並輸出 sanitized status。它不啟動 Slack、Codex、delivery 或 MCP live loops。
@@ -43,12 +47,17 @@ SQLite 保存本機 gateway state：
 - Slack delivery receipts。
 - channel throttles 與 rate-limit cooldowns。
 - payload、delivery、context attempt、summary、artifact retention metadata。
+- scheduled jobs、immutable occurrence snapshots、run leases/attempts/results、delivery intents/attempts、execution 與 accepted-delivery baselines、operator actions，以及 append-only retention audits。
 
 ## Configuration
 
 最小本機設定：
 
 ```toml
+[server]
+bind = "127.0.0.1:7788"
+allow_non_loopback = false
+
 [state]
 dir = "${CODEOFF_STATE_DIR:-./.codeoff}"
 
@@ -62,6 +71,27 @@ delivery_days = 30
 context_attempt_days = 14
 conversation_summary_days = 90
 artifact_days = 7
+scheduled_run_days = 30
+scheduled_delivery_days = 30
+scheduled_retention_batch_limit = 100
+
+[scheduler]
+enabled = false
+run_claims_enabled = false
+delivery_claims_enabled = false
+recovery_batch_limit = 32
+materialization_batch_limit = 32
+tick_interval_ms = 250
+error_backoff_ms = 1000
+lease_seconds = 60
+heartbeat_interval_ms = 15000
+total_timeout_seconds = 1800
+prepare_grace_ms = 5000
+cancellation_grace_ms = 5000
+finalization_grace_ms = 5000
+retry_delay_seconds = 30
+run_deadline_seconds = 3600
+max_attempts = 3
 
 [slack]
 workspace_id = "T00000000"
@@ -102,6 +132,12 @@ bind = "127.0.0.1:7789"
 ```
 
 Secrets 必須來自 environment variables 或 secret manager，不寫入版本控制。
+
+`scheduler.enabled` 是 scheduler global switch。`run_claims_enabled` 與 `delivery_claims_enabled` 是獨立的 fail-closed kill switches：run claims disabled 時不會消費 pending Agent work；delivery claims disabled 時仍會 prepare payload，但不會送往 provider。啟用 delivery claims 必須提供對應 provider credentials。Scheduler state 可跨 restart 持久保存，delivery retry 或 unknown-resolution operation 不會重新執行 Agent occurrence。
+
+Automatic retention 使用獨立的 run 與 delivery age cutoffs，每次 cleanup 最多刪除 `scheduled_retention_batch_limit` 個 candidate runs。Accepted delivery baseline 的 identity/digest authority 與 append-only audit evidence 會在 source history cleanup 後保留；latest execution-success source 會受保護。設定範圍為 1–3650 天與 1–1024 candidates。
+
+Operational HTTP server 會由 `serve` 一律啟動。除非 deployment 明確允許 non-loopback exposure 並提供自己的 network/authentication boundary，否則應保留預設 loopback bind。Scheduler disabled 時，只要 SQLite 通過即為 ready；scheduler enabled 時，若 loop、required claim dependency 或 scheduler snapshot unavailable/stale，readiness 會 fail closed。
 
 `mention_user_ids` 匹配 Slack text 中的 `<@U00000000>`。`allowed_dm_user_ids` 限制可驅動 DM intake 的 Slack users。`[slack.user_tokens.<key>]` 允許 channel tools 使用 `send_as = "user:<key>"`；未指定 `send_as` 時使用 bot token。
 

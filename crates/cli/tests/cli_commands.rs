@@ -58,6 +58,21 @@ fn test_cli_exposes_expected_subcommands() {
       .to_string()
       .contains("--as-user")
   );
+  let status_help = scheduler
+    .find_subcommand("status")
+    .expect("scheduler status")
+    .clone()
+    .render_long_help()
+    .to_string();
+  for claim in [
+    "enablement",
+    "claim switches",
+    "/healthz",
+    "/readyz",
+    "/metrics",
+  ] {
+    assert!(status_help.contains(claim), "missing status help {claim}");
+  }
 
   let config = command
     .find_subcommand("config")

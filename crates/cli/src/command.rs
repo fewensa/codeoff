@@ -43,7 +43,10 @@ pub enum Command {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum SchedulerCommand {
-  /// Reports sanitized scheduler control-plane reachability.
+  /// Reports sanitized scheduler reachability, enablement, claim switches, and batch limits.
+  #[command(
+    long_about = "Report sanitized scheduler control-plane reachability and configured scheduler enablement, claim switches, and batch limits. This diagnostic is not process readiness; use the operational HTTP GET endpoints /healthz, /readyz, and /metrics for runtime probes and telemetry."
+  )]
   Status {
     #[arg(long)]
     json: bool,

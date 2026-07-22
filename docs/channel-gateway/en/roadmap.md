@@ -13,12 +13,16 @@ This does not define Codex product work.
 - Provider-neutral MCP tools for reply/send, context, resources, users, channels, senders, workspaces, and connector status.
 - Slack delivery queue, receipts, production Web API client construction, rate-limit behavior, and delivery drain.
 - Data retention configuration for gateway records and artifacts.
+- Durable scheduler control plane and dynamic tools for create/get/list/update/pause/resume/delete.
+- Scheduler materialization, fenced Agent execution, delivery preparation/claims, exact `on_change` suppression, restart recovery, retryable and ambiguous-delivery operator recovery, and audited bounded history retention.
+- Trusted-local scheduler status/run/delivery diagnostics and bounded reconciliation commands.
+- Operational HTTP `GET /healthz`, `/readyz`, and `/metrics`, bounded scheduler snapshots, Prometheus/OpenMetrics telemetry, and JSON scheduler tracing.
 - Docker image with Codeoff, Codex, and common operational tools.
 
 ## Next Gateway Work
 
-- Improve production reliability tests for restart recovery, queue retry, delivery retry, and parallel conversation dispatch.
-- Add service-oriented observability: health/readiness, Prometheus metrics, and structured logs.
+- Continue production reliability work for provider failures and parallel conversation dispatch without weakening the existing scheduler restart/retry lifecycle coverage.
+- Add authenticated, bounded admin read endpoints only when operational use requires more than the implemented health/readiness/metrics surface.
 - Expand resource extraction for files that Codex asks to inspect.
 - Add additional communication providers behind the same `channel.*` tool model when needed.
 - Keep config examples and Docker deployment docs aligned with the checked-in config structs.

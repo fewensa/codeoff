@@ -1,14 +1,17 @@
 //! Codex App Server backend wiring for Codeoff.
 
 mod scheduled;
+#[cfg(unix)]
+mod scheduled_artifacts;
 
 pub use scheduled::{
   AttestedCapabilityProfile, BuiltScheduledCodexExecutor, CODEX_APP_SERVER_SCHEMA_SHA256,
   CODEX_CLI_VERSION, GITHUB_MCP_ARTIFACT_SHA256_ARM64, GITHUB_MCP_ARTIFACT_SHA256_X86_64,
   GITHUB_MCP_SERVER_VERSION, PreparedScheduledCodexExecution, ProcessExit,
   RequestedCapabilityProfile, ScheduledCodexExecution, ScheduledCodexExecutor,
-  ScheduledCodexRequest, ScheduledExecutionResult, ScheduledFailure, ScheduledFailureKind,
-  ScheduledFinalOutput, ScheduledJsonlTransport, ScheduledRuntimeEvidence, ScheduledUsage,
+  ScheduledCodexRequest, ScheduledDeploymentAuthority, ScheduledExecutionIdentity,
+  ScheduledExecutionResult, ScheduledFailure, ScheduledFailureKind, ScheduledFinalOutput,
+  ScheduledIsolationPermit, ScheduledJsonlTransport, ScheduledRuntimeEvidence, ScheduledUsage,
   TimedRead, build_production_scheduled_codex_executor, prepare_scheduled_codex_home,
 };
 

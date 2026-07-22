@@ -6,18 +6,19 @@ use std::time::Duration;
 
 use codeoff_state::{
   AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot,
-  ClaimedScheduledDelivery, ClaimedScheduledRun, CreateScheduledJob, DeliveryPayloadSnapshot,
-  DeliveryTargetSnapshot, ExpiredRunReclaimOutcome, LateEvidenceAppendOutcome,
-  MaterializationOutcome, OccurrenceError, PreflightFailureDisposition, PreparedScheduledDelivery,
-  PrincipalKey, RetentionPolicy, ScheduleMutationIdempotency, ScheduleSpec,
-  ScheduledDeliveryFailure, ScheduledDeliveryReconcileOutcome, ScheduledDeliveryState,
-  ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
-  ScheduledExecutionTerminal, ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus,
-  ScheduledPrepareAuthority, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind,
-  ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
-  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
-  StateError, StateStore, StateValueError, TransactionalMutationOutcome, TransportConvergence,
-  UpdateScheduledJob,
+  ClaimedScheduledDelivery, ClaimedScheduledRun, ConsumeScheduledExecutionPermit,
+  CreateScheduledJob, DeliveryPayloadSnapshot, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome,
+  LateEvidenceAppendOutcome, MaterializationOutcome, OccurrenceError, PreflightFailureDisposition,
+  PreparedScheduledDelivery, PrincipalKey, RetentionPolicy, ScheduleMutationIdempotency,
+  ScheduleSpec, ScheduledDeliveryFailure, ScheduledDeliveryReconcileOutcome,
+  ScheduledDeliveryState, ScheduledDeliveryUnknownAction, ScheduledDeliveryWork,
+  ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledExecutorEpochAuthority,
+  ScheduledExecutorEpochRegistration, ScheduledJobDefinition, ScheduledJobMutation,
+  ScheduledJobStatus, ScheduledPrepareAuthority, ScheduledRunExecutionOutcome,
+  ScheduledRunLateEvidenceKind, ScheduledRunReconcileOutcome, ScheduledRunResult,
+  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerOperatorMutationOutcome,
+  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, StateStore, StateValueError,
+  TransactionalMutationOutcome, TransportConvergence, UpdateScheduledJob,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -41,6 +42,129 @@ type DeliveryIntentAuthorityRow = (
   Option<Vec<u8>>,
   String,
 );
+
+fn executor_epoch(epoch: i64, marker: char) -> ScheduledExecutorEpochAuthority {
+  ScheduledExecutorEpochAuthority {
+    schema_version: 1,
+    deployment_epoch: epoch,
+    attestation_id: marker.to_string().repeat(64),
+    attestation_digest: char::from_u32(u32::from(marker) + 1)
+      .expect("digest marker")
+      .to_string()
+      .repeat(64),
+    profile_digest: char::from_u32(u32::from(marker) + 2)
+      .expect("profile marker")
+      .to_string()
+      .repeat(64),
+    issued_at: 100,
+    expires_at: 200,
+  }
+}
+
+fn execution_permit(
+  authority: &ScheduledExecutorEpochAuthority,
+) -> ConsumeScheduledExecutionPermit {
+  ConsumeScheduledExecutionPermit {
+    deployment_epoch: authority.deployment_epoch,
+    attestation_id: authority.attestation_id.clone(),
+    profile_digest: authority.profile_digest.clone(),
+    run_id: "run-1".to_owned(),
+    job_id: "job-1".to_owned(),
+    attempt: 1,
+    fence: 1,
+    authority_digest: "d".repeat(64),
+    nonce: "e".repeat(64),
+    permit_id: "f".repeat(64),
+    consumed_at: 110,
+  }
+}
+
+#[tokio::test]
+async fn scheduled_executor_epoch_is_monotonic_and_restart_safe() {
+  let temp = tempdir().expect("tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("state");
+  let epoch_one = executor_epoch(1, 'a');
+  assert_eq!(
+    store
+      .register_scheduled_executor_epoch(&epoch_one, 110)
+      .await
+      .expect("activate epoch"),
+    ScheduledExecutorEpochRegistration::Activated
+  );
+  drop(store);
+
+  let restarted = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("restart state");
+  assert_eq!(
+    restarted
+      .register_scheduled_executor_epoch(&epoch_one, 111)
+      .await
+      .expect("resume exact epoch"),
+    ScheduledExecutorEpochRegistration::Resumed
+  );
+  let mut conflicting = epoch_one.clone();
+  conflicting.attestation_digest = "9".repeat(64);
+  assert!(
+    restarted
+      .register_scheduled_executor_epoch(&conflicting, 111)
+      .await
+      .is_err()
+  );
+  let epoch_two = executor_epoch(2, '4');
+  assert_eq!(
+    restarted
+      .register_scheduled_executor_epoch(&epoch_two, 112)
+      .await
+      .expect("rotate epoch"),
+    ScheduledExecutorEpochRegistration::Activated
+  );
+  assert!(
+    restarted
+      .register_scheduled_executor_epoch(&epoch_one, 112)
+      .await
+      .is_err()
+  );
+}
+
+#[tokio::test]
+async fn scheduled_execution_permit_is_consumed_once_across_restart() {
+  let temp = tempdir().expect("tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("state");
+  let authority = executor_epoch(1, 'a');
+  store
+    .register_scheduled_executor_epoch(&authority, 110)
+    .await
+    .expect("epoch");
+  let permit = execution_permit(&authority);
+  store
+    .consume_scheduled_execution_permit(&permit)
+    .await
+    .expect("first consumption");
+  assert!(
+    store
+      .consume_scheduled_execution_permit(&permit)
+      .await
+      .is_err()
+  );
+  drop(store);
+
+  let restarted = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("restart state");
+  assert!(
+    restarted
+      .consume_scheduled_execution_permit(&permit)
+      .await
+      .is_err()
+  );
+}
 type LegacyDeliveryRow = (
   String,
   String,

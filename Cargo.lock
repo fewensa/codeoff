@@ -394,7 +394,6 @@ name = "codeoff-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "codeoff-agent-codex",
  "codeoff-agent-contract",
  "codeoff-channel-contract",
  "codeoff-config",

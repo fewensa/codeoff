@@ -37,7 +37,7 @@ hyper = { version = "1.10.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["server", "service", "tokio"] }
 jiff = { version = "=0.2.34", default-features = false, features = ["std", "tzdb-bundle-always"] }
 jiff-tzdb = "=0.1.8"
-nix = { version = "=0.31.3", default-features = false, features = ["signal", "process"] }
+nix = { version = "=0.31.3", default-features = false, features = ["fs", "signal", "process", "user"] }
 prometheus-client = { version = "0.25.0", default-features = false }
 ring = "0.17.14"
 serde = { version = "1", features = ["derive"] }

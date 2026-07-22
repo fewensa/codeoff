@@ -11,7 +11,6 @@ path = "src/lib.rs"
 [dependencies]
 async-trait = "0.1"
 codeoff-agent-contract = { path = "../agent/contract" }
-codeoff-agent-codex = { path = "../agent/codex" }
 codeoff-channel-contract = { path = "../channel/contract" }
 codeoff-config = { path = "../config" }
 codeoff-state = { path = "../state" }

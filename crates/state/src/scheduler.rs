@@ -53,6 +53,8 @@ pub enum StateValueError {
   ForbiddenDurableData { field: &'static str },
   #[error("{field} must be lowercase sha256")]
   InvalidSha256 { field: &'static str },
+  #[error("{field} is invalid")]
+  InvalidValue { field: &'static str },
   #[error("version must be positive")]
   InvalidVersion,
   #[error("once timestamp must be strictly later than now")]
@@ -946,6 +948,97 @@ pub struct RunLeaseBinding {
   attempt: i64,
   fence: i64,
   lease_owner: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledExecutorEpochAuthority {
+  pub schema_version: u32,
+  pub deployment_epoch: i64,
+  pub attestation_id: String,
+  pub attestation_digest: String,
+  pub profile_digest: String,
+  pub issued_at: i64,
+  pub expires_at: i64,
+}
+
+impl ScheduledExecutorEpochAuthority {
+  /// Validates the durable deployment epoch authority before registration.
+  ///
+  /// # Errors
+  /// Returns an error for unsupported versions, invalid digests, epochs, or time bounds.
+  pub fn validate(&self, now: i64) -> Result<(), StateValueError> {
+    if self.schema_version != 1 || self.deployment_epoch <= 0 {
+      return Err(StateValueError::InvalidValue {
+        field: "scheduled executor deployment epoch",
+      });
+    }
+    for (field, value) in [
+      ("scheduled executor attestation id", &self.attestation_id),
+      (
+        "scheduled executor attestation digest",
+        &self.attestation_digest,
+      ),
+      ("scheduled executor profile digest", &self.profile_digest),
+    ] {
+      validate_lowercase_sha256(field, value)?;
+    }
+    if self.issued_at <= 0 || self.expires_at <= self.issued_at || self.expires_at <= now {
+      return Err(StateValueError::InvalidValue {
+        field: "scheduled executor epoch validity",
+      });
+    }
+    Ok(())
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledExecutorEpochRegistration {
+  Activated,
+  Resumed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumeScheduledExecutionPermit {
+  pub deployment_epoch: i64,
+  pub attestation_id: String,
+  pub profile_digest: String,
+  pub run_id: String,
+  pub job_id: String,
+  pub attempt: i64,
+  pub fence: i64,
+  pub authority_digest: String,
+  pub nonce: String,
+  pub permit_id: String,
+  pub consumed_at: i64,
+}
+
+impl ConsumeScheduledExecutionPermit {
+  fn validate(&self) -> Result<(), StateValueError> {
+    if self.deployment_epoch <= 0
+      || self.attempt <= 0
+      || self.fence <= 0
+      || self.consumed_at <= 0
+      || self.run_id.is_empty()
+      || self.job_id.is_empty()
+    {
+      return Err(StateValueError::InvalidValue {
+        field: "scheduled execution permit binding",
+      });
+    }
+    for (field, value) in [
+      ("scheduled execution attestation id", &self.attestation_id),
+      ("scheduled execution profile digest", &self.profile_digest),
+      (
+        "scheduled execution authority digest",
+        &self.authority_digest,
+      ),
+      ("scheduled execution permit nonce", &self.nonce),
+      ("scheduled execution permit id", &self.permit_id),
+    ] {
+      validate_lowercase_sha256(field, value)?;
+    }
+    Ok(())
+  }
 }
 
 impl RunLeaseBinding {

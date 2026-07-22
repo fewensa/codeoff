@@ -345,6 +345,10 @@ impl ScheduledCodexConfig {
       ("scheduled_codex.codex_home", &self.codex_home),
       ("scheduled_codex.cwd", &self.cwd),
       (
+        "scheduled_codex.github_mcp_artifact_path",
+        &self.github_mcp_artifact_path,
+      ),
+      (
         "scheduled_codex.isolation_attestation_path",
         &self.isolation_attestation_path,
       ),
@@ -360,6 +364,12 @@ impl ScheduledCodexConfig {
       return Err(invalid(
         "scheduled_codex.cwd",
         "must not overlap the dedicated CODEX_HOME",
+      ));
+    }
+    if self.trusted_owner_uid == self.runtime_uid || self.trusted_owner_gid == self.runtime_gid {
+      return Err(invalid(
+        "scheduled_codex.runtime_uid",
+        "must identify an unprivileged runtime distinct from the trusted artifact owner",
       ));
     }
     for (field, value) in [
@@ -645,6 +655,7 @@ pub struct ScheduledCodexConfig {
   pub codex_home: PathBuf,
   pub cwd: PathBuf,
   pub github_mcp_url: String,
+  pub github_mcp_artifact_path: PathBuf,
   pub github_mcp_artifact_sha256: String,
   pub github_mcp_endpoint_identity: String,
   pub credential_reference: String,
@@ -653,6 +664,10 @@ pub struct ScheduledCodexConfig {
   pub config_sha256: String,
   pub isolation_attestation_path: PathBuf,
   pub isolation_verifier_public_key: String,
+  pub trusted_owner_uid: u32,
+  pub trusted_owner_gid: u32,
+  pub runtime_uid: u32,
+  pub runtime_gid: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

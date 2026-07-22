@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -12,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 #[cfg(unix)]
@@ -29,10 +31,16 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use nix::errno::Errno;
 #[cfg(unix)]
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+#[cfg(unix)]
 use nix::sys::signal::{Signal, killpg};
 #[cfg(unix)]
 use nix::unistd::Pid;
 
+#[cfg(unix)]
+use crate::scheduled_artifacts::{VerifiedScheduledArtifacts, verify_scheduled_artifacts};
+#[cfg(all(unix, test))]
+use crate::scheduled_artifacts::{test_artifacts, verify_scheduled_artifacts_for_test};
 use crate::{JsonlTransport, send_notification, send_request};
 
 pub const CODEX_CLI_VERSION: &str = "0.144.6";
@@ -68,7 +76,10 @@ const MAX_INTERRUPT_GRACE: Duration = Duration::from_secs(30);
 const MAX_TERMINATE_GRACE: Duration = Duration::from_secs(30);
 const MAX_KILL_GRACE: Duration = Duration::from_secs(30);
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const ISOLATION_ATTESTATION_SCHEMA_VERSION: u64 = 1;
+const ISOLATION_ATTESTATION_SCHEMA_VERSION: u64 = 2;
+const ISOLATION_ATTESTATION_MAX_ISSUED_AGE_SECONDS: u64 = 300;
+const ISOLATION_ATTESTATION_MAX_VALIDITY_SECONDS: u64 = 600;
+const ISOLATION_ATTESTATION_FUTURE_SKEW_SECONDS: u64 = 30;
 #[cfg(test)]
 const TEST_PERMIT_TTL: Duration = Duration::from_secs(30);
 #[cfg_attr(
@@ -149,10 +160,12 @@ impl RequestedCapabilityProfile {
       "github_mcp_artifact_sha256",
       &self.github_mcp_artifact_sha256,
     )?;
-    if !matches!(
-      self.github_mcp_artifact_sha256.as_str(),
-      GITHUB_MCP_ARTIFACT_SHA256_X86_64 | GITHUB_MCP_ARTIFACT_SHA256_ARM64
-    ) {
+    if !cfg!(test)
+      && !matches!(
+        self.github_mcp_artifact_sha256.as_str(),
+        GITHUB_MCP_ARTIFACT_SHA256_X86_64 | GITHUB_MCP_ARTIFACT_SHA256_ARM64
+      )
+    {
       return Err(preflight("github_mcp_artifact_digest_not_pinned_v1_6_0"));
     }
     let actual_config_hash = sha256_hex(self.dedicated_config().as_bytes());
@@ -174,12 +187,84 @@ pub struct ScheduledRuntimeEvidence {
 #[derive(Debug, Clone)]
 pub struct ScheduledCodexRequest {
   pub task: AgentTask,
+  pub identity: ScheduledExecutionIdentity,
   pub profile: RequestedCapabilityProfile,
   pub cancellation: Arc<AtomicBool>,
   pub timeout: Duration,
   pub interrupt_grace: Duration,
   pub terminate_grace: Duration,
   pub kill_grace: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledExecutionIdentity {
+  pub run_id: String,
+  pub job_id: String,
+  pub attempt: i64,
+  pub fence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledDeploymentAuthority {
+  pub schema_version: u32,
+  pub deployment_epoch: i64,
+  pub attestation_id: String,
+  pub attestation_digest: String,
+  pub profile_digest: String,
+  pub isolation_revision: String,
+  pub issued_at_unix_seconds: u64,
+  pub expires_at_unix_seconds: u64,
+}
+
+#[derive(Debug)]
+pub struct ScheduledIsolationPermit {
+  identity: ScheduledExecutionIdentity,
+  deployment_epoch: i64,
+  attestation_id: String,
+  profile_digest: String,
+  nonce: String,
+  permit_id: String,
+  isolation_revision: String,
+  expires_at_unix_seconds: u64,
+}
+
+impl ScheduledIsolationPermit {
+  /// Reconstructs an opaque permit only after its exact binding was durably consumed.
+  ///
+  /// # Errors
+  /// Returns an error when the persisted binding is malformed or does not match the current
+  /// signed deployment authority.
+  pub fn from_consumed(
+    authority: &ScheduledDeploymentAuthority,
+    identity: ScheduledExecutionIdentity,
+    profile_digest: &str,
+    nonce: String,
+    permit_id: String,
+  ) -> Result<Self, ScheduledFailure> {
+    if authority.schema_version != 1
+      || authority.deployment_epoch <= 0
+      || authority.expires_at_unix_seconds <= now_unix_seconds()
+      || authority.profile_digest != profile_digest
+      || identity.run_id.is_empty()
+      || identity.job_id.is_empty()
+      || identity.attempt <= 0
+      || identity.fence <= 0
+      || !is_lowercase_hex(&nonce, 64)
+      || !is_lowercase_hex(&permit_id, 64)
+    {
+      return Err(preflight("scheduled_consumed_permit_binding_invalid"));
+    }
+    Ok(Self {
+      identity,
+      deployment_epoch: authority.deployment_epoch,
+      attestation_id: authority.attestation_id.clone(),
+      profile_digest: profile_digest.to_owned(),
+      nonce,
+      permit_id,
+      isolation_revision: authority.isolation_revision.clone(),
+      expires_at_unix_seconds: authority.expires_at_unix_seconds,
+    })
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,31 +472,28 @@ impl StdioScheduledJsonlTransport {
   pub(crate) fn spawn(
     profile: &RequestedCapabilityProfile,
     runtime_evidence: ScheduledRuntimeEvidence,
+    artifacts: &Arc<VerifiedScheduledArtifacts>,
   ) -> Result<Self, String> {
     profile.validate().map_err(|failure| failure.message)?;
-    let executable_hash = sha256_file(&profile.codex_program)?;
-    if executable_hash != profile.codex_program_sha256
-      || executable_hash != runtime_evidence.codex_program_sha256
-    {
+    if profile.codex_program_sha256 != runtime_evidence.codex_program_sha256 {
       return Err("codex_program_digest_mismatch_before_spawn".to_owned());
     }
-    let config_path = profile.codex_home.join("config.toml");
-    let config_hash = sha256_file(&config_path)?;
-    if config_hash != profile.config_sha256 || config_hash != runtime_evidence.config_sha256 {
+    if profile.config_sha256 != runtime_evidence.config_sha256 {
       return Err("scheduled_config_digest_mismatch_before_spawn".to_owned());
     }
-    let mut command = Command::new(&profile.codex_program);
-    command
-      .args(["app-server", "--listen", "stdio://"])
-      .env_clear()
-      .envs(fixed_child_environment())
-      .env("CODEX_HOME", &profile.codex_home)
-      .current_dir(&profile.cwd)
+    let mut verified = verified_command(
+      artifacts,
+      &["codex", "app-server", "--listen", "stdio://"],
+      true,
+    )?;
+    verified
+      .command
       .stdin(Stdio::piped())
       .stdout(Stdio::piped())
       .stderr(Stdio::null())
       .process_group(0);
-    let mut child = command
+    let mut child = verified
+      .command
       .spawn()
       .map_err(|error| format!("start scheduled codex app server: {error}"))?;
     let stdin = child
@@ -626,55 +708,29 @@ pub trait ScheduledCodexExecution: Send + Sync {
   fn prepare(
     &self,
     request: ScheduledCodexRequest,
+    permit: ScheduledIsolationPermit,
   ) -> Result<Box<dyn PreparedScheduledCodexExecution>, ScheduledExecutionResult>;
 
-  fn execute(&self, request: ScheduledCodexRequest) -> ScheduledExecutionResult {
-    match self.prepare(request) {
+  fn execute(
+    &self,
+    request: ScheduledCodexRequest,
+    permit: ScheduledIsolationPermit,
+  ) -> ScheduledExecutionResult {
+    match self.prepare(request, permit) {
       Ok(prepared) => prepared.execute(),
       Err(result) => result,
     }
   }
 }
 
-#[derive(Debug)]
-struct CredentialIsolationPermit {
-  run_id: String,
-  nonce: u64,
-  github_mcp_url: String,
-  endpoint_identity: String,
-  github_mcp_artifact_sha256: String,
-  credential_reference: String,
-  codex_program_sha256: String,
-  config_sha256: String,
-  permission_policy_revision: String,
-  isolation_revision: String,
-  expires_at: Instant,
-}
-
 pub struct ScheduledCodexExecutor<F> {
   transport_factory: F,
-  isolation_verifier: Arc<dyn CredentialIsolationVerifier>,
 }
 
 impl<F> ScheduledCodexExecutor<F> {
-  /// Creates a production executor with credential-bearing scheduled execution disabled.
-  ///
-  /// A deployment verifier in this crate must issue the opaque, single-use isolation permit before
-  /// production execution can be enabled. Until that verifier exists, execution fails closed before
-  /// the transport factory is called.
+  /// Creates an executor that still requires a durably consumed isolation permit on every prepare.
   pub fn new(transport_factory: F) -> Self {
-    Self {
-      transport_factory,
-      isolation_verifier: Arc::new(DisabledIsolationVerifier),
-    }
-  }
-
-  #[cfg(test)]
-  fn new_with_test_permit(transport_factory: F, request: &ScheduledCodexRequest) -> Self {
-    Self {
-      transport_factory,
-      isolation_verifier: Arc::new(TestIsolationVerifier::new(request)),
-    }
+    Self { transport_factory }
   }
 }
 
@@ -690,11 +746,12 @@ where
   fn prepare(
     &self,
     request: ScheduledCodexRequest,
+    permit: ScheduledIsolationPermit,
   ) -> Result<Box<dyn PreparedScheduledCodexExecution>, ScheduledExecutionResult> {
     if let Err(failure) = validate_request(&request) {
       return Err(ScheduledExecutionResult::PreflightRejected(failure));
     }
-    let isolation_permit = match self.isolation_verifier.verify(&request) {
+    let permit = match validate_isolation_permit(permit, &request) {
       Ok(permit) => permit,
       Err(failure) => return Err(ScheduledExecutionResult::PreflightRejected(failure)),
     };
@@ -706,17 +763,14 @@ where
         ));
       }
     };
-    let attested_profile = match attest_runtime(
-      &request.profile,
-      transport.runtime_evidence(),
-      isolation_permit,
-    ) {
-      Ok(profile) => profile,
-      Err(failure) => {
-        let _ = bounded_shutdown(&mut transport, &request);
-        return Err(ScheduledExecutionResult::PreflightRejected(failure));
-      }
-    };
+    let attested_profile =
+      match attest_runtime(&request.profile, transport.runtime_evidence(), permit) {
+        Ok(profile) => profile,
+        Err(failure) => {
+          let _ = bounded_shutdown(&mut transport, &request);
+          return Err(ScheduledExecutionResult::PreflightRejected(failure));
+        }
+      };
     let Some(deadline) = Instant::now().checked_add(request.timeout) else {
       let _ = bounded_shutdown(&mut transport, &request);
       return Err(ScheduledExecutionResult::PreflightRejected(preflight(
@@ -727,93 +781,9 @@ where
   }
 }
 
-trait CredentialIsolationVerifier: Send + Sync {
-  fn verify(
-    &self,
-    request: &ScheduledCodexRequest,
-  ) -> Result<CredentialIsolationPermit, ScheduledFailure>;
-}
-
-struct DisabledIsolationVerifier;
-
-impl CredentialIsolationVerifier for DisabledIsolationVerifier {
-  fn verify(
-    &self,
-    _request: &ScheduledCodexRequest,
-  ) -> Result<CredentialIsolationPermit, ScheduledFailure> {
-    Err(ScheduledFailure::new(
-      ScheduledFailureKind::CredentialIsolationUnproven,
-      "credential_isolation_verifier_disabled",
-    ))
-  }
-}
-
-struct SignedIsolationVerifier {
-  profile_binding_digest: String,
-  isolation_revision: String,
-  expires_at_unix_seconds: u64,
-  next_nonce: AtomicU64,
-}
-
-impl CredentialIsolationVerifier for SignedIsolationVerifier {
-  fn verify(
-    &self,
-    request: &ScheduledCodexRequest,
-  ) -> Result<CredentialIsolationPermit, ScheduledFailure> {
-    let run_id = scheduled_run_id(&request.task).ok_or_else(|| {
-      ScheduledFailure::new(
-        ScheduledFailureKind::CredentialIsolationUnproven,
-        "credential_isolation_permit_missing_run_binding",
-      )
-    })?;
-    if self.expires_at_unix_seconds <= now_unix_seconds()
-      || isolation_profile_binding_digest(&request.profile).as_deref()
-        != Ok(self.profile_binding_digest.as_str())
-    {
-      return Err(ScheduledFailure::new(
-        ScheduledFailureKind::CredentialIsolationUnproven,
-        "credential_isolation_attestation_expired_or_mismatched",
-      ));
-    }
-    let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
-    if nonce == 0 {
-      return Err(ScheduledFailure::new(
-        ScheduledFailureKind::CredentialIsolationUnproven,
-        "credential_isolation_permit_nonce_exhausted",
-      ));
-    }
-    let ttl = self
-      .expires_at_unix_seconds
-      .saturating_sub(now_unix_seconds());
-    let expires_at = Instant::now()
-      .checked_add(Duration::from_secs(ttl))
-      .ok_or_else(|| {
-        ScheduledFailure::new(
-          ScheduledFailureKind::CredentialIsolationUnproven,
-          "credential_isolation_permit_expiry_overflow",
-        )
-      })?;
-    validate_isolation_permit(
-      CredentialIsolationPermit {
-        run_id: run_id.to_owned(),
-        nonce,
-        github_mcp_url: request.profile.github_mcp_url.clone(),
-        endpoint_identity: request.profile.github_mcp_endpoint_identity.clone(),
-        github_mcp_artifact_sha256: request.profile.github_mcp_artifact_sha256.clone(),
-        credential_reference: request.profile.credential_reference.clone(),
-        codex_program_sha256: request.profile.codex_program_sha256.clone(),
-        config_sha256: request.profile.config_sha256.clone(),
-        permission_policy_revision: request.profile.permission_policy_revision.clone(),
-        isolation_revision: self.isolation_revision.clone(),
-        expires_at,
-      },
-      request,
-    )
-  }
-}
-
 pub struct BuiltScheduledCodexExecutor {
   pub profile: RequestedCapabilityProfile,
+  pub authority: ScheduledDeploymentAuthority,
   pub executor: Arc<dyn ScheduledCodexExecution>,
 }
 
@@ -828,24 +798,29 @@ pub fn build_production_scheduled_codex_executor(
 ) -> Result<BuiltScheduledCodexExecutor, ScheduledFailure> {
   let profile = requested_profile(config);
   profile.validate()?;
-  verify_production_profile_files(&profile, &config.isolation_attestation_path)?;
-  verify_codex_version(&profile.codex_program)?;
-  let isolation_verifier = Arc::new(load_signed_isolation_verifier(
-    &profile,
-    &config.isolation_attestation_path,
-    &config.isolation_verifier_public_key,
-  )?);
   #[cfg(unix)]
-  let executor = ScheduledCodexExecutor {
-    transport_factory: spawn_production_transport
-      as fn(RequestedCapabilityProfile) -> Result<StdioScheduledJsonlTransport, String>,
-    isolation_verifier,
-  };
+  let artifacts = Arc::new(
+    verify_scheduled_artifacts(config, &profile)
+      .map_err(|error| preflight(format!("scheduled_artifact_verification_failed:{error}")))?,
+  );
+  #[cfg(unix)]
+  verify_codex_version(&artifacts)?;
+  #[cfg(unix)]
+  let authority = load_signed_isolation_authority_contents(
+    &profile,
+    &artifacts.attestation_contents,
+    &config.isolation_verifier_public_key,
+  )?;
+  #[cfg(unix)]
+  let executor = ScheduledCodexExecutor::new(move |profile| {
+    spawn_production_transport(profile, Arc::clone(&artifacts))
+  });
   #[cfg(not(unix))]
   return Err(preflight("scheduled_executor_requires_unix_process_groups"));
   #[cfg(unix)]
   Ok(BuiltScheduledCodexExecutor {
     profile,
+    authority,
     executor: Arc::new(executor),
   })
 }
@@ -873,6 +848,7 @@ fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfil
 )]
 fn spawn_production_transport(
   profile: RequestedCapabilityProfile,
+  artifacts: Arc<VerifiedScheduledArtifacts>,
 ) -> Result<StdioScheduledJsonlTransport, String> {
   let runtime_evidence = ScheduledRuntimeEvidence {
     codex_version: CODEX_CLI_VERSION.to_owned(),
@@ -880,46 +856,16 @@ fn spawn_production_transport(
     codex_program_sha256: profile.codex_program_sha256.clone(),
     config_sha256: profile.config_sha256.clone(),
   };
-  StdioScheduledJsonlTransport::spawn(&profile, runtime_evidence)
+  StdioScheduledJsonlTransport::spawn(&profile, runtime_evidence, &artifacts)
 }
 
-fn verify_production_profile_files(
-  profile: &RequestedCapabilityProfile,
-  isolation_attestation_path: &Path,
+#[cfg(unix)]
+fn verify_codex_version(
+  artifacts: &Arc<VerifiedScheduledArtifacts>,
 ) -> Result<(), ScheduledFailure> {
-  require_read_only_file(&profile.codex_program, false, "scheduled_codex_program")?;
-  require_read_only_directory(&profile.codex_home, "scheduled_codex_home")?;
-  require_read_only_directory(&profile.cwd, "scheduled_cwd")?;
-  require_read_only_file(
-    &profile.codex_home.join("config.toml"),
-    true,
-    "scheduled_config",
-  )?;
-  require_read_only_file(
-    isolation_attestation_path,
-    true,
-    "scheduled_isolation_attestation",
-  )?;
-  let actual_program_hash = sha256_file(&profile.codex_program)
-    .map_err(|error| preflight(format!("scheduled_codex_program_hash_failed:{error}")))?;
-  if actual_program_hash != profile.codex_program_sha256 {
-    return Err(preflight("codex_program_digest_mismatch_at_startup"));
-  }
-  let config_path = profile.codex_home.join("config.toml");
-  let config = fs::read_to_string(&config_path)
-    .map_err(|error| preflight(format!("read_scheduled_config:{error}")))?;
-  if config != profile.dedicated_config() || sha256_hex(config.as_bytes()) != profile.config_sha256
-  {
-    return Err(preflight("scheduled_config_content_mismatch_at_startup"));
-  }
-  Ok(())
-}
-
-fn verify_codex_version(program: &Path) -> Result<(), ScheduledFailure> {
-  let output = Command::new(program)
-    .arg("--version")
-    .env_clear()
-    .envs(fixed_child_environment())
+  let output = verified_command(artifacts, &["codex", "--version"], false)
+    .map_err(|error| preflight(format!("scheduled_codex_version_probe_failed:{error}")))?
+    .command
     .output()
     .map_err(|error| preflight(format!("scheduled_codex_version_probe_failed:{error}")))?;
   let version = String::from_utf8(output.stdout)
@@ -928,6 +874,60 @@ fn verify_codex_version(program: &Path) -> Result<(), ScheduledFailure> {
     return Err(preflight("scheduled_codex_version_mismatch_at_startup"));
   }
   Ok(())
+}
+
+#[cfg(unix)]
+struct VerifiedCommand {
+  command: Command,
+  _program: fs::File,
+  _codex_home: fs::File,
+  _cwd: fs::File,
+}
+
+#[cfg(unix)]
+fn verified_command(
+  artifacts: &Arc<VerifiedScheduledArtifacts>,
+  arguments: &[&str],
+  use_codex_home: bool,
+) -> Result<VerifiedCommand, String> {
+  let program = artifacts
+    .program
+    .try_clone()
+    .map_err(|error| format!("clone verified codex program: {error}"))?;
+  let cwd = artifacts
+    .cwd
+    .try_clone()
+    .map_err(|error| format!("clone verified scheduled cwd: {error}"))?;
+  let codex_home = artifacts
+    .codex_home
+    .try_clone()
+    .map_err(|error| format!("clone verified CODEX_HOME: {error}"))?;
+  fcntl(&program, FcntlArg::F_SETFD(FdFlag::empty()))
+    .map_err(|error| format!("make verified codex descriptor executable: {error}"))?;
+  fcntl(&cwd, FcntlArg::F_SETFD(FdFlag::empty()))
+    .map_err(|error| format!("inherit verified scheduled cwd descriptor: {error}"))?;
+  if use_codex_home {
+    fcntl(&codex_home, FcntlArg::F_SETFD(FdFlag::empty()))
+      .map_err(|error| format!("inherit verified CODEX_HOME descriptor: {error}"))?;
+  }
+  let mut command = Command::new(format!("/proc/self/fd/{}", program.as_raw_fd()));
+  command
+    .args(&arguments[1..])
+    .env_clear()
+    .envs(fixed_child_environment())
+    .current_dir(format!("/proc/self/fd/{}", cwd.as_raw_fd()));
+  if use_codex_home {
+    command.env(
+      "CODEX_HOME",
+      format!("/proc/self/fd/{}", codex_home.as_raw_fd()),
+    );
+  }
+  Ok(VerifiedCommand {
+    command,
+    _program: program,
+    _codex_home: codex_home,
+    _cwd: cwd,
+  })
 }
 
 /// Creates a new dedicated `CODEX_HOME` containing only the pinned scheduled config.
@@ -976,13 +976,13 @@ pub fn prepare_scheduled_codex_home(
   })?;
   #[cfg(unix)]
   {
-    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o400)).map_err(|error| {
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o444)).map_err(|error| {
       ScheduledFailure::new(
         ScheduledFailureKind::InvalidRequest,
         format!("protect scheduled config: {error}"),
       )
     })?;
-    fs::set_permissions(&profile.codex_home, fs::Permissions::from_mode(0o500)).map_err(
+    fs::set_permissions(&profile.codex_home, fs::Permissions::from_mode(0o555)).map_err(
       |error| {
         ScheduledFailure::new(
           ScheduledFailureKind::InvalidRequest,
@@ -1038,9 +1038,9 @@ fn validate_request(request: &ScheduledCodexRequest) -> Result<(), ScheduledFail
 fn attest_runtime(
   requested: &RequestedCapabilityProfile,
   evidence: &ScheduledRuntimeEvidence,
-  isolation_permit: CredentialIsolationPermit,
+  isolation_permit: ScheduledIsolationPermit,
 ) -> Result<AttestedCapabilityProfile, ScheduledFailure> {
-  if isolation_permit.expires_at <= Instant::now() {
+  if isolation_permit.expires_at_unix_seconds <= now_unix_seconds() {
     return Err(ScheduledFailure::new(
       ScheduledFailureKind::CredentialIsolationUnproven,
       "credential_isolation_permit_expired_during_startup",
@@ -1749,15 +1749,34 @@ fn profile_sha256(profile: &AttestedCapabilityProfile) -> String {
   sha256_hex(canonical.to_string().as_bytes())
 }
 
-fn load_signed_isolation_verifier(
+#[cfg(test)]
+fn load_signed_isolation_authority(
   profile: &RequestedCapabilityProfile,
   path: &Path,
   public_key_hex: &str,
-) -> Result<SignedIsolationVerifier, ScheduledFailure> {
+) -> Result<ScheduledDeploymentAuthority, ScheduledFailure> {
   let contents = fs::read_to_string(path)
     .map_err(|error| preflight(format!("read_scheduled_isolation_attestation:{error}")))?;
-  let document: Value = serde_json::from_str(&contents)
+  load_signed_isolation_authority_contents(profile, &contents, public_key_hex)
+}
+
+#[allow(
+  clippy::too_many_lines,
+  reason = "keeps the exact signed attestation shape and validation order auditable in one owner"
+)]
+fn load_signed_isolation_authority_contents(
+  profile: &RequestedCapabilityProfile,
+  contents: &str,
+  public_key_hex: &str,
+) -> Result<ScheduledDeploymentAuthority, ScheduledFailure> {
+  let document: Value = serde_json::from_str(contents)
     .map_err(|_| preflight("scheduled_isolation_attestation_invalid_json"))?;
+  let canonical_document = document.to_string();
+  if canonical_document.as_bytes() != contents.as_bytes() {
+    return Err(preflight(
+      "scheduled_isolation_attestation_must_be_canonical_json",
+    ));
+  }
   let document = document
     .as_object()
     .filter(|object| object.len() == 3)
@@ -1770,7 +1789,7 @@ fn load_signed_isolation_verifier(
   let payload = document
     .get("payload")
     .and_then(Value::as_object)
-    .filter(|object| object.len() == 7)
+    .filter(|object| object.len() == 8)
     .ok_or_else(|| preflight("scheduled_isolation_attestation_payload_fields_mismatch"))?;
   let canonical_payload = Value::Object(payload.clone()).to_string();
   let signature = decode_lowercase_hex(
@@ -1813,9 +1832,20 @@ fn load_signed_isolation_verifier(
     .and_then(Value::as_u64)
     .ok_or_else(|| preflight("scheduled_isolation_attestation_expires_at_invalid"))?;
   let now = now_unix_seconds();
-  if issued_at > now.saturating_add(300) || expires_at <= now || expires_at <= issued_at {
+  if issued_at > now.saturating_add(ISOLATION_ATTESTATION_FUTURE_SKEW_SECONDS)
+    || now.saturating_sub(issued_at) > ISOLATION_ATTESTATION_MAX_ISSUED_AGE_SECONDS
+    || expires_at <= now
+    || expires_at <= issued_at
+    || expires_at.saturating_sub(issued_at) > ISOLATION_ATTESTATION_MAX_VALIDITY_SECONDS
+  {
     return Err(preflight("scheduled_isolation_attestation_not_current"));
   }
+  let deployment_epoch = payload
+    .get("deployment_epoch")
+    .and_then(Value::as_u64)
+    .and_then(|value| i64::try_from(value).ok())
+    .filter(|value| *value > 0)
+    .ok_or_else(|| preflight("scheduled_isolation_deployment_epoch_invalid"))?;
   let profile_binding_digest = payload
     .get("profile_binding_digest")
     .and_then(Value::as_str)
@@ -1837,11 +1867,15 @@ fn load_signed_isolation_verifier(
       "scheduled_isolation_negative_test_revision_mismatch",
     ));
   }
-  Ok(SignedIsolationVerifier {
-    profile_binding_digest: profile_binding_digest.to_owned(),
+  Ok(ScheduledDeploymentAuthority {
+    schema_version: 1,
+    deployment_epoch,
+    attestation_id: attestation_id.to_owned(),
+    attestation_digest: sha256_hex(contents.as_bytes()),
+    profile_digest: profile_binding_digest.to_owned(),
     isolation_revision: isolation_revision.to_owned(),
+    issued_at_unix_seconds: issued_at,
     expires_at_unix_seconds: expires_at,
-    next_nonce: AtomicU64::new(1),
   })
 }
 
@@ -1913,42 +1947,11 @@ fn decode_lowercase_hex(
     .collect()
 }
 
-fn require_read_only_file(
-  path: &Path,
-  require_read_only: bool,
-  field: &'static str,
-) -> Result<(), ScheduledFailure> {
-  let metadata =
-    fs::metadata(path).map_err(|error| preflight(format!("{field}_missing:{error}")))?;
-  if !metadata.is_file() {
-    return Err(preflight(format!("{field}_must_be_a_file")));
-  }
-  #[cfg(unix)]
-  {
-    let mode = metadata.permissions().mode() & 0o777;
-    if require_read_only && mode != 0o400 {
-      return Err(preflight(format!("{field}_must_have_mode_0400")));
-    }
-    if !require_read_only && (mode & 0o111 == 0 || mode & 0o022 != 0) {
-      return Err(preflight(format!(
-        "{field}_must_be_executable_and_not_group_or_world_writable"
-      )));
-    }
-  }
-  Ok(())
-}
-
-fn require_read_only_directory(path: &Path, field: &'static str) -> Result<(), ScheduledFailure> {
-  let metadata =
-    fs::metadata(path).map_err(|error| preflight(format!("{field}_missing:{error}")))?;
-  if !metadata.is_dir() {
-    return Err(preflight(format!("{field}_must_be_a_directory")));
-  }
-  #[cfg(unix)]
-  if metadata.permissions().mode() & 0o777 != 0o500 {
-    return Err(preflight(format!("{field}_must_have_mode_0500")));
-  }
-  Ok(())
+fn is_lowercase_hex(value: &str, expected_len: usize) -> bool {
+  value.len() == expected_len
+    && value
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn is_loopback_http_url(url: &str) -> bool {
@@ -1994,13 +1997,6 @@ fn capability(message: impl AsRef<str>) -> ScheduledFailure {
 
 fn output_violation(message: impl AsRef<str>) -> ScheduledFailure {
   ScheduledFailure::new(ScheduledFailureKind::OutputSchemaViolation, message)
-}
-
-fn scheduled_run_id(task: &AgentTask) -> Option<&str> {
-  match &task.source {
-    InvocationSource::ScheduledRun { run_id, .. } => Some(run_id),
-    _ => None,
-  }
 }
 
 fn protocol_failure(failure: ScheduledFailure) -> ScheduledExecutionResult {
@@ -2074,87 +2070,31 @@ fn now_unix_seconds() -> u64 {
 }
 
 #[cfg(test)]
-fn issue_test_isolation_permit(request: &ScheduledCodexRequest) -> CredentialIsolationPermit {
+fn issue_test_isolation_permit(request: &ScheduledCodexRequest) -> ScheduledIsolationPermit {
   static NEXT_TEST_NONCE: AtomicU64 = AtomicU64::new(1);
-  CredentialIsolationPermit {
-    run_id: scheduled_run_id(&request.task)
-      .expect("test permit requires scheduled run")
-      .to_owned(),
-    nonce: NEXT_TEST_NONCE.fetch_add(1, Ordering::Relaxed),
-    github_mcp_url: request.profile.github_mcp_url.clone(),
-    endpoint_identity: request.profile.github_mcp_endpoint_identity.clone(),
-    github_mcp_artifact_sha256: request.profile.github_mcp_artifact_sha256.clone(),
-    credential_reference: request.profile.credential_reference.clone(),
-    codex_program_sha256: request.profile.codex_program_sha256.clone(),
-    config_sha256: request.profile.config_sha256.clone(),
-    permission_policy_revision: request.profile.permission_policy_revision.clone(),
+  ScheduledIsolationPermit {
+    identity: request.identity.clone(),
+    deployment_epoch: 1,
+    attestation_id: "a".repeat(64),
+    profile_digest: isolation_profile_binding_digest(&request.profile).expect("profile digest"),
+    nonce: format!("{:064x}", NEXT_TEST_NONCE.fetch_add(1, Ordering::Relaxed)),
+    permit_id: format!("{:064x}", NEXT_TEST_NONCE.fetch_add(1, Ordering::Relaxed)),
     isolation_revision: "test-only-process-isolation-v1".to_owned(),
-    expires_at: Instant::now()
-      .checked_add(TEST_PERMIT_TTL)
-      .expect("test permit expiry"),
-  }
-}
-
-#[cfg(test)]
-struct TestIsolationVerifier {
-  permit: Mutex<Option<CredentialIsolationPermit>>,
-}
-
-#[cfg(test)]
-impl TestIsolationVerifier {
-  fn new(request: &ScheduledCodexRequest) -> Self {
-    Self {
-      permit: Mutex::new(Some(issue_test_isolation_permit(request))),
-    }
-  }
-}
-
-#[cfg(test)]
-impl CredentialIsolationVerifier for TestIsolationVerifier {
-  fn verify(
-    &self,
-    request: &ScheduledCodexRequest,
-  ) -> Result<CredentialIsolationPermit, ScheduledFailure> {
-    let permit = self
-      .permit
-      .lock()
-      .map_err(|_| {
-        ScheduledFailure::new(
-          ScheduledFailureKind::CredentialIsolationUnproven,
-          "credential_isolation_permit_state_unavailable",
-        )
-      })?
-      .take()
-      .ok_or_else(|| {
-        ScheduledFailure::new(
-          ScheduledFailureKind::CredentialIsolationUnproven,
-          "credential_isolation_verifier_disabled",
-        )
-      })?;
-    validate_isolation_permit(permit, request)
+    expires_at_unix_seconds: now_unix_seconds().saturating_add(TEST_PERMIT_TTL.as_secs()),
   }
 }
 
 fn validate_isolation_permit(
-  permit: CredentialIsolationPermit,
+  permit: ScheduledIsolationPermit,
   request: &ScheduledCodexRequest,
-) -> Result<CredentialIsolationPermit, ScheduledFailure> {
-  let run_id = scheduled_run_id(&request.task).ok_or_else(|| {
-    ScheduledFailure::new(
-      ScheduledFailureKind::CredentialIsolationUnproven,
-      "credential_isolation_permit_missing_run_binding",
-    )
-  })?;
-  if permit.nonce == 0
-    || permit.expires_at <= Instant::now()
-    || permit.run_id != run_id
-    || permit.github_mcp_url != request.profile.github_mcp_url
-    || permit.endpoint_identity != request.profile.github_mcp_endpoint_identity
-    || permit.github_mcp_artifact_sha256 != request.profile.github_mcp_artifact_sha256
-    || permit.credential_reference != request.profile.credential_reference
-    || permit.codex_program_sha256 != request.profile.codex_program_sha256
-    || permit.config_sha256 != request.profile.config_sha256
-    || permit.permission_policy_revision != request.profile.permission_policy_revision
+) -> Result<ScheduledIsolationPermit, ScheduledFailure> {
+  if permit.expires_at_unix_seconds <= now_unix_seconds()
+    || permit.identity != request.identity
+    || permit.profile_digest != isolation_profile_binding_digest(&request.profile)?
+    || permit.deployment_epoch <= 0
+    || !is_lowercase_hex(&permit.attestation_id, 64)
+    || !is_lowercase_hex(&permit.nonce, 64)
+    || !is_lowercase_hex(&permit.permit_id, 64)
     || permit.isolation_revision.trim().is_empty()
   {
     return Err(ScheduledFailure::new(
@@ -2168,6 +2108,7 @@ fn validate_isolation_permit(
 #[cfg(test)]
 mod tests {
   use std::collections::VecDeque;
+  use std::os::unix::fs::MetadataExt;
   use std::sync::{Arc, Mutex};
 
   use codeoff_agent_contract::{InvocationPrincipal, SessionMode};
@@ -2305,6 +2246,12 @@ mod tests {
   fn request(profile: RequestedCapabilityProfile) -> ScheduledCodexRequest {
     ScheduledCodexRequest {
       task: task(),
+      identity: ScheduledExecutionIdentity {
+        run_id: "run-1".to_owned(),
+        job_id: "job-1".to_owned(),
+        attempt: 1,
+        fence: 1,
+      },
       profile,
       cancellation: Arc::new(AtomicBool::new(false)),
       timeout: Duration::from_secs(30),
@@ -2337,6 +2284,7 @@ mod tests {
     let now = now_unix_seconds();
     json!({
       "schema_version": ISOLATION_ATTESTATION_SCHEMA_VERSION,
+      "deployment_epoch": 1,
       "attestation_id": "ab".repeat(32),
       "issued_at_unix_seconds": now.saturating_sub(1),
       "expires_at_unix_seconds": now.saturating_add(300),
@@ -2438,21 +2386,46 @@ mod tests {
 
   fn executor_for(
     transport: MockTransport,
-    request: &ScheduledCodexRequest,
+    _request: &ScheduledCodexRequest,
   ) -> ScheduledCodexExecutor<
     impl Fn(RequestedCapabilityProfile) -> Result<MockTransport, String> + use<>,
   > {
     let transport = Arc::new(Mutex::new(Some(transport)));
-    ScheduledCodexExecutor::new_with_test_permit(
-      move |_| {
-        transport
-          .lock()
-          .expect("transport")
-          .take()
-          .ok_or_else(|| "mock transport already used".to_owned())
-      },
-      request,
-    )
+    ScheduledCodexExecutor::new(move |_| {
+      transport
+        .lock()
+        .expect("transport")
+        .take()
+        .ok_or_else(|| "mock transport already used".to_owned())
+    })
+  }
+
+  fn execute_test<F, T>(
+    executor: &ScheduledCodexExecutor<F>,
+    request: ScheduledCodexRequest,
+  ) -> ScheduledExecutionResult
+  where
+    F: Fn(RequestedCapabilityProfile) -> Result<T, String> + Send + Sync,
+    T: ScheduledJsonlTransport + Send + 'static,
+  {
+    let permit = issue_test_isolation_permit(&request);
+    executor.execute(request, permit)
+  }
+
+  #[allow(
+    clippy::result_large_err,
+    reason = "the test helper preserves the production trait result without lossy conversion"
+  )]
+  fn prepare_test<F, T>(
+    executor: &ScheduledCodexExecutor<F>,
+    request: ScheduledCodexRequest,
+  ) -> Result<Box<dyn PreparedScheduledCodexExecution>, ScheduledExecutionResult>
+  where
+    F: Fn(RequestedCapabilityProfile) -> Result<T, String> + Send + Sync,
+    T: ScheduledJsonlTransport + Send + 'static,
+  {
+    let permit = issue_test_isolation_permit(&request);
+    executor.prepare(request, permit)
   }
 
   #[test]
@@ -2466,7 +2439,7 @@ mod tests {
     };
     let request = request(profile);
     let executor = executor_for(transport, &request);
-    let result = executor.execute(request);
+    let result = execute_test(&executor, request);
     let ScheduledExecutionResult::Completed {
       output,
       usage,
@@ -2515,7 +2488,10 @@ mod tests {
         panic!("disabled production executor must not start transport")
       },
     );
-    let result = executor.execute(request(profile));
+    let request = request(profile);
+    let mut permit = issue_test_isolation_permit(&request);
+    permit.profile_digest = "0".repeat(64);
+    let result = executor.execute(request, permit);
     assert!(matches!(
       result,
       ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
@@ -2526,54 +2502,23 @@ mod tests {
   }
 
   #[test]
-  fn test_isolation_permit_is_bound_and_single_use() {
+  fn test_isolation_permit_is_exactly_bound_and_expiring() {
     let profile = profile();
     let scheduled_request = request(profile.clone());
     let first_nonce = issue_test_isolation_permit(&scheduled_request).nonce;
     let second_nonce = issue_test_isolation_permit(&scheduled_request).nonce;
     assert_ne!(first_nonce, second_nonce);
-    let actions = Arc::new(Mutex::new(Actions::default()));
-    let transport = Arc::new(Mutex::new(Some(MockTransport {
-      evidence: evidence(&profile),
-      reads: successful_reads(),
-      actions,
-    })));
-    let available = Arc::clone(&transport);
-    let executor = ScheduledCodexExecutor::new_with_test_permit(
-      move |_| {
-        available
-          .lock()
-          .expect("transport")
-          .take()
-          .ok_or_else(|| "transport already used".to_owned())
-      },
-      &scheduled_request,
-    );
-    assert!(matches!(
-      executor.execute(scheduled_request.clone()),
-      ScheduledExecutionResult::Completed { .. }
-    ));
-    assert!(matches!(
-      executor.execute(scheduled_request),
-      ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
-        kind: ScheduledFailureKind::CredentialIsolationUnproven,
-        ..
-      })
-    ));
 
     let original = request(profile.clone());
-    let executor = ScheduledCodexExecutor::new_with_test_permit(
+    let executor = ScheduledCodexExecutor::new(
       |_: RequestedCapabilityProfile| -> Result<MockTransport, String> {
         panic!("mismatched permit must not start transport")
       },
-      &original,
     );
-    let mut mismatched = original;
-    if let InvocationSource::ScheduledRun { run_id, .. } = &mut mismatched.task.source {
-      *run_id = "different-run".to_owned();
-    }
+    let mut mismatched_permit = issue_test_isolation_permit(&original);
+    mismatched_permit.identity.run_id = "different-run".to_owned();
     assert!(matches!(
-      executor.execute(mismatched),
+      executor.execute(original, mismatched_permit),
       ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
         kind: ScheduledFailureKind::CredentialIsolationUnproven,
         ..
@@ -2582,17 +2527,14 @@ mod tests {
 
     let expired_request = request(profile);
     let mut expired_permit = issue_test_isolation_permit(&expired_request);
-    expired_permit.expires_at = Instant::now();
-    let executor = ScheduledCodexExecutor {
-      transport_factory: |_: RequestedCapabilityProfile| -> Result<MockTransport, String> {
+    expired_permit.expires_at_unix_seconds = now_unix_seconds();
+    let executor = ScheduledCodexExecutor::new(
+      |_: RequestedCapabilityProfile| -> Result<MockTransport, String> {
         panic!("expired permit must not start transport")
       },
-      isolation_verifier: Arc::new(TestIsolationVerifier {
-        permit: Mutex::new(Some(expired_permit)),
-      }),
-    };
+    );
     assert!(matches!(
-      executor.execute(expired_request),
+      executor.execute(expired_request, expired_permit),
       ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
         kind: ScheduledFailureKind::CredentialIsolationUnproven,
         ..
@@ -2608,16 +2550,15 @@ mod tests {
     let temp = TempDir::new().expect("tempdir");
 
     let path = write_signed_attestation(&temp, &key, &isolation_payload(&profile));
-    let verifier = load_signed_isolation_verifier(&profile, &path, &public_key)
+    let authority = load_signed_isolation_authority(&profile, &path, &public_key)
       .expect("valid signed attestation");
-    assert!(verifier.verify(&request(profile.clone())).is_ok());
+    assert_eq!(authority.deployment_epoch, 1);
 
     let mut other_profile = profile.clone();
     other_profile.github_mcp_endpoint_identity = "different-endpoint".to_owned();
     let path = write_signed_attestation(&temp, &key, &isolation_payload(&other_profile));
-    let failure = load_signed_isolation_verifier(&profile, &path, &public_key)
-      .err()
-      .expect("mismatched profile must fail");
+    let failure = load_signed_isolation_authority(&profile, &path, &public_key)
+      .expect_err("mismatched profile must fail");
     assert_eq!(
       failure.message,
       "scheduled_isolation_profile_binding_mismatch"
@@ -2628,22 +2569,56 @@ mod tests {
     expired["issued_at_unix_seconds"] = json!(now.saturating_sub(10));
     expired["expires_at_unix_seconds"] = json!(now.saturating_sub(1));
     let path = write_signed_attestation(&temp, &key, &expired);
-    assert!(load_signed_isolation_verifier(&profile, &path, &public_key).is_err());
+    assert!(load_signed_isolation_authority(&profile, &path, &public_key).is_err());
+  }
+
+  #[test]
+  fn signed_isolation_attestation_rejects_stale_future_and_overlong_windows() {
+    let profile = profile();
+    let key = signing_key();
+    let public_key = lowercase_hex(key.public_key().as_ref());
+    let temp = TempDir::new().expect("tempdir");
+    let now = now_unix_seconds();
+    let cases = [
+      (
+        now.saturating_sub(ISOLATION_ATTESTATION_MAX_ISSUED_AGE_SECONDS + 1),
+        now.saturating_add(30),
+      ),
+      (
+        now.saturating_add(ISOLATION_ATTESTATION_FUTURE_SKEW_SECONDS + 1),
+        now.saturating_add(ISOLATION_ATTESTATION_FUTURE_SKEW_SECONDS + 60),
+      ),
+      (
+        now.saturating_sub(1),
+        now.saturating_add(ISOLATION_ATTESTATION_MAX_VALIDITY_SECONDS + 1),
+      ),
+    ];
+    for (issued_at, expires_at) in cases {
+      let mut payload = isolation_payload(&profile);
+      payload["issued_at_unix_seconds"] = json!(issued_at);
+      payload["expires_at_unix_seconds"] = json!(expires_at);
+      let path = write_signed_attestation(&temp, &key, &payload);
+      assert!(load_signed_isolation_authority(&profile, &path, &public_key).is_err());
+    }
   }
 
   #[cfg(unix)]
   #[test]
-  fn production_builder_accepts_exact_protected_signed_profile() {
-    let temp = TempDir::new().expect("tempdir");
+  fn production_components_accept_exact_protected_signed_profile() {
+    let temp = TempDir::new_in("/code/helixbox").expect("tempdir");
     let codex_program = temp.path().join("codex");
     fs::write(&codex_program, "#!/bin/sh\nprintf 'codex-cli 0.144.6\\n'\n")
       .expect("write codex probe");
-    fs::set_permissions(&codex_program, fs::Permissions::from_mode(0o500))
+    fs::set_permissions(&codex_program, fs::Permissions::from_mode(0o555))
       .expect("protect codex probe");
+    let github_mcp_artifact = temp.path().join("github-mcp-server");
+    fs::write(&github_mcp_artifact, "test github mcp artifact").expect("write github MCP artifact");
+    fs::set_permissions(&github_mcp_artifact, fs::Permissions::from_mode(0o555))
+      .expect("protect github MCP artifact");
     let codex_home = temp.path().join("codex-home");
     let cwd = temp.path().join("workspace");
     fs::create_dir(&cwd).expect("create workspace");
-    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o500)).expect("protect workspace");
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o555)).expect("protect workspace");
     let attestation_path = temp.path().join("isolation-attestation.json");
     let key = signing_key();
     let mut config = ScheduledCodexConfig {
@@ -2652,7 +2627,8 @@ mod tests {
       codex_home: codex_home.clone(),
       cwd,
       github_mcp_url: "http://127.0.0.1:18081/mcp".to_owned(),
-      github_mcp_artifact_sha256: GITHUB_MCP_ARTIFACT_SHA256_X86_64.to_owned(),
+      github_mcp_artifact_path: github_mcp_artifact.clone(),
+      github_mcp_artifact_sha256: sha256_file(&github_mcp_artifact).expect("MCP digest"),
       github_mcp_endpoint_identity: "github-readonly-sidecar".to_owned(),
       credential_reference: "github-readonly-service-account".to_owned(),
       permission_policy_revision: "github-issues-read-v1".to_owned(),
@@ -2660,17 +2636,35 @@ mod tests {
       config_sha256: String::new(),
       isolation_attestation_path: attestation_path.clone(),
       isolation_verifier_public_key: lowercase_hex(key.public_key().as_ref()),
+      trusted_owner_uid: fs::metadata(&codex_program)
+        .expect("program metadata")
+        .uid(),
+      trusted_owner_gid: fs::metadata(&codex_program)
+        .expect("program metadata")
+        .gid(),
+      runtime_uid: 65_534,
+      runtime_gid: 65_534,
     };
     let mut requested = requested_profile(&config);
     config.config_sha256 = sha256_hex(requested.dedicated_config().as_bytes());
     requested.config_sha256.clone_from(&config.config_sha256);
     prepare_scheduled_codex_home(&requested).expect("prepare codex home");
     write_signed_attestation(&temp, &key, &isolation_payload(&requested));
-    fs::set_permissions(&attestation_path, fs::Permissions::from_mode(0o400))
+    fs::set_permissions(&attestation_path, fs::Permissions::from_mode(0o444))
       .expect("protect attestation");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555)).expect("protect tempdir");
 
-    let built = build_production_scheduled_codex_executor(&config).expect("production executor");
-    assert_eq!(built.profile, requested);
+    let artifacts = Arc::new(
+      verify_scheduled_artifacts_for_test(&config, &requested).expect("verified artifacts"),
+    );
+    verify_codex_version(&artifacts).expect("version probe");
+    let authority = load_signed_isolation_authority_contents(
+      &requested,
+      &artifacts.attestation_contents,
+      &config.isolation_verifier_public_key,
+    )
+    .expect("signed authority");
+    assert_eq!(authority.deployment_epoch, 1);
   }
 
   #[test]
@@ -2686,17 +2680,17 @@ mod tests {
         .expect("parse attestation");
     bad_signature["signature"] = json!("00".repeat(64));
     fs::write(&path, bad_signature.to_string()).expect("write bad signature");
-    assert!(load_signed_isolation_verifier(&profile, &path, &public_key).is_err());
+    assert!(load_signed_isolation_authority(&profile, &path, &public_key).is_err());
 
     let mut legacy = isolation_payload(&profile);
     legacy["schema_version"] = json!(0);
     let path = write_signed_attestation(&temp, &key, &legacy);
-    assert!(load_signed_isolation_verifier(&profile, &path, &public_key).is_err());
+    assert!(load_signed_isolation_authority(&profile, &path, &public_key).is_err());
 
     let mut unknown = isolation_payload(&profile);
     unknown["unexpected"] = json!(true);
     let path = write_signed_attestation(&temp, &key, &unknown);
-    assert!(load_signed_isolation_verifier(&profile, &path, &public_key).is_err());
+    assert!(load_signed_isolation_authority(&profile, &path, &public_key).is_err());
   }
 
   #[test]
@@ -2720,7 +2714,7 @@ mod tests {
       };
       let request = request(profile);
       assert!(matches!(
-        executor_for(transport, &request).execute(request),
+        execute_test(&executor_for(transport, &request), request),
         ScheduledExecutionResult::Failed(ScheduledFailure {
           kind: ScheduledFailureKind::OutputSchemaViolation,
           ..
@@ -2764,7 +2758,7 @@ mod tests {
     };
     let request = request(profile);
     assert!(matches!(
-      executor_for(transport, &request).execute(request),
+      execute_test(&executor_for(transport, &request), request),
       ScheduledExecutionResult::Failed(ScheduledFailure {
         kind: ScheduledFailureKind::OutputSchemaViolation,
         ..
@@ -2792,7 +2786,7 @@ mod tests {
     };
     let request = request(profile);
     assert!(matches!(
-      executor_for(transport, &request).execute(request),
+      execute_test(&executor_for(transport, &request), request),
       ScheduledExecutionResult::Failed(ScheduledFailure {
         kind: ScheduledFailureKind::OutputSchemaViolation,
         message,
@@ -2819,7 +2813,7 @@ mod tests {
         },
       );
       assert!(matches!(
-        executor.execute(request),
+        execute_test(&executor, request),
         ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
           kind: ScheduledFailureKind::InvalidRequest,
           ..
@@ -2858,7 +2852,7 @@ mod tests {
       let request = request(profile);
       let executor = executor_for(transport, &request);
       assert!(matches!(
-        executor.execute(request),
+        execute_test(&executor, request),
         ScheduledExecutionResult::PreflightRejected(_)
       ));
       assert!(
@@ -2893,7 +2887,7 @@ mod tests {
     let mut request = request(profile);
     request.timeout = Duration::from_millis(10);
     let executor = executor_for(transport, &request);
-    let prepared = executor.prepare(request).expect("prepare execution");
+    let prepared = prepare_test(&executor, request).expect("prepare execution");
     std::thread::sleep(Duration::from_millis(15));
     assert!(matches!(
       prepared.execute(),
@@ -2991,7 +2985,7 @@ mod tests {
       };
       let request = request(profile);
       assert!(matches!(
-        executor_for(transport, &request).execute(request),
+        execute_test(&executor_for(transport, &request), request),
         ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
           kind: ScheduledFailureKind::CapabilityMismatch,
           ..
@@ -3033,7 +3027,7 @@ mod tests {
       };
       let request = request(profile);
       assert!(matches!(
-        executor_for(transport, &request).execute(request),
+        execute_test(&executor_for(transport, &request), request),
         ScheduledExecutionResult::PreflightRejected(_)
       ));
       assert!(
@@ -3073,7 +3067,7 @@ mod tests {
     };
     let request = request(profile);
     assert!(matches!(
-      executor_for(transport, &request).execute(request),
+      execute_test(&executor_for(transport, &request), request),
       ScheduledExecutionResult::Failed(ScheduledFailure {
         kind: ScheduledFailureKind::OutputSchemaViolation,
         ..
@@ -3106,9 +3100,8 @@ mod tests {
     };
     let mut request = request(profile);
     request.timeout = Duration::from_millis(10);
-    let prepared = executor_for(transport, &request)
-      .prepare(request)
-      .expect("prepare execution");
+    let prepared =
+      prepare_test(&executor_for(transport, &request), request).expect("prepare execution");
     std::thread::sleep(Duration::from_millis(15));
     assert!(matches!(
       prepared.execute(),
@@ -3124,6 +3117,33 @@ mod tests {
         .count(),
       1
     );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn verified_command_executes_opened_inode_after_path_replacement() {
+    let temp = TempDir::new().expect("tempdir");
+    let program = temp.path().join("program");
+    fs::write(&program, "#!/bin/sh\nprintf 'trusted-inode\\n'\n").expect("program");
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o555)).expect("protect program");
+    let codex_home = temp.path().join("codex-home");
+    let cwd = temp.path().join("cwd");
+    fs::create_dir(&codex_home).expect("CODEX_HOME");
+    fs::create_dir(&cwd).expect("cwd");
+    let artifacts = Arc::new(test_artifacts(&program, &codex_home, &cwd));
+    let replacement = temp.path().join("replacement");
+    fs::write(&replacement, "#!/bin/sh\nprintf 'replacement\\n'\n").expect("replacement");
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o555))
+      .expect("protect replacement");
+    fs::rename(&replacement, &program).expect("swap program path");
+
+    let output = verified_command(&artifacts, &["program"], false)
+      .expect("verified command")
+      .command
+      .output()
+      .expect("execute verified descriptor");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"trusted-inode\n");
   }
 
   #[cfg(unix)]
@@ -3151,7 +3171,9 @@ mod tests {
     prepare_scheduled_codex_home(&profile).expect("codex home");
     let runtime = evidence(&profile);
     let started = Instant::now();
-    let transport = StdioScheduledJsonlTransport::spawn(&profile, runtime).expect("spawn");
+    let artifacts = Arc::new(test_artifacts(&program, &codex_home, &cwd));
+    let transport =
+      StdioScheduledJsonlTransport::spawn(&profile, runtime, &artifacts).expect("spawn");
     let pid_deadline = Instant::now() + Duration::from_secs(2);
     while !pid_file.exists() && Instant::now() < pid_deadline {
       thread::sleep(Duration::from_millis(5));

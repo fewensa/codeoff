@@ -9,26 +9,27 @@ use sqlx::{Row, Sqlite, Transaction};
 use super::{
   AcceptedDeliveryBaseline, AcceptedDeliveryBaselineIdentity, AttestedExecutionProfileSnapshot,
   BoundedSchedulerAge, BoundedSchedulerGauge, CapabilityProfileSnapshot, ClaimedScheduledDelivery,
-  ClaimedScheduledRun, CreateScheduledJob, DEFAULT_OCCURRENCE_STEPS,
-  DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION, DeliveryPayloadSnapshot,
-  DeliveryTargetRoute, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome, IdempotencyDecision,
-  LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES, MAX_DELIVERY_TARGETS, MAX_SNAPSHOT_BYTES,
-  MaterializationOutcome, PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey,
-  RunLeaseBinding, ScheduleAuditSummary, ScheduleMutationAudit, ScheduleMutationIdempotency,
-  ScheduleSpec, ScheduledDeliveryAuthority, ScheduledDeliveryBinding, ScheduledDeliveryFailure,
-  ScheduledDeliveryOperatorProjection, ScheduledDeliveryReconcileOutcome,
-  ScheduledDeliveryRenderInput, ScheduledDeliveryRetentionReport, ScheduledDeliveryState,
-  ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
-  ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
-  ScheduledJobMutation, ScheduledJobStatus, ScheduledRunExecutionOutcome,
-  ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection, ScheduledRunReconcileCandidate,
-  ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
-  SchedulerObservabilitySnapshot, SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome,
-  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome,
-  UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
-  invalid_value, materialized_run, operator_action_request_digest,
-  operator_delivery_evidence_binding, positive_u32, scheduler_error, validate_lowercase_sha256,
-  validate_text,
+  ClaimedScheduledRun, ConsumeScheduledExecutionPermit, CreateScheduledJob,
+  DEFAULT_OCCURRENCE_STEPS, DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION,
+  DeliveryPayloadSnapshot, DeliveryTargetRoute, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome,
+  IdempotencyDecision, LateEvidenceAppendOutcome, MAX_CONTEXT_BYTES, MAX_DELIVERY_TARGETS,
+  MAX_SNAPSHOT_BYTES, MaterializationOutcome, PreflightFailureDisposition,
+  PreparedScheduledDelivery, PrincipalKey, RunLeaseBinding, ScheduleAuditSummary,
+  ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryAuthority,
+  ScheduledDeliveryBinding, ScheduledDeliveryFailure, ScheduledDeliveryOperatorProjection,
+  ScheduledDeliveryReconcileOutcome, ScheduledDeliveryRenderInput,
+  ScheduledDeliveryRetentionReport, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
+  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
+  ScheduledExecutorEpochAuthority, ScheduledExecutorEpochRegistration, ScheduledJob,
+  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
+  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
+  ScheduledRunReconcileCandidate, ScheduledRunReconcileOutcome, ScheduledRunResult,
+  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerObservabilitySnapshot,
+  SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
+  SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome, UpdateExecutionBaseline,
+  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
+  operator_action_request_digest, operator_delivery_evidence_binding, positive_u32,
+  scheduler_error, validate_lowercase_sha256, validate_text,
 };
 use crate::StateStore;
 
@@ -184,6 +185,119 @@ fn observability_snapshot_from_row(
 }
 
 impl StateStore {
+  /// Registers or resumes the highest trusted scheduled executor deployment epoch.
+  ///
+  /// # Errors
+  /// Returns an error for stale, rollback, same-epoch conflicting, expired, or invalid authority.
+  pub async fn register_scheduled_executor_epoch(
+    &self,
+    authority: &ScheduledExecutorEpochAuthority,
+    now: i64,
+  ) -> Result<ScheduledExecutorEpochRegistration, StateError> {
+    authority.validate(now).map_err(invalid_value)?;
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let changed = sqlx::query(
+      "insert into scheduled_executor_epochs (authority_key, schema_version, deployment_epoch, attestation_id, attestation_digest, profile_digest, issued_at, expires_at, registered_at) values ('scheduled-codex-v1', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) on conflict(authority_key) do update set schema_version = excluded.schema_version, deployment_epoch = excluded.deployment_epoch, attestation_id = excluded.attestation_id, attestation_digest = excluded.attestation_digest, profile_digest = excluded.profile_digest, issued_at = excluded.issued_at, expires_at = excluded.expires_at, registered_at = excluded.registered_at where excluded.deployment_epoch > scheduled_executor_epochs.deployment_epoch",
+    )
+    .bind(i64::from(authority.schema_version))
+    .bind(authority.deployment_epoch)
+    .bind(&authority.attestation_id)
+    .bind(&authority.attestation_digest)
+    .bind(&authority.profile_digest)
+    .bind(authority.issued_at)
+    .bind(authority.expires_at)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?
+    .rows_affected();
+    let current = sqlx::query(
+      "select schema_version, deployment_epoch, attestation_id, attestation_digest, profile_digest, issued_at, expires_at from scheduled_executor_epochs where authority_key = 'scheduled-codex-v1'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let exact = current
+      .try_get::<i64, _>("schema_version")
+      .map_err(scheduler_error)?
+      == i64::from(authority.schema_version)
+      && current
+        .try_get::<i64, _>("deployment_epoch")
+        .map_err(scheduler_error)?
+        == authority.deployment_epoch
+      && current
+        .try_get::<String, _>("attestation_id")
+        .map_err(scheduler_error)?
+        == authority.attestation_id
+      && current
+        .try_get::<String, _>("attestation_digest")
+        .map_err(scheduler_error)?
+        == authority.attestation_digest
+      && current
+        .try_get::<String, _>("profile_digest")
+        .map_err(scheduler_error)?
+        == authority.profile_digest
+      && current
+        .try_get::<i64, _>("issued_at")
+        .map_err(scheduler_error)?
+        == authority.issued_at
+      && current
+        .try_get::<i64, _>("expires_at")
+        .map_err(scheduler_error)?
+        == authority.expires_at;
+    if !exact {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled executor epoch rollback or same-epoch authority conflict".to_owned(),
+      });
+    }
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(if changed == 0 {
+      ScheduledExecutorEpochRegistration::Resumed
+    } else {
+      ScheduledExecutorEpochRegistration::Activated
+    })
+  }
+
+  /// Atomically consumes one exact scheduled execution permit binding.
+  ///
+  /// # Errors
+  /// Returns an error when the deployment epoch is no longer current or this run binding, permit,
+  /// or nonce was already consumed.
+  pub async fn consume_scheduled_execution_permit(
+    &self,
+    permit: &ConsumeScheduledExecutionPermit,
+  ) -> Result<(), StateError> {
+    permit.validate().map_err(invalid_value)?;
+    let result = sqlx::query(
+      "insert into scheduled_execution_permit_consumptions (permit_id, schema_version, authority_key, deployment_epoch, attestation_id, profile_digest, run_id, job_id, attempt, fence, authority_digest, nonce, consumed_at) select ?1, 1, 'scheduled-codex-v1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 where exists (select 1 from scheduled_executor_epochs where authority_key = 'scheduled-codex-v1' and deployment_epoch = ?2 and attestation_id = ?3 and profile_digest = ?4 and expires_at > ?11)",
+    )
+    .bind(&permit.permit_id)
+    .bind(permit.deployment_epoch)
+    .bind(&permit.attestation_id)
+    .bind(&permit.profile_digest)
+    .bind(&permit.run_id)
+    .bind(&permit.job_id)
+    .bind(permit.attempt)
+    .bind(permit.fence)
+    .bind(&permit.authority_digest)
+    .bind(&permit.nonce)
+    .bind(permit.consumed_at)
+    .execute(&self.pool)
+    .await;
+    match result {
+      Ok(result) if result.rows_affected() == 1 => Ok(()),
+      Ok(_) => Err(StateError::InvalidSchedulerState {
+        reason: "scheduled execution permit deployment epoch is not current".to_owned(),
+      }),
+      Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+        Err(StateError::InvalidSchedulerState {
+          reason: "scheduled execution permit was already consumed or replayed".to_owned(),
+        })
+      }
+      Err(error) => Err(scheduler_error(error)),
+    }
+  }
+
   /// Reads a bounded, identifier-free scheduler telemetry snapshot.
   ///
   /// Each count stops after `count_cap + 1` indexed active-state rows and carries its own

@@ -58,7 +58,7 @@ use codeoff_runtime::{
     ScheduledWorkerShutdown, spawn_scheduled_worker,
   },
 };
-use codeoff_state::{RetentionPolicy, StateError, StateStore};
+use codeoff_state::{RetentionPolicy, ScheduledExecutorEpochAuthority, StateError, StateStore};
 use tokio::sync::OnceCell;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -68,6 +68,7 @@ use crate::observability::{
   OperationalHttpServer, PrometheusSchedulerTelemetry, SNAPSHOT_INTERVAL, init_scheduler_tracing,
   refresh_scheduler_snapshot,
 };
+use crate::scheduled_codex::CodexScheduledExecutionBackend;
 use crate::scheduler::{
   SchedulerCommandError, SchedulerOperatorConfig, UnavailableSchedulerAuthorityVerifier,
   execute_scheduler_command_with_policy_and_verifier, render_scheduler_human,
@@ -639,17 +640,41 @@ async fn build_serve_lifecycle(
 ) -> Result<ServeLifecycle, Box<dyn Error>> {
   let scheduled_delivery = build_scheduled_delivery_provider(config)?;
   let scheduled_executor = if config.scheduler.run_claims_enabled {
-    Some(ScheduledExecutor::codex(
-      build_production_scheduled_codex_executor(&config.agent.scheduled_codex).map_err(
-        |failure| {
-          io::Error::other(format!(
-            "scheduled executor validation failed ({:?}): {}",
-            failure.kind, failure.message
-          ))
+    let built = build_production_scheduled_codex_executor(&config.agent.scheduled_codex).map_err(
+      |failure| {
+        io::Error::other(format!(
+          "scheduled executor validation failed ({:?}): {}",
+          failure.kind, failure.message
+        ))
+      },
+    )?;
+    let now = i64::try_from(now_unix_seconds())
+      .map_err(|_| io::Error::other("system timestamp exceeds SQLite range"))?;
+    state
+      .register_scheduled_executor_epoch(
+        &ScheduledExecutorEpochAuthority {
+          schema_version: built.authority.schema_version,
+          deployment_epoch: built.authority.deployment_epoch,
+          attestation_id: built.authority.attestation_id.clone(),
+          attestation_digest: built.authority.attestation_digest.clone(),
+          profile_digest: built.authority.profile_digest.clone(),
+          issued_at: i64::try_from(built.authority.issued_at_unix_seconds).map_err(|_| {
+            io::Error::other("scheduled executor issued-at timestamp exceeds SQLite range")
+          })?,
+          expires_at: i64::try_from(built.authority.expires_at_unix_seconds).map_err(|_| {
+            io::Error::other("scheduled executor expiry timestamp exceeds SQLite range")
+          })?,
         },
-      )?,
-      scheduled_worker_config(&config.scheduler),
-    ))
+        now,
+      )
+      .await?;
+    Some(ScheduledExecutor::new(Arc::new(
+      CodexScheduledExecutionBackend::new(
+        state.clone(),
+        built,
+        scheduled_worker_config(&config.scheduler),
+      ),
+    )))
   } else {
     None
   };

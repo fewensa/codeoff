@@ -250,6 +250,7 @@ codex_program_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 codex_home = "/var/lib/codeoff/scheduled-codex"
 cwd = "/work/codeoff-scheduled"
 github_mcp_url = "http://127.0.0.1:8090/mcp"
+github_mcp_artifact_path = "/opt/codeoff/bin/github-mcp-server"
 github_mcp_artifact_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 github_mcp_endpoint_identity = "github-mcp-scheduled-v1"
 credential_reference = "kubernetes:codeoff/github-mcp"
@@ -258,6 +259,10 @@ config_revision = "scheduled-codex-v1"
 config_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 isolation_attestation_path = "/var/run/codeoff/isolation-attestation.json"
 isolation_verifier_public_key = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+trusted_owner_uid = 0
+trusted_owner_gid = 0
+runtime_uid = 65534
+runtime_gid = 65534
 "#,
   )
   .expect("write config");
@@ -315,6 +320,7 @@ fn valid_scheduled_codex_config() -> ScheduledCodexConfig {
     codex_home: "/var/lib/codeoff/scheduled-codex".into(),
     cwd: "/work/codeoff-scheduled".into(),
     github_mcp_url: "http://127.0.0.1:8090/mcp".to_owned(),
+    github_mcp_artifact_path: "/opt/codeoff/bin/github-mcp-server".into(),
     github_mcp_artifact_sha256: "b".repeat(64),
     github_mcp_endpoint_identity: "github-mcp-scheduled-v1".to_owned(),
     credential_reference: "kubernetes:codeoff/github-mcp".to_owned(),
@@ -323,6 +329,10 @@ fn valid_scheduled_codex_config() -> ScheduledCodexConfig {
     config_sha256: "c".repeat(64),
     isolation_attestation_path: "/var/run/codeoff/isolation-attestation.json".into(),
     isolation_verifier_public_key: "d".repeat(64),
+    trusted_owner_uid: 0,
+    trusted_owner_gid: 0,
+    runtime_uid: 65_534,
+    runtime_gid: 65_534,
   }
 }
 

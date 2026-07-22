@@ -60,9 +60,9 @@ pub enum SchedulerCommand {
   },
   /// Plans or applies bounded exact lease reconciliation.
   Reconcile {
-    #[arg(long, conflicts_with = "apply")]
+    #[arg(long, conflicts_with = "apply", required_unless_present = "apply")]
     dry_run: bool,
-    #[arg(long, conflicts_with = "dry_run")]
+    #[arg(long, conflicts_with = "dry_run", required_unless_present = "dry_run")]
     apply: bool,
     #[arg(long, default_value_t = 32)]
     limit: u16,
@@ -114,6 +114,10 @@ pub enum SchedulerCommand {
     expected_fence: i64,
     #[arg(long)]
     evidence_file: PathBuf,
+    #[arg(long, required_if_eq("disposition", "force-resend"))]
+    reason_file: Option<PathBuf>,
+    #[arg(long, required_if_eq("disposition", "force-resend"))]
+    acknowledge_duplicate_risk: bool,
     #[arg(long)]
     authority_file: PathBuf,
   },
@@ -258,6 +262,30 @@ impl SchedulerCommand {
         | Self::Delete { .. }
     )
   }
+
+  #[must_use]
+  pub(crate) const fn uses_json_output(&self) -> bool {
+    match self {
+      Self::Status { json } | Self::Reconcile { json, .. } => *json,
+      Self::Runs { command } => match command {
+        SchedulerRunsCommand::List { json, .. } | SchedulerRunsCommand::Show { json, .. } => *json,
+      },
+      Self::Deliveries { command } => match command {
+        SchedulerDeliveriesCommand::List { json, .. }
+        | SchedulerDeliveriesCommand::Show { json, .. } => *json,
+      },
+      Self::RetryRun { .. }
+      | Self::RetryDelivery { .. }
+      | Self::ResolveDeliveryUnknown { .. }
+      | Self::Create { .. }
+      | Self::Get { .. }
+      | Self::List { .. }
+      | Self::Update { .. }
+      | Self::Pause { .. }
+      | Self::Resume { .. }
+      | Self::Delete { .. } => true,
+    }
+  }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -281,4 +309,90 @@ pub enum WorkerCommand {
 #[derive(Debug, Copy, Clone, Subcommand)]
 pub enum ConfigCommand {
   Check,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn scheduler_diagnostic_output_mode_follows_each_json_flag() {
+    for command in [
+      SchedulerCommand::Status { json: false },
+      SchedulerCommand::Runs {
+        command: SchedulerRunsCommand::List {
+          status: None,
+          limit: 1,
+          json: false,
+        },
+      },
+      SchedulerCommand::Runs {
+        command: SchedulerRunsCommand::Show {
+          run_id: "run".to_owned(),
+          json: false,
+        },
+      },
+      SchedulerCommand::Deliveries {
+        command: SchedulerDeliveriesCommand::List {
+          status: None,
+          limit: 1,
+          json: false,
+        },
+      },
+      SchedulerCommand::Deliveries {
+        command: SchedulerDeliveriesCommand::Show {
+          delivery_id: "delivery".to_owned(),
+          json: false,
+        },
+      },
+      SchedulerCommand::Reconcile {
+        dry_run: true,
+        apply: false,
+        limit: 1,
+        authority_file: None,
+        json: false,
+      },
+    ] {
+      assert!(!command.uses_json_output());
+    }
+
+    for command in [
+      SchedulerCommand::Status { json: true },
+      SchedulerCommand::Runs {
+        command: SchedulerRunsCommand::List {
+          status: None,
+          limit: 1,
+          json: true,
+        },
+      },
+      SchedulerCommand::Runs {
+        command: SchedulerRunsCommand::Show {
+          run_id: "run".to_owned(),
+          json: true,
+        },
+      },
+      SchedulerCommand::Deliveries {
+        command: SchedulerDeliveriesCommand::List {
+          status: None,
+          limit: 1,
+          json: true,
+        },
+      },
+      SchedulerCommand::Deliveries {
+        command: SchedulerDeliveriesCommand::Show {
+          delivery_id: "delivery".to_owned(),
+          json: true,
+        },
+      },
+      SchedulerCommand::Reconcile {
+        dry_run: false,
+        apply: true,
+        limit: 1,
+        authority_file: Some(PathBuf::from("authority")),
+        json: true,
+      },
+    ] {
+      assert!(command.uses_json_output());
+    }
+  }
 }

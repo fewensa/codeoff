@@ -1,4 +1,4 @@
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -1852,6 +1852,8 @@ impl SchedulerOperatorRequest {
         expected_fence,
         expected_state.as_str(),
         "pending",
+        None,
+        None,
         Some(reason_json),
         Some(reason_digest),
         None,
@@ -1899,6 +1901,8 @@ impl SchedulerOperatorRequest {
         Some(reason_json),
         Some(reason_digest),
         None,
+        None,
+        None,
         false,
         occurred_at,
       ),
@@ -1926,8 +1930,16 @@ impl SchedulerOperatorRequest {
     if expected_attempt <= 0 || expected_fence <= 0 {
       return Err(StateValueError::InvalidVersion);
     }
-    let (action_name, after_state, evidence_json, evidence_digest, receipt, duplicate_ack) =
-      action.authority_parts()?;
+    let (
+      action_name,
+      after_state,
+      evidence_json,
+      evidence_digest,
+      receipt,
+      reason_json,
+      reason_digest,
+      duplicate_ack,
+    ) = action.authority_parts()?;
     Ok(Self {
       principal,
       request_id,
@@ -1941,6 +1953,8 @@ impl SchedulerOperatorRequest {
         after_state,
         Some(evidence_json),
         Some(evidence_digest),
+        reason_json,
+        reason_digest,
         receipt,
         duplicate_ack,
         occurred_at,
@@ -1957,7 +1971,7 @@ pub enum SchedulerOperatorMutationOutcome {
   Conflict,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ScheduledDeliveryUnknownAction {
   ConfirmDelivered {
     provider_receipt: String,
@@ -1971,6 +1985,8 @@ pub enum ScheduledDeliveryUnknownAction {
   ForceResend {
     evidence_json: String,
     evidence_digest: String,
+    reason_json: String,
+    reason_digest: String,
     duplicate_risk_acknowledged: bool,
   },
   AcknowledgeUnknown {
@@ -1979,11 +1995,49 @@ pub enum ScheduledDeliveryUnknownAction {
   },
 }
 
+impl fmt::Debug for ScheduledDeliveryUnknownAction {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::ConfirmDelivered {
+        evidence_digest, ..
+      } => formatter
+        .debug_struct("ConfirmDelivered")
+        .field("evidence_digest", evidence_digest)
+        .finish_non_exhaustive(),
+      Self::ConfirmNoWriteTerminal {
+        evidence_digest, ..
+      } => formatter
+        .debug_struct("ConfirmNoWriteTerminal")
+        .field("evidence_digest", evidence_digest)
+        .finish_non_exhaustive(),
+      Self::ForceResend {
+        evidence_digest,
+        reason_digest,
+        duplicate_risk_acknowledged,
+        ..
+      } => formatter
+        .debug_struct("ForceResend")
+        .field("evidence_digest", evidence_digest)
+        .field("reason_digest", reason_digest)
+        .field("duplicate_risk_acknowledged", duplicate_risk_acknowledged)
+        .finish_non_exhaustive(),
+      Self::AcknowledgeUnknown {
+        evidence_digest, ..
+      } => formatter
+        .debug_struct("AcknowledgeUnknown")
+        .field("evidence_digest", evidence_digest)
+        .finish_non_exhaustive(),
+    }
+  }
+}
+
 type DeliveryUnknownAuthorityParts<'a> = (
   &'static str,
   &'static str,
   &'a str,
   &'a str,
+  Option<&'a str>,
+  Option<&'a str>,
   Option<&'a str>,
   bool,
 );
@@ -2009,6 +2063,8 @@ impl ScheduledDeliveryUnknownAction {
           evidence_json.as_str(),
           evidence_digest.as_str(),
           Some(provider_receipt.as_str()),
+          None,
+          None,
           false,
         )
       }
@@ -2028,17 +2084,22 @@ impl ScheduledDeliveryUnknownAction {
           evidence_json.as_str(),
           evidence_digest.as_str(),
           None,
+          None,
+          None,
           false,
         )
       }
       Self::ForceResend {
         evidence_json,
         evidence_digest,
+        reason_json,
+        reason_digest,
         duplicate_risk_acknowledged,
       } => {
         if !duplicate_risk_acknowledged {
           return Err(StateValueError::InvalidVersion);
         }
+        validate_operator_reason(reason_json, reason_digest)?;
         validate_operator_delivery_evidence(
           evidence_json,
           evidence_digest,
@@ -2051,6 +2112,8 @@ impl ScheduledDeliveryUnknownAction {
           evidence_json.as_str(),
           evidence_digest.as_str(),
           None,
+          Some(reason_json.as_str()),
+          Some(reason_digest.as_str()),
           true,
         )
       }
@@ -2069,6 +2132,8 @@ impl ScheduledDeliveryUnknownAction {
           "delivery_unknown",
           evidence_json.as_str(),
           evidence_digest.as_str(),
+          None,
+          None,
           None,
           false,
         )
@@ -2139,6 +2204,7 @@ fn validate_operator_provider_receipt(provider_receipt: &str) -> Result<(), Stat
   Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_operator_delivery_evidence(
   evidence_json: &str,
   evidence_digest: &str,
@@ -2163,6 +2229,24 @@ fn validate_operator_delivery_evidence(
     "target_kind",
     "tenant",
   ];
+  let expected_query_result = match expected_kind {
+    "provider_confirmed_delivered" => Some("write_confirmed"),
+    "provider_confirmed_no_write" => Some("no_write_confirmed"),
+    "operator_force_resend" => Some("no_matching_write_found"),
+    "operator_acknowledged_unknown" => None,
+    _ => return Err(StateValueError::InvalidVersion),
+  };
+  if expected_query_result.is_some() {
+    exact_keys.extend([
+      "provider_query_completed_at",
+      "provider_query_result",
+      "provider_query_scope",
+      "provider_query_started_at",
+      "provider_query_summary_digest",
+      "provider_query_window_end",
+      "provider_query_window_start",
+    ]);
+  }
   if provider_receipt.is_some() {
     exact_keys.push("receipt_digest");
   }
@@ -2184,6 +2268,53 @@ fn validate_operator_delivery_evidence(
         field: "operator delivery evidence",
       })?;
     validate_text("operator delivery evidence identity", value)?;
+  }
+  if let Some(expected_query_result) = expected_query_result {
+    let started_at = object
+      .get("provider_query_started_at")
+      .and_then(Value::as_i64)
+      .ok_or(StateValueError::InvalidJson {
+        field: "operator delivery evidence",
+      })?;
+    let completed_at = object
+      .get("provider_query_completed_at")
+      .and_then(Value::as_i64)
+      .ok_or(StateValueError::InvalidJson {
+        field: "operator delivery evidence",
+      })?;
+    let window_start = object
+      .get("provider_query_window_start")
+      .and_then(Value::as_i64)
+      .ok_or(StateValueError::InvalidJson {
+        field: "operator delivery evidence",
+      })?;
+    let window_end = object
+      .get("provider_query_window_end")
+      .and_then(Value::as_i64)
+      .ok_or(StateValueError::InvalidJson {
+        field: "operator delivery evidence",
+      })?;
+    if started_at < 0
+      || completed_at < started_at
+      || window_start < 0
+      || window_end < window_start
+      || window_end > completed_at
+      || window_end - window_start > 31 * 24 * 60 * 60
+      || object.get("provider_query_scope").and_then(Value::as_str)
+        != Some("canonical_delivery_target")
+      || object.get("provider_query_result").and_then(Value::as_str) != Some(expected_query_result)
+    {
+      return Err(StateValueError::InvalidJson {
+        field: "operator delivery evidence",
+      });
+    }
+    let summary_digest = object
+      .get("provider_query_summary_digest")
+      .and_then(Value::as_str)
+      .ok_or(StateValueError::InvalidJson {
+        field: "operator delivery evidence",
+      })?;
+    validate_lowercase_sha256("operator query summary digest", summary_digest)?;
   }
   if let Some(provider_receipt) = provider_receipt {
     let receipt_digest =
@@ -2220,7 +2351,7 @@ fn validate_operator_delivery_evidence(
 pub(crate) fn operator_delivery_evidence_binding(
   action: &ScheduledDeliveryUnknownAction,
 ) -> Result<(String, String, String), StateValueError> {
-  let (_, _, evidence_json, _, _, _) = action.authority_parts()?;
+  let (_, _, evidence_json, _, _, _, _, _) = action.authority_parts()?;
   let evidence: Value =
     serde_json::from_str(evidence_json).map_err(|_| StateValueError::InvalidJson {
       field: "operator delivery evidence",
@@ -2264,6 +2395,8 @@ pub(crate) fn operator_action_request_digest(
   after_state: &str,
   evidence_json: Option<&str>,
   evidence_digest: Option<&str>,
+  reason_json: Option<&str>,
+  reason_digest: Option<&str>,
   provider_receipt: Option<&str>,
   duplicate_risk_acknowledged: bool,
   effective_at: i64,
@@ -2280,6 +2413,8 @@ pub(crate) fn operator_action_request_digest(
       "expected_attempt": expected_attempt,
       "expected_fence": expected_fence,
       "provider_receipt": provider_receipt,
+      "reason_digest": reason_digest,
+      "reason_json": reason_json,
       "target_id": target_id,
       "target_kind": target_kind,
     })

@@ -1,7 +1,7 @@
 use std::fs;
 
 use assert_cmd::Command;
-use clap::CommandFactory;
+use clap::{CommandFactory, Parser};
 use codeoff_channel_contract::{ChannelEvent, ChannelEventKind, ChannelReplyTarget};
 use codeoff_cli::Cli;
 use codeoff_config::{CodeoffConfig, ConfigLoadOptions};
@@ -98,6 +98,89 @@ fn test_scheduler_diagnostics_and_dry_run_do_not_require_operator_identity() {
     assert_eq!(output["schema_version"], 1);
     assert_eq!(output["ok"], true);
   }
+}
+
+#[test]
+fn test_scheduler_diagnostics_default_to_sanitized_human_output() {
+  let dir = tempdir().expect("create tempdir");
+  let state_dir = dir.path().join("state");
+  for arguments in [
+    vec!["scheduler", "status"],
+    vec!["scheduler", "runs", "list", "--limit", "10"],
+    vec!["scheduler", "deliveries", "list", "--limit", "10"],
+    vec!["scheduler", "reconcile", "--dry-run", "--limit", "10"],
+  ] {
+    let output = Command::cargo_bin("codeoff")
+      .expect("codeoff binary")
+      .env_remove("CODEOFF_SCHEDULER_OPERATOR_ID")
+      .env_remove("CODEOFF_SCHEDULER_OPERATOR_REALM")
+      .arg("--state-dir")
+      .arg(&state_dir)
+      .args(arguments)
+      .assert()
+      .success()
+      .get_output()
+      .stdout
+      .clone();
+    let output = String::from_utf8(output).expect("human output");
+    assert!(output.starts_with("status: ok\n"));
+    assert!(serde_json::from_str::<serde_json::Value>(&output).is_err());
+    for forbidden in [
+      "reason-sentinel",
+      "evidence-sentinel",
+      "receipt-sentinel",
+      "authority-sentinel",
+    ] {
+      assert!(!output.contains(forbidden));
+    }
+  }
+}
+
+#[test]
+fn test_scheduler_reconcile_requires_exactly_one_mode() {
+  assert!(
+    Cli::try_parse_from(["codeoff", "scheduler", "reconcile"])
+      .expect_err("missing mode must fail")
+      .to_string()
+      .contains("--dry-run")
+  );
+  assert!(
+    Cli::try_parse_from(["codeoff", "scheduler", "reconcile", "--dry-run", "--apply",]).is_err()
+  );
+  assert!(Cli::try_parse_from(["codeoff", "scheduler", "reconcile", "--dry-run"]).is_ok());
+  assert!(Cli::try_parse_from(["codeoff", "scheduler", "reconcile", "--apply"]).is_ok());
+}
+
+#[test]
+fn test_scheduler_force_resend_requires_reason_and_duplicate_risk_acknowledgement() {
+  let prefix = [
+    "codeoff",
+    "scheduler",
+    "resolve-delivery-unknown",
+    "delivery",
+    "--disposition",
+    "force-resend",
+    "--request-id",
+    "request",
+    "--expected-attempt",
+    "1",
+    "--expected-fence",
+    "1",
+    "--evidence-file",
+    "evidence.json",
+    "--authority-file",
+    "authority.bin",
+  ];
+  assert!(Cli::try_parse_from(prefix).is_err());
+  assert!(Cli::try_parse_from(prefix.into_iter().chain(["--reason-file", "reason.json"])).is_err());
+  assert!(
+    Cli::try_parse_from(prefix.into_iter().chain([
+      "--reason-file",
+      "reason.json",
+      "--acknowledge-duplicate-risk",
+    ]))
+    .is_ok()
+  );
 }
 
 #[test]

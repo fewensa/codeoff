@@ -157,7 +157,7 @@ impl fmt::Display for SchedulerCommandError {
 
 impl std::error::Error for SchedulerCommandError {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SchedulerReasonFile {
   schema_version: u32,
@@ -165,7 +165,7 @@ struct SchedulerReasonFile {
   reason: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SchedulerEvidenceFile {
   schema_version: u32,
@@ -434,11 +434,18 @@ async fn execute_scheduler_operator_command(
       }
     },
     SchedulerCommand::Reconcile {
+      dry_run,
       apply,
       limit,
       authority_file,
       ..
     } => {
+      if dry_run == apply {
+        return Err(command_error(
+          "invalid_request",
+          "exactly one of --dry-run or --apply is required",
+        ));
+      }
       validate_operator_limit(limit)?;
       let limit = limit.min(policy.recovery_batch_limit).min(100);
       let run_candidates = state
@@ -653,10 +660,22 @@ async fn execute_scheduler_operator_command(
       expected_attempt,
       expected_fence,
       evidence_file,
+      reason_file,
+      acknowledge_duplicate_risk,
       authority_file,
     } => {
-      reject_ambiguous_stdin(&[&evidence_file, &authority_file])?;
-      let evidence = read_evidence_file(&evidence_file, disposition)?;
+      let mut input_paths: Vec<&Path> = vec![&evidence_file, &authority_file];
+      if let Some(reason_file) = &reason_file {
+        input_paths.push(reason_file);
+      }
+      reject_ambiguous_stdin(&input_paths)?;
+      let reason = reason_file.as_deref().map(read_reason_file).transpose()?;
+      let evidence = read_evidence_file(
+        &evidence_file,
+        disposition,
+        reason.as_ref(),
+        acknowledge_duplicate_risk,
+      )?;
       let authority = read_bounded_file(&authority_file)?;
       let provisional = SchedulerOperatorRequest::for_delivery_action(
         provisional_principal(),
@@ -719,6 +738,40 @@ struct ValidatedEvidence {
 
 fn success(data: Value) -> Value {
   json!({"data": data, "ok": true, "schema_version": 1})
+}
+
+pub(crate) fn render_scheduler_human(output: &Value) -> String {
+  let mut lines = vec!["status: ok".to_owned()];
+  append_human_value(&mut lines, "", &output["data"]);
+  lines.join("\n")
+}
+
+fn append_human_value(lines: &mut Vec<String>, prefix: &str, value: &Value) {
+  match value {
+    Value::Object(object) if object.is_empty() => lines.push(format!("{prefix}: none")),
+    Value::Object(object) => {
+      for (key, value) in object {
+        let name = if prefix.is_empty() {
+          key.clone()
+        } else {
+          format!("{prefix}.{key}")
+        };
+        append_human_value(lines, &name, value);
+      }
+    }
+    Value::Array(array) if array.is_empty() => lines.push(format!("{prefix}: none")),
+    Value::Array(array) => {
+      for (index, value) in array.iter().enumerate() {
+        append_human_value(lines, &format!("{prefix}[{index}]"), value);
+      }
+    }
+    Value::String(value) => lines.push(format!(
+      "{prefix}: {}",
+      serde_json::to_string(value).expect("JSON strings are serializable")
+    )),
+    Value::Null => lines.push(format!("{prefix}: none")),
+    Value::Bool(_) | Value::Number(_) => lines.push(format!("{prefix}: {value}")),
+  }
 }
 
 fn command_error(code: &str, message: &str) -> SchedulerCommandError {
@@ -860,6 +913,8 @@ fn read_reason_file(path: &Path) -> Result<ValidatedReason, SchedulerCommandErro
 fn read_evidence_file(
   path: &Path,
   disposition: SchedulerDeliveryDisposition,
+  reason: Option<&ValidatedReason>,
+  duplicate_risk_acknowledged: bool,
 ) -> Result<ValidatedEvidence, SchedulerCommandError> {
   let bytes = read_bounded_file(path)?;
   validate_canonical_operator_json(&bytes, "evidence file is invalid")?;
@@ -872,7 +927,9 @@ fn read_evidence_file(
     .map_err(|_| command_error("invalid_request", "evidence file is invalid"))?;
   let evidence_digest = sha256_hex(evidence_json.as_bytes());
   let action = match disposition {
-    SchedulerDeliveryDisposition::ConfirmDelivered => {
+    SchedulerDeliveryDisposition::ConfirmDelivered
+      if reason.is_none() && !duplicate_risk_acknowledged =>
+    {
       let receipt = input.provider_receipt.ok_or_else(|| {
         command_error(
           "invalid_request",
@@ -885,20 +942,29 @@ fn read_evidence_file(
         evidence_digest: evidence_digest.clone(),
       }
     }
-    SchedulerDeliveryDisposition::ConfirmNoWriteTerminal if input.provider_receipt.is_none() => {
+    SchedulerDeliveryDisposition::ConfirmNoWriteTerminal
+      if input.provider_receipt.is_none() && reason.is_none() && !duplicate_risk_acknowledged =>
+    {
       ScheduledDeliveryUnknownAction::ConfirmNoWriteTerminal {
         evidence_json,
         evidence_digest: evidence_digest.clone(),
       }
     }
-    SchedulerDeliveryDisposition::ForceResend if input.provider_receipt.is_none() => {
+    SchedulerDeliveryDisposition::ForceResend
+      if input.provider_receipt.is_none() && reason.is_some() && duplicate_risk_acknowledged =>
+    {
+      let reason = reason.expect("guarded reason");
       ScheduledDeliveryUnknownAction::ForceResend {
         evidence_json,
         evidence_digest: evidence_digest.clone(),
-        duplicate_risk_acknowledged: true,
+        reason_json: reason.canonical_json.clone(),
+        reason_digest: reason.digest.clone(),
+        duplicate_risk_acknowledged,
       }
     }
-    SchedulerDeliveryDisposition::AcknowledgeUnknown if input.provider_receipt.is_none() => {
+    SchedulerDeliveryDisposition::AcknowledgeUnknown
+      if input.provider_receipt.is_none() && reason.is_none() && !duplicate_risk_acknowledged =>
+    {
       ScheduledDeliveryUnknownAction::AcknowledgeUnknown {
         evidence_json,
         evidence_digest: evidence_digest.clone(),
@@ -1717,6 +1783,7 @@ kind = "none"
     assert!(!reason.canonical_json.contains("Authorization"));
     assert_eq!(reason.digest.len(), 64);
     assert!(reject_ambiguous_stdin(&[Path::new("-"), Path::new("-")]).is_err());
+    assert!(reject_ambiguous_stdin(&[Path::new("-"), Path::new("-"), Path::new("-")]).is_err());
     assert!(reject_ambiguous_stdin(&[Path::new("-"), &reason_path]).is_ok());
 
     std::fs::write(
@@ -1724,7 +1791,63 @@ kind = "none"
       r#"{"schema_version":1,"reason_code":"bad-code","reason":"secret","extra":true}"#,
     )
     .expect("write invalid reason");
-    assert!(read_reason_file(&reason_path).is_err());
+    let Err(error) = read_reason_file(&reason_path) else {
+      panic!("invalid reason must fail");
+    };
+    for rendered in [error.to_string(), format!("{error:?}")] {
+      assert!(!rendered.contains("secret"));
+      assert!(!rendered.contains("bad-code"));
+    }
+  }
+
+  #[test]
+  fn reconcile_outcome_labels_cover_applied_stale_not_eligible_and_error() {
+    assert_eq!(
+      reconcile_run_outcome(Ok(codeoff_state::ScheduledRunReconcileOutcome::Applied(
+        codeoff_state::ExpiredRunReclaimOutcome::Idle,
+      ))),
+      "applied"
+    );
+    assert_eq!(
+      reconcile_run_outcome(Ok(codeoff_state::ScheduledRunReconcileOutcome::Stale)),
+      "stale"
+    );
+    assert_eq!(
+      reconcile_run_outcome(Ok(codeoff_state::ScheduledRunReconcileOutcome::NotEligible)),
+      "not_eligible"
+    );
+    assert_eq!(
+      reconcile_run_outcome(Err(codeoff_state::StateError::InvalidSchedulerState {
+        reason: "redacted".to_owned(),
+      })),
+      "error"
+    );
+    assert_eq!(
+      reconcile_delivery_outcome(Ok(
+        codeoff_state::ScheduledDeliveryReconcileOutcome::Applied {
+          delivery_id: "delivery".to_owned(),
+          attempt: 1,
+          fence: 1,
+        },
+      )),
+      "applied"
+    );
+    assert_eq!(
+      reconcile_delivery_outcome(Ok(codeoff_state::ScheduledDeliveryReconcileOutcome::Stale,)),
+      "stale"
+    );
+    assert_eq!(
+      reconcile_delivery_outcome(Ok(
+        codeoff_state::ScheduledDeliveryReconcileOutcome::NotEligible,
+      )),
+      "not_eligible"
+    );
+    assert_eq!(
+      reconcile_delivery_outcome(Err(codeoff_state::StateError::InvalidSchedulerState {
+        reason: "redacted".to_owned(),
+      })),
+      "error"
+    );
   }
 
   async fn execute_test_operator_command(
@@ -1756,6 +1879,21 @@ kind = "none"
     });
     if let Some(receipt) = &receipt {
       evidence["receipt_digest"] = json!(sha256_hex(receipt.to_string().as_bytes()));
+    }
+    if kind != "operator_acknowledged_unknown" {
+      evidence["provider_query_started_at"] = json!(900);
+      evidence["provider_query_completed_at"] = json!(910);
+      evidence["provider_query_window_start"] = json!(800);
+      evidence["provider_query_window_end"] = json!(900);
+      evidence["provider_query_scope"] = json!("canonical_delivery_target");
+      evidence["provider_query_result"] = json!(match kind {
+        "provider_confirmed_delivered" => "write_confirmed",
+        "provider_confirmed_no_write" => "no_write_confirmed",
+        "operator_force_resend" => "no_matching_write_found",
+        _ => panic!("unsupported resolution evidence kind"),
+      });
+      evidence["provider_query_summary_digest"] =
+        json!(sha256_hex(b"redacted-provider-query-summary"));
     }
     let envelope = json!({
       "evidence": evidence,
@@ -1855,14 +1993,23 @@ kind = "none"
         })
       });
       let evidence = temp.path().join(format!("evidence-{index}.json"));
-      write_operator_evidence(&evidence, kind, &format!("evidence-{index}"), receipt);
+      write_operator_evidence(
+        &evidence,
+        kind,
+        &format!("evidence-{index}"),
+        receipt.clone(),
+      );
+      let request_id = format!("unknown-request-{index}");
       let command = SchedulerCommand::ResolveDeliveryUnknown {
         delivery_id: unknown.delivery_id.clone(),
         disposition,
-        request_id: format!("unknown-request-{index}"),
+        request_id: request_id.clone(),
         expected_attempt: unknown.attempt,
         expected_fence: unknown.fence,
-        evidence_file: evidence,
+        evidence_file: evidence.clone(),
+        reason_file: (disposition == SchedulerDeliveryDisposition::ForceResend)
+          .then(|| reason.clone()),
+        acknowledge_duplicate_risk: disposition == SchedulerDeliveryDisposition::ForceResend,
         authority_file: authority.clone(),
       };
       let output = execute_test_operator_command(command.clone(), state.clone(), &verifier, 1000)
@@ -1873,16 +2020,163 @@ kind = "none"
         .await
         .expect("replay unknown");
       assert_eq!(replay["data"]["outcome"], "replay");
-      let text = output.to_string();
-      for forbidden in [
-        "authority-sentinel",
-        "provider recovered",
-        "verified-operator",
-        "message-",
-        "evidence-",
-        "payload-",
+      let changed_evidence = temp.path().join(format!("changed-evidence-{index}.json"));
+      write_operator_evidence(
+        &changed_evidence,
+        kind,
+        &format!("changed-evidence-{index}"),
+        receipt.clone(),
+      );
+      let changed_evidence_conflict = execute_test_operator_command(
+        SchedulerCommand::ResolveDeliveryUnknown {
+          delivery_id: unknown.delivery_id.clone(),
+          disposition,
+          request_id: request_id.clone(),
+          expected_attempt: unknown.attempt,
+          expected_fence: unknown.fence,
+          evidence_file: changed_evidence,
+          reason_file: (disposition == SchedulerDeliveryDisposition::ForceResend)
+            .then(|| reason.clone()),
+          acknowledge_duplicate_risk: disposition == SchedulerDeliveryDisposition::ForceResend,
+          authority_file: authority.clone(),
+        },
+        state.clone(),
+        &verifier,
+        1000,
+      )
+      .await
+      .expect("changed evidence conflict");
+      assert_eq!(changed_evidence_conflict["data"]["outcome"], "conflict");
+      if disposition == SchedulerDeliveryDisposition::ConfirmDelivered {
+        let changed_receipt_evidence = temp.path().join("changed-receipt-evidence.json");
+        write_operator_evidence(
+          &changed_receipt_evidence,
+          kind,
+          "changed-receipt-evidence",
+          Some(json!({
+            "conversation_id": "C1",
+            "message_id": "changed-message",
+            "provider": "slack",
+            "receipt_version": 1,
+            "target_kind": "channel",
+            "tenant": "T00000000",
+            "thread_id": null,
+          })),
+        );
+        let conflict = execute_test_operator_command(
+          SchedulerCommand::ResolveDeliveryUnknown {
+            delivery_id: unknown.delivery_id.clone(),
+            disposition,
+            request_id: request_id.clone(),
+            expected_attempt: unknown.attempt,
+            expected_fence: unknown.fence,
+            evidence_file: changed_receipt_evidence,
+            reason_file: None,
+            acknowledge_duplicate_risk: false,
+            authority_file: authority.clone(),
+          },
+          state.clone(),
+          &verifier,
+          1000,
+        )
+        .await
+        .expect("changed receipt conflict");
+        assert_eq!(conflict["data"]["outcome"], "conflict");
+      }
+      if disposition == SchedulerDeliveryDisposition::ForceResend {
+        let changed_reason = temp.path().join("changed-force-reason.json");
+        std::fs::write(
+          &changed_reason,
+          r#"{"reason":"changed duplicate decision","reason_code":"changed_duplicate_decision","schema_version":1}"#,
+        )
+        .expect("changed force reason");
+        let conflict = execute_test_operator_command(
+          SchedulerCommand::ResolveDeliveryUnknown {
+            delivery_id: unknown.delivery_id.clone(),
+            disposition,
+            request_id: request_id.clone(),
+            expected_attempt: unknown.attempt,
+            expected_fence: unknown.fence,
+            evidence_file: evidence.clone(),
+            reason_file: Some(changed_reason),
+            acknowledge_duplicate_risk: true,
+            authority_file: authority.clone(),
+          },
+          state.clone(),
+          &verifier,
+          1000,
+        )
+        .await
+        .expect("changed reason conflict");
+        assert_eq!(conflict["data"]["outcome"], "conflict");
+      }
+      if index == 0 {
+        for (delivery_id, expected_fence) in [
+          (unknown.delivery_id.clone(), unknown.fence + 1),
+          ("changed-delivery-id".to_owned(), unknown.fence),
+        ] {
+          let conflict = execute_test_operator_command(
+            SchedulerCommand::ResolveDeliveryUnknown {
+              delivery_id,
+              disposition,
+              request_id: request_id.clone(),
+              expected_attempt: unknown.attempt,
+              expected_fence,
+              evidence_file: evidence.clone(),
+              reason_file: None,
+              acknowledge_duplicate_risk: false,
+              authority_file: authority.clone(),
+            },
+            state.clone(),
+            &verifier,
+            1000,
+          )
+          .await
+          .expect("changed target or CAS conflict");
+          assert_eq!(conflict["data"]["outcome"], "conflict");
+        }
+        let changed_disposition_evidence = temp.path().join("changed-disposition-evidence.json");
+        write_operator_evidence(
+          &changed_disposition_evidence,
+          "provider_confirmed_no_write",
+          "changed-disposition",
+          None,
+        );
+        let conflict = execute_test_operator_command(
+          SchedulerCommand::ResolveDeliveryUnknown {
+            delivery_id: unknown.delivery_id.clone(),
+            disposition: SchedulerDeliveryDisposition::ConfirmNoWriteTerminal,
+            request_id: request_id.clone(),
+            expected_attempt: unknown.attempt,
+            expected_fence: unknown.fence,
+            evidence_file: changed_disposition_evidence,
+            reason_file: None,
+            acknowledge_duplicate_risk: false,
+            authority_file: authority.clone(),
+          },
+          state.clone(),
+          &verifier,
+          1000,
+        )
+        .await
+        .expect("changed disposition conflict");
+        assert_eq!(conflict["data"]["outcome"], "conflict");
+      }
+      for text in [
+        output.to_string(),
+        format!("{output:?}"),
+        render_scheduler_human(&output),
       ] {
-        assert!(!text.contains(forbidden), "leaked {forbidden}");
+        for forbidden in [
+          "authority-sentinel",
+          "provider recovered",
+          "verified-operator",
+          "message-",
+          "evidence-",
+          "payload-",
+        ] {
+          assert!(!text.contains(forbidden), "leaked {forbidden}");
+        }
       }
     }
     assert!(verifier.0.lock().expect("digests").len() >= 10);
@@ -1969,6 +2263,99 @@ kind = "none"
     let sending =
       prepare_cli_delivery(&reconcile_state, "cli-reconcile-delivery", 1_200, None).await;
     let leased = prepare_cli_leased_run(&reconcile_state, "cli-reconcile-run", 1_300).await;
+    for command in [
+      SchedulerCommand::Runs {
+        command: SchedulerRunsCommand::List {
+          status: Some(SchedulerRunStatus::Leased),
+          limit: 10,
+          json: true,
+        },
+      },
+      SchedulerCommand::Runs {
+        command: SchedulerRunsCommand::Show {
+          run_id: leased.binding.run_id().to_owned(),
+          json: false,
+        },
+      },
+      SchedulerCommand::Deliveries {
+        command: SchedulerDeliveriesCommand::List {
+          status: Some(SchedulerDeliveryStatus::Sending),
+          limit: 10,
+          json: true,
+        },
+      },
+      SchedulerCommand::Deliveries {
+        command: SchedulerDeliveriesCommand::Show {
+          delivery_id: sending.delivery_id.clone(),
+          json: false,
+        },
+      },
+    ] {
+      let diagnostic =
+        execute_test_operator_command(command, reconcile_state.clone(), &verifier, 1_400)
+          .await
+          .expect("populated diagnostic");
+      for rendered in [
+        diagnostic.to_string(),
+        format!("{diagnostic:?}"),
+        render_scheduler_human(&diagnostic),
+      ] {
+        for forbidden in [
+          "run-worker",
+          "delivery-worker",
+          "payload-",
+          "C1",
+          "authority-sentinel",
+        ] {
+          assert!(
+            !rendered.contains(forbidden),
+            "diagnostic leaked {forbidden}"
+          );
+        }
+      }
+    }
+    let verifier_calls_before_dry_run = verifier.0.lock().expect("digests").len();
+    let dry_run = execute_test_operator_command(
+      SchedulerCommand::Reconcile {
+        dry_run: true,
+        apply: false,
+        limit: 10,
+        authority_file: None,
+        json: true,
+      },
+      reconcile_state.clone(),
+      &verifier,
+      1_400,
+    )
+    .await
+    .expect("plan exact reconcile");
+    assert_eq!(
+      dry_run["data"]["plan_digest"],
+      sha256_hex(dry_run["data"]["plan"].to_string().as_bytes())
+    );
+    assert_eq!(
+      verifier.0.lock().expect("digests").len(),
+      verifier_calls_before_dry_run,
+      "dry-run must not invoke mutation authority"
+    );
+    assert_eq!(
+      reconcile_state
+        .get_scheduled_run_operator_projection(leased.binding.run_id())
+        .await
+        .expect("read run after dry-run")
+        .expect("run after dry-run")
+        .state,
+      ScheduledRunState::Leased
+    );
+    assert_eq!(
+      reconcile_state
+        .get_scheduled_delivery_operator_projection(&sending.delivery_id)
+        .await
+        .expect("read delivery after dry-run")
+        .expect("delivery after dry-run")
+        .state,
+      ScheduledDeliveryState::Sending
+    );
     let reconcile = SchedulerCommand::Reconcile {
       dry_run: false,
       apply: true,
@@ -1979,6 +2366,19 @@ kind = "none"
     let output = execute_test_operator_command(reconcile, reconcile_state, &verifier, 1_400)
       .await
       .expect("apply exact reconcile");
+    assert_eq!(
+      output["data"]["plan_digest"],
+      dry_run["data"]["plan_digest"]
+    );
+    assert_eq!(
+      verifier
+        .0
+        .lock()
+        .expect("digests")
+        .last()
+        .map(String::as_str),
+      output["data"]["plan_digest"].as_str()
+    );
     assert_eq!(
       output["data"]["run_results"][0]["run_id"],
       leased.binding.run_id()
@@ -2519,21 +2919,6 @@ kind = "none"
         )
         .await
         .expect("record real resolver ambiguity");
-      let (receipt_digest, operator_evidence_digest) = match expected_kind {
-        "channel" => (
-          "e56ebe0615616be029fe6affbf10eae04563718f089002c65794756a4762f535",
-          "bac34051ce5ed63dcc66dc15c17ea73c3050b5a05b3f3e04deeb75c1466d1112",
-        ),
-        "direct_message" => (
-          "55258902520189aede7485035ced4b0e63a48a144479006cc457b1f80d87424c",
-          "522b9e4fc386aec5958c5d5a91bbe77aba68e6dc9bb8d157897d3a10b09c2eff",
-        ),
-        "thread" => (
-          "f62298ae6787508f5e0ae7e9908d4a2e7c1344572100a22db98831e93b03a46f",
-          "1380f082082a6101d1a2a7e6b3a6ca0a229a747dc23b9aea00975c8a8a0a2c1c",
-        ),
-        _ => unreachable!(),
-      };
       let receipt = json!({
         "conversation_id": channel_id,
         "message_id": format!("operator-{expected_kind}-message"),
@@ -2544,20 +2929,29 @@ kind = "none"
         "thread_id": thread_ts,
       })
       .to_string();
+      let receipt_digest = sha256_hex(receipt.as_bytes());
       let operator_evidence = json!({
         "evidence_id": format!("real-resolver-{expected_kind}"),
         "evidence_version": 1,
         "kind": "provider_confirmed_delivered",
         "provider": "slack",
         "receipt_digest": receipt_digest,
+        "provider_query_completed_at": 506,
+        "provider_query_result": "write_confirmed",
+        "provider_query_scope": "canonical_delivery_target",
+        "provider_query_started_at": 505,
+        "provider_query_summary_digest": sha256_hex(b"redacted-provider-query-summary"),
+        "provider_query_window_end": 505,
+        "provider_query_window_start": 500,
         "target_kind": expected_kind,
         "tenant": "T00000000",
       })
       .to_string();
+      let operator_evidence_digest = sha256_hex(operator_evidence.as_bytes());
       let action = ScheduledDeliveryUnknownAction::ConfirmDelivered {
         provider_receipt: receipt,
         evidence_json: operator_evidence,
-        evidence_digest: operator_evidence_digest.to_owned(),
+        evidence_digest: operator_evidence_digest,
       };
       let operator_request = SchedulerOperatorRequest::for_delivery_action(
         PrincipalKey::new("operator", "local", "ops", "reviewer").expect("operator"),

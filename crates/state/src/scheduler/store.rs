@@ -2490,6 +2490,8 @@ impl StateStore {
               expected_fence,
               state,
               "pending",
+              None,
+              None,
               Some(reason_json),
               Some(reason_digest),
               None,
@@ -2692,8 +2694,16 @@ impl StateStore {
         reason: "invalid operator delivery authority".to_owned(),
       });
     }
-    let (action_name, after_state, evidence_json, evidence_digest, provider_receipt, duplicate_ack) =
-      action.authority_parts().map_err(invalid_value)?;
+    let (
+      action_name,
+      after_state,
+      evidence_json,
+      evidence_digest,
+      provider_receipt,
+      reason_json,
+      reason_digest,
+      duplicate_ack,
+    ) = action.authority_parts().map_err(invalid_value)?;
     let action_insert = OperatorActionInsert {
       action: action_name,
       target_kind: "delivery",
@@ -2704,8 +2714,8 @@ impl StateStore {
       after_state,
       evidence_json: Some(evidence_json),
       evidence_digest: Some(evidence_digest),
-      reason_json: None,
-      reason_digest: None,
+      reason_json,
+      reason_digest,
       provider_receipt,
       duplicate_risk_acknowledged: duplicate_ack,
       effective_at: request.occurred_at,
@@ -5075,8 +5085,10 @@ fn operator_action_digest(action: &OperatorActionInsert<'_>) -> String {
     action.expected_fence,
     action.before_state,
     action.after_state,
-    action.reason_json.or(action.evidence_json),
-    action.reason_digest.or(action.evidence_digest),
+    action.evidence_json,
+    action.evidence_digest,
+    action.reason_json,
+    action.reason_digest,
     action.provider_receipt,
     action.duplicate_risk_acknowledged,
     action.effective_at,

@@ -13,10 +13,11 @@ use codeoff_state::{
   ScheduledDeliveryReconcileOutcome, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
   ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
   ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
-  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunResult,
-  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerOperatorMutationOutcome,
-  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, StateStore, StateValueError,
-  TransactionalMutationOutcome, TransportConvergence, UpdateScheduledJob,
+  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunReconcileOutcome,
+  ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
+  StateError, StateStore, StateValueError, TransactionalMutationOutcome, TransportConvergence,
+  UpdateScheduledJob,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -4222,6 +4223,234 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
       .expect("reject unknown retry"),
     SchedulerOperatorMutationOutcome::Conflict
   );
+}
+
+#[tokio::test]
+async fn test_exact_run_reconciliation_uses_observed_lease_authority_across_stores() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let first = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize first store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  first
+    .create_scheduled_job(&create_request(
+      "exact-run-reconcile",
+      ScheduleSpec::once(110),
+      100,
+    ))
+    .await
+    .expect("create job");
+  first
+    .materialize_due_schedule("exact-run-reconcile", 0, 110)
+    .await
+    .expect("materialize");
+  let claim = first
+    .claim_next_scheduled_run("worker", 111, 120)
+    .await
+    .expect("claim")
+    .expect("run");
+  assert!(matches!(
+    first
+      .reconcile_expired_scheduled_run(
+        claim.binding.run_id(),
+        ScheduledRunState::Leased,
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        claim.binding.lease_owner(),
+        120,
+        3,
+        130,
+        121,
+      )
+      .await
+      .expect("reconcile exact run"),
+    ScheduledRunReconcileOutcome::Applied(ExpiredRunReclaimOutcome::Retried { .. })
+  ));
+  assert_eq!(
+    second
+      .reconcile_expired_scheduled_run(
+        claim.binding.run_id(),
+        ScheduledRunState::Leased,
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        claim.binding.lease_owner(),
+        120,
+        3,
+        130,
+        121,
+      )
+      .await
+      .expect("reject stale observation"),
+    ScheduledRunReconcileOutcome::Stale
+  );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_operator_delivery_retry_is_exact_idempotent_and_audited() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  let claim = prepare_operator_sending_delivery(&store, "operator-delivery-retry", 110).await;
+  store
+    .complete_scheduled_delivery_failure(
+      &claim.binding,
+      &ScheduledDeliveryFailure::ConfirmedNoWriteRetryable {
+        error_kind: "rate_limited".to_owned(),
+        redacted_message: Some("retry later".to_owned()),
+        next_attempt_at: 140,
+      },
+      116,
+    )
+    .await
+    .expect("record retryable failure");
+  let reason = r#"{"reason":"operator approved early retry","reason_code":"provider_recovered","schema_version":1}"#;
+  let reason_digest = test_sha256_hex(reason);
+  let request = SchedulerOperatorRequest::for_delivery_retry(
+    owner(),
+    "delivery-retry-request",
+    claim.binding.delivery_id(),
+    claim.binding.attempt(),
+    claim.binding.fence(),
+    reason,
+    &reason_digest,
+    120,
+  )
+  .expect("operator request");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  assert!(
+    sqlx::query(
+      "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, updated_at = 120 where delivery_id = ?1 and state = 'failed_retryable'",
+    )
+    .bind(claim.binding.delivery_id())
+    .execute(&pool)
+    .await
+    .is_err(),
+    "direct early retry must not bypass operator authority"
+  );
+  let barrier = Arc::new(Barrier::new(3));
+  let first_task = tokio::spawn(operator_delivery_retry_after_barrier(
+    store.clone(),
+    Arc::clone(&barrier),
+    request.clone(),
+    claim.binding.delivery_id().to_owned(),
+    claim.binding.attempt(),
+    claim.binding.fence(),
+    reason.to_owned(),
+    reason_digest.clone(),
+  ));
+  let second_task = tokio::spawn(operator_delivery_retry_after_barrier(
+    second,
+    Arc::clone(&barrier),
+    request.clone(),
+    claim.binding.delivery_id().to_owned(),
+    claim.binding.attempt(),
+    claim.binding.fence(),
+    reason.to_owned(),
+    reason_digest.clone(),
+  ));
+  barrier.wait().await;
+  let outcomes = [
+    first_task.await.expect("first task").expect("first retry"),
+    second_task
+      .await
+      .expect("second task")
+      .expect("second retry"),
+  ];
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| **outcome == SchedulerOperatorMutationOutcome::Applied)
+      .count(),
+    1
+  );
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| **outcome == SchedulerOperatorMutationOutcome::Replay)
+      .count(),
+    1
+  );
+  assert_eq!(
+    store
+      .operator_retry_scheduled_delivery(
+        &request,
+        claim.binding.delivery_id(),
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        reason,
+        &reason_digest,
+      )
+      .await
+      .expect("replay retry"),
+    SchedulerOperatorMutationOutcome::Replay
+  );
+  let actions = store
+    .list_scheduler_operator_actions("delivery", claim.binding.delivery_id(), 10)
+    .await
+    .expect("list audit");
+  assert_eq!(actions.len(), 1);
+  assert_eq!(actions[0].action, "retry_delivery");
+  assert!(actions[0].consumed);
+  let state: String =
+    sqlx::query_scalar("select state from scheduled_run_deliveries where delivery_id = ?1")
+      .bind(claim.binding.delivery_id())
+      .fetch_one(&pool)
+      .await
+      .expect("read state");
+  assert_eq!(state, "pending");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn operator_delivery_retry_after_barrier(
+  store: StateStore,
+  barrier: Arc<Barrier>,
+  request: SchedulerOperatorRequest,
+  delivery_id: String,
+  expected_attempt: i64,
+  expected_fence: i64,
+  reason_json: String,
+  reason_digest: String,
+) -> Result<SchedulerOperatorMutationOutcome, StateError> {
+  barrier.wait().await;
+  for _ in 0..20 {
+    match store
+      .operator_retry_scheduled_delivery(
+        &request,
+        &delivery_id,
+        expected_attempt,
+        expected_fence,
+        &reason_json,
+        &reason_digest,
+      )
+      .await
+    {
+      Err(error) if error.is_transient_storage_contention() => {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      result => return result,
+    }
+  }
+  store
+    .operator_retry_scheduled_delivery(
+      &request,
+      &delivery_id,
+      expected_attempt,
+      expected_fence,
+      &reason_json,
+      &reason_digest,
+    )
+    .await
 }
 
 #[tokio::test]

@@ -21,10 +21,10 @@ use super::{
   ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob,
   ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
   ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
-  ScheduledRunResult, ScheduledRunSuccessOutcome, SchedulerOperatorActionSummary,
-  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
-  StateError, TransactionalMutationOutcome, UpdateExecutionBaseline, UpdateScheduledJob, Value,
-  invalid_json, invalid_occurrence, invalid_value, materialized_run,
+  ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
+  SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome, UpdateExecutionBaseline,
+  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
   operator_action_request_digest, operator_delivery_evidence_binding, positive_u32,
   scheduler_error, validate_lowercase_sha256, validate_text,
 };
@@ -2237,6 +2237,147 @@ impl StateStore {
     Ok(transition.outcome)
   }
 
+  /// Reconciles one exact expired run lease using caller-observed CAS authority.
+  ///
+  /// Pre-execution leases may be retried according to the supplied policy. Executing leases are
+  /// retried only when their persisted version-two recovery attestation remains valid; otherwise
+  /// they converge to `outcome_unknown`.
+  ///
+  /// # Errors
+  /// Returns an error for invalid authority, inconsistent persisted attempt authority, or storage
+  /// failure.
+  #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+  pub async fn reconcile_expired_scheduled_run(
+    &self,
+    run_id: &str,
+    expected_state: ScheduledRunState,
+    expected_attempt: i64,
+    expected_fence: i64,
+    expected_lease_owner: &str,
+    expected_lease_expires_at: i64,
+    max_attempts: i64,
+    next_attempt_at: i64,
+    now: i64,
+  ) -> Result<ScheduledRunReconcileOutcome, StateError> {
+    validate_text("scheduled run reconciliation id", run_id).map_err(invalid_value)?;
+    validate_text("scheduled run reconciliation owner", expected_lease_owner)
+      .map_err(invalid_value)?;
+    if !matches!(
+      expected_state,
+      ScheduledRunState::Leased | ScheduledRunState::Executing
+    ) || expected_attempt <= 0
+      || expected_fence <= 0
+      || expected_lease_expires_at < 0
+      || max_attempts <= 0
+      || next_attempt_at <= now
+      || now < 0
+    {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "invalid exact scheduled run reconciliation authority".to_owned(),
+      });
+    }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let row = sqlx::query(
+      "select r.job_id, r.state, r.attempt, r.fence, r.lease_owner, r.lease_expires_at, r.updated_at, r.schedule_id, r.job_generation, r.schedule_generation, r.scheduled_for, r.coalesced_through, r.definition_version, r.definition_json, r.capability_schema_version, r.capability_digest, r.capability_json, r.targets_json, r.execution_baseline_json, a.attested_profile_schema_version, a.attested_profile_json, a.attested_profile_hash_algorithm, a.attested_profile_digest from scheduled_runs r left join scheduled_run_attempts a on a.run_id = r.run_id and a.job_id = r.job_id and a.attempt = r.attempt and a.fence = r.fence and a.lease_owner = r.lease_owner and a.state = r.state where r.run_id = ?1",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(row) = row else {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ScheduledRunReconcileOutcome::Stale);
+    };
+    let state: String = row.try_get("state").map_err(scheduler_error)?;
+    let attempt: i64 = row.try_get("attempt").map_err(scheduler_error)?;
+    let fence: i64 = row.try_get("fence").map_err(scheduler_error)?;
+    let lease_owner: Option<String> = row.try_get("lease_owner").map_err(scheduler_error)?;
+    let lease_expires_at: Option<i64> = row.try_get("lease_expires_at").map_err(scheduler_error)?;
+    if state != expected_state.as_str()
+      || attempt != expected_attempt
+      || fence != expected_fence
+      || lease_owner.as_deref() != Some(expected_lease_owner)
+      || lease_expires_at != Some(expected_lease_expires_at)
+    {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ScheduledRunReconcileOutcome::Stale);
+    }
+    if expected_lease_expires_at > now
+      || row
+        .try_get::<i64, _>("updated_at")
+        .map_err(scheduler_error)?
+        > now
+    {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ScheduledRunReconcileOutcome::NotEligible);
+    }
+    let job_id: String = row.try_get("job_id").map_err(scheduler_error)?;
+    let binding = RunLeaseBinding {
+      run_id: run_id.to_owned(),
+      job_id: job_id.clone(),
+      attempt,
+      fence,
+      lease_owner: expected_lease_owner.to_owned(),
+    };
+    let safe_execution_retry =
+      state == "executing" && persisted_profile_allows_recovery(&binding, &row)?;
+    let transition = expired_reclaim_transition(
+      &state,
+      run_id,
+      attempt,
+      fence,
+      max_attempts,
+      safe_execution_retry,
+    );
+    let retry_at = (transition.run_state == "pending").then_some(next_attempt_at);
+    let run = sqlx::query(
+      "update scheduled_runs set state = ?1, next_attempt_at = ?2, lease_owner = null, lease_expires_at = null, overlap_slot = ?3, error_kind = case when ?1 in ('failed', 'outcome_unknown') then ?4 else null end, error_message = case when ?1 in ('failed', 'outcome_unknown') then ?4 else null end, updated_at = ?5 where run_id = ?6 and job_id = ?7 and attempt = ?8 and fence = ?9 and lease_owner = ?10 and state = ?11 and lease_expires_at = ?12 and lease_expires_at <= ?5 and updated_at <= ?5",
+    )
+    .bind(transition.run_state)
+    .bind(retry_at)
+    .bind(transition.overlap_slot)
+    .bind(transition.error_kind)
+    .bind(now)
+    .bind(run_id)
+    .bind(&job_id)
+    .bind(attempt)
+    .bind(fence)
+    .bind(expected_lease_owner)
+    .bind(&state)
+    .bind(expected_lease_expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if run.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      return Ok(ScheduledRunReconcileOutcome::Stale);
+    }
+    let attempt_updated = sqlx::query(
+      "update scheduled_run_attempts set state = ?1, completed_at = ?2, error_kind = ?3, error_message = ?3 where run_id = ?4 and job_id = ?5 and attempt = ?6 and fence = ?7 and lease_owner = ?8 and state = ?9 and lease_expires_at = ?10 and lease_expires_at <= ?2 and claimed_at <= ?2",
+    )
+    .bind(transition.attempt_state)
+    .bind(now)
+    .bind(transition.error_kind)
+    .bind(run_id)
+    .bind(&job_id)
+    .bind(attempt)
+    .bind(fence)
+    .bind(expected_lease_owner)
+    .bind(&state)
+    .bind(expected_lease_expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if attempt_updated.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      return Err(StateError::InvalidSchedulerState {
+        reason: "exact run reconciliation found inconsistent attempt authority".to_owned(),
+      });
+    }
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(ScheduledRunReconcileOutcome::Applied(transition.outcome))
+  }
+
   /// Requeues one conclusively terminal run under idempotent trusted-operator authority.
   ///
   /// # Errors
@@ -2320,6 +2461,102 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     if updated.rows_affected() != 1 {
+      return Ok(SchedulerOperatorMutationOutcome::Conflict);
+    }
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(SchedulerOperatorMutationOutcome::Applied)
+  }
+
+  /// Requeues one exact conclusively unwritten delivery under trusted-operator authority.
+  ///
+  /// # Errors
+  /// Returns an error for invalid authority, stale CAS, malformed evidence, or storage failure.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn operator_retry_scheduled_delivery(
+    &self,
+    request: &SchedulerOperatorRequest,
+    delivery_id: &str,
+    expected_attempt: i64,
+    expected_fence: i64,
+    reason_json: &str,
+    reason_digest: &str,
+  ) -> Result<SchedulerOperatorMutationOutcome, StateError> {
+    validate_operator_request(request)?;
+    validate_text("operator delivery id", delivery_id).map_err(invalid_value)?;
+    if reason_json.len() > MAX_CONTEXT_BYTES {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "operator delivery retry reason exceeds its storage bound".to_owned(),
+      });
+    }
+    super::validate_canonical_json("operator delivery retry reason", reason_json)
+      .map_err(invalid_value)?;
+    validate_lowercase_sha256("operator delivery retry reason digest", reason_digest)
+      .map_err(invalid_value)?;
+    if sha256_hex(reason_json.as_bytes()) != reason_digest {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "operator delivery retry reason digest does not match its canonical evidence"
+          .to_owned(),
+      });
+    }
+    if expected_attempt <= 0 || expected_fence <= 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "invalid operator delivery retry authority".to_owned(),
+      });
+    }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    if let Some(outcome) = existing_operator_request(&mut transaction, request).await? {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(outcome);
+    }
+    let next_attempt_at: Option<i64> = sqlx::query_scalar(
+      "select next_attempt_at from scheduled_run_deliveries where delivery_id = ?1 and attempt = ?2 and fence = ?3 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null",
+    )
+    .bind(delivery_id)
+    .bind(expected_attempt)
+    .bind(expected_fence)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?
+    .flatten();
+    if next_attempt_at.is_none_or(|retry_at| retry_at <= request.occurred_at) {
+      return Ok(SchedulerOperatorMutationOutcome::Conflict);
+    }
+    let action = OperatorActionInsert {
+      action: "retry_delivery",
+      target_kind: "delivery",
+      target_id: delivery_id,
+      expected_attempt,
+      expected_fence,
+      before_state: "failed_retryable",
+      after_state: "pending",
+      evidence_json: Some(reason_json),
+      evidence_digest: Some(reason_digest),
+      provider_receipt: None,
+      duplicate_risk_acknowledged: false,
+      effective_at: request.occurred_at,
+    };
+    match insert_operator_action(&mut transaction, request, &action).await? {
+      OperatorActionInsertOutcome::Replay => {
+        transaction.commit().await.map_err(scheduler_error)?;
+        return Ok(SchedulerOperatorMutationOutcome::Replay);
+      }
+      OperatorActionInsertOutcome::Conflict => {
+        return Ok(SchedulerOperatorMutationOutcome::Conflict);
+      }
+      OperatorActionInsertOutcome::Inserted => {}
+    }
+    let updated = sqlx::query(
+      "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id = ?2 and attempt = ?3 and fence = ?4 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null and next_attempt_at > ?1",
+    )
+    .bind(request.occurred_at)
+    .bind(delivery_id)
+    .bind(expected_attempt)
+    .bind(expected_fence)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if updated.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
       return Ok(SchedulerOperatorMutationOutcome::Conflict);
     }
     transaction.commit().await.map_err(scheduler_error)?;

@@ -20,7 +20,7 @@ pub use scheduler::{
   ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
   ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority, ScheduledRun,
   ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
-  ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
+  ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
   SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
   SkippedNoneBaselinePolicy, StateValueError, TransactionalMutationOutcome, TransportConvergence,
   UpdateExecutionBaseline, UpdateScheduledJob,

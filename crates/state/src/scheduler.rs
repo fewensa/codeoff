@@ -1416,6 +1416,13 @@ pub enum ExpiredRunReclaimOutcome {
   },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduledRunReconcileOutcome {
+  Applied(ExpiredRunReclaimOutcome),
+  Stale,
+  NotEligible,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledRunLateEvidenceKind {
   CompletionAfterLeaseLoss,
@@ -1796,6 +1803,61 @@ impl SchedulerOperatorRequest {
         None,
         false,
         next_attempt_at,
+      ),
+      occurred_at,
+    })
+  }
+
+  /// Builds authority for one exact manual retry of a conclusively unwritten delivery.
+  ///
+  /// # Errors
+  /// Returns an error for invalid principal, request, target, evidence, or counters.
+  #[allow(clippy::too_many_arguments)]
+  pub fn for_delivery_retry(
+    principal: PrincipalKey,
+    request_id: impl Into<String>,
+    delivery_id: &str,
+    expected_attempt: i64,
+    expected_fence: i64,
+    reason_json: &str,
+    reason_digest: &str,
+    occurred_at: i64,
+  ) -> Result<Self, StateValueError> {
+    principal.validate()?;
+    let request_id = request_id.into();
+    validate_text("operator request id", &request_id)?;
+    validate_text("operator delivery id", delivery_id)?;
+    if reason_json.len() > MAX_CONTEXT_BYTES {
+      return Err(StateValueError::TooLarge {
+        field: "operator delivery retry reason",
+      });
+    }
+    validate_canonical_json("operator delivery retry reason", reason_json)?;
+    validate_lowercase_sha256("operator delivery retry reason digest", reason_digest)?;
+    if sha256_hex(reason_json.as_bytes()) != reason_digest {
+      return Err(StateValueError::InvalidSha256 {
+        field: "operator delivery retry reason digest",
+      });
+    }
+    if expected_attempt <= 0 || expected_fence <= 0 || occurred_at < 0 {
+      return Err(StateValueError::InvalidVersion);
+    }
+    Ok(Self {
+      principal,
+      request_id,
+      request_digest: operator_action_request_digest(
+        "retry_delivery",
+        "delivery",
+        delivery_id,
+        expected_attempt,
+        expected_fence,
+        "failed_retryable",
+        "pending",
+        Some(reason_json),
+        Some(reason_digest),
+        None,
+        false,
+        occurred_at,
       ),
       occurred_at,
     })

@@ -519,7 +519,9 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
   let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
   for entry in std::fs::read_dir(source).expect("read migrations") {
     let entry = entry.expect("migration entry");
-    if entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql" {
+    if entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
+      && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
+    {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
     }
@@ -553,6 +555,13 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
   .execute(&pool)
   .await
   .expect("insert preserved consumption");
+  sqlx::query(
+    "insert into scheduler_operator_actions (action_id, principal_kind, principal_provider, principal_tenant, principal_subject, request_id, request_hash_algorithm, request_digest, action, target_kind, target_id, expected_attempt, expected_fence, before_state, after_state, evidence_hash_algorithm, evidence_json, evidence_digest, provider_receipt, duplicate_risk_acknowledged, effective_at, occurred_at) values ('legacy-run-action', 'service', 'codeoff', 'ops', 'operator', 'legacy-run-request', 'sha256-v1', ?1, 'retry_run', 'run', 'legacy-run', 1, 1, 'failed', 'pending', null, null, null, null, 0, 100, 100)",
+  )
+  .bind("d".repeat(64))
+  .execute(&pool)
+  .await
+  .expect("insert legacy run action");
   pool.close().await;
 
   let store = StateStore::initialize(&state_dir, None)
@@ -568,6 +577,13 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
   .await
   .expect("read preserved authority");
   assert_eq!(preserved, (1, 1));
+  let legacy_reason_version: i64 = sqlx::query_scalar(
+    "select reason_schema_version from scheduler_operator_actions where action_id = 'legacy-run-action'",
+  )
+  .fetch_one(&upgraded)
+  .await
+  .expect("read preserved legacy run action");
+  assert_eq!(legacy_reason_version, 0);
   assert!(
     sqlx::query("delete from scheduler_operator_actions where action_id = 'preserved-action'")
       .execute(&upgraded)
@@ -594,6 +610,16 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
     .await
     .is_err(),
     "run target bound must remain unchanged"
+  );
+  assert!(
+    sqlx::query(
+      "insert into scheduler_operator_actions (action_id, principal_kind, principal_provider, principal_tenant, principal_subject, request_id, request_hash_algorithm, request_digest, action, target_kind, target_id, expected_attempt, expected_fence, before_state, after_state, evidence_hash_algorithm, evidence_json, evidence_digest, provider_receipt, duplicate_risk_acknowledged, effective_at, occurred_at) values ('missing-run-reason', 'service', 'codeoff', 'ops', 'operator', 'missing-run-reason-request', 'sha256-v1', ?1, 'retry_run', 'run', 'run', 1, 1, 'failed', 'pending', null, null, null, null, 0, 100, 100)",
+    )
+    .bind("e".repeat(64))
+    .execute(&upgraded)
+    .await
+    .is_err(),
+    "new run retry must carry strict reason authority"
   );
   drop(store);
 }
@@ -896,6 +922,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
           | "20260722010000_scheduler_delivery_readiness.sql"
           | "20260722020000_scheduler_operator.sql"
           | "20260722030000_scheduler_operator_target_bounds.sql"
+          | "20260722040000_scheduler_run_retry_reason.sql"
       )
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
@@ -1218,6 +1245,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
       && entry.file_name() != "20260722020000_scheduler_operator.sql"
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
+      && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1299,6 +1327,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
       && entry.file_name() != "20260722020000_scheduler_operator.sql"
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
+      && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1378,6 +1407,7 @@ async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_pay
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
       && entry.file_name() != "20260722020000_scheduler_operator.sql"
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
+      && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy issue-06 migration");
@@ -1554,6 +1584,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
       && entry.file_name() != "20260722020000_scheduler_operator.sql"
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
+      && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1798,6 +1829,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
       && entry.file_name() != "20260722020000_scheduler_operator.sql"
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
+      && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1869,6 +1901,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
       && entry.file_name() != "20260722020000_scheduler_operator.sql"
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
+      && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1953,6 +1986,7 @@ async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_ident
       && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
       && entry.file_name() != "20260722020000_scheduler_operator.sql"
       && entry.file_name() != "20260722030000_scheduler_operator_target_bounds.sql"
+      && entry.file_name() != "20260722040000_scheduler_run_retry_reason.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -4141,6 +4175,9 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
     .is_err(),
     "direct SQL must not bypass run operator authority"
   );
+  let reason =
+    r#"{"reason":"operator approved retry","reason_code":"manual_retry","schema_version":1}"#;
+  let reason_digest = test_sha256_hex(reason);
   let request = SchedulerOperatorRequest::for_run_retry(
     owner(),
     "retry-request",
@@ -4148,6 +4185,8 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
     claim.binding.attempt(),
     claim.binding.fence(),
     ScheduledRunState::Failed,
+    reason,
+    &reason_digest,
     120,
     113,
   )
@@ -4159,6 +4198,8 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
     claim.binding.attempt(),
     claim.binding.fence() + 1,
     ScheduledRunState::Failed,
+    reason,
+    &reason_digest,
     120,
     113,
   )
@@ -4170,6 +4211,8 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
         claim.binding.run_id(),
         claim.binding.attempt(),
         claim.binding.fence() + 1,
+        reason,
+        &reason_digest,
         120,
       )
       .await
@@ -4183,6 +4226,8 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
         claim.binding.run_id(),
         claim.binding.attempt(),
         claim.binding.fence(),
+        reason,
+        &reason_digest,
         120,
       )
       .await
@@ -4196,11 +4241,44 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
         claim.binding.run_id(),
         claim.binding.attempt(),
         claim.binding.fence(),
+        reason,
+        &reason_digest,
         120,
       )
       .await
       .expect("replay retry"),
     SchedulerOperatorMutationOutcome::Replay
+  );
+  let changed_reason =
+    r#"{"reason":"changed operator reason","reason_code":"manual_retry","schema_version":1}"#;
+  let changed_reason_digest = test_sha256_hex(changed_reason);
+  let changed_reason_request = SchedulerOperatorRequest::for_run_retry(
+    owner(),
+    "retry-request",
+    claim.binding.run_id(),
+    claim.binding.attempt(),
+    claim.binding.fence(),
+    ScheduledRunState::Failed,
+    changed_reason,
+    &changed_reason_digest,
+    120,
+    113,
+  )
+  .expect("changed reason request");
+  assert_eq!(
+    store
+      .operator_retry_scheduled_run(
+        &changed_reason_request,
+        claim.binding.run_id(),
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        changed_reason,
+        &changed_reason_digest,
+        120,
+      )
+      .await
+      .expect("changed reason conflict"),
+    SchedulerOperatorMutationOutcome::Conflict
   );
   assert!(
     store
@@ -4209,6 +4287,8 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
         "changed-run-id",
         claim.binding.attempt(),
         claim.binding.fence(),
+        reason,
+        &reason_digest,
         120,
       )
       .await
@@ -4230,6 +4310,8 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
         claim.binding.run_id(),
         claim.binding.attempt(),
         claim.binding.fence(),
+        reason,
+        &reason_digest,
         120,
       )
       .await,
@@ -4242,6 +4324,19 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
   assert_eq!(projections.len(), 1);
   assert_eq!(projections[0].state, ScheduledRunState::Pending);
   assert_eq!(projections[0].next_attempt_at, Some(120));
+  let exact = store
+    .get_scheduled_run_operator_projection(claim.binding.run_id())
+    .await
+    .expect("get exact run")
+    .expect("run projection");
+  assert_eq!(exact, projections[0]);
+  assert!(
+    store
+      .get_scheduled_run_operator_projection("missing-run")
+      .await
+      .expect("missing run")
+      .is_none()
+  );
   assert!(
     store
       .list_scheduled_run_operator_projections(None, 101)
@@ -4314,6 +4409,8 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
     unknown.binding.attempt(),
     unknown.binding.fence(),
     ScheduledRunState::Failed,
+    reason,
+    &reason_digest,
     150,
     142,
   )
@@ -4325,6 +4422,8 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
         unknown.binding.run_id(),
         unknown.binding.attempt(),
         unknown.binding.fence(),
+        reason,
+        &reason_digest,
         150,
       )
       .await
@@ -4515,6 +4614,19 @@ async fn test_operator_delivery_retry_is_exact_idempotent_and_audited() {
   assert_eq!(actions.len(), 1);
   assert_eq!(actions[0].action, "retry_delivery");
   assert!(actions[0].consumed);
+  let exact = store
+    .get_scheduled_delivery_operator_projection(claim.binding.delivery_id())
+    .await
+    .expect("get exact delivery")
+    .expect("delivery projection");
+  assert_eq!(exact.state, ScheduledDeliveryState::Pending);
+  assert!(
+    store
+      .get_scheduled_delivery_operator_projection("missing-delivery")
+      .await
+      .expect("missing delivery")
+      .is_none()
+  );
   let state: String =
     sqlx::query_scalar("select state from scheduled_run_deliveries where delivery_id = ?1")
       .bind(claim.binding.delivery_id())
@@ -7071,6 +7183,44 @@ async fn prepare_operator_unknown_delivery(
     resolved_slack_target(job_id, "channel", "C1", None),
   )
   .await
+}
+
+#[tokio::test]
+async fn test_operator_state_filters_and_delivery_candidates_apply_before_sql_limit() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let live = prepare_operator_sending_delivery(&store, "a-live-delivery", 200).await;
+  store
+    .heartbeat_scheduled_delivery(&live.binding, 206, 400)
+    .await
+    .expect("extend live delivery");
+  let expired = prepare_operator_sending_delivery(&store, "z-expired-delivery", 220).await;
+
+  let candidates = store
+    .list_scheduled_delivery_reconcile_candidates(321, 1)
+    .await
+    .expect("list exact candidates");
+  assert_eq!(candidates.len(), 1);
+  assert_eq!(candidates[0].delivery_id, expired.binding.delivery_id());
+  let sending = store
+    .list_scheduled_delivery_operator_projections_by_state(
+      None,
+      Some(ScheduledDeliveryState::Sending),
+      1,
+    )
+    .await
+    .expect("filter sending deliveries");
+  assert_eq!(sending.len(), 1);
+  assert_eq!(sending[0].state, ScheduledDeliveryState::Sending);
+  let succeeded_runs = store
+    .list_scheduled_run_operator_projections_by_state(None, Some(ScheduledRunState::Succeeded), 1)
+    .await
+    .expect("filter succeeded runs");
+  assert_eq!(succeeded_runs.len(), 1);
+  assert_eq!(succeeded_runs[0].state, ScheduledRunState::Succeeded);
 }
 
 async fn reconcile_delivery_after_barrier(

@@ -1821,6 +1821,8 @@ impl SchedulerOperatorRequest {
     expected_attempt: i64,
     expected_fence: i64,
     expected_state: ScheduledRunState,
+    reason_json: &str,
+    reason_digest: &str,
     next_attempt_at: i64,
     occurred_at: i64,
   ) -> Result<Self, StateValueError> {
@@ -1828,6 +1830,7 @@ impl SchedulerOperatorRequest {
     let request_id = request_id.into();
     validate_text("operator request id", &request_id)?;
     validate_text("operator run id", run_id)?;
+    validate_operator_reason(reason_json, reason_digest)?;
     if expected_attempt <= 0
       || expected_fence <= 0
       || next_attempt_at < occurred_at
@@ -1849,8 +1852,8 @@ impl SchedulerOperatorRequest {
         expected_fence,
         expected_state.as_str(),
         "pending",
-        None,
-        None,
+        Some(reason_json),
+        Some(reason_digest),
         None,
         false,
         next_attempt_at,
@@ -1878,18 +1881,7 @@ impl SchedulerOperatorRequest {
     let request_id = request_id.into();
     validate_text("operator request id", &request_id)?;
     validate_text("operator delivery id", delivery_id)?;
-    if reason_json.len() > MAX_CONTEXT_BYTES {
-      return Err(StateValueError::TooLarge {
-        field: "operator delivery retry reason",
-      });
-    }
-    validate_canonical_json("operator delivery retry reason", reason_json)?;
-    validate_lowercase_sha256("operator delivery retry reason digest", reason_digest)?;
-    if sha256_hex(reason_json.as_bytes()) != reason_digest {
-      return Err(StateValueError::InvalidSha256 {
-        field: "operator delivery retry reason digest",
-      });
-    }
+    validate_operator_reason(reason_json, reason_digest)?;
     if expected_attempt <= 0 || expected_fence <= 0 || occurred_at < 0 {
       return Err(StateValueError::InvalidVersion);
     }
@@ -2482,6 +2474,44 @@ fn validate_canonical_json(field: &'static str, json: &str) -> Result<(), StateV
     serde_json::from_str::<Value>(json).map_err(|_| StateValueError::InvalidJson { field })?;
   if serde_json::to_string(&value).ok().as_deref() != Some(json) {
     return Err(StateValueError::NonCanonicalJson { field });
+  }
+  Ok(())
+}
+
+fn validate_operator_reason(reason_json: &str, reason_digest: &str) -> Result<(), StateValueError> {
+  const FIELD: &str = "operator retry reason";
+  if reason_json.len() > MAX_CONTEXT_BYTES {
+    return Err(StateValueError::TooLarge { field: FIELD });
+  }
+  validate_canonical_json(FIELD, reason_json)?;
+  validate_lowercase_sha256("operator retry reason digest", reason_digest)?;
+  if sha256_hex(reason_json.as_bytes()) != reason_digest {
+    return Err(StateValueError::InvalidSha256 {
+      field: "operator retry reason digest",
+    });
+  }
+  let value: Value =
+    serde_json::from_str(reason_json).map_err(|_| StateValueError::InvalidJson { field: FIELD })?;
+  let object = value
+    .as_object()
+    .ok_or(StateValueError::InvalidJson { field: FIELD })?;
+  let exact_keys = ["reason", "reason_code", "schema_version"];
+  let reason = object.get("reason").and_then(Value::as_str);
+  let reason_code = object.get("reason_code").and_then(Value::as_str);
+  if object.len() != exact_keys.len()
+    || exact_keys.iter().any(|key| !object.contains_key(*key))
+    || object.get("schema_version").and_then(Value::as_u64) != Some(1)
+    || reason
+      .is_none_or(|reason| reason.is_empty() || reason.len() > 4 * 1024 || reason.trim() != reason)
+    || reason_code.is_none_or(|code| {
+      code.is_empty()
+        || code.len() > 64
+        || !code
+          .bytes()
+          .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    })
+  {
+    return Err(StateValueError::InvalidJson { field: FIELD });
   }
   Ok(())
 }

@@ -23,6 +23,7 @@ codeoff-runtime = { path = "../runtime" }
 codeoff-state = { version = "0.1.0", path = "../state" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "time"] }
 toml.workspace = true
 

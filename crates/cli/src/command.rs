@@ -43,6 +43,80 @@ pub enum Command {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum SchedulerCommand {
+  /// Reports sanitized scheduler control-plane reachability.
+  Status {
+    #[arg(long)]
+    json: bool,
+  },
+  /// Reads bounded sanitized run diagnostics.
+  Runs {
+    #[command(subcommand)]
+    command: SchedulerRunsCommand,
+  },
+  /// Reads bounded sanitized delivery diagnostics.
+  Deliveries {
+    #[command(subcommand)]
+    command: SchedulerDeliveriesCommand,
+  },
+  /// Plans or applies bounded exact lease reconciliation.
+  Reconcile {
+    #[arg(long, conflicts_with = "apply")]
+    dry_run: bool,
+    #[arg(long, conflicts_with = "dry_run")]
+    apply: bool,
+    #[arg(long, default_value_t = 32)]
+    limit: u16,
+    #[arg(long)]
+    authority_file: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+  },
+  /// Retries one conclusively terminal run under authenticated operator authority.
+  RetryRun {
+    run_id: String,
+    #[arg(long, value_enum)]
+    expected_state: SchedulerRetryRunState,
+    #[arg(long)]
+    request_id: String,
+    #[arg(long)]
+    expected_attempt: i64,
+    #[arg(long)]
+    expected_fence: i64,
+    #[arg(long)]
+    reason_file: PathBuf,
+    #[arg(long)]
+    authority_file: PathBuf,
+  },
+  /// Retries one conclusively unwritten delivery under authenticated operator authority.
+  RetryDelivery {
+    delivery_id: String,
+    #[arg(long)]
+    request_id: String,
+    #[arg(long)]
+    expected_attempt: i64,
+    #[arg(long)]
+    expected_fence: i64,
+    #[arg(long)]
+    reason_file: PathBuf,
+    #[arg(long)]
+    authority_file: PathBuf,
+  },
+  /// Resolves one ambiguous delivery using strict provider evidence.
+  ResolveDeliveryUnknown {
+    delivery_id: String,
+    #[arg(long, value_enum)]
+    disposition: SchedulerDeliveryDisposition,
+    #[arg(long)]
+    request_id: String,
+    #[arg(long)]
+    expected_attempt: i64,
+    #[arg(long)]
+    expected_fence: i64,
+    #[arg(long)]
+    evidence_file: PathBuf,
+    #[arg(long)]
+    authority_file: PathBuf,
+  },
   /// Creates a schedule from a strict versioned JSON or TOML document.
   Create {
     #[arg(long)]
@@ -95,6 +169,95 @@ pub enum SchedulerCommand {
     #[arg(long)]
     request_id: String,
   },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SchedulerRunsCommand {
+  List {
+    #[arg(long, value_enum)]
+    status: Option<SchedulerRunStatus>,
+    #[arg(long, default_value_t = 50)]
+    limit: u16,
+    #[arg(long)]
+    json: bool,
+  },
+  Show {
+    run_id: String,
+    #[arg(long)]
+    json: bool,
+  },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SchedulerDeliveriesCommand {
+  List {
+    #[arg(long, value_enum)]
+    status: Option<SchedulerDeliveryStatus>,
+    #[arg(long, default_value_t = 50)]
+    limit: u16,
+    #[arg(long)]
+    json: bool,
+  },
+  Show {
+    delivery_id: String,
+    #[arg(long)]
+    json: bool,
+  },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SchedulerDeliveryDisposition {
+  ConfirmDelivered,
+  ConfirmNoWriteTerminal,
+  ForceResend,
+  AcknowledgeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SchedulerRunStatus {
+  Pending,
+  Leased,
+  Executing,
+  Succeeded,
+  Failed,
+  TimedOut,
+  Cancelled,
+  OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SchedulerRetryRunState {
+  Failed,
+  TimedOut,
+  Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SchedulerDeliveryStatus {
+  Pending,
+  Sending,
+  Delivered,
+  FailedRetryable,
+  FailedTerminal,
+  DeliveryUnknown,
+  SkippedNone,
+  SkippedUnchanged,
+}
+
+impl SchedulerCommand {
+  #[must_use]
+  pub(crate) const fn uses_legacy_service(&self) -> bool {
+    matches!(
+      self,
+      Self::Create { .. }
+        | Self::Get { .. }
+        | Self::List { .. }
+        | Self::Update { .. }
+        | Self::Pause { .. }
+        | Self::Resume { .. }
+        | Self::Delete { .. }
+    )
+  }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, clap::ValueEnum)]

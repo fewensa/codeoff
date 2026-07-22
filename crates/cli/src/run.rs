@@ -64,7 +64,8 @@ use tokio::task::JoinSet;
 
 use crate::command::{Cli, Command, ConfigCommand, SchedulerCommand, WorkerCommand};
 use crate::scheduler::{
-  SchedulerCommandError, SchedulerOperatorConfig, execute_scheduler_command_with_resolvers,
+  SchedulerCommandError, SchedulerOperatorConfig, UnavailableSchedulerAuthorityVerifier,
+  execute_scheduler_command_with_policy_and_verifier,
 };
 
 /// Parses CLI arguments and runs the selected Codeoff command.
@@ -95,9 +96,14 @@ fn run_scheduler(
   config_path: Option<PathBuf>,
   state_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
-  let operator = SchedulerOperatorConfig::from_environment()
-    .map_err(|error| SchedulerCommandError::service(&error))?;
+  let operator = if command.uses_legacy_service() {
+    SchedulerOperatorConfig::from_environment()
+      .map_err(|error| SchedulerCommandError::service(&error))?
+  } else {
+    SchedulerOperatorConfig::diagnostic()
+  };
   let config = load_config(config_path, state_dir)?;
+  config.validate()?;
   let runtime = tokio::runtime::Runtime::new()?;
   let state = runtime.block_on(StateStore::initialize(
     config.state_dir(),
@@ -111,11 +117,13 @@ fn run_scheduler(
       Duration::from_secs(5),
     ));
   }
-  let output = runtime.block_on(execute_scheduler_command_with_resolvers(
+  let output = runtime.block_on(execute_scheduler_command_with_policy_and_verifier(
     command,
     state,
     operator,
     Arc::new(targets),
+    &config.scheduler,
+    &UnavailableSchedulerAuthorityVerifier,
     now,
   ))?;
   println!("{}", serde_json::to_string(&output)?);

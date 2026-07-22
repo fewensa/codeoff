@@ -2458,17 +2458,20 @@ impl StateStore {
   /// # Errors
   /// Returns an error for invalid authority, stale CAS, unknown execution outcome, or storage
   /// failure.
-  #[allow(clippy::too_many_lines)]
+  #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
   pub async fn operator_retry_scheduled_run(
     &self,
     request: &SchedulerOperatorRequest,
     run_id: &str,
     expected_attempt: i64,
     expected_fence: i64,
+    reason_json: &str,
+    reason_digest: &str,
     next_attempt_at: i64,
   ) -> Result<SchedulerOperatorMutationOutcome, StateError> {
     validate_operator_request(request)?;
     validate_text("operator run id", run_id).map_err(invalid_value)?;
+    super::validate_operator_reason(reason_json, reason_digest).map_err(invalid_value)?;
     if expected_attempt <= 0 || expected_fence <= 0 || next_attempt_at < request.occurred_at {
       return Err(StateError::InvalidSchedulerState {
         reason: "invalid operator run retry authority".to_owned(),
@@ -2487,8 +2490,8 @@ impl StateStore {
               expected_fence,
               state,
               "pending",
-              None,
-              None,
+              Some(reason_json),
+              Some(reason_digest),
               None,
               false,
               next_attempt_at,
@@ -2535,6 +2538,8 @@ impl StateStore {
       after_state: "pending",
       evidence_json: None,
       evidence_digest: None,
+      reason_json: Some(reason_json),
+      reason_digest: Some(reason_digest),
       provider_receipt: None,
       duplicate_risk_acknowledged: false,
       effective_at: next_attempt_at,
@@ -2614,6 +2619,8 @@ impl StateStore {
       after_state: "pending",
       evidence_json: Some(reason_json),
       evidence_digest: Some(reason_digest),
+      reason_json: None,
+      reason_digest: None,
       provider_receipt: None,
       duplicate_risk_acknowledged: false,
       effective_at: request.occurred_at,
@@ -2697,6 +2704,8 @@ impl StateStore {
       after_state,
       evidence_json: Some(evidence_json),
       evidence_digest: Some(evidence_digest),
+      reason_json: None,
+      reason_digest: None,
       provider_receipt,
       duplicate_risk_acknowledged: duplicate_ack,
       effective_at: request.occurred_at,
@@ -2762,11 +2771,27 @@ impl StateStore {
     after_run_id: Option<&str>,
     limit: u16,
   ) -> Result<Vec<ScheduledRunOperatorProjection>, StateError> {
+    self
+      .list_scheduled_run_operator_projections_by_state(after_run_id, None, limit)
+      .await
+  }
+
+  /// Lists one bounded stable page of run authority after applying an optional state predicate.
+  ///
+  /// # Errors
+  /// Returns an error for an invalid cursor/limit or storage failure.
+  pub async fn list_scheduled_run_operator_projections_by_state(
+    &self,
+    after_run_id: Option<&str>,
+    state: Option<ScheduledRunState>,
+    limit: u16,
+  ) -> Result<Vec<ScheduledRunOperatorProjection>, StateError> {
     validate_operator_page(after_run_id, limit)?;
     let rows = sqlx::query(
-      "select run_id, job_id, state, attempt, fence, next_attempt_at, lease_expires_at, error_kind, updated_at from scheduled_runs where run_id > ?1 order by run_id limit ?2",
+      "select run_id, job_id, state, attempt, fence, next_attempt_at, lease_expires_at, error_kind, updated_at from scheduled_runs where run_id > ?1 and (?2 is null or state = ?2) order by run_id limit ?3",
     )
     .bind(after_run_id.unwrap_or(""))
+    .bind(state.map(ScheduledRunState::as_str))
     .bind(i64::from(limit))
     .fetch_all(&self.pool)
     .await
@@ -2792,6 +2817,27 @@ impl StateStore {
       .collect()
   }
 
+  /// Reads one exact sanitized run operator projection.
+  ///
+  /// # Errors
+  /// Returns an error for an invalid id, malformed persisted state, or storage failure.
+  pub async fn get_scheduled_run_operator_projection(
+    &self,
+    run_id: &str,
+  ) -> Result<Option<ScheduledRunOperatorProjection>, StateError> {
+    validate_text("operator run projection id", run_id).map_err(invalid_value)?;
+    let row = sqlx::query(
+      "select run_id, job_id, state, attempt, fence, next_attempt_at, lease_expires_at, error_kind, updated_at from scheduled_runs where run_id = ?1 limit 1",
+    )
+    .bind(run_id)
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    row
+      .map(|row| scheduled_run_operator_projection(&row))
+      .transpose()
+  }
+
   /// Lists one bounded stable page of delivery authority for operators.
   ///
   /// # Errors
@@ -2801,11 +2847,27 @@ impl StateStore {
     after_delivery_id: Option<&str>,
     limit: u16,
   ) -> Result<Vec<ScheduledDeliveryOperatorProjection>, StateError> {
+    self
+      .list_scheduled_delivery_operator_projections_by_state(after_delivery_id, None, limit)
+      .await
+  }
+
+  /// Lists one bounded stable page of delivery authority after an optional state predicate.
+  ///
+  /// # Errors
+  /// Returns an error for an invalid cursor/limit or storage failure.
+  pub async fn list_scheduled_delivery_operator_projections_by_state(
+    &self,
+    after_delivery_id: Option<&str>,
+    state: Option<ScheduledDeliveryState>,
+    limit: u16,
+  ) -> Result<Vec<ScheduledDeliveryOperatorProjection>, StateError> {
     validate_operator_page(after_delivery_id, limit)?;
     let rows = sqlx::query(
-      "select delivery_id, run_id, job_id, state, attempt, fence, next_attempt_at, lease_expires_at, provider_outcome, error_kind, updated_at from scheduled_run_deliveries where delivery_id > ?1 order by delivery_id limit ?2",
+      "select delivery_id, run_id, job_id, state, attempt, fence, next_attempt_at, lease_expires_at, provider_outcome, error_kind, updated_at from scheduled_run_deliveries where delivery_id > ?1 and (?2 is null or state = ?2) order by delivery_id limit ?3",
     )
     .bind(after_delivery_id.unwrap_or(""))
+    .bind(state.map(ScheduledDeliveryState::as_str))
     .bind(i64::from(limit))
     .fetch_all(&self.pool)
     .await
@@ -2831,6 +2893,56 @@ impl StateStore {
         })
       })
       .collect()
+  }
+
+  /// Lists bounded exact expired sending-delivery authority for reconcile planning.
+  ///
+  /// # Errors
+  /// Returns an error for invalid time/limit, malformed persisted state, or storage failure.
+  pub async fn list_scheduled_delivery_reconcile_candidates(
+    &self,
+    now: i64,
+    limit: u16,
+  ) -> Result<Vec<ScheduledDeliveryOperatorProjection>, StateError> {
+    if now < 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "invalid delivery reconcile candidate time".to_owned(),
+      });
+    }
+    validate_operator_page(None, limit)?;
+    let rows = sqlx::query(
+      "select delivery_id, run_id, job_id, state, attempt, fence, next_attempt_at, lease_expires_at, provider_outcome, error_kind, updated_at from scheduled_run_deliveries where state = 'sending' and lease_expires_at <= ?1 and updated_at <= ?1 order by lease_expires_at, delivery_id limit ?2",
+    )
+    .bind(now)
+    .bind(i64::from(limit))
+    .fetch_all(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    rows
+      .into_iter()
+      .map(|row| scheduled_delivery_operator_projection(&row))
+      .collect()
+  }
+
+  /// Reads one exact sanitized delivery operator projection.
+  ///
+  /// # Errors
+  /// Returns an error for an invalid id, malformed persisted state, or storage failure.
+  pub async fn get_scheduled_delivery_operator_projection(
+    &self,
+    delivery_id: &str,
+  ) -> Result<Option<ScheduledDeliveryOperatorProjection>, StateError> {
+    validate_text("operator delivery projection id", delivery_id).map_err(invalid_value)?;
+    let row = sqlx::query(
+      "select delivery_id, run_id, job_id, state, attempt, fence, next_attempt_at, lease_expires_at, provider_outcome, error_kind, updated_at from scheduled_run_deliveries where delivery_id = ?1 limit 1",
+    )
+    .bind(delivery_id)
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    row
+      .map(|row| scheduled_delivery_operator_projection(&row))
+      .transpose()
   }
 
   /// Lists bounded append-only operator audit for one target.
@@ -4876,6 +4988,8 @@ struct OperatorActionInsert<'a> {
   after_state: &'a str,
   evidence_json: Option<&'a str>,
   evidence_digest: Option<&'a str>,
+  reason_json: Option<&'a str>,
+  reason_digest: Option<&'a str>,
   provider_receipt: Option<&'a str>,
   duplicate_risk_acknowledged: bool,
   effective_at: i64,
@@ -4912,6 +5026,46 @@ fn validate_operator_page(cursor: Option<&str>, limit: u16) -> Result<(), StateE
   Ok(())
 }
 
+fn scheduled_run_operator_projection(
+  row: &SqliteRow,
+) -> Result<ScheduledRunOperatorProjection, StateError> {
+  Ok(ScheduledRunOperatorProjection {
+    run_id: row.try_get("run_id").map_err(scheduler_error)?,
+    job_id: row.try_get("job_id").map_err(scheduler_error)?,
+    state: row
+      .try_get::<String, _>("state")
+      .map_err(scheduler_error)?
+      .parse()?,
+    attempt: row.try_get("attempt").map_err(scheduler_error)?,
+    fence: row.try_get("fence").map_err(scheduler_error)?,
+    next_attempt_at: row.try_get("next_attempt_at").map_err(scheduler_error)?,
+    lease_expires_at: row.try_get("lease_expires_at").map_err(scheduler_error)?,
+    error_kind: row.try_get("error_kind").map_err(scheduler_error)?,
+    updated_at: row.try_get("updated_at").map_err(scheduler_error)?,
+  })
+}
+
+fn scheduled_delivery_operator_projection(
+  row: &SqliteRow,
+) -> Result<ScheduledDeliveryOperatorProjection, StateError> {
+  Ok(ScheduledDeliveryOperatorProjection {
+    delivery_id: row.try_get("delivery_id").map_err(scheduler_error)?,
+    run_id: row.try_get("run_id").map_err(scheduler_error)?,
+    job_id: row.try_get("job_id").map_err(scheduler_error)?,
+    state: row
+      .try_get::<String, _>("state")
+      .map_err(scheduler_error)?
+      .parse()?,
+    attempt: row.try_get("attempt").map_err(scheduler_error)?,
+    fence: row.try_get("fence").map_err(scheduler_error)?,
+    next_attempt_at: row.try_get("next_attempt_at").map_err(scheduler_error)?,
+    lease_expires_at: row.try_get("lease_expires_at").map_err(scheduler_error)?,
+    provider_outcome: row.try_get("provider_outcome").map_err(scheduler_error)?,
+    error_kind: row.try_get("error_kind").map_err(scheduler_error)?,
+    updated_at: row.try_get("updated_at").map_err(scheduler_error)?,
+  })
+}
+
 fn operator_action_digest(action: &OperatorActionInsert<'_>) -> String {
   operator_action_request_digest(
     action.action,
@@ -4921,8 +5075,8 @@ fn operator_action_digest(action: &OperatorActionInsert<'_>) -> String {
     action.expected_fence,
     action.before_state,
     action.after_state,
-    action.evidence_json,
-    action.evidence_digest,
+    action.reason_json.or(action.evidence_json),
+    action.reason_digest.or(action.evidence_digest),
     action.provider_receipt,
     action.duplicate_risk_acknowledged,
     action.effective_at,
@@ -4959,7 +5113,7 @@ async fn insert_operator_action(
     .as_bytes(),
   );
   let inserted = sqlx::query(
-    "insert or ignore into scheduler_operator_actions (action_id, principal_kind, principal_provider, principal_tenant, principal_subject, request_id, request_hash_algorithm, request_digest, action, target_kind, target_id, expected_attempt, expected_fence, before_state, after_state, evidence_hash_algorithm, evidence_json, evidence_digest, provider_receipt, duplicate_risk_acknowledged, effective_at, occurred_at) values (?1, ?2, ?3, ?4, ?5, ?6, 'sha256-v1', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+    "insert or ignore into scheduler_operator_actions (action_id, principal_kind, principal_provider, principal_tenant, principal_subject, request_id, request_hash_algorithm, request_digest, action, target_kind, target_id, expected_attempt, expected_fence, before_state, after_state, evidence_hash_algorithm, evidence_json, evidence_digest, provider_receipt, duplicate_risk_acknowledged, effective_at, occurred_at, reason_schema_version, reason_hash_algorithm, reason_json, reason_digest) values (?1, ?2, ?3, ?4, ?5, ?6, 'sha256-v1', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
   )
   .bind(&action_id)
   .bind(request.principal.kind())
@@ -4982,6 +5136,10 @@ async fn insert_operator_action(
   .bind(action.duplicate_risk_acknowledged)
   .bind(action.effective_at)
   .bind(request.occurred_at)
+  .bind(i64::from(action.reason_json.is_some()))
+  .bind(action.reason_digest.map(|_| "sha256-v1"))
+  .bind(action.reason_json)
+  .bind(action.reason_digest)
   .execute(&mut **transaction)
   .await
   .map_err(scheduler_error)?;

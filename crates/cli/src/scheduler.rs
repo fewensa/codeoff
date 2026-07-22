@@ -6,22 +6,32 @@ use std::path::Path;
 
 use chrono::DateTime;
 use codeoff_agent_contract::{InvocationPrincipal, InvocationSource};
+use codeoff_config::SchedulerRuntimeConfig;
 use codeoff_runtime::schedule_service::{
   ConfiguredOperatorIdentityPolicy, CreateScheduleRequest, DefaultCapabilityRegistry,
   DeliveryTargetRequest, LifecycleScheduleRequest, OperatorAuthorizationPolicy,
   PreviousSuccessPolicy, ScheduleInvocation, ScheduleService, ScheduleServiceError,
   TargetResolverRegistry, UpdateScheduleRequest,
 };
-use codeoff_state::{ScheduleSpec, ScheduledJobStatus, StateStore};
+use codeoff_state::{
+  PrincipalKey, ScheduleSpec, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
+  ScheduledJobStatus, ScheduledRunState, SchedulerOperatorRequest, StateStore,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
-use crate::command::{SchedulerCommand, SchedulerFileFormat};
+use crate::command::{
+  SchedulerCommand, SchedulerDeliveriesCommand, SchedulerDeliveryDisposition,
+  SchedulerDeliveryStatus, SchedulerFileFormat, SchedulerRetryRunState, SchedulerRunStatus,
+  SchedulerRunsCommand,
+};
 
 const SCHEDULER_REQUEST_SCHEMA_VERSION: u32 = 1;
 const MAX_SCHEDULER_REQUEST_BYTES: u64 = 128 * 1024;
 const OPERATOR_ID_ENV: &str = "CODEOFF_SCHEDULER_OPERATOR_ID";
 const OPERATOR_REALM_ENV: &str = "CODEOFF_SCHEDULER_OPERATOR_REALM";
+const MAX_OPERATOR_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +130,14 @@ impl SchedulerOperatorConfig {
       realm,
     })
   }
+
+  pub(crate) fn diagnostic() -> Self {
+    Self {
+      service_identity: "scheduler-diagnostic".to_owned(),
+      realm: "local".to_owned(),
+      subject: "scheduler-diagnostic".to_owned(),
+    }
+  }
 }
 
 #[derive(Debug)]
@@ -139,6 +157,47 @@ impl fmt::Display for SchedulerCommandError {
 
 impl std::error::Error for SchedulerCommandError {}
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerReasonFile {
+  schema_version: u32,
+  reason_code: String,
+  reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerEvidenceFile {
+  schema_version: u32,
+  evidence: Value,
+  #[serde(default)]
+  provider_receipt: Option<Value>,
+}
+
+pub(crate) trait SchedulerAuthorityVerifier: Send + Sync {
+  fn verify(
+    &self,
+    authority: &[u8],
+    action_digest: &str,
+  ) -> Result<PrincipalKey, SchedulerCommandError>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct UnavailableSchedulerAuthorityVerifier;
+
+impl SchedulerAuthorityVerifier for UnavailableSchedulerAuthorityVerifier {
+  fn verify(
+    &self,
+    _authority: &[u8],
+    _action_digest: &str,
+  ) -> Result<PrincipalKey, SchedulerCommandError> {
+    Err(command_error(
+      "authority_verifier_unavailable",
+      "scheduler mutation authority verifier is not available",
+    ))
+  }
+}
+
 #[cfg(test)]
 pub(crate) async fn execute_scheduler_command(
   command: SchedulerCommand,
@@ -157,6 +216,7 @@ pub(crate) async fn execute_scheduler_command(
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn execute_scheduler_command_with_resolvers(
   command: SchedulerCommand,
   state: StateStore,
@@ -164,6 +224,32 @@ pub(crate) async fn execute_scheduler_command_with_resolvers(
   target_resolvers: std::sync::Arc<TargetResolverRegistry>,
   now: i64,
 ) -> Result<Value, SchedulerCommandError> {
+  execute_scheduler_command_with_policy_and_verifier(
+    command,
+    state,
+    operator,
+    target_resolvers,
+    &SchedulerRuntimeConfig::default(),
+    &UnavailableSchedulerAuthorityVerifier,
+    now,
+  )
+  .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn execute_scheduler_command_with_policy_and_verifier(
+  command: SchedulerCommand,
+  state: StateStore,
+  operator: SchedulerOperatorConfig,
+  target_resolvers: std::sync::Arc<TargetResolverRegistry>,
+  policy: &SchedulerRuntimeConfig,
+  authority_verifier: &dyn SchedulerAuthorityVerifier,
+  now: i64,
+) -> Result<Value, SchedulerCommandError> {
+  if !command.uses_legacy_service() {
+    return execute_scheduler_operator_command(command, &state, policy, authority_verifier, now)
+      .await;
+  }
   let service = build_scheduler_service(state, &operator, target_resolvers)
     .map_err(|error| SchedulerCommandError::service(&error))?;
   let result = match command {
@@ -268,9 +354,626 @@ pub(crate) async fn execute_scheduler_command_with_resolvers(
       )
       .await
     }
+    SchedulerCommand::Status { .. }
+    | SchedulerCommand::Runs { .. }
+    | SchedulerCommand::Deliveries { .. }
+    | SchedulerCommand::Reconcile { .. }
+    | SchedulerCommand::RetryRun { .. }
+    | SchedulerCommand::RetryDelivery { .. }
+    | SchedulerCommand::ResolveDeliveryUnknown { .. } => {
+      unreachable!("operator command handled before schedule service construction")
+    }
   }
   .map_err(|error| SchedulerCommandError::service(&error))?;
   Ok(sanitize_output(result))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute_scheduler_operator_command(
+  command: SchedulerCommand,
+  state: &StateStore,
+  policy: &SchedulerRuntimeConfig,
+  authority_verifier: &dyn SchedulerAuthorityVerifier,
+  now: i64,
+) -> Result<Value, SchedulerCommandError> {
+  match command {
+    SchedulerCommand::Status { .. } => Ok(success(json!({
+      "scheduler": "reachable",
+      "recovery_batch_limit": policy.recovery_batch_limit.min(100),
+    }))),
+    SchedulerCommand::Runs { command } => match command {
+      SchedulerRunsCommand::List { status, limit, .. } => {
+        validate_operator_limit(limit)?;
+        let runs = state
+          .list_scheduled_run_operator_projections_by_state(
+            None,
+            status.map(run_status_state),
+            limit,
+          )
+          .await
+          .map_err(state_command_error)?;
+        let items = runs
+          .into_iter()
+          .map(run_projection_json)
+          .collect::<Vec<_>>();
+        Ok(success(json!({"items": items, "limit": limit})))
+      }
+      SchedulerRunsCommand::Show { run_id, .. } => {
+        let run = state
+          .get_scheduled_run_operator_projection(&run_id)
+          .await
+          .map_err(state_command_error)?
+          .ok_or_else(|| command_error("not_found", "scheduled run was not found"))?;
+        Ok(success(run_projection_json(run)))
+      }
+    },
+    SchedulerCommand::Deliveries { command } => match command {
+      SchedulerDeliveriesCommand::List { status, limit, .. } => {
+        validate_operator_limit(limit)?;
+        let deliveries = state
+          .list_scheduled_delivery_operator_projections_by_state(
+            None,
+            status.map(delivery_status_state),
+            limit,
+          )
+          .await
+          .map_err(state_command_error)?;
+        let items = deliveries
+          .into_iter()
+          .map(delivery_projection_json)
+          .collect::<Vec<_>>();
+        Ok(success(json!({"items": items, "limit": limit})))
+      }
+      SchedulerDeliveriesCommand::Show { delivery_id, .. } => {
+        let delivery = state
+          .get_scheduled_delivery_operator_projection(&delivery_id)
+          .await
+          .map_err(state_command_error)?
+          .ok_or_else(|| command_error("not_found", "scheduled delivery was not found"))?;
+        Ok(success(delivery_projection_json(delivery)))
+      }
+    },
+    SchedulerCommand::Reconcile {
+      apply,
+      limit,
+      authority_file,
+      ..
+    } => {
+      validate_operator_limit(limit)?;
+      let limit = limit.min(policy.recovery_batch_limit).min(100);
+      let run_candidates = state
+        .list_scheduled_run_reconcile_candidates(now, limit)
+        .await
+        .map_err(state_command_error)?;
+      let deliveries = state
+        .list_scheduled_delivery_reconcile_candidates(now, limit)
+        .await
+        .map_err(state_command_error)?;
+      let next_attempt_at = now
+        .checked_add(i64::from(policy.retry_delay_seconds))
+        .ok_or_else(|| command_error("invalid_policy", "scheduler retry timing overflowed"))?;
+      let run_plan = run_candidates
+        .iter()
+        .map(|candidate| {
+          serde_json::from_str::<Value>(&candidate.canonical_plan_snapshot())
+            .expect("state returns canonical reconcile snapshots")
+        })
+        .collect::<Vec<_>>();
+      let delivery_plan = deliveries
+        .iter()
+        .map(|delivery| {
+          json!({
+            "attempt": delivery.attempt,
+            "delivery_id": delivery.delivery_id,
+            "fence": delivery.fence,
+            "lease_expires_at": delivery.lease_expires_at,
+            "state": delivery.state.as_str(),
+          })
+        })
+        .collect::<Vec<_>>();
+      let plan = json!({
+        "delivery_candidates": delivery_plan,
+        "limit": limit,
+        "max_attempts": policy.max_attempts,
+        "next_attempt_at": next_attempt_at,
+        "now": now,
+        "run_candidates": run_plan,
+        "schema_version": 1,
+      });
+      let plan_digest = sha256_hex(plan.to_string().as_bytes());
+      if !apply {
+        return Ok(success(json!({"plan": plan, "plan_digest": plan_digest})));
+      }
+      let authority_file = authority_file.ok_or_else(|| {
+        command_error(
+          "invalid_request",
+          "--authority-file is required with --apply",
+        )
+      })?;
+      let authority = read_bounded_file(&authority_file)?;
+      let _principal = authority_verifier.verify(&authority, &plan_digest)?;
+      let mut run_results = Vec::with_capacity(run_candidates.len());
+      for candidate in &run_candidates {
+        let outcome = state
+          .reconcile_scheduled_run_candidate(
+            candidate,
+            i64::from(policy.max_attempts),
+            next_attempt_at,
+            now,
+          )
+          .await;
+        run_results.push(json!({
+          "run_id": candidate.run_id(),
+          "outcome": reconcile_run_outcome(outcome),
+        }));
+      }
+      let mut delivery_results = Vec::with_capacity(deliveries.len());
+      for delivery in &deliveries {
+        let outcome = state
+          .reconcile_expired_scheduled_delivery(
+            &delivery.delivery_id,
+            delivery.state,
+            delivery.attempt,
+            delivery.fence,
+            delivery.lease_expires_at.expect("filtered expiry"),
+            now,
+          )
+          .await;
+        delivery_results.push(json!({
+          "delivery_id": delivery.delivery_id,
+          "outcome": reconcile_delivery_outcome(outcome),
+        }));
+      }
+      Ok(success(json!({
+        "delivery_results": delivery_results,
+        "plan_digest": plan_digest,
+        "run_results": run_results,
+      })))
+    }
+    SchedulerCommand::RetryRun {
+      run_id,
+      expected_state,
+      request_id,
+      expected_attempt,
+      expected_fence,
+      reason_file,
+      authority_file,
+    } => {
+      reject_ambiguous_stdin(&[&reason_file, &authority_file])?;
+      let reason = read_reason_file(&reason_file)?;
+      let authority = read_bounded_file(&authority_file)?;
+      let expected_state = retry_run_state(expected_state);
+      let next_attempt_at = now
+        .checked_add(i64::from(policy.retry_delay_seconds))
+        .ok_or_else(|| command_error("invalid_policy", "scheduler retry timing overflowed"))?;
+      let provisional = SchedulerOperatorRequest::for_run_retry(
+        provisional_principal(),
+        &request_id,
+        &run_id,
+        expected_attempt,
+        expected_fence,
+        expected_state,
+        &reason.canonical_json,
+        &reason.digest,
+        next_attempt_at,
+        now,
+      )
+      .map_err(value_command_error)?;
+      let principal = authority_verifier.verify(&authority, &provisional.request_digest)?;
+      let request = SchedulerOperatorRequest::for_run_retry(
+        principal,
+        request_id,
+        &run_id,
+        expected_attempt,
+        expected_fence,
+        expected_state,
+        &reason.canonical_json,
+        &reason.digest,
+        next_attempt_at,
+        now,
+      )
+      .map_err(value_command_error)?;
+      let outcome = state
+        .operator_retry_scheduled_run(
+          &request,
+          &run_id,
+          expected_attempt,
+          expected_fence,
+          &reason.canonical_json,
+          &reason.digest,
+          next_attempt_at,
+        )
+        .await
+        .map_err(state_command_error)?;
+      Ok(success(json!({
+        "outcome": format!("{outcome:?}").to_lowercase(),
+        "reason_code": reason.reason_code,
+        "reason_digest": reason.digest,
+        "request_digest": request.request_digest,
+        "run_id": run_id,
+      })))
+    }
+    SchedulerCommand::RetryDelivery {
+      delivery_id,
+      request_id,
+      expected_attempt,
+      expected_fence,
+      reason_file,
+      authority_file,
+    } => {
+      reject_ambiguous_stdin(&[&reason_file, &authority_file])?;
+      let reason = read_reason_file(&reason_file)?;
+      let authority = read_bounded_file(&authority_file)?;
+      let provisional = SchedulerOperatorRequest::for_delivery_retry(
+        provisional_principal(),
+        &request_id,
+        &delivery_id,
+        expected_attempt,
+        expected_fence,
+        &reason.canonical_json,
+        &reason.digest,
+        now,
+      )
+      .map_err(value_command_error)?;
+      let principal = authority_verifier.verify(&authority, &provisional.request_digest)?;
+      let request = SchedulerOperatorRequest::for_delivery_retry(
+        principal,
+        request_id,
+        &delivery_id,
+        expected_attempt,
+        expected_fence,
+        &reason.canonical_json,
+        &reason.digest,
+        now,
+      )
+      .map_err(value_command_error)?;
+      let outcome = state
+        .operator_retry_scheduled_delivery(
+          &request,
+          &delivery_id,
+          expected_attempt,
+          expected_fence,
+          &reason.canonical_json,
+          &reason.digest,
+        )
+        .await
+        .map_err(state_command_error)?;
+      Ok(success(json!({
+        "delivery_id": delivery_id,
+        "outcome": format!("{outcome:?}").to_lowercase(),
+        "reason_code": reason.reason_code,
+        "reason_digest": reason.digest,
+        "request_digest": request.request_digest,
+      })))
+    }
+    SchedulerCommand::ResolveDeliveryUnknown {
+      delivery_id,
+      disposition,
+      request_id,
+      expected_attempt,
+      expected_fence,
+      evidence_file,
+      authority_file,
+    } => {
+      reject_ambiguous_stdin(&[&evidence_file, &authority_file])?;
+      let evidence = read_evidence_file(&evidence_file, disposition)?;
+      let authority = read_bounded_file(&authority_file)?;
+      let provisional = SchedulerOperatorRequest::for_delivery_action(
+        provisional_principal(),
+        &request_id,
+        &delivery_id,
+        expected_attempt,
+        expected_fence,
+        &evidence.action,
+        now,
+      )
+      .map_err(value_command_error)?;
+      let principal = authority_verifier.verify(&authority, &provisional.request_digest)?;
+      let request = SchedulerOperatorRequest::for_delivery_action(
+        principal,
+        request_id,
+        &delivery_id,
+        expected_attempt,
+        expected_fence,
+        &evidence.action,
+        now,
+      )
+      .map_err(value_command_error)?;
+      let outcome = state
+        .operator_act_on_unknown_delivery(
+          &request,
+          &delivery_id,
+          expected_attempt,
+          expected_fence,
+          &evidence.action,
+        )
+        .await
+        .map_err(state_command_error)?;
+      Ok(success(json!({
+        "delivery_id": delivery_id,
+        "evidence_digest": evidence.digest,
+        "outcome": format!("{outcome:?}").to_lowercase(),
+        "request_digest": request.request_digest,
+      })))
+    }
+    SchedulerCommand::Create { .. }
+    | SchedulerCommand::Get { .. }
+    | SchedulerCommand::List { .. }
+    | SchedulerCommand::Update { .. }
+    | SchedulerCommand::Pause { .. }
+    | SchedulerCommand::Resume { .. }
+    | SchedulerCommand::Delete { .. } => unreachable!("legacy command routed separately"),
+  }
+}
+
+struct ValidatedReason {
+  canonical_json: String,
+  digest: String,
+  reason_code: String,
+}
+
+struct ValidatedEvidence {
+  action: ScheduledDeliveryUnknownAction,
+  digest: String,
+}
+
+fn success(data: Value) -> Value {
+  json!({"data": data, "ok": true, "schema_version": 1})
+}
+
+fn command_error(code: &str, message: &str) -> SchedulerCommandError {
+  SchedulerCommandError(json!({
+    "error": {"code": code, "message": message},
+    "ok": false,
+    "schema_version": 1,
+  }))
+}
+
+fn state_command_error(_error: codeoff_state::StateError) -> SchedulerCommandError {
+  command_error("state_error", "scheduler state operation failed")
+}
+
+fn value_command_error(_error: codeoff_state::StateValueError) -> SchedulerCommandError {
+  command_error("invalid_request", "scheduler operator request is invalid")
+}
+
+fn validate_operator_limit(limit: u16) -> Result<(), SchedulerCommandError> {
+  if limit == 0 || limit > 100 {
+    return Err(command_error(
+      "invalid_request",
+      "operator limit must be between 1 and 100",
+    ));
+  }
+  Ok(())
+}
+
+const fn run_status_state(status: SchedulerRunStatus) -> ScheduledRunState {
+  match status {
+    SchedulerRunStatus::Pending => ScheduledRunState::Pending,
+    SchedulerRunStatus::Leased => ScheduledRunState::Leased,
+    SchedulerRunStatus::Executing => ScheduledRunState::Executing,
+    SchedulerRunStatus::Succeeded => ScheduledRunState::Succeeded,
+    SchedulerRunStatus::Failed => ScheduledRunState::Failed,
+    SchedulerRunStatus::TimedOut => ScheduledRunState::TimedOut,
+    SchedulerRunStatus::Cancelled => ScheduledRunState::Cancelled,
+    SchedulerRunStatus::OutcomeUnknown => ScheduledRunState::OutcomeUnknown,
+  }
+}
+
+const fn retry_run_state(status: SchedulerRetryRunState) -> ScheduledRunState {
+  match status {
+    SchedulerRetryRunState::Failed => ScheduledRunState::Failed,
+    SchedulerRetryRunState::TimedOut => ScheduledRunState::TimedOut,
+    SchedulerRetryRunState::Cancelled => ScheduledRunState::Cancelled,
+  }
+}
+
+const fn delivery_status_state(status: SchedulerDeliveryStatus) -> ScheduledDeliveryState {
+  match status {
+    SchedulerDeliveryStatus::Pending => ScheduledDeliveryState::Pending,
+    SchedulerDeliveryStatus::Sending => ScheduledDeliveryState::Sending,
+    SchedulerDeliveryStatus::Delivered => ScheduledDeliveryState::Delivered,
+    SchedulerDeliveryStatus::FailedRetryable => ScheduledDeliveryState::FailedRetryable,
+    SchedulerDeliveryStatus::FailedTerminal => ScheduledDeliveryState::FailedTerminal,
+    SchedulerDeliveryStatus::DeliveryUnknown => ScheduledDeliveryState::DeliveryUnknown,
+    SchedulerDeliveryStatus::SkippedNone => ScheduledDeliveryState::SkippedNone,
+    SchedulerDeliveryStatus::SkippedUnchanged => ScheduledDeliveryState::SkippedUnchanged,
+  }
+}
+
+fn provisional_principal() -> PrincipalKey {
+  PrincipalKey::new("service", "codeoff", "local", "authority-verifier")
+    .expect("static provisional principal")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+  let mut hasher = Sha256::new();
+  hasher.update(bytes);
+  format!("{:x}", hasher.finalize())
+}
+
+fn read_bounded_file(path: &Path) -> Result<Vec<u8>, SchedulerCommandError> {
+  let mut bytes = Vec::new();
+  if path == Path::new("-") {
+    io::stdin()
+      .lock()
+      .take(MAX_OPERATOR_FILE_BYTES + 1)
+      .read_to_end(&mut bytes)
+      .map_err(|_| command_error("read_failed", "failed to read operator input"))?;
+  } else {
+    File::open(path)
+      .map_err(|_| command_error("read_failed", "failed to read operator input"))?
+      .take(MAX_OPERATOR_FILE_BYTES + 1)
+      .read_to_end(&mut bytes)
+      .map_err(|_| command_error("read_failed", "failed to read operator input"))?;
+  }
+  if bytes.is_empty() || bytes.len() as u64 > MAX_OPERATOR_FILE_BYTES {
+    return Err(command_error(
+      "invalid_request",
+      "operator input is empty or exceeds its byte limit",
+    ));
+  }
+  Ok(bytes)
+}
+
+fn reject_ambiguous_stdin(paths: &[&Path]) -> Result<(), SchedulerCommandError> {
+  if paths.iter().filter(|path| **path == Path::new("-")).count() > 1 {
+    return Err(command_error(
+      "invalid_request",
+      "a command cannot read more than one input from stdin",
+    ));
+  }
+  Ok(())
+}
+
+fn read_reason_file(path: &Path) -> Result<ValidatedReason, SchedulerCommandError> {
+  let bytes = read_bounded_file(path)?;
+  validate_canonical_operator_json(&bytes, "reason file is invalid")?;
+  let input: SchedulerReasonFile = serde_json::from_slice(&bytes)
+    .map_err(|_| command_error("invalid_request", "reason file is invalid"))?;
+  if input.schema_version != 1
+    || input.reason_code.is_empty()
+    || input.reason_code.len() > 64
+    || !input
+      .reason_code
+      .bytes()
+      .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    || input.reason.trim() != input.reason
+    || input.reason.is_empty()
+    || input.reason.len() > 4 * 1024
+  {
+    return Err(command_error("invalid_request", "reason file is invalid"));
+  }
+  let canonical_json = json!({
+    "reason": input.reason,
+    "reason_code": input.reason_code.clone(),
+    "schema_version": 1,
+  })
+  .to_string();
+  Ok(ValidatedReason {
+    digest: sha256_hex(canonical_json.as_bytes()),
+    reason_code: input.reason_code,
+    canonical_json,
+  })
+}
+
+fn read_evidence_file(
+  path: &Path,
+  disposition: SchedulerDeliveryDisposition,
+) -> Result<ValidatedEvidence, SchedulerCommandError> {
+  let bytes = read_bounded_file(path)?;
+  validate_canonical_operator_json(&bytes, "evidence file is invalid")?;
+  let input: SchedulerEvidenceFile = serde_json::from_slice(&bytes)
+    .map_err(|_| command_error("invalid_request", "evidence file is invalid"))?;
+  if input.schema_version != 1 {
+    return Err(command_error("invalid_request", "evidence file is invalid"));
+  }
+  let evidence_json = serde_json::to_string(&input.evidence)
+    .map_err(|_| command_error("invalid_request", "evidence file is invalid"))?;
+  let evidence_digest = sha256_hex(evidence_json.as_bytes());
+  let action = match disposition {
+    SchedulerDeliveryDisposition::ConfirmDelivered => {
+      let receipt = input.provider_receipt.ok_or_else(|| {
+        command_error(
+          "invalid_request",
+          "confirm-delivered requires provider_receipt",
+        )
+      })?;
+      ScheduledDeliveryUnknownAction::ConfirmDelivered {
+        provider_receipt: receipt.to_string(),
+        evidence_json,
+        evidence_digest: evidence_digest.clone(),
+      }
+    }
+    SchedulerDeliveryDisposition::ConfirmNoWriteTerminal if input.provider_receipt.is_none() => {
+      ScheduledDeliveryUnknownAction::ConfirmNoWriteTerminal {
+        evidence_json,
+        evidence_digest: evidence_digest.clone(),
+      }
+    }
+    SchedulerDeliveryDisposition::ForceResend if input.provider_receipt.is_none() => {
+      ScheduledDeliveryUnknownAction::ForceResend {
+        evidence_json,
+        evidence_digest: evidence_digest.clone(),
+        duplicate_risk_acknowledged: true,
+      }
+    }
+    SchedulerDeliveryDisposition::AcknowledgeUnknown if input.provider_receipt.is_none() => {
+      ScheduledDeliveryUnknownAction::AcknowledgeUnknown {
+        evidence_json,
+        evidence_digest: evidence_digest.clone(),
+      }
+    }
+    _ => return Err(command_error("invalid_request", "evidence file is invalid")),
+  };
+  Ok(ValidatedEvidence {
+    action,
+    digest: evidence_digest,
+  })
+}
+
+fn validate_canonical_operator_json(
+  bytes: &[u8],
+  message: &str,
+) -> Result<(), SchedulerCommandError> {
+  let value: Value =
+    serde_json::from_slice(bytes).map_err(|_| command_error("invalid_request", message))?;
+  if serde_json::to_vec(&value).ok().as_deref() != Some(bytes) {
+    return Err(command_error("invalid_request", message));
+  }
+  Ok(())
+}
+
+fn run_projection_json(run: codeoff_state::ScheduledRunOperatorProjection) -> Value {
+  json!({
+    "attempt": run.attempt,
+    "error_kind": run.error_kind,
+    "fence": run.fence,
+    "job_id": run.job_id,
+    "lease_expires_at": run.lease_expires_at,
+    "next_attempt_at": run.next_attempt_at,
+    "run_id": run.run_id,
+    "state": run.state.as_str(),
+    "updated_at": run.updated_at,
+  })
+}
+
+fn delivery_projection_json(delivery: codeoff_state::ScheduledDeliveryOperatorProjection) -> Value {
+  json!({
+    "attempt": delivery.attempt,
+    "delivery_id": delivery.delivery_id,
+    "error_kind": delivery.error_kind,
+    "fence": delivery.fence,
+    "job_id": delivery.job_id,
+    "lease_expires_at": delivery.lease_expires_at,
+    "next_attempt_at": delivery.next_attempt_at,
+    "provider_outcome": delivery.provider_outcome,
+    "run_id": delivery.run_id,
+    "state": delivery.state.as_str(),
+    "updated_at": delivery.updated_at,
+  })
+}
+
+fn reconcile_run_outcome(
+  outcome: Result<codeoff_state::ScheduledRunReconcileOutcome, codeoff_state::StateError>,
+) -> &'static str {
+  match outcome {
+    Ok(codeoff_state::ScheduledRunReconcileOutcome::Applied(_)) => "applied",
+    Ok(codeoff_state::ScheduledRunReconcileOutcome::Stale) => "stale",
+    Ok(codeoff_state::ScheduledRunReconcileOutcome::NotEligible) => "not_eligible",
+    Err(_) => "error",
+  }
+}
+
+fn reconcile_delivery_outcome(
+  outcome: Result<codeoff_state::ScheduledDeliveryReconcileOutcome, codeoff_state::StateError>,
+) -> &'static str {
+  match outcome {
+    Ok(codeoff_state::ScheduledDeliveryReconcileOutcome::Applied { .. }) => "applied",
+    Ok(codeoff_state::ScheduledDeliveryReconcileOutcome::Stale) => "stale",
+    Ok(codeoff_state::ScheduledDeliveryReconcileOutcome::NotEligible) => "not_eligible",
+    Err(_) => "error",
+  }
 }
 
 fn build_scheduler_service(
@@ -580,8 +1283,9 @@ mod tests {
   };
   use codeoff_runtime::schedule_tools::ScheduleDynamicToolHandler;
   use codeoff_state::{
-    AttestedExecutionProfileSnapshot, PreparedScheduledDelivery, PrincipalKey,
-    ScheduledDeliveryFailure, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
+    AttestedExecutionProfileSnapshot, ClaimedScheduledRun, PreflightFailureDisposition,
+    PreparedScheduledDelivery, PrincipalKey, ScheduledDeliveryFailure,
+    ScheduledDeliveryOperatorProjection, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
     ScheduledRunResult, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
     SkippedNoneBaselinePolicy,
   };
@@ -591,6 +1295,27 @@ mod tests {
   use std::time::Duration;
 
   struct CountingSlackVerifier(Arc<AtomicUsize>);
+
+  #[derive(Default)]
+  struct AcceptingAuthorityVerifier(Mutex<Vec<String>>);
+
+  impl SchedulerAuthorityVerifier for AcceptingAuthorityVerifier {
+    fn verify(
+      &self,
+      authority: &[u8],
+      action_digest: &str,
+    ) -> Result<PrincipalKey, SchedulerCommandError> {
+      assert_eq!(authority, b"authority-sentinel");
+      assert_eq!(action_digest.len(), 64);
+      self
+        .0
+        .lock()
+        .expect("verifier records")
+        .push(action_digest.to_owned());
+      PrincipalKey::new("service", "codeoff", "ops", "verified-operator")
+        .map_err(value_command_error)
+    }
+  }
 
   #[derive(Clone, Default)]
   struct FakeSlackHttp {
@@ -689,6 +1414,144 @@ mod tests {
       Duration::from_millis(100),
     ));
     Arc::new(resolvers)
+  }
+
+  async fn prepare_cli_delivery(
+    state: &StateStore,
+    job_id: &str,
+    scheduled_for: i64,
+    failure: Option<ScheduledDeliveryFailure>,
+  ) -> ScheduledDeliveryOperatorProjection {
+    let operator =
+      SchedulerOperatorConfig::new("ops-a".to_owned(), "realm-a".to_owned()).expect("operator");
+    let service = build_scheduler_service(
+      state.clone(),
+      &operator,
+      real_slack_resolvers(vec![slack_auth(), slack_channel("C1", false)]),
+    )
+    .expect("service");
+    let created = service
+      .create(
+        &trusted_operator_invocation(&operator, job_id),
+        CreateScheduleRequest {
+          request_id: job_id.to_owned(),
+          instruction: format!("execute {job_id}"),
+          previous_success: PreviousSuccessPolicy::None,
+          schedule: ScheduleSpec::once(scheduled_for),
+          target: DeliveryTargetRequest::Channel {
+            channel_id: "C1".to_owned(),
+          },
+          capability: "none".to_owned(),
+          now: 100,
+        },
+      )
+      .await
+      .expect("create delivery job");
+    let actual_job_id = created["data"]["job_id"]
+      .as_str()
+      .expect("created job id")
+      .to_owned();
+    state
+      .materialize_due_schedule(&actual_job_id, 0, scheduled_for)
+      .await
+      .expect("materialize");
+    let run = state
+      .claim_next_scheduled_run("run-worker", scheduled_for + 1, scheduled_for + 50)
+      .await
+      .expect("claim run")
+      .expect("run");
+    let profile =
+      AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+    state
+      .mark_scheduled_run_executing(&run.binding, &profile, scheduled_for + 2)
+      .await
+      .expect("execute");
+    state
+      .complete_scheduled_run_success(
+        &run.binding,
+        &ScheduledRunResult::new(format!("payload-{job_id}"), "").expect("result"),
+        scheduled_for + 3,
+      )
+      .await
+      .expect("complete");
+    let delivery_id = state
+      .list_scheduled_delivery_operator_projections(None, 100)
+      .await
+      .expect("list deliveries")
+      .into_iter()
+      .find(|delivery| delivery.job_id == actual_job_id)
+      .expect("delivery")
+      .delivery_id;
+    assert!(matches!(
+      state
+        .prepare_scheduled_delivery(
+          &delivery_id,
+          "text/plain; charset=utf-8",
+          &format!("payload-{job_id}"),
+          1,
+          scheduled_for + 4,
+          SkippedNoneBaselinePolicy::DoNotAdvance,
+        )
+        .await
+        .expect("prepare"),
+      PreparedScheduledDelivery::Pending(_)
+    ));
+    let delivery = state
+      .claim_next_scheduled_delivery("delivery-worker", scheduled_for + 5, scheduled_for + 50)
+      .await
+      .expect("claim delivery")
+      .expect("delivery");
+    if let Some(failure) = failure {
+      state
+        .complete_scheduled_delivery_failure(&delivery.binding, &failure, scheduled_for + 6)
+        .await
+        .expect("delivery failure");
+    }
+    state
+      .get_scheduled_delivery_operator_projection(&delivery_id)
+      .await
+      .expect("projection")
+      .expect("delivery projection")
+  }
+
+  async fn prepare_cli_leased_run(
+    state: &StateStore,
+    request_id: &str,
+    scheduled_for: i64,
+  ) -> ClaimedScheduledRun {
+    let operator =
+      SchedulerOperatorConfig::new("ops-a".to_owned(), "realm-a".to_owned()).expect("operator");
+    let service = build_scheduler_service(
+      state.clone(),
+      &operator,
+      Arc::new(TargetResolverRegistry::with_defaults()),
+    )
+    .expect("service");
+    let created = service
+      .create(
+        &trusted_operator_invocation(&operator, request_id),
+        CreateScheduleRequest {
+          request_id: request_id.to_owned(),
+          instruction: format!("execute {request_id}"),
+          previous_success: PreviousSuccessPolicy::None,
+          schedule: ScheduleSpec::once(scheduled_for),
+          target: DeliveryTargetRequest::None,
+          capability: "none".to_owned(),
+          now: 100,
+        },
+      )
+      .await
+      .expect("create run job");
+    let job_id = created["data"]["job_id"].as_str().expect("job id");
+    state
+      .materialize_due_schedule(job_id, 0, scheduled_for)
+      .await
+      .expect("materialize run");
+    state
+      .claim_next_scheduled_run("run-worker", scheduled_for + 1, scheduled_for + 50)
+      .await
+      .expect("claim run")
+      .expect("run")
   }
 
   #[async_trait]
@@ -838,6 +1701,304 @@ kind = "none"
       resolve_format(Path::new("request.json"), None),
       Ok(SchedulerFileFormat::Json)
     );
+  }
+
+  #[test]
+  fn operator_reason_is_strict_canonical_and_stdin_inputs_are_unambiguous() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reason_path = temp.path().join("reason.json");
+    std::fs::write(
+      &reason_path,
+      r#"{"reason":"provider recovered","reason_code":"provider_recovered","schema_version":1}"#,
+    )
+    .expect("write reason");
+    let reason = read_reason_file(&reason_path).expect("valid reason");
+    assert_eq!(reason.reason_code, "provider_recovered");
+    assert!(!reason.canonical_json.contains("Authorization"));
+    assert_eq!(reason.digest.len(), 64);
+    assert!(reject_ambiguous_stdin(&[Path::new("-"), Path::new("-")]).is_err());
+    assert!(reject_ambiguous_stdin(&[Path::new("-"), &reason_path]).is_ok());
+
+    std::fs::write(
+      &reason_path,
+      r#"{"schema_version":1,"reason_code":"bad-code","reason":"secret","extra":true}"#,
+    )
+    .expect("write invalid reason");
+    assert!(read_reason_file(&reason_path).is_err());
+  }
+
+  async fn execute_test_operator_command(
+    command: SchedulerCommand,
+    state: StateStore,
+    verifier: &AcceptingAuthorityVerifier,
+    now: i64,
+  ) -> Result<Value, SchedulerCommandError> {
+    execute_scheduler_command_with_policy_and_verifier(
+      command,
+      state,
+      SchedulerOperatorConfig::diagnostic(),
+      Arc::new(TargetResolverRegistry::with_defaults()),
+      &SchedulerRuntimeConfig::default(),
+      verifier,
+      now,
+    )
+    .await
+  }
+
+  fn write_operator_evidence(path: &Path, kind: &str, evidence_id: &str, receipt: Option<Value>) {
+    let mut evidence = json!({
+      "evidence_id": evidence_id,
+      "evidence_version": 1,
+      "kind": kind,
+      "provider": "slack",
+      "target_kind": "channel",
+      "tenant": "T00000000",
+    });
+    if let Some(receipt) = &receipt {
+      evidence["receipt_digest"] = json!(sha256_hex(receipt.to_string().as_bytes()));
+    }
+    let envelope = json!({
+      "evidence": evidence,
+      "provider_receipt": receipt,
+      "schema_version": 1,
+    });
+    std::fs::write(path, envelope.to_string()).expect("write evidence");
+  }
+
+  #[tokio::test]
+  #[allow(clippy::too_many_lines)]
+  async fn operator_cli_adapter_binds_retry_and_unknown_delivery_actions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    let verifier = AcceptingAuthorityVerifier::default();
+    let authority = temp.path().join("authority.bin");
+    std::fs::write(&authority, b"authority-sentinel").expect("authority");
+    let reason = temp.path().join("reason.json");
+    std::fs::write(
+      &reason,
+      r#"{"reason":"provider recovered","reason_code":"provider_recovered","schema_version":1}"#,
+    )
+    .expect("reason");
+
+    let retryable = prepare_cli_delivery(
+      &state,
+      "cli-retry-delivery",
+      200,
+      Some(ScheduledDeliveryFailure::ConfirmedNoWriteRetryable {
+        error_kind: "rate_limited".to_owned(),
+        redacted_message: None,
+        next_attempt_at: 2_000,
+      }),
+    )
+    .await;
+    let retry_command = SchedulerCommand::RetryDelivery {
+      delivery_id: retryable.delivery_id.clone(),
+      request_id: "retry-delivery-request".to_owned(),
+      expected_attempt: retryable.attempt,
+      expected_fence: retryable.fence,
+      reason_file: reason.clone(),
+      authority_file: authority.clone(),
+    };
+    let applied =
+      execute_test_operator_command(retry_command.clone(), state.clone(), &verifier, 1000)
+        .await
+        .expect("apply retry");
+    assert_eq!(applied["data"]["outcome"], "applied");
+    let replay = execute_test_operator_command(retry_command, state.clone(), &verifier, 1000)
+      .await
+      .expect("replay retry");
+    assert_eq!(replay["data"]["outcome"], "replay");
+
+    for (index, disposition, kind) in [
+      (
+        0_i64,
+        SchedulerDeliveryDisposition::ConfirmDelivered,
+        "provider_confirmed_delivered",
+      ),
+      (
+        1,
+        SchedulerDeliveryDisposition::ConfirmNoWriteTerminal,
+        "provider_confirmed_no_write",
+      ),
+      (
+        2,
+        SchedulerDeliveryDisposition::ForceResend,
+        "operator_force_resend",
+      ),
+      (
+        3,
+        SchedulerDeliveryDisposition::AcknowledgeUnknown,
+        "operator_acknowledged_unknown",
+      ),
+    ] {
+      let unknown = prepare_cli_delivery(
+        &state,
+        &format!("cli-unknown-{index}"),
+        300 + index * 100,
+        Some(ScheduledDeliveryFailure::AmbiguousPostWrite {
+          error_kind: "ambiguous".to_owned(),
+          redacted_message: None,
+        }),
+      )
+      .await;
+      let receipt = (disposition == SchedulerDeliveryDisposition::ConfirmDelivered).then(|| {
+        json!({
+          "conversation_id": "C1",
+          "message_id": format!("message-{index}"),
+          "provider": "slack",
+          "receipt_version": 1,
+          "target_kind": "channel",
+          "tenant": "T00000000",
+          "thread_id": null,
+        })
+      });
+      let evidence = temp.path().join(format!("evidence-{index}.json"));
+      write_operator_evidence(&evidence, kind, &format!("evidence-{index}"), receipt);
+      let command = SchedulerCommand::ResolveDeliveryUnknown {
+        delivery_id: unknown.delivery_id.clone(),
+        disposition,
+        request_id: format!("unknown-request-{index}"),
+        expected_attempt: unknown.attempt,
+        expected_fence: unknown.fence,
+        evidence_file: evidence,
+        authority_file: authority.clone(),
+      };
+      let output = execute_test_operator_command(command.clone(), state.clone(), &verifier, 1000)
+        .await
+        .expect("resolve unknown");
+      assert_eq!(output["data"]["outcome"], "applied");
+      let replay = execute_test_operator_command(command, state.clone(), &verifier, 1000)
+        .await
+        .expect("replay unknown");
+      assert_eq!(replay["data"]["outcome"], "replay");
+      let text = output.to_string();
+      for forbidden in [
+        "authority-sentinel",
+        "provider recovered",
+        "verified-operator",
+        "message-",
+        "evidence-",
+        "payload-",
+      ] {
+        assert!(!text.contains(forbidden), "leaked {forbidden}");
+      }
+    }
+    assert!(verifier.0.lock().expect("digests").len() >= 10);
+  }
+
+  #[tokio::test]
+  #[allow(clippy::too_many_lines)]
+  async fn operator_cli_adapter_applies_run_retry_and_exact_reconcile_plan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    let verifier = AcceptingAuthorityVerifier::default();
+    let authority = temp.path().join("authority.bin");
+    std::fs::write(&authority, b"authority-sentinel").expect("authority");
+    let reason = temp.path().join("reason.json");
+    std::fs::write(
+      &reason,
+      r#"{"reason":"operator approved retry","reason_code":"manual_retry","schema_version":1}"#,
+    )
+    .expect("reason");
+
+    let terminal = prepare_cli_leased_run(&state, "cli-retry-run", 800).await;
+    state
+      .record_scheduled_run_preflight_failure(
+        &terminal.binding,
+        PreflightFailureDisposition::Fail,
+        "preflight_failed",
+        "redacted failure",
+        802,
+      )
+      .await
+      .expect("terminalize run");
+    let retry = SchedulerCommand::RetryRun {
+      run_id: terminal.binding.run_id().to_owned(),
+      expected_state: SchedulerRetryRunState::Failed,
+      request_id: "retry-run-request".to_owned(),
+      expected_attempt: terminal.binding.attempt(),
+      expected_fence: terminal.binding.fence(),
+      reason_file: reason,
+      authority_file: authority.clone(),
+    };
+    let applied = execute_test_operator_command(retry.clone(), state.clone(), &verifier, 900)
+      .await
+      .expect("apply run retry");
+    assert_eq!(applied["data"]["outcome"], "applied");
+    let replay = execute_test_operator_command(retry.clone(), state.clone(), &verifier, 900)
+      .await
+      .expect("replay run retry");
+    assert_eq!(replay["data"]["outcome"], "replay");
+    let SchedulerCommand::RetryRun {
+      run_id,
+      request_id,
+      expected_attempt,
+      expected_fence,
+      reason_file,
+      authority_file,
+      ..
+    } = retry
+    else {
+      unreachable!("run retry command")
+    };
+    let conflict = execute_test_operator_command(
+      SchedulerCommand::RetryRun {
+        run_id,
+        expected_state: SchedulerRetryRunState::Cancelled,
+        request_id,
+        expected_attempt,
+        expected_fence,
+        reason_file,
+        authority_file,
+      },
+      state.clone(),
+      &verifier,
+      900,
+    )
+    .await
+    .expect("conflicting run retry");
+    assert_eq!(conflict["data"]["outcome"], "conflict");
+
+    let reconcile_state = StateStore::initialize(&temp.path().join("reconcile-state"), None)
+      .await
+      .expect("reconcile state");
+    let sending =
+      prepare_cli_delivery(&reconcile_state, "cli-reconcile-delivery", 1_200, None).await;
+    let leased = prepare_cli_leased_run(&reconcile_state, "cli-reconcile-run", 1_300).await;
+    let reconcile = SchedulerCommand::Reconcile {
+      dry_run: false,
+      apply: true,
+      limit: 10,
+      authority_file: Some(authority),
+      json: true,
+    };
+    let output = execute_test_operator_command(reconcile, reconcile_state, &verifier, 1_400)
+      .await
+      .expect("apply exact reconcile");
+    assert_eq!(
+      output["data"]["run_results"][0]["run_id"],
+      leased.binding.run_id()
+    );
+    assert_eq!(output["data"]["run_results"][0]["outcome"], "applied");
+    assert_eq!(
+      output["data"]["delivery_results"][0]["delivery_id"],
+      sending.delivery_id
+    );
+    assert_eq!(output["data"]["delivery_results"][0]["outcome"], "applied");
+    let text = output.to_string();
+    for forbidden in [
+      "authority-sentinel",
+      "operator approved retry",
+      "run-worker",
+      "delivery-worker",
+      "payload-",
+    ] {
+      assert!(!text.contains(forbidden), "leaked {forbidden}");
+    }
   }
 
   #[tokio::test]

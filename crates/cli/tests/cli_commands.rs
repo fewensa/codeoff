@@ -32,7 +32,20 @@ fn test_cli_exposes_expected_subcommands() {
     .expect("scheduler subcommand")
     .clone();
   for operation in [
-    "create", "get", "list", "update", "pause", "resume", "delete",
+    "status",
+    "runs",
+    "deliveries",
+    "reconcile",
+    "retry-run",
+    "retry-delivery",
+    "resolve-delivery-unknown",
+    "create",
+    "get",
+    "list",
+    "update",
+    "pause",
+    "resume",
+    "delete",
   ] {
     assert!(
       scheduler.find_subcommand(operation).is_some(),
@@ -50,6 +63,85 @@ fn test_cli_exposes_expected_subcommands() {
     .find_subcommand("config")
     .expect("config subcommand");
   assert!(config.find_subcommand("check").is_some());
+}
+
+#[test]
+fn test_scheduler_diagnostics_and_dry_run_do_not_require_operator_identity() {
+  let dir = tempdir().expect("create tempdir");
+  let state_dir = dir.path().join("state");
+  for arguments in [
+    vec!["scheduler", "status", "--json"],
+    vec!["scheduler", "runs", "list", "--limit", "10", "--json"],
+    vec!["scheduler", "deliveries", "list", "--limit", "10", "--json"],
+    vec![
+      "scheduler",
+      "reconcile",
+      "--dry-run",
+      "--limit",
+      "10",
+      "--json",
+    ],
+  ] {
+    let output = Command::cargo_bin("codeoff")
+      .expect("codeoff binary")
+      .env_remove("CODEOFF_SCHEDULER_OPERATOR_ID")
+      .env_remove("CODEOFF_SCHEDULER_OPERATOR_REALM")
+      .arg("--state-dir")
+      .arg(&state_dir)
+      .args(arguments)
+      .assert()
+      .success()
+      .get_output()
+      .stdout
+      .clone();
+    let output: serde_json::Value = serde_json::from_slice(&output).expect("sanitized JSON");
+    assert_eq!(output["schema_version"], 1);
+    assert_eq!(output["ok"], true);
+  }
+}
+
+#[test]
+fn test_scheduler_mutation_fails_closed_when_authority_verifier_is_unavailable() {
+  let dir = tempdir().expect("create tempdir");
+  let state_dir = dir.path().join("state");
+  let reason = dir.path().join("reason.json");
+  let authority = dir.path().join("authority.bin");
+  fs::write(
+    &reason,
+    r#"{"reason":"provider recovered","reason_code":"provider_recovered","schema_version":1}"#,
+  )
+  .expect("write reason");
+  fs::write(&authority, b"opaque-authority").expect("write authority");
+  let stderr = Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env_remove("CODEOFF_SCHEDULER_OPERATOR_ID")
+    .env_remove("CODEOFF_SCHEDULER_OPERATOR_REALM")
+    .arg("--state-dir")
+    .arg(&state_dir)
+    .args([
+      "scheduler",
+      "retry-delivery",
+      "delivery-id",
+      "--request-id",
+      "request-1",
+      "--expected-attempt",
+      "1",
+      "--expected-fence",
+      "1",
+      "--reason-file",
+      reason.to_str().expect("reason path"),
+      "--authority-file",
+      authority.to_str().expect("authority path"),
+    ])
+    .assert()
+    .failure()
+    .get_output()
+    .stderr
+    .clone();
+  let error: serde_json::Value = serde_json::from_slice(&stderr).expect("structured error");
+  assert_eq!(error["error"]["code"], "authority_verifier_unavailable");
+  assert!(!String::from_utf8_lossy(&stderr).contains("opaque-authority"));
+  assert!(!String::from_utf8_lossy(&stderr).contains("provider recovered"));
 }
 
 #[test]

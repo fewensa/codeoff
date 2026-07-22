@@ -267,9 +267,12 @@ pub struct ScheduledDeliveryAuthority {
   payload_digest: String,
   binding_digest: String,
   intent_key: String,
+  payload_created_at: i64,
+  scheduler_policy: SchedulerOperationalPolicy,
 }
 
 impl ScheduledDeliveryAuthority {
+  #[allow(clippy::too_many_arguments)]
   pub(crate) fn new(
     delivery_id: String,
     source_state: ScheduledDeliveryState,
@@ -278,6 +281,8 @@ impl ScheduledDeliveryAuthority {
     payload_digest: String,
     binding_digest: String,
     intent_key: String,
+    payload_created_at: i64,
+    scheduler_policy: SchedulerOperationalPolicy,
   ) -> Self {
     Self {
       delivery_id,
@@ -287,6 +292,8 @@ impl ScheduledDeliveryAuthority {
       payload_digest,
       binding_digest,
       intent_key,
+      payload_created_at,
+      scheduler_policy,
     }
   }
 
@@ -316,6 +323,14 @@ impl ScheduledDeliveryAuthority {
   }
   pub(crate) fn intent_key(&self) -> &str {
     &self.intent_key
+  }
+  #[must_use]
+  pub const fn payload_created_at(&self) -> i64 {
+    self.payload_created_at
+  }
+  #[must_use]
+  pub const fn scheduler_policy(&self) -> &SchedulerOperationalPolicy {
+    &self.scheduler_policy
   }
 }
 

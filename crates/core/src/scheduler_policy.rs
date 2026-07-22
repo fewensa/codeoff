@@ -173,6 +173,70 @@ impl SchedulerOperationalPolicy {
       attempt,
     )
   }
+
+  #[must_use]
+  pub fn run_deadline_at(&self, scheduled_for: i64) -> Option<i64> {
+    scheduled_for.checked_add(i64::from(self.run_deadline_seconds))
+  }
+
+  #[must_use]
+  pub fn delivery_deadline_at(&self, payload_created_at: i64) -> Option<i64> {
+    payload_created_at.checked_add(i64::from(self.delivery_deadline_seconds))
+  }
+
+  #[must_use]
+  pub fn run_retry_at(
+    &self,
+    run_id: &str,
+    attempt: i64,
+    scheduled_for: i64,
+    now: i64,
+  ) -> Option<i64> {
+    let next = now.checked_add(i64::from(self.run_retry_delay_seconds(run_id, attempt)))?;
+    can_retry(
+      attempt,
+      self.run_max_attempts,
+      next,
+      self.run_deadline_at(scheduled_for)?,
+    )
+    .then_some(next)
+  }
+
+  #[must_use]
+  pub fn delivery_retry_at(
+    &self,
+    delivery_id: &str,
+    attempt: i64,
+    payload_created_at: i64,
+    now: i64,
+    retry_after_seconds: Option<u64>,
+  ) -> Option<i64> {
+    let policy_delay = i64::from(self.delivery_retry_delay_seconds(delivery_id, attempt));
+    let retry_after = retry_after_seconds.map_or(0, |seconds| {
+      i64::try_from(seconds)
+        .unwrap_or(i64::from(self.delivery_retry_after_max_seconds))
+        .clamp(1, i64::from(self.delivery_retry_after_max_seconds))
+    });
+    let next = now.checked_add(policy_delay.max(retry_after))?;
+    can_retry(
+      attempt,
+      self.delivery_max_attempts,
+      next,
+      self.delivery_deadline_at(payload_created_at)?,
+    )
+    .then_some(next)
+  }
+
+  #[must_use]
+  pub fn delivery_can_retry_at(&self, attempt: i64, payload_created_at: i64, next_at: i64) -> bool {
+    self
+      .delivery_deadline_at(payload_created_at)
+      .is_some_and(|deadline| can_retry(attempt, self.delivery_max_attempts, next_at, deadline))
+  }
+}
+
+fn can_retry(attempt: i64, max_attempts: u16, next_at: i64, absolute_deadline: i64) -> bool {
+  attempt < i64::from(max_attempts) && next_at < absolute_deadline
 }
 
 fn validate_run_policy(
@@ -462,5 +526,24 @@ mod tests {
     assert!((20..=24).contains(&second));
     assert_eq!(second, policy.run_retry_delay_seconds("run-a", 2));
     assert_eq!(policy.run_retry_delay_seconds("run-a", 20), 40);
+  }
+
+  #[test]
+  fn scheduler_retry_authority_is_strict_at_attempt_and_deadline_boundaries() {
+    let policy = SchedulerOperationalPolicy {
+      run_retry_base_seconds: 10,
+      run_retry_max_seconds: 10,
+      run_deadline_seconds: 100,
+      run_max_attempts: 2,
+      delivery_retry_base_seconds: 10,
+      delivery_retry_max_seconds: 10,
+      delivery_deadline_seconds: 100,
+      delivery_max_attempts: 2,
+      ..SchedulerOperationalPolicy::default()
+    };
+    assert!(policy.run_retry_at("run", 1, 100, 190).is_none());
+    assert!(policy.run_retry_at("run", 2, 100, 110).is_none());
+    assert!(!policy.delivery_can_retry_at(1, 100, 200));
+    assert!(!policy.delivery_can_retry_at(2, 100, 150));
   }
 }

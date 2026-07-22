@@ -38,6 +38,8 @@ const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 const MAX_PREVIOUS_SUCCESS_BYTES: usize = 16 * 1024;
 const MAX_DELIVERY_TARGETS: usize = 32;
 const MAX_CRON_HORIZON_SECONDS: i64 = 366 * 24 * 60 * 60 * 10;
+const GREGORIAN_CYCLE_START: i64 = 946_684_800;
+const GREGORIAN_CYCLE_END: i64 = 13_569_465_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum StateValueError {
@@ -63,6 +65,10 @@ pub enum StateValueError {
   InvalidInterval,
   #[error("schedule cadence is shorter than the configured minimum")]
   CadenceTooShort,
+  #[error("cron cadence proof exhausted its configured occurrence bound")]
+  CadenceProofExhausted,
+  #[error("cron cadence cannot be proven for this timezone and minimum")]
+  CadenceProofUnavailable,
   #[error("cron must contain exactly five fields")]
   InvalidCronFieldCount,
   #[error("invalid cron expression")]
@@ -769,22 +775,16 @@ impl ScheduleSpec {
     &self,
     now: i64,
     minimum_seconds: u32,
+    proof_limit: u32,
   ) -> Result<(), StateValueError> {
     let minimum = i64::from(minimum_seconds);
     let valid = match self {
       Self::Once { at } => at.checked_sub(now).is_some_and(|delay| delay >= minimum),
       Self::FixedInterval { every_seconds, .. } => *every_seconds >= minimum,
-      Self::Cron { .. } => {
-        let first = self
-          .next_after(now)
-          .map_err(|_| StateValueError::InvalidCron)?;
-        let second = self
-          .next_after(first)
-          .map_err(|_| StateValueError::InvalidCron)?;
-        second
-          .checked_sub(first)
-          .is_some_and(|cadence| cadence >= minimum)
-      }
+      Self::Cron {
+        expression,
+        timezone,
+      } => prove_cron_minimum_cadence(expression, timezone, minimum, proof_limit)?,
     };
     if !valid {
       return Err(StateValueError::CadenceTooShort);
@@ -924,6 +924,78 @@ impl ScheduleSpec {
       reason: "invalid persisted schedule".to_owned(),
     })
   }
+}
+
+fn prove_cron_minimum_cadence(
+  expression: &str,
+  timezone: &str,
+  minimum: i64,
+  proof_limit: u32,
+) -> Result<bool, StateValueError> {
+  if minimum <= 60 {
+    return Ok(true);
+  }
+  let fields = expression.split_whitespace().collect::<Vec<_>>();
+  if fields.len() != 5 {
+    return Err(StateValueError::InvalidCron);
+  }
+  let fixed_minute = fields[0].parse::<u8>().is_ok_and(|minute| minute < 60);
+  let fixed_hour = fields[1].parse::<u8>().is_ok_and(|hour| hour < 24);
+  if timezone == "UTC" && fixed_minute && fields[1] == "*" && fields[2..] == ["*", "*", "*"] {
+    return Ok(minimum <= 3_600);
+  }
+  if timezone == "UTC" && fixed_minute && fixed_hour && fields[2..] == ["*", "*", "*"] {
+    return Ok(minimum <= 86_400);
+  }
+  let fixed_daily = fixed_minute && fixed_hour && fields[2..] == ["*", "*", "*"];
+  if timezone != "UTC" && !fixed_daily {
+    return Err(StateValueError::CadenceProofUnavailable);
+  }
+  let proof_limit = if fixed_daily {
+    proof_limit.max(146_100)
+  } else {
+    proof_limit
+  };
+  let cron = CronParser::new()
+    .parse(expression)
+    .map_err(|_| StateValueError::InvalidCron)?;
+  let timezone =
+    BundledTimeZone::parse(timezone).map_err(|()| StateValueError::CadenceProofUnavailable)?;
+  let mut previous = None;
+  let mut first = None;
+  let mut reference = GREGORIAN_CYCLE_START - 1;
+  let mut occurrences = 0_u32;
+  loop {
+    let reference_utc = DateTime::<Utc>::from_timestamp(reference, 0)
+      .ok_or(StateValueError::CadenceProofUnavailable)?;
+    let occurrence = cron
+      .find_next_occurrence(&reference_utc.with_timezone(&timezone), false)
+      .map_err(|_| StateValueError::CadenceProofUnavailable)?
+      .timestamp();
+    if occurrence <= reference {
+      return Err(StateValueError::CadenceProofUnavailable);
+    }
+    if occurrence >= GREGORIAN_CYCLE_END {
+      break;
+    }
+    occurrences = occurrences
+      .checked_add(1)
+      .ok_or(StateValueError::CadenceProofExhausted)?;
+    if occurrences > proof_limit {
+      return Err(StateValueError::CadenceProofExhausted);
+    }
+    first.get_or_insert(occurrence);
+    if previous.is_some_and(|prior| occurrence - prior < minimum) {
+      return Ok(false);
+    }
+    previous = Some(occurrence);
+    reference = occurrence;
+  }
+  let (Some(first), Some(last)) = (first, previous) else {
+    return Err(StateValueError::CadenceProofUnavailable);
+  };
+  let cycle = GREGORIAN_CYCLE_END - GREGORIAN_CYCLE_START;
+  Ok(first + cycle - last >= minimum)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2986,4 +3058,50 @@ fn positive_u32(value: i64) -> Result<u32, StateError> {
     .ok_or_else(|| StateError::InvalidSchedulerState {
       reason: "persisted version is not positive".to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{ScheduleSpec, StateValueError};
+
+  #[test]
+  fn cron_cadence_proof_rejects_a_later_short_pair() {
+    let schedule = ScheduleSpec::cron("0 0 1,15,16 * *", "UTC").expect("valid cron");
+    assert_eq!(
+      schedule
+        .validate_minimum_cadence(1_800_000_000, 2 * 86_400, 100_000)
+        .expect_err("the monthly 15th to 16th gap is too short"),
+      StateValueError::CadenceTooShort
+    );
+  }
+
+  #[test]
+  fn cron_cadence_proof_accepts_common_safe_utc_and_timezone_daily_schedules() {
+    ScheduleSpec::cron("0 3 * * *", "UTC")
+      .expect("valid UTC daily cron")
+      .validate_minimum_cadence(1_800_000_000, 86_400, 1)
+      .expect("fixed UTC daily cadence is statically proven");
+    ScheduleSpec::cron("0 3 * * *", "America/New_York")
+      .expect("valid timezone daily cron")
+      .validate_minimum_cadence(1_800_000_000, 23 * 3_600, 1)
+      .expect("full-cycle timezone proof includes DST transitions");
+  }
+
+  #[test]
+  fn cron_cadence_proof_fails_closed_for_exhaustion_and_variable_timezone_rules() {
+    let exhausted = ScheduleSpec::cron("0 0 1 * *", "UTC").expect("valid monthly cron");
+    assert_eq!(
+      exhausted
+        .validate_minimum_cadence(1_800_000_000, 61, 1)
+        .expect_err("proof bound must be enforced"),
+      StateValueError::CadenceProofExhausted
+    );
+    let variable = ScheduleSpec::cron("0 0 1,15,16 * *", "America/New_York").expect("valid cron");
+    assert_eq!(
+      variable
+        .validate_minimum_cadence(1_800_000_000, 61, 100_000)
+        .expect_err("variable timezone expression is not canonically provable"),
+      StateValueError::CadenceProofUnavailable
+    );
+  }
 }

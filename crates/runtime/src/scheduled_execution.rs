@@ -11,10 +11,10 @@ use codeoff_agent_contract::{
 };
 use codeoff_core::SchedulerOperationalPolicy;
 use codeoff_state::{
-  AttestedExecutionProfileSnapshot, ClaimedScheduledRun, ExpiredRunReclaimOutcome,
-  PreflightFailureDisposition, RunLeaseBinding, ScheduledExecutionDisposition,
-  ScheduledExecutionTerminal, ScheduledExecutorAdmission, ScheduledPrepareAuthority,
-  ScheduledRunLateEvidenceKind, ScheduledRunResult, StateError, StateStore, TransportConvergence,
+  AttestedExecutionProfileSnapshot, ClaimedScheduledRun, ExpiredRunReclaimOutcome, RunLeaseBinding,
+  ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledExecutorAdmission,
+  ScheduledPrepareAuthority, ScheduledRunLateEvidenceKind, ScheduledRunResult, StateError,
+  StateStore, TransportConvergence,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -258,7 +258,12 @@ async fn run_scheduled_worker(
       break;
     }
     let started_at = Instant::now();
-    let tick = run_scheduled_worker_tick(&state, &orchestrator, shutdown.clone()).await;
+    let tick = Box::pin(run_scheduled_worker_tick(
+      &state,
+      &orchestrator,
+      shutdown.clone(),
+    ))
+    .await;
     let (status, error_kind) = match &tick {
       Ok(outcome) => (execution_tick_status(*outcome), None),
       Err(_) => (
@@ -891,15 +896,21 @@ impl ScheduledRunOrchestrator {
       return Ok(TickOutcome::Cancelled);
     }
     let now = self.clock.now();
-    let lease_expires_at = checked_add(now, self.policy.lease_seconds, "lease expiry")?;
     let claim_result = match &admission {
       RefreshedExecutorAdmission::Unavailable => Ok(None),
-      RefreshedExecutorAdmission::Ready => tokio::select! {
-        result = self
-          .state
-          .claim_next_scheduled_run(&self.lease_owner, now, lease_expires_at) => result,
-        () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
-      },
+      RefreshedExecutorAdmission::Ready => {
+        let clock_read = || self.clock.now();
+        tokio::select! {
+          result = self
+            .state
+            .claim_next_scheduled_run_from_snapshot_with_clock(
+              &self.lease_owner,
+              now,
+              &clock_read,
+            ) => result,
+          () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
+        }
+      }
       RefreshedExecutorAdmission::Authority(authority) => {
         let state = self.state.clone();
         let lease_owner = self.lease_owner.clone();
@@ -911,10 +922,9 @@ impl ScheduledRunOrchestrator {
           async move {
             let clock_read = || clock.now();
             state
-              .claim_next_scheduled_run_with_admission(
+              .claim_next_scheduled_run_from_snapshot_with_admission(
                 &lease_owner,
                 now,
-                lease_expires_at,
                 &authority,
                 &clock_read,
                 task_cancellation.as_ref(),
@@ -949,6 +959,10 @@ impl ScheduledRunOrchestrator {
       return Ok(TickOutcome::Idle);
     };
     let snapshot_policy = ExecutionPolicy::from_policy(&claim.scheduler_policy);
+    #[cfg(test)]
+    {
+      self.policy.lease_seconds = snapshot_policy.lease_seconds;
+    }
     #[cfg(not(test))]
     {
       self.policy = snapshot_policy;
@@ -957,6 +971,23 @@ impl ScheduledRunOrchestrator {
     if self.policy == ExecutionPolicy::default() {
       self.policy = snapshot_policy;
     }
+    let Some(absolute_deadline) = claim.scheduler_policy.run_deadline_at(claim.scheduled_for)
+    else {
+      self
+        .record_preflight_failure(&claim, PrepareFailure::fatal("run_deadline_overflow"))
+        .await?;
+      return Ok(TickOutcome::Failed);
+    };
+    let deadline_now = self.clock.now();
+    if deadline_now >= absolute_deadline {
+      self
+        .record_preflight_failure(&claim, PrepareFailure::fatal("run_deadline_exceeded"))
+        .await?;
+      return Ok(TickOutcome::Failed);
+    }
+    self.policy.total_timeout = self.policy.total_timeout.min(Duration::from_secs(
+      u64::try_from(absolute_deadline - deadline_now).unwrap_or(0),
+    ));
     let total_deadline = tokio::time::Instant::now()
       .checked_add(self.policy.total_timeout)
       .ok_or_else(|| StateError::InvalidSchedulerState {
@@ -1011,6 +1042,13 @@ impl ScheduledRunOrchestrator {
       cancellation: Arc::clone(&cancellation),
     };
     let backend = Arc::clone(&self.backend);
+    if self.clock.now() >= absolute_deadline {
+      let outcome = self
+        .record_preflight_failure(&claim, PrepareFailure::fatal("run_deadline_exceeded"))
+        .await;
+      stop_heartbeat(&mut heartbeat).await;
+      return outcome;
+    }
     let authorization = tokio::select! {
       biased;
       () = cancellation_requested(shutdown.clone()) => {
@@ -1054,6 +1092,13 @@ impl ScheduledRunOrchestrator {
         return outcome;
       }
     };
+    if self.clock.now() >= absolute_deadline {
+      let outcome = self
+        .record_preflight_failure(&claim, PrepareFailure::fatal("run_deadline_exceeded"))
+        .await;
+      stop_heartbeat(&mut heartbeat).await;
+      return outcome;
+    }
     let mut prepare = tokio::task::spawn_blocking(move || backend.prepare(input, authorization));
     let prepared = tokio::select! {
       biased;
@@ -1120,6 +1165,13 @@ impl ScheduledRunOrchestrator {
       cancellation.store(true, Ordering::Release);
       let outcome = self
         .record_shutdown_preflight(&claim, "scheduler_shutdown_before_execution")
+        .await;
+      stop_heartbeat(&mut heartbeat).await;
+      return outcome;
+    }
+    if self.clock.now() >= absolute_deadline {
+      let outcome = self
+        .record_preflight_failure(&claim, PrepareFailure::fatal("run_deadline_exceeded"))
         .await;
       stop_heartbeat(&mut heartbeat).await;
       return outcome;
@@ -1316,24 +1368,11 @@ impl ScheduledRunOrchestrator {
     failure: PrepareFailure,
   ) -> Result<TickOutcome, StateError> {
     let now = self.clock.now();
-    let disposition = if failure.retryable {
-      PreflightFailureDisposition::RetryAt(checked_add(
-        now,
-        i64::from(
-          claim
-            .scheduler_policy
-            .run_retry_delay_seconds(claim.binding.run_id(), claim.binding.attempt()),
-        ),
-        "preflight retry",
-      )?)
-    } else {
-      PreflightFailureDisposition::Fail
-    };
     match self
       .state
-      .record_scheduled_run_preflight_failure(
+      .record_scheduled_run_preflight_failure_from_snapshot(
         &claim.binding,
-        disposition,
+        failure.retryable,
         &failure.kind,
         &failure.message,
         now,
@@ -1421,7 +1460,7 @@ impl ScheduledRunOrchestrator {
       }
       result => result,
     };
-    let (disposition, kind, message) = execution_failure_disposition(claim, result, now)?;
+    let (disposition, kind, message) = execution_failure_disposition(claim, result, now);
     self
       .state
       .record_scheduled_run_execution_outcome(&claim.binding, disposition, kind, message, now)
@@ -1571,29 +1610,26 @@ fn execution_failure_disposition(
   claim: &ClaimedScheduledRun,
   result: ExecutionResult,
   now: i64,
-) -> Result<(ScheduledExecutionDisposition, &'static str, &'static str), StateError> {
-  let retry_at = checked_add(
-    now,
-    i64::from(
-      claim
-        .scheduler_policy
-        .run_retry_delay_seconds(claim.binding.run_id(), claim.binding.attempt()),
+) -> (ScheduledExecutionDisposition, &'static str, &'static str) {
+  let retry = |exhausted| match (
+    claim.scheduler_policy.run_retry_at(
+      claim.binding.run_id(),
+      claim.binding.attempt(),
+      claim.scheduled_for,
+      now,
     ),
-    "execution retry",
-  )?;
-  let deadline_at = checked_add(
-    claim.scheduled_for,
-    i64::from(claim.scheduler_policy.run_deadline_seconds),
-    "execution deadline",
-  )?;
-  let retry = |exhausted| ScheduledExecutionDisposition::RetryAt {
-    retry_at,
-    deadline_at,
-    max_attempts: i64::from(claim.scheduler_policy.run_max_attempts),
-    transport: TransportConvergence::Converged,
-    exhausted,
+    claim.scheduler_policy.run_deadline_at(claim.scheduled_for),
+  ) {
+    (Some(retry_at), Some(deadline_at)) => ScheduledExecutionDisposition::RetryAt {
+      retry_at,
+      deadline_at,
+      max_attempts: i64::from(claim.scheduler_policy.run_max_attempts),
+      transport: TransportConvergence::Converged,
+      exhausted,
+    },
+    _ => ScheduledExecutionDisposition::Terminal(exhausted),
   };
-  Ok(match result {
+  match result {
     ExecutionResult::Interrupted {
       transport_converged: true,
     } => (
@@ -1631,15 +1667,7 @@ fn execution_failure_disposition(
       "scheduled execution returned an empty result",
     ),
     ExecutionResult::Completed { .. } => unreachable!("completed results commit separately"),
-  })
-}
-
-fn checked_add(value: i64, delta: i64, field: &str) -> Result<i64, StateError> {
-  value
-    .checked_add(delta)
-    .ok_or_else(|| StateError::InvalidSchedulerState {
-      reason: format!("scheduled {field} overflow"),
-    })
+  }
 }
 
 fn prepare_nonce(binding: &RunLeaseBinding) -> String {
@@ -2144,9 +2172,13 @@ mod tests {
     let (_shutdown, shutdown_rx) = watch::channel(false);
 
     assert_eq!(
-      run_scheduled_worker_tick(&state, &runtime, shutdown_rx.clone())
-        .await
-        .expect("gap tick"),
+      Box::pin(run_scheduled_worker_tick(
+        &state,
+        &runtime,
+        shutdown_rx.clone()
+      ))
+      .await
+      .expect("gap tick"),
       TickOutcome::Unavailable
     );
     assert_eq!(
@@ -2159,7 +2191,7 @@ mod tests {
 
     available.store(true, Ordering::Release);
     assert_eq!(
-      run_scheduled_worker_tick(&state, &runtime, shutdown_rx)
+      Box::pin(run_scheduled_worker_tick(&state, &runtime, shutdown_rx))
         .await
         .expect("recovery tick"),
       TickOutcome::Completed
@@ -2248,9 +2280,13 @@ mod tests {
     let (_shutdown, shutdown_rx) = watch::channel(false);
 
     assert_eq!(
-      run_scheduled_worker_tick(&state, &runtime, shutdown_rx.clone())
-        .await
-        .expect("stale admission tick"),
+      Box::pin(run_scheduled_worker_tick(
+        &state,
+        &runtime,
+        shutdown_rx.clone()
+      ))
+      .await
+      .expect("stale admission tick"),
       TickOutcome::Unavailable
     );
     assert_eq!(
@@ -2264,7 +2300,7 @@ mod tests {
     *admission.lock().expect("executor admission") =
       RefreshedExecutorAdmission::Authority(test_executor_admission(&epoch_two, 150));
     assert_eq!(
-      run_scheduled_worker_tick(&state, &runtime, shutdown_rx)
+      Box::pin(run_scheduled_worker_tick(&state, &runtime, shutdown_rx))
         .await
         .expect("rotated admission tick"),
       TickOutcome::Completed
@@ -2548,7 +2584,7 @@ mod tests {
     let (_shutdown, shutdown_rx) = watch::channel(false);
 
     assert_eq!(
-      run_scheduled_worker_tick(&state, &runtime, shutdown_rx)
+      Box::pin(run_scheduled_worker_tick(&state, &runtime, shutdown_rx))
         .await
         .expect("tick"),
       TickOutcome::Unavailable
@@ -2960,10 +2996,9 @@ mod tests {
     let mut runtime = orchestrator(
       state.clone(),
       backend,
-      Arc::new(TestClock(AtomicI64::new(111), 2)),
+      Arc::new(TestClock(AtomicI64::new(111), 61)),
       1,
     );
-    runtime.policy.lease_seconds = 1;
     runtime.policy.heartbeat_interval = Duration::from_millis(1);
     assert_eq!(
       runtime.run_once().await.expect("tick"),

@@ -225,7 +225,11 @@ impl ScheduleService {
       ));
     }
     schedule
-      .validate_minimum_cadence(now, policy.minimum_schedule_cadence_seconds)
+      .validate_minimum_cadence(
+        now,
+        policy.minimum_schedule_cadence_seconds,
+        policy.occurrence_search_limit,
+      )
       .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))
   }
 

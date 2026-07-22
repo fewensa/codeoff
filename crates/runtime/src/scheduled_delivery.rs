@@ -556,6 +556,7 @@ async fn run_scheduled_delivery_tick_with_timeline(
       if *shutdown.borrow() {
         return Ok(ScheduledDeliveryTickOutcome::Cancelled);
       }
+      let policy = authority.scheduler_policy().clone();
       let readiness = provider.readiness(DeliveryProviderReadinessRequest {
         delivery_id: authority.delivery_id(),
         target_json: authority.target_json(),
@@ -608,13 +609,8 @@ async fn run_scheduled_delivery_tick_with_timeline(
         return Ok(ScheduledDeliveryTickOutcome::Cancelled);
       }
       let claim_time = timeline.fresh_now();
-      let lease_expires_at = checked_add(
-        claim_time,
-        i64::from(policy.delivery_lease_seconds),
-        "delivery lease",
-      )?;
       let Some(claim) = state
-        .claim_scheduled_delivery(&authority, lease_owner, claim_time, lease_expires_at)
+        .claim_scheduled_delivery_from_snapshot(&authority, lease_owner, claim_time)
         .await?
       else {
         return Ok(ScheduledDeliveryTickOutcome::Idle);
@@ -669,7 +665,27 @@ async fn dispatch_claimed_delivery_inner(
   if *shutdown.borrow() {
     return release_before_dispatch(state, &claim, &timeline, &mut heartbeat).await;
   }
-  timeline.fresh_now();
+  let dispatch_now = timeline.fresh_now();
+  if claim
+    .scheduler_policy
+    .delivery_deadline_at(claim.payload.created_at())
+    .is_none_or(|deadline| dispatch_now >= deadline)
+  {
+    if let Err(error) = heartbeat.stop_and_join().await {
+      return authority_error(error);
+    }
+    return commit_failure(
+      state,
+      &claim,
+      ScheduledDeliveryFailure::ConfirmedNoWriteTerminal {
+        error_kind: "delivery_deadline_exceeded".to_owned(),
+        redacted_message: None,
+      },
+      dispatch_now,
+      ScheduledDeliveryTickOutcome::FailedTerminal,
+    )
+    .await;
+  }
 
   let request = DeliveryProviderRequest {
     payload: &claim.payload,
@@ -889,26 +905,35 @@ async fn release_before_dispatch(
     return authority_error(error);
   }
   let now = timeline.fresh_now();
-  let next_attempt_at = checked_add(
-    now,
-    i64::from(
-      claim
-        .scheduler_policy
-        .delivery_retry_delay_seconds(claim.binding.delivery_id(), claim.binding.attempt()),
-    ),
-    "shutdown delivery retry",
-  )?;
-  let commit = commit_failure(
-    state,
-    claim,
-    ScheduledDeliveryFailure::ConfirmedNoWriteRetryable {
-      error_kind: "cancelled_before_dispatch".to_owned(),
-      redacted_message: None,
-      next_attempt_at,
-    },
-    now,
-    ScheduledDeliveryTickOutcome::RetryDeferred,
-  );
+  let failure = claim
+    .scheduler_policy
+    .delivery_retry_at(
+      claim.binding.delivery_id(),
+      claim.binding.attempt(),
+      claim.payload.created_at(),
+      now,
+      None,
+    )
+    .map_or_else(
+      || ScheduledDeliveryFailure::ConfirmedNoWriteTerminal {
+        error_kind: "delivery_retry_exhausted".to_owned(),
+        redacted_message: None,
+      },
+      |next_attempt_at| ScheduledDeliveryFailure::ConfirmedNoWriteRetryable {
+        error_kind: "cancelled_before_dispatch".to_owned(),
+        redacted_message: None,
+        next_attempt_at,
+      },
+    );
+  let outcome = if matches!(
+    failure,
+    ScheduledDeliveryFailure::ConfirmedNoWriteRetryable { .. }
+  ) {
+    ScheduledDeliveryTickOutcome::RetryDeferred
+  } else {
+    ScheduledDeliveryTickOutcome::FailedTerminal
+  };
+  let commit = commit_failure(state, claim, failure, now, outcome);
   match tokio::time::timeout(
     Duration::from_secs(u64::from(
       claim.scheduler_policy.delivery_finalization_timeout_seconds,
@@ -947,7 +972,7 @@ async fn commit_outcome(
       retry_after_seconds,
       error_kind,
     } => {
-      let Some(next_attempt_at) = retry_at(claim, now, retry_after_seconds)? else {
+      let Some(next_attempt_at) = retry_at(claim, now, retry_after_seconds) else {
         return commit_failure(
           state,
           claim,
@@ -1023,38 +1048,17 @@ fn retry_at(
   claim: &ClaimedScheduledDelivery,
   now: i64,
   retry_after_seconds: Option<u64>,
-) -> Result<Option<i64>, StateError> {
-  if claim.payload.delivery_policy_version() != DELIVERY_POLICY_VERSION
-    || claim.binding.attempt() >= i64::from(claim.scheduler_policy.delivery_max_attempts)
-  {
-    return Ok(None);
+) -> Option<i64> {
+  if claim.payload.delivery_policy_version() != DELIVERY_POLICY_VERSION {
+    return None;
   }
-  let deadline = checked_add(
+  claim.scheduler_policy.delivery_retry_at(
+    claim.binding.delivery_id(),
+    claim.binding.attempt(),
     claim.payload.created_at(),
-    i64::from(claim.scheduler_policy.delivery_deadline_seconds),
-    "delivery deadline",
-  )?;
-  if now >= deadline {
-    return Ok(None);
-  }
-  let policy_delay = i64::from(
-    claim
-      .scheduler_policy
-      .delivery_retry_delay_seconds(claim.binding.delivery_id(), claim.binding.attempt()),
-  );
-  let retry_after = retry_after_seconds.map_or(0, |seconds| {
-    i64::try_from(seconds)
-      .unwrap_or(i64::from(
-        claim.scheduler_policy.delivery_retry_after_max_seconds,
-      ))
-      .clamp(
-        1,
-        i64::from(claim.scheduler_policy.delivery_retry_after_max_seconds),
-      )
-  });
-  let delay = policy_delay.max(retry_after);
-  let next_attempt_at = checked_add(now, delay, "delivery retry")?;
-  Ok((next_attempt_at <= deadline).then_some(next_attempt_at))
+    now,
+    retry_after_seconds,
+  )
 }
 
 fn is_lost_delivery_authority(error: &StateError) -> bool {

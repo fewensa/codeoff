@@ -823,11 +823,42 @@ impl StateStore {
       .claim_next_scheduled_run_inner(
         lease_owner,
         now,
-        lease_expires_at,
+        Some(lease_expires_at),
         None,
         &|| now,
         &cancellation,
       )
+      .await
+  }
+
+  /// Claims the oldest eligible run using its durable policy snapshot for the initial lease.
+  ///
+  /// # Errors
+  /// Returns an error for invalid snapshot authority, counters, or storage failure.
+  pub async fn claim_next_scheduled_run_from_snapshot(
+    &self,
+    lease_owner: &str,
+    now: i64,
+  ) -> Result<Option<ClaimedScheduledRun>, StateError> {
+    let cancellation = AtomicBool::new(false);
+    self
+      .claim_next_scheduled_run_inner(lease_owner, now, None, None, &|| now, &cancellation)
+      .await
+  }
+
+  /// Claims from a durable snapshot using a fresh transaction-time clock read.
+  ///
+  /// # Errors
+  /// Returns an error for invalid snapshot authority, counters, or storage failure.
+  pub async fn claim_next_scheduled_run_from_snapshot_with_clock(
+    &self,
+    lease_owner: &str,
+    now: i64,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+  ) -> Result<Option<ClaimedScheduledRun>, StateError> {
+    let cancellation = AtomicBool::new(false);
+    self
+      .claim_next_scheduled_run_inner(lease_owner, now, None, None, clock, &cancellation)
       .await
   }
 
@@ -849,11 +880,28 @@ impl StateStore {
       .claim_next_scheduled_run_inner(
         lease_owner,
         now,
-        lease_expires_at,
+        Some(lease_expires_at),
         Some(admission),
         clock,
         cancellation,
       )
+      .await
+  }
+
+  /// Claims with executor admission and the exact run policy snapshot as initial lease authority.
+  ///
+  /// # Errors
+  /// Returns an admission error or an error for invalid snapshot authority or storage failure.
+  pub async fn claim_next_scheduled_run_from_snapshot_with_admission(
+    &self,
+    lease_owner: &str,
+    now: i64,
+    admission: &ScheduledExecutorAdmission,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+    cancellation: &AtomicBool,
+  ) -> Result<Option<ClaimedScheduledRun>, StateError> {
+    self
+      .claim_next_scheduled_run_inner(lease_owner, now, None, Some(admission), clock, cancellation)
       .await
   }
 
@@ -865,13 +913,13 @@ impl StateStore {
     &self,
     lease_owner: &str,
     now: i64,
-    lease_expires_at: i64,
+    lease_expires_at: Option<i64>,
     admission: Option<&ScheduledExecutorAdmission>,
     clock: &(dyn Fn() -> i64 + Send + Sync),
     cancellation: &AtomicBool,
   ) -> Result<Option<ClaimedScheduledRun>, StateError> {
     validate_text("scheduled run lease owner", lease_owner).map_err(invalid_value)?;
-    if lease_expires_at <= now {
+    if lease_expires_at.is_some_and(|expires_at| expires_at <= now) {
       return Err(StateError::InvalidSchedulerState {
         reason: "scheduled run lease must expire after claim time".to_owned(),
       });
@@ -884,12 +932,23 @@ impl StateStore {
       .map_err(|error| executor_admission_storage_error(error, admission))?;
     acquire_and_validate_executor_admission(&mut transaction, admission, clock).await?;
     ensure_executor_admission_not_cancelled(admission, cancellation)?;
+    let mutation_now = clock();
+    if lease_expires_at.is_none() {
+      sqlx::query(
+        "update scheduled_runs set state = 'failed', overlap_slot = null, next_attempt_at = null, lease_owner = null, lease_expires_at = null, error_kind = case when scheduled_for > 9223372036854775807 - cast(json_extract(scheduler_policy_json, '$.run_deadline_seconds') as integer) or ?1 >= scheduled_for + cast(json_extract(scheduler_policy_json, '$.run_deadline_seconds') as integer) then 'run_deadline_exceeded' else 'run_retry_exhausted' end, error_message = null, updated_at = ?1 where state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?1) and (scheduled_for > 9223372036854775807 - cast(json_extract(scheduler_policy_json, '$.run_deadline_seconds') as integer) or ?1 >= scheduled_for + cast(json_extract(scheduler_policy_json, '$.run_deadline_seconds') as integer) or attempt >= cast(json_extract(scheduler_policy_json, '$.run_max_attempts') as integer))",
+      )
+      .bind(mutation_now)
+      .execute(&mut *transaction)
+      .await
+      .map_err(scheduler_error)?;
+    }
+    let requested_lease_expires_at = lease_expires_at.unwrap_or(mutation_now);
     let row = sqlx::query(
-      "update scheduled_runs set state = 'leased', attempt = attempt + 1, fence = fence + 1, next_attempt_at = null, lease_owner = ?1, lease_expires_at = ?2, updated_at = ?3 where run_id = (select run_id from scheduled_runs indexed by idx_scheduled_runs_claim where state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 order by scheduled_for, run_id limit 1) and state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 returning run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, scheduler_policy_version, scheduler_policy_json, attempt, fence",
+      "update scheduled_runs set state = 'leased', attempt = attempt + 1, fence = fence + 1, next_attempt_at = null, lease_owner = ?1, lease_expires_at = case when ?2 > ?3 then ?2 else ?3 + cast(json_extract(scheduler_policy_json, '$.run_lease_seconds') as integer) end, updated_at = ?3 where run_id = (select run_id from scheduled_runs indexed by idx_scheduled_runs_claim where state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 order by scheduled_for, run_id limit 1) and state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 returning run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, scheduler_policy_version, scheduler_policy_json, attempt, fence, lease_expires_at",
     )
     .bind(lease_owner)
-    .bind(lease_expires_at)
-    .bind(now)
+    .bind(requested_lease_expires_at)
+    .bind(mutation_now)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(scheduler_error)?;
@@ -897,7 +956,7 @@ impl StateStore {
       let exhausted: i64 = sqlx::query_scalar(
         "select exists(select 1 from scheduled_runs where state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?1) and (attempt = 9223372036854775807 or fence = 9223372036854775807))",
       )
-      .bind(now)
+      .bind(mutation_now)
       .fetch_one(&mut *transaction)
       .await
       .map_err(scheduler_error)?;
@@ -925,8 +984,8 @@ impl StateStore {
     .bind(attempt)
     .bind(fence)
     .bind(lease_owner)
-    .bind(now)
-    .bind(lease_expires_at)
+    .bind(mutation_now)
+    .bind(row.try_get::<i64, _>("lease_expires_at").map_err(scheduler_error)?)
     .execute(&mut *transaction)
     .await
     .map_err(scheduler_error)?;
@@ -1296,7 +1355,7 @@ impl StateStore {
       });
     }
     let pending = sqlx::query(
-      "select candidate.delivery_id, candidate.state, candidate.target_json, candidate.target_identity_digest, candidate.target_snapshot_digest_algorithm, candidate.target_snapshot_digest, candidate.payload_digest, candidate.intent_key, exists(select 1 from scheduled_delivery_baselines baseline where baseline.job_id = candidate.job_id and baseline.target_identity_digest = candidate.target_identity_digest and baseline.target_snapshot_digest_algorithm = candidate.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = candidate.target_snapshot_digest and baseline.delivery_policy_version = candidate.delivery_policy_version and baseline.render_version = candidate.render_version and baseline.hash_algorithm = candidate.hash_algorithm and baseline.accepted_payload_digest = candidate.payload_digest) as unchanged from scheduled_run_deliveries candidate where ((candidate.state = 'failed_retryable' and candidate.next_attempt_at <= ?1) or (candidate.state = 'pending' and candidate.updated_at <= ?1)) and candidate.authority_kind = 'intent_v1' and candidate.payload_snapshot is not null and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.delivery_id <> candidate.delivery_id and active.job_id = candidate.job_id and active.target_identity_digest = candidate.target_identity_digest and active.target_snapshot_digest = candidate.target_snapshot_digest and active.delivery_policy_version = candidate.delivery_policy_version and active.render_version = candidate.render_version and active.hash_algorithm = candidate.hash_algorithm) order by case candidate.state when 'failed_retryable' then 0 else 1 end, case candidate.state when 'failed_retryable' then candidate.next_attempt_at else candidate.created_at end, candidate.delivery_id limit 1",
+      "select candidate.delivery_id, candidate.state, candidate.target_json, candidate.target_identity_digest, candidate.target_snapshot_digest_algorithm, candidate.target_snapshot_digest, candidate.payload_digest, candidate.intent_key, candidate.payload_created_at, candidate.scheduler_policy_version, candidate.scheduler_policy_json, exists(select 1 from scheduled_delivery_baselines baseline where baseline.job_id = candidate.job_id and baseline.target_identity_digest = candidate.target_identity_digest and baseline.target_snapshot_digest_algorithm = candidate.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = candidate.target_snapshot_digest and baseline.delivery_policy_version = candidate.delivery_policy_version and baseline.render_version = candidate.render_version and baseline.hash_algorithm = candidate.hash_algorithm and baseline.accepted_payload_digest = candidate.payload_digest) as unchanged from scheduled_run_deliveries candidate where ((candidate.state = 'failed_retryable' and candidate.next_attempt_at <= ?1) or (candidate.state = 'pending' and candidate.updated_at <= ?1)) and candidate.authority_kind = 'intent_v1' and candidate.payload_snapshot is not null and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.delivery_id <> candidate.delivery_id and active.job_id = candidate.job_id and active.target_identity_digest = candidate.target_identity_digest and active.target_snapshot_digest = candidate.target_snapshot_digest and active.delivery_policy_version = candidate.delivery_policy_version and active.render_version = candidate.render_version and active.hash_algorithm = candidate.hash_algorithm) order by case candidate.state when 'failed_retryable' then 0 else 1 end, case candidate.state when 'failed_retryable' then candidate.next_attempt_at else candidate.created_at end, candidate.delivery_id limit 1",
     )
     .bind(now)
     .fetch_optional(&self.pool)
@@ -1306,6 +1365,20 @@ impl StateStore {
       return Ok(ScheduledDeliveryWork::Idle);
     };
     let authority = scheduled_delivery_authority_from_row(&pending)?;
+    if authority
+      .scheduler_policy()
+      .delivery_deadline_at(authority.payload_created_at())
+      .is_none_or(|deadline| now >= deadline)
+    {
+      sqlx::query("update scheduled_run_deliveries set state = 'failed_terminal', next_attempt_at = null, provider_outcome = 'confirmed_no_write_terminal', error_kind = 'delivery_deadline_exceeded', error_message = null, updated_at = ?1 where delivery_id = ?2 and state = ?3")
+        .bind(now)
+        .bind(authority.delivery_id())
+        .bind(authority.source_state().as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(scheduler_error)?;
+      return Ok(ScheduledDeliveryWork::Idle);
+    }
     if authority.source_state() == ScheduledDeliveryState::Pending
       && pending
         .try_get::<i64, _>("unchanged")
@@ -1522,6 +1595,23 @@ impl StateStore {
       });
     }
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let terminalized = sqlx::query(
+      "update scheduled_run_deliveries set state = 'failed_terminal', next_attempt_at = null, provider_outcome = 'confirmed_no_write_terminal', error_kind = case when payload_created_at > 9223372036854775807 - cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) or ?1 >= payload_created_at + cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) then 'delivery_deadline_exceeded' else 'delivery_retry_exhausted' end, error_message = null, updated_at = ?1 where delivery_id = ?2 and state = ?3 and target_json = ?4 and target_snapshot_digest = ?5 and payload_digest = ?6 and intent_key = ?7 and (attempt >= cast(json_extract(scheduler_policy_json, '$.delivery_max_attempts') as integer) or payload_created_at > 9223372036854775807 - cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) or ?1 >= payload_created_at + cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer))",
+    )
+    .bind(now)
+    .bind(authority.delivery_id())
+    .bind(authority.source_state().as_str())
+    .bind(authority.target_json())
+    .bind(authority.target_digest())
+    .bind(authority.payload_digest())
+    .bind(authority.intent_key())
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if terminalized.rows_affected() == 1 {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(None);
+    }
     if authority.source_state() == ScheduledDeliveryState::FailedRetryable
       && !requeue_exact_retryable_delivery(&mut transaction, authority, now).await?
     {
@@ -1613,6 +1703,37 @@ impl StateStore {
           .map_err(scheduler_error)?,
       )?,
     }))
+  }
+
+  /// Claims exact delivery authority using its durable policy snapshot for the initial lease.
+  ///
+  /// # Errors
+  /// Returns an error for invalid delivery authority, lease arithmetic, or storage failure.
+  pub async fn claim_scheduled_delivery_from_snapshot(
+    &self,
+    authority: &ScheduledDeliveryAuthority,
+    lease_owner: &str,
+    now: i64,
+  ) -> Result<Option<ClaimedScheduledDelivery>, StateError> {
+    let Some(deadline) = authority
+      .scheduler_policy()
+      .delivery_deadline_at(authority.payload_created_at())
+    else {
+      return Ok(None);
+    };
+    if now >= deadline {
+      return Ok(None);
+    }
+    let lease_expires_at = now
+      .checked_add(i64::from(
+        authority.scheduler_policy().delivery_lease_seconds,
+      ))
+      .ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "scheduled delivery lease overflows".to_owned(),
+      })?;
+    self
+      .claim_scheduled_delivery(authority, lease_owner, now, lease_expires_at)
+      .await
   }
 
   /// Extends the current delivery attempt lease using strict owner/fence authority.
@@ -1898,7 +2019,7 @@ impl StateStore {
     completed_at: i64,
   ) -> Result<(), StateError> {
     validate_delivery_binding(binding)?;
-    let (state, outcome, error_kind, message, next_attempt_at) = match failure {
+    let (mut state, mut outcome, mut error_kind, message, mut next_attempt_at) = match failure {
       ScheduledDeliveryFailure::ConfirmedNoWriteRetryable {
         error_kind,
         redacted_message,
@@ -1912,7 +2033,7 @@ impl StateStore {
         (
           "failed_retryable",
           "confirmed_no_write_retryable",
-          error_kind,
+          error_kind.as_str(),
           redacted_message.as_deref(),
           Some(*next_attempt_at),
         )
@@ -1923,7 +2044,7 @@ impl StateStore {
       } => (
         "failed_terminal",
         "confirmed_no_write_terminal",
-        error_kind,
+        error_kind.as_str(),
         redacted_message.as_deref(),
         None,
       ),
@@ -1933,13 +2054,45 @@ impl StateStore {
       } => (
         "delivery_unknown",
         "ambiguous_post_write",
-        error_kind,
+        error_kind.as_str(),
         redacted_message.as_deref(),
         None,
       ),
     };
     validate_delivery_error(error_kind, message)?;
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    if let Some(retry_at) = next_attempt_at {
+      let row = sqlx::query(
+        "select payload_created_at, scheduler_policy_version, scheduler_policy_json from scheduled_run_deliveries where delivery_id = ?1 and attempt = ?2 and fence = ?3 and lease_owner = ?4 and state = 'sending' and lease_expires_at > ?5",
+      )
+      .bind(binding.delivery_id())
+      .bind(binding.attempt())
+      .bind(binding.fence())
+      .bind(binding.lease_owner())
+      .bind(completed_at)
+      .fetch_optional(&mut *transaction)
+      .await
+      .map_err(scheduler_error)?
+      .ok_or(StateError::ScheduledDeliveryLostLease)?;
+      let policy = scheduler_policy_from_snapshot(
+        row
+          .try_get("scheduler_policy_version")
+          .map_err(scheduler_error)?,
+        row
+          .try_get("scheduler_policy_json")
+          .map_err(scheduler_error)?,
+      )?;
+      if !policy.delivery_can_retry_at(
+        binding.attempt(),
+        row.try_get("payload_created_at").map_err(scheduler_error)?,
+        retry_at,
+      ) {
+        state = "failed_terminal";
+        outcome = "confirmed_no_write_terminal";
+        error_kind = "delivery_retry_exhausted";
+        next_attempt_at = None;
+      }
+    }
     transition_delivery_terminal(
       &mut transaction,
       binding,
@@ -1969,15 +2122,24 @@ impl StateStore {
         reason: "scheduled delivery requeue limit must be positive".to_owned(),
       });
     }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     sqlx::query(
+      "update scheduled_run_deliveries set state = 'failed_terminal', next_attempt_at = null, provider_outcome = 'confirmed_no_write_terminal', error_kind = 'delivery_retry_exhausted', error_message = null, updated_at = ?1 where state = 'failed_retryable' and next_attempt_at <= ?1 and (attempt >= cast(json_extract(scheduler_policy_json, '$.delivery_max_attempts') as integer) or payload_created_at > 9223372036854775807 - cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) or next_attempt_at >= payload_created_at + cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer))",
+    )
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let result = sqlx::query(
       "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id in (select delivery_id from scheduled_run_deliveries where state = 'failed_retryable' and next_attempt_at <= ?1 order by next_attempt_at, delivery_id limit ?2)",
     )
     .bind(now)
     .bind(i64::from(limit))
-    .execute(&self.pool)
+    .execute(&mut *transaction)
     .await
-    .map(|result| result.rows_affected())
-    .map_err(scheduler_error)
+    .map_err(scheduler_error)?;
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(result.rows_affected())
   }
 
   /// Prunes one succeeded run's accepted terminal delivery evidence under durable audit authority.
@@ -2939,6 +3101,51 @@ where run.run_id = ?2
     error_message: &str,
     now: i64,
   ) -> Result<(), StateError> {
+    self
+      .record_scheduled_run_preflight_failure_inner(
+        binding,
+        disposition,
+        None,
+        error_kind,
+        error_message,
+        now,
+      )
+      .await
+  }
+
+  /// Records preflight failure with retry eligibility derived only from the durable run snapshot.
+  ///
+  /// # Errors
+  /// Returns an error for stale lease authority, invalid evidence, or storage failure.
+  pub async fn record_scheduled_run_preflight_failure_from_snapshot(
+    &self,
+    binding: &RunLeaseBinding,
+    retryable: bool,
+    error_kind: &str,
+    error_message: &str,
+    now: i64,
+  ) -> Result<(), StateError> {
+    self
+      .record_scheduled_run_preflight_failure_inner(
+        binding,
+        PreflightFailureDisposition::Fail,
+        Some(retryable),
+        error_kind,
+        error_message,
+        now,
+      )
+      .await
+  }
+
+  async fn record_scheduled_run_preflight_failure_inner(
+    &self,
+    binding: &RunLeaseBinding,
+    disposition: PreflightFailureDisposition,
+    snapshot_retryable: Option<bool>,
+    error_kind: &str,
+    error_message: &str,
+    now: i64,
+  ) -> Result<(), StateError> {
     validate_lease_binding(binding)?;
     validate_text("scheduled preflight error kind", error_kind).map_err(invalid_value)?;
     if error_message.len() > MAX_CONTEXT_BYTES {
@@ -2946,6 +3153,45 @@ where run.run_id = ?2
         reason: "scheduled preflight error exceeds its storage bound".to_owned(),
       });
     }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let disposition = if snapshot_retryable == Some(true) {
+      let row = sqlx::query(
+        "select scheduled_for, scheduler_policy_version, scheduler_policy_json from scheduled_runs where run_id = ?1 and job_id = ?2 and attempt = ?3 and fence = ?4 and lease_owner = ?5 and state = 'leased' and lease_expires_at > ?6",
+      )
+      .bind(binding.run_id())
+      .bind(binding.job_id())
+      .bind(binding.attempt())
+      .bind(binding.fence())
+      .bind(binding.lease_owner())
+      .bind(now)
+      .fetch_optional(&mut *transaction)
+      .await
+      .map_err(scheduler_error)?
+      .ok_or(StateError::ScheduledRunLostLease)?;
+      let policy = scheduler_policy_from_snapshot(
+        row
+          .try_get("scheduler_policy_version")
+          .map_err(scheduler_error)?,
+        row
+          .try_get("scheduler_policy_json")
+          .map_err(scheduler_error)?,
+      )?;
+      policy
+        .run_retry_at(
+          binding.run_id(),
+          binding.attempt(),
+          row.try_get("scheduled_for").map_err(scheduler_error)?,
+          now,
+        )
+        .map_or(
+          PreflightFailureDisposition::Fail,
+          PreflightFailureDisposition::RetryAt,
+        )
+    } else if snapshot_retryable == Some(false) {
+      PreflightFailureDisposition::Fail
+    } else {
+      disposition
+    };
     let (run_state, attempt_state, retry_at, overlap_slot) = match disposition {
       PreflightFailureDisposition::RetryAt(retry_at) if retry_at > now => {
         ("pending", "retry_scheduled", Some(retry_at), Some(1_i64))
@@ -2957,7 +3203,6 @@ where run.run_id = ?2
       }
       PreflightFailureDisposition::Fail => ("failed", "preflight_rejected", None, None),
     };
-    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let run = sqlx::query(
       "update scheduled_runs set state = ?1, next_attempt_at = ?2, lease_owner = null, lease_expires_at = null, overlap_slot = ?3, error_kind = case when ?1 = 'failed' then ?4 else null end, error_message = case when ?1 = 'failed' then ?5 else null end, updated_at = ?6 where run_id = ?7 and job_id = ?8 and attempt = ?9 and fence = ?10 and lease_owner = ?11 and state = 'leased' and lease_expires_at > ?6",
     )
@@ -3183,25 +3428,14 @@ where run.run_id = ?2
           .try_get("scheduler_policy_json")
           .map_err(scheduler_error)?,
       )?;
-      let delay = i64::from(policy.run_retry_delay_seconds(&run_id, attempt));
-      let retry_at = now
-        .checked_add(delay)
-        .ok_or_else(|| StateError::InvalidSchedulerState {
-          reason: "scheduled run reclaim retry overflow".to_owned(),
-        })?;
-      let deadline_at = row
+      let scheduled_for = row
         .try_get::<i64, _>("scheduled_for")
-        .map_err(scheduler_error)?
-        .checked_add(i64::from(policy.run_deadline_seconds))
-        .ok_or_else(|| StateError::InvalidSchedulerState {
-          reason: "scheduled run reclaim deadline overflow".to_owned(),
-        })?;
-      let max_attempts = if retry_at > deadline_at {
-        attempt
-      } else {
-        i64::from(policy.run_max_attempts)
-      };
-      (max_attempts, retry_at)
+        .map_err(scheduler_error)?;
+      policy
+        .run_retry_at(&run_id, attempt, scheduled_for, now)
+        .map_or((attempt, now), |retry_at| {
+          (i64::from(policy.run_max_attempts), retry_at)
+        })
     };
     let binding = RunLeaseBinding {
       run_id: run_id.clone(),
@@ -5010,6 +5244,15 @@ fn scheduled_delivery_authority_from_row(
     payload_digest,
     binding_digest,
     intent_key,
+    row.try_get("payload_created_at").map_err(scheduler_error)?,
+    scheduler_policy_from_snapshot(
+      row
+        .try_get("scheduler_policy_version")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("scheduler_policy_json")
+        .map_err(scheduler_error)?,
+    )?,
   ))
 }
 
@@ -5018,8 +5261,23 @@ async fn requeue_exact_retryable_delivery(
   authority: &ScheduledDeliveryAuthority,
   now: i64,
 ) -> Result<bool, StateError> {
+  let terminalized = sqlx::query(
+    "update scheduled_run_deliveries set state = 'failed_terminal', next_attempt_at = null, provider_outcome = 'confirmed_no_write_terminal', error_kind = 'delivery_retry_exhausted', error_message = null, updated_at = ?1 where delivery_id = ?2 and state = 'failed_retryable' and target_json = ?3 and target_snapshot_digest = ?4 and payload_digest = ?5 and intent_key = ?6 and next_attempt_at <= ?1 and (attempt >= cast(json_extract(scheduler_policy_json, '$.delivery_max_attempts') as integer) or payload_created_at > 9223372036854775807 - cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) or next_attempt_at >= payload_created_at + cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer))",
+  )
+  .bind(now)
+  .bind(authority.delivery_id())
+  .bind(authority.target_json())
+  .bind(authority.target_digest())
+  .bind(authority.payload_digest())
+  .bind(authority.intent_key())
+  .execute(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  if terminalized.rows_affected() == 1 {
+    return Ok(false);
+  }
   let requeued = sqlx::query(
-    "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id = ?2 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null and target_json = ?3 and target_snapshot_digest = ?4 and payload_digest = ?5 and intent_key = ?6 and next_attempt_at <= ?1 and attempt < 9223372036854775807 and fence < 9223372036854775807 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.delivery_id <> scheduled_run_deliveries.delivery_id and active.job_id = scheduled_run_deliveries.job_id and active.target_identity_digest = scheduled_run_deliveries.target_identity_digest and active.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and active.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and active.render_version = scheduled_run_deliveries.render_version and active.hash_algorithm = scheduled_run_deliveries.hash_algorithm) and not exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest)",
+    "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id = ?2 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null and target_json = ?3 and target_snapshot_digest = ?4 and payload_digest = ?5 and intent_key = ?6 and next_attempt_at <= ?1 and attempt < cast(json_extract(scheduler_policy_json, '$.delivery_max_attempts') as integer) and attempt < 9223372036854775807 and fence < 9223372036854775807 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.delivery_id <> scheduled_run_deliveries.delivery_id and active.job_id = scheduled_run_deliveries.job_id and active.target_identity_digest = scheduled_run_deliveries.target_identity_digest and active.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and active.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and active.render_version = scheduled_run_deliveries.render_version and active.hash_algorithm = scheduled_run_deliveries.hash_algorithm) and not exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest)",
   )
   .bind(now)
   .bind(authority.delivery_id())
@@ -5063,6 +5321,11 @@ fn validate_scheduled_delivery_authority(
   {
     return Err(StateError::InvalidSchedulerState {
       reason: "scheduled delivery readiness authority is invalid".to_owned(),
+    });
+  }
+  if authority.payload_created_at() < 0 || authority.scheduler_policy().validate().is_err() {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduled delivery readiness policy authority is invalid".to_owned(),
     });
   }
   validate_lowercase_sha256(
@@ -5365,7 +5628,11 @@ fn validate_create_request(
     .map_err(invalid_value)?;
   request
     .schedule
-    .validate_minimum_cadence(request.now, policy.minimum_schedule_cadence_seconds)
+    .validate_minimum_cadence(
+      request.now,
+      policy.minimum_schedule_cadence_seconds,
+      policy.occurrence_search_limit,
+    )
     .map_err(invalid_value)?;
   validate_definition_policy(&request.definition, policy)?;
   validate_delivery_targets(&request.targets)?;
@@ -5569,7 +5836,11 @@ async fn apply_resume(
   .ok_or(StateError::SchedulerGenerationConflict)?;
   let schedule = schedule_from_row(&row)?;
   schedule
-    .validate_minimum_cadence(now, policy.minimum_schedule_cadence_seconds)
+    .validate_minimum_cadence(
+      now,
+      policy.minimum_schedule_cadence_seconds,
+      policy.occurrence_search_limit,
+    )
     .map_err(invalid_value)?;
   let owner = owner_from_row(&row)?;
   enforce_active_job_limits(transaction, policy, &owner, None).await?;
@@ -5947,7 +6218,11 @@ fn validate_update_request(
     .map_err(invalid_value)?;
   request
     .schedule
-    .validate_minimum_cadence(request.now, policy.minimum_schedule_cadence_seconds)
+    .validate_minimum_cadence(
+      request.now,
+      policy.minimum_schedule_cadence_seconds,
+      policy.occurrence_search_limit,
+    )
     .map_err(invalid_value)?;
   request.definition.validate().map_err(invalid_value)?;
   validate_definition_policy(&request.definition, policy)?;
@@ -6187,14 +6462,26 @@ fn execution_outcome_transition(
     ScheduledExecutionDisposition::Terminal(terminal) => terminal,
     ScheduledExecutionDisposition::RetryAt {
       retry_at,
-      deadline_at,
-      max_attempts,
+      deadline_at: _,
+      max_attempts: _,
       transport: super::TransportConvergence::Converged,
       exhausted,
     } => {
+      let policy = scheduler_policy_from_snapshot(
+        row
+          .try_get("scheduler_policy_version")
+          .map_err(scheduler_error)?,
+        row
+          .try_get("scheduler_policy_json")
+          .map_err(scheduler_error)?,
+      )?;
+      let durable_deadline =
+        policy.run_deadline_at(row.try_get("scheduled_for").map_err(scheduler_error)?);
       if !persisted_profile_allows_retry(binding, row)? {
         ScheduledExecutionTerminal::OutcomeUnknown
-      } else if binding.attempt() >= max_attempts || now >= deadline_at || retry_at > deadline_at {
+      } else if binding.attempt() >= i64::from(policy.run_max_attempts)
+        || durable_deadline.is_none_or(|deadline| now >= deadline || retry_at >= deadline)
+      {
         exhausted
       } else {
         return Ok(ExecutionOutcomeTransition {

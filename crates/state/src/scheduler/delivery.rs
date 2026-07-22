@@ -15,6 +15,7 @@ pub enum ScheduledDeliveryState {
   FailedTerminal,
   DeliveryUnknown,
   SkippedNone,
+  SkippedUnchanged,
 }
 
 impl ScheduledDeliveryState {
@@ -28,6 +29,7 @@ impl ScheduledDeliveryState {
       Self::FailedTerminal => "failed_terminal",
       Self::DeliveryUnknown => "delivery_unknown",
       Self::SkippedNone => "skipped_none",
+      Self::SkippedUnchanged => "skipped_unchanged",
     }
   }
 }
@@ -44,6 +46,7 @@ impl FromStr for ScheduledDeliveryState {
       "failed_terminal" => Ok(Self::FailedTerminal),
       "delivery_unknown" => Ok(Self::DeliveryUnknown),
       "skipped_none" => Ok(Self::SkippedNone),
+      "skipped_unchanged" => Ok(Self::SkippedUnchanged),
       _ => Err(StateError::InvalidSchedulerState {
         reason: format!("invalid delivery state {value}"),
       }),
@@ -250,6 +253,7 @@ pub enum SkippedNoneBaselinePolicy {
 pub enum PreparedScheduledDelivery {
   Pending(DeliveryPayloadSnapshot),
   SkippedNone(DeliveryPayloadSnapshot),
+  SkippedUnchanged(DeliveryPayloadSnapshot),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,4 +321,14 @@ pub struct AcceptedDeliveryBaseline {
   pub source_result_hash: String,
   pub accepted_at: i64,
   pub baseline_version: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduledDeliveryRetentionReport {
+  pub delivery_attempts: u64,
+  pub deliveries: u64,
+  pub late_evidence: u64,
+  pub run_attempts: u64,
+  pub result_artifacts: u64,
+  pub runs: u64,
 }

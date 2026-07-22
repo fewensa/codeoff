@@ -150,6 +150,9 @@ pub enum StateError {
   #[error("scheduled delivery payload conflicts with immutable authority")]
   ScheduledDeliveryPayloadConflict,
 
+  #[error("scheduled delivery history is not eligible for retention")]
+  ScheduledDeliveryRetentionConflict,
+
   #[error("scheduled once occurrence is expired and cannot be resumed")]
   ScheduledOnceExpired,
 

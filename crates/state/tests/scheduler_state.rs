@@ -44,6 +44,15 @@ type LegacyDeliveryRow = (
   Option<String>,
   Option<Vec<u8>>,
 );
+type QuarantinedDeliveryRow = (
+  String,
+  String,
+  String,
+  Option<String>,
+  Option<String>,
+  Option<Vec<u8>>,
+  Option<i64>,
+);
 
 const NONE_TARGET_IDENTITY: &str =
   "0000000000000000000000000000000000000000000000000000000000000001";
@@ -146,6 +155,10 @@ fn test_scheduled_run_result_is_typed_and_bounded() {
   assert_eq!(
     ScheduledDeliveryState::from_str("failed_retryable").expect("frozen state"),
     ScheduledDeliveryState::FailedRetryable
+  );
+  assert_eq!(
+    ScheduledDeliveryState::from_str("skipped_unchanged").expect("frozen state"),
+    ScheduledDeliveryState::SkippedUnchanged
   );
   assert!(ScheduledRunResult::new("", "context").is_err());
   assert!(ScheduledRunResult::new("summary", "x".repeat(65_537)).is_err());
@@ -309,6 +322,7 @@ async fn test_initialize_adds_scheduler_tables_and_constraints() {
 
   for table in [
     "scheduled_delivery_baselines",
+    "scheduled_delivery_retention_audit",
     "scheduled_execution_baselines",
     "scheduled_job_delivery_targets",
     "scheduled_jobs",
@@ -1079,6 +1093,98 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       "succeeded".to_owned()
     )
   );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_payload() {
+  let temp = tempdir().expect("create tempdir");
+  let parent_migrations = temp.path().join("issue-06-migrations");
+  std::fs::create_dir(&parent_migrations).expect("create migration fixture");
+  let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+  for entry in std::fs::read_dir(source).expect("read migrations") {
+    let entry = entry.expect("migration entry");
+    if entry.file_name() != "20260722000000_scheduler_delivery_authority.sql" {
+      std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
+        .expect("copy issue-06 migration");
+    }
+  }
+  let state_dir = temp.path().join("state");
+  std::fs::create_dir(&state_dir).expect("create state dir");
+  let options = SqliteConnectOptions::from_str(&database_url(&state_dir))
+    .expect("database options")
+    .create_if_missing(true);
+  let pool = SqlitePoolOptions::new()
+    .max_connections(1)
+    .connect_with(options)
+    .await
+    .expect("connect issue-06 database");
+  Migrator::new(parent_migrations)
+    .await
+    .expect("load issue-06 migrator")
+    .run(&pool)
+    .await
+    .expect("run issue-06 migrations");
+  sqlx::query("insert into scheduled_jobs (job_id, definition_version, definition_json, creator_kind, creator_provider, creator_tenant, creator_subject, owner_kind, owner_provider, owner_tenant, owner_subject, status, generation, capability_schema_version, capability_digest, capability_json, created_at, updated_at) values ('issue-06-payload', 1, '{}', 'user', 'test', 'tenant', 'creator', 'user', 'test', 'tenant', 'owner', 'active', 0, 1, 'profile', '{}', 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed job");
+  sqlx::query("insert into schedules (schedule_id, job_id, kind, canonical_spec, once_at, next_run_at, created_at, updated_at) values ('schedule-issue-06-payload', 'issue-06-payload', 'once', '200', 200, 200, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed schedule");
+  sqlx::query("insert into scheduled_execution_baselines (job_id) values ('issue-06-payload')")
+    .execute(&pool)
+    .await
+    .expect("seed execution baseline");
+  sqlx::query("insert into scheduled_runs (run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, state, overlap_slot, created_at, updated_at) values ('issue-06-payload-run', 'issue-06-payload', 'schedule-issue-06-payload', 0, 0, 110, 110, 1, '{}', 1, 'profile', '{}', '[{\"identity_digest\":\"0000000000000000000000000000000000000000000000000000000000000002\"}]', 'pending', 1, 100, 100)")
+    .execute(&pool)
+    .await
+    .expect("seed run");
+  let exact_legacy_bytes = "Cafe\u{301}  \n".as_bytes();
+  sqlx::query("insert into scheduled_run_deliveries (delivery_id, run_id, job_id, target_identity_digest, target_json, state, delivery_policy_version, render_version, hash_algorithm, payload_digest, payload_snapshot, expected_baseline_version, created_at, updated_at) values ('legacy-rendered', 'issue-06-payload-run', 'issue-06-payload', '0000000000000000000000000000000000000000000000000000000000000002', '{\"kind\":\"slack\"}', 'pending', 1, 1, 'legacy-unconstrained', 'not-a-sha256', ?1, 0, 100, 101)")
+    .bind(exact_legacy_bytes)
+    .execute(&pool)
+    .await
+    .expect("seed rendered issue-06 payload");
+  pool.close().await;
+
+  StateStore::initialize(&state_dir, None)
+    .await
+    .expect("upgrade issue-06 database");
+  StateStore::initialize(&state_dir, None)
+    .await
+    .expect("repeat forward-only initialization");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect upgraded database");
+  let authority: QuarantinedDeliveryRow = sqlx::query_as(
+    "select state, provider_outcome, error_kind, hash_algorithm, payload_digest, payload_snapshot, target_snapshot_version from scheduled_run_deliveries where delivery_id = 'legacy-rendered'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read quarantined authority");
+  assert_eq!(authority.0, "failed_terminal");
+  assert_eq!(authority.1, "confirmed_no_write_terminal");
+  assert_eq!(authority.2, "legacy_payload_digest_unverified");
+  assert!(authority.3.is_none());
+  assert!(authority.4.is_none());
+  assert!(authority.5.is_none());
+  assert!(authority.6.is_none());
+  let falsely_relabelled: i64 = sqlx::query_scalar(
+    "select count(*) from scheduled_run_deliveries where hash_algorithm = 'sha256-utf8-exact-v1'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("scan false exact-digest labels");
+  assert_eq!(falsely_relabelled, 0);
+  let migration_count: i64 = sqlx::query_scalar(
+    "select count(*) from _sqlx_migrations where version = 20260722000000 and success = true",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read migration ledger");
+  assert_eq!(migration_count, 1);
 }
 
 #[tokio::test]
@@ -3080,6 +3186,38 @@ async fn prepare_executing_run(
   claim
 }
 
+async fn complete_due_run(
+  store: &StateStore,
+  job_id: &str,
+  due_at: i64,
+  completed_at: i64,
+) -> ClaimedScheduledRun {
+  store
+    .materialize_due_schedule(job_id, 0, due_at)
+    .await
+    .expect("materialize occurrence");
+  let claim = store
+    .claim_next_scheduled_run("occurrence-worker", completed_at - 2, completed_at + 100)
+    .await
+    .expect("claim occurrence")
+    .expect("due occurrence");
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  store
+    .mark_scheduled_run_executing(&claim.binding, &profile, completed_at - 1)
+    .await
+    .expect("execute occurrence");
+  store
+    .complete_scheduled_run_success(
+      &claim.binding,
+      &ScheduledRunResult::new(format!("result-{completed_at}"), "").expect("result"),
+      completed_at,
+    )
+    .await
+    .expect("complete occurrence");
+  claim
+}
+
 async fn complete_success_after_barrier(
   store: StateStore,
   binding: codeoff_state::RunLeaseBinding,
@@ -4081,6 +4219,250 @@ async fn test_skipped_none_advances_only_accepted_delivery_baseline_with_exact_p
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn test_exact_unchanged_payload_skips_and_survives_audited_history_retention() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let mut request = create_request(
+    "unchanged-retention",
+    ScheduleSpec::fixed_interval(110, 10).expect("interval"),
+    100,
+  );
+  request.targets = vec![second_target("unchanged-retention")];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let exact_body = "\u{00e9}|e\u{0301}|tail  \n";
+
+  let first_run = complete_due_run(&store, "unchanged-retention", 110, 120).await;
+  let first_delivery: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(first_run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("first delivery");
+  let PreparedScheduledDelivery::Pending(first_payload) = store
+    .prepare_scheduled_delivery(
+      &first_delivery,
+      "text/plain; charset=utf-8",
+      exact_body,
+      1,
+      121,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare first payload")
+  else {
+    panic!("first exact payload must be sent");
+  };
+  assert_eq!(first_payload.body().as_bytes(), exact_body.as_bytes());
+  assert_eq!(first_payload.digest(), test_sha256_hex(exact_body));
+  let first_claim = store
+    .claim_next_scheduled_delivery("delivery-worker", 122, 200)
+    .await
+    .expect("claim first delivery")
+    .expect("first delivery claim");
+  store
+    .complete_scheduled_delivery_delivered(&first_claim.binding, "receipt-1", 123)
+    .await
+    .expect("accept first delivery");
+  let identity = AcceptedDeliveryBaselineIdentity {
+    job_id: "unchanged-retention".to_owned(),
+    target_identity_digest: first_payload.target_identity_digest().to_owned(),
+    target_snapshot_digest_algorithm: "sha256-v1".to_owned(),
+    target_snapshot_digest: first_payload.target_snapshot_digest().to_owned(),
+    delivery_policy_version: 1,
+    render_version: 1,
+    hash_algorithm: "sha256-utf8-exact-v1".to_owned(),
+  };
+
+  let second_run = complete_due_run(&store, "unchanged-retention", 120, 130).await;
+  let second_delivery: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(second_run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("second delivery");
+  let PreparedScheduledDelivery::SkippedUnchanged(second_payload) = store
+    .prepare_scheduled_delivery(
+      &second_delivery,
+      "text/plain; charset=utf-8",
+      exact_body,
+      1,
+      131,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare unchanged payload")
+  else {
+    panic!("exact baseline match must skip without a provider");
+  };
+  assert_eq!(second_payload.digest(), first_payload.digest());
+  let skipped_authority: (String, String, i64) = sqlx::query_as(
+    "select state, provider_outcome, (select count(*) from scheduled_delivery_attempts where delivery_id = ?1) from scheduled_run_deliveries where delivery_id = ?1",
+  )
+  .bind(&second_delivery)
+  .fetch_one(&pool)
+  .await
+  .expect("read skipped authority");
+  assert_eq!(
+    skipped_authority,
+    (
+      "skipped_unchanged".to_owned(),
+      "skipped_unchanged".to_owned(),
+      0
+    )
+  );
+  let baseline_before_retention = store
+    .get_accepted_delivery_baseline(&identity)
+    .await
+    .expect("read baseline")
+    .expect("accepted baseline");
+  assert_eq!(baseline_before_retention.baseline_version, 1);
+  assert_eq!(baseline_before_retention.source_delivery_id, first_delivery);
+  assert!(
+    sqlx::query("delete from scheduled_run_deliveries where delivery_id = ?1")
+      .bind(&first_delivery)
+      .execute(&pool)
+      .await
+      .is_err()
+  );
+
+  let retained = store
+    .prune_scheduled_delivery_history("retention-operation-1", first_run.binding.run_id(), 132)
+    .await
+    .expect("prune first history");
+  assert_eq!(retained.deliveries, 1);
+  assert_eq!(retained.delivery_attempts, 1);
+  assert_eq!(retained.result_artifacts, 1);
+  assert_eq!(retained.runs, 1);
+  let baseline_after_retention = store
+    .get_accepted_delivery_baseline(&identity)
+    .await
+    .expect("read retained baseline")
+    .expect("retained baseline");
+  assert_eq!(baseline_after_retention, baseline_before_retention);
+  let deleted_history: (i64, i64, i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduled_runs where run_id = ?1), (select count(*) from scheduled_run_result_artifacts where run_id = ?1), (select count(*) from scheduled_run_deliveries where run_id = ?1), (select count(*) from scheduled_delivery_attempts where delivery_id = ?2)",
+  )
+  .bind(first_run.binding.run_id())
+  .bind(&first_delivery)
+  .fetch_one(&pool)
+  .await
+  .expect("read pruned history");
+  assert_eq!(deleted_history, (0, 0, 0, 0));
+  let audit: (i64, i64) = sqlx::query_as(
+    "select attempts_deleted, completed_at from scheduled_delivery_retention_audit where operation_id = 'retention-operation-1' and delivery_id = ?1",
+  )
+  .bind(&first_delivery)
+  .fetch_one(&pool)
+  .await
+  .expect("read retention audit");
+  assert_eq!(audit, (1, 132));
+  assert!(
+    sqlx::query(
+      "delete from scheduled_delivery_retention_audit where operation_id = 'retention-operation-1' and delivery_id = ?1",
+    )
+    .bind(&first_delivery)
+    .execute(&pool)
+    .await
+    .is_err()
+  );
+
+  let third_run = complete_due_run(&store, "unchanged-retention", 130, 140).await;
+  let third_delivery: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(third_run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("third delivery");
+  assert!(matches!(
+    store
+      .prepare_scheduled_delivery(
+        &third_delivery,
+        "text/plain; charset=utf-8",
+        exact_body,
+        1,
+        141,
+        SkippedNoneBaselinePolicy::DoNotAdvance,
+      )
+      .await
+      .expect("prepare retained-baseline match"),
+    PreparedScheduledDelivery::SkippedUnchanged(_)
+  ));
+  let third_baseline_version: i64 = sqlx::query_scalar(
+    "select baseline_version from scheduled_delivery_baselines where job_id = 'unchanged-retention'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read unchanged baseline version");
+  assert_eq!(third_baseline_version, 1);
+
+  let fourth_run = complete_due_run(&store, "unchanged-retention", 140, 150).await;
+  let fourth_delivery: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(fourth_run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("fourth delivery");
+  let changed_body = "e\u{0301}|e\u{0301}|tail  \n";
+  let PreparedScheduledDelivery::Pending(changed_payload) = store
+    .prepare_scheduled_delivery(
+      &fourth_delivery,
+      "text/plain; charset=utf-8",
+      changed_body,
+      1,
+      151,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare normalization-changed payload")
+  else {
+    panic!("different UTF-8 bytes must remain sendable");
+  };
+  assert_ne!(changed_payload.digest(), first_payload.digest());
+  assert!(
+    sqlx::query(
+      "update scheduled_run_deliveries set state = 'skipped_unchanged', provider_outcome = 'skipped_unchanged' where delivery_id = ?1",
+    )
+    .bind(&fourth_delivery)
+    .execute(&pool)
+    .await
+    .is_err()
+  );
+  let changed_claim = store
+    .claim_next_scheduled_delivery("changed-worker", 152, 200)
+    .await
+    .expect("claim changed payload")
+    .expect("changed delivery");
+  store
+    .complete_scheduled_delivery_failure(
+      &changed_claim.binding,
+      &ScheduledDeliveryFailure::ConfirmedNoWriteTerminal {
+        error_kind: "provider_rejected".to_owned(),
+        redacted_message: None,
+      },
+      153,
+    )
+    .await
+    .expect("record terminal no-write failure");
+  let baseline_after_failure: i64 = sqlx::query_scalar(
+    "select baseline_version from scheduled_delivery_baselines where job_id = 'unchanged-retention'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read baseline after failure");
+  assert_eq!(baseline_after_failure, 1);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_two_independent_stores_claim_once_and_reject_stale_delivery_fence() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -4236,6 +4618,208 @@ async fn delivery_claim_after_barrier(
   store.claim_next_scheduled_delivery(owner, 122, 200).await
 }
 
+async fn delivery_reclaim_after_barrier(
+  store: StateStore,
+  barrier: Arc<Barrier>,
+  now: i64,
+) -> Result<u64, StateError> {
+  barrier.wait().await;
+  for _ in 0..20 {
+    match store.reclaim_expired_scheduled_deliveries(now, 1).await {
+      Err(error) if error.is_transient_storage_contention() => {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      result => return result,
+    }
+  }
+  store.reclaim_expired_scheduled_deliveries(now, 1).await
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_expired_delivery_reclaim_has_one_winner_and_unblocks_later_occurrence() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let first = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize first store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  let mut request = create_request(
+    "delivery-reclaim",
+    ScheduleSpec::fixed_interval(110, 10).expect("interval"),
+    100,
+  );
+  request.targets = vec![second_target("delivery-reclaim")];
+  first
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+
+  let first_run = complete_due_run(&first, "delivery-reclaim", 110, 120).await;
+  let first_delivery: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(first_run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("first delivery");
+  assert!(matches!(
+    first
+      .prepare_scheduled_delivery(
+        &first_delivery,
+        "text/plain; charset=utf-8",
+        "first",
+        1,
+        121,
+        SkippedNoneBaselinePolicy::DoNotAdvance,
+      )
+      .await
+      .expect("prepare first"),
+    PreparedScheduledDelivery::Pending(_)
+  ));
+  let first_claim = first
+    .claim_next_scheduled_delivery("expired-worker", 122, 125)
+    .await
+    .expect("claim first")
+    .expect("first claim");
+  assert!(matches!(
+    first
+      .heartbeat_scheduled_delivery(&first_claim.binding, 123, 125)
+      .await,
+    Err(StateError::ScheduledDeliveryLostLease)
+  ));
+  assert!(matches!(
+    first
+      .heartbeat_scheduled_delivery(&first_claim.binding, 123, 124)
+      .await,
+    Err(StateError::ScheduledDeliveryLostLease)
+  ));
+  first
+    .heartbeat_scheduled_delivery(&first_claim.binding, 123, 130)
+    .await
+    .expect("strictly extend lease");
+
+  let second_run = complete_due_run(&first, "delivery-reclaim", 120, 128).await;
+  let second_delivery: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(second_run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("second delivery");
+  assert!(matches!(
+    first
+      .prepare_scheduled_delivery(
+        &second_delivery,
+        "text/plain; charset=utf-8",
+        "second",
+        1,
+        129,
+        SkippedNoneBaselinePolicy::DoNotAdvance,
+      )
+      .await
+      .expect("prepare second"),
+    PreparedScheduledDelivery::Pending(_)
+  ));
+  assert!(
+    first
+      .claim_next_scheduled_delivery("blocked-worker", 130, 200)
+      .await
+      .expect("blocked claim")
+      .is_none()
+  );
+
+  let barrier = Arc::new(Barrier::new(3));
+  let first_task = tokio::spawn(delivery_reclaim_after_barrier(
+    first,
+    Arc::clone(&barrier),
+    131,
+  ));
+  let second_task = tokio::spawn(delivery_reclaim_after_barrier(
+    second,
+    Arc::clone(&barrier),
+    131,
+  ));
+  barrier.wait().await;
+  let outcomes = [
+    first_task
+      .await
+      .expect("first task")
+      .expect("first reclaim"),
+    second_task
+      .await
+      .expect("second task")
+      .expect("second reclaim"),
+  ];
+  assert_eq!(outcomes.iter().sum::<u64>(), 1);
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("reopen store");
+  assert!(matches!(
+    store
+      .heartbeat_scheduled_delivery(&first_claim.binding, 132, 220)
+      .await,
+    Err(StateError::ScheduledDeliveryLostLease)
+  ));
+  assert_eq!(
+    store
+      .requeue_due_scheduled_deliveries(i64::MAX, 10)
+      .await
+      .expect("retry scan"),
+    0
+  );
+  let reclaimed_authority: (String, String, String, i64) = sqlx::query_as(
+    "select delivery.state, attempt.state, delivery.provider_outcome, (select count(*) from scheduled_delivery_baselines where job_id = 'delivery-reclaim') from scheduled_run_deliveries delivery join scheduled_delivery_attempts attempt on attempt.delivery_id = delivery.delivery_id and attempt.attempt = delivery.attempt where delivery.delivery_id = ?1",
+  )
+  .bind(&first_delivery)
+  .fetch_one(&pool)
+  .await
+  .expect("read reclaimed authority");
+  assert_eq!(
+    reclaimed_authority,
+    (
+      "delivery_unknown".to_owned(),
+      "delivery_unknown".to_owned(),
+      "ambiguous_post_write".to_owned(),
+      0
+    )
+  );
+  assert!(matches!(
+    store
+      .prune_scheduled_delivery_history("must-not-prune-unknown", first_run.binding.run_id(), 132,)
+      .await,
+    Err(StateError::ScheduledDeliveryRetentionConflict)
+  ));
+  assert!(
+    sqlx::query(
+      "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at) select 'bypass-unknown', delivery_id, run_id, job_id, state, payload_digest, 132 from scheduled_run_deliveries where delivery_id = ?1",
+    )
+    .bind(&first_delivery)
+    .execute(&pool)
+    .await
+    .is_err()
+  );
+  let later_claim = store
+    .claim_next_scheduled_delivery("later-worker", 132, 200)
+    .await
+    .expect("claim later occurrence")
+    .expect("later occurrence unblocked");
+  assert_eq!(later_claim.binding.delivery_id(), second_delivery);
+  assert!(matches!(
+    store
+      .complete_scheduled_delivery_delivered(&later_claim.binding, "too-early", 131)
+      .await,
+    Err(StateError::ScheduledDeliveryLostLease)
+  ));
+  store
+    .complete_scheduled_delivery_delivered(&later_claim.binding, "receipt-2", 133)
+    .await
+    .expect("complete later occurrence monotonically");
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_ambiguous_post_write_becomes_unknown_without_retry_or_baseline() {
@@ -4351,6 +4935,85 @@ async fn test_ambiguous_post_write_becomes_unknown_without_retry_or_baseline() {
   .expect("baseline foreign keys");
   assert_eq!(baseline_foreign_keys, vec!["scheduled_jobs"]);
   assert_eq!(claim.payload.digest(), payload.digest());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_delivered_baseline_conflict_rolls_back_terminal_authority_atomically() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let mut request = create_request("delivery-baseline-conflict", ScheduleSpec::once(110), 100);
+  request.targets = vec![second_target("delivery-baseline-conflict")];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  let run = complete_due_run(&store, "delivery-baseline-conflict", 110, 120).await;
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let delivery_id: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("delivery id");
+  let PreparedScheduledDelivery::Pending(payload) = store
+    .prepare_scheduled_delivery(
+      &delivery_id,
+      "text/plain; charset=utf-8",
+      "payload",
+      1,
+      121,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare payload")
+  else {
+    panic!("first payload must remain pending");
+  };
+  let claim = store
+    .claim_next_scheduled_delivery("delivery-worker", 122, 200)
+    .await
+    .expect("claim delivery")
+    .expect("delivery claim");
+  let competing_digest = test_sha256_hex("competing payload");
+  sqlx::query(
+    "insert into scheduled_delivery_baselines (job_id, target_identity_digest, target_snapshot_digest_algorithm, target_snapshot_digest, delivery_policy_version, render_version, hash_algorithm, accepted_payload_digest, source_delivery_id, source_run_id, source_result_id, source_result_hash, accepted_at, baseline_version) values ('delivery-baseline-conflict', ?1, 'sha256-v1', ?2, 1, 1, 'sha256-utf8-exact-v1', ?3, 'competing-delivery', 'competing-run', null, 'competing-result', 122, 1)",
+  )
+  .bind(payload.target_identity_digest())
+  .bind(payload.target_snapshot_digest())
+  .bind(&competing_digest)
+  .execute(&pool)
+  .await
+  .expect("seed competing baseline");
+  assert!(matches!(
+    store
+      .complete_scheduled_delivery_delivered(&claim.binding, "receipt", 123)
+      .await,
+    Err(StateError::ScheduledDeliveryBaselineConflict)
+  ));
+  let authority: (String, String, Option<String>, Option<String>, String, i64) = sqlx::query_as(
+    "select delivery.state, attempt.state, delivery.provider_receipt, delivery.provider_outcome, baseline.source_delivery_id, baseline.baseline_version from scheduled_run_deliveries delivery join scheduled_delivery_attempts attempt on attempt.delivery_id = delivery.delivery_id and attempt.attempt = delivery.attempt join scheduled_delivery_baselines baseline on baseline.job_id = delivery.job_id and baseline.target_identity_digest = delivery.target_identity_digest and baseline.target_snapshot_digest_algorithm = delivery.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = delivery.target_snapshot_digest and baseline.delivery_policy_version = delivery.delivery_policy_version and baseline.render_version = delivery.render_version and baseline.hash_algorithm = delivery.hash_algorithm where delivery.delivery_id = ?1",
+  )
+  .bind(&delivery_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled back authority");
+  assert_eq!(
+    authority,
+    (
+      "sending".to_owned(),
+      "sending".to_owned(),
+      None,
+      None,
+      "competing-delivery".to_owned(),
+      1
+    )
+  );
 }
 
 #[tokio::test]

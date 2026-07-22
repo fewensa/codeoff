@@ -17,7 +17,7 @@ pub use delivery::{
   AcceptedDeliveryBaseline, AcceptedDeliveryBaselineIdentity, ClaimedScheduledDelivery,
   DELIVERY_PAYLOAD_HASH_ALGORITHM, DELIVERY_PAYLOAD_SCHEMA_VERSION, DeliveryPayloadSnapshot,
   PreparedScheduledDelivery, ScheduledDeliveryBinding, ScheduledDeliveryFailure,
-  ScheduledDeliveryState, SkippedNoneBaselinePolicy,
+  ScheduledDeliveryRetentionReport, ScheduledDeliveryState, SkippedNoneBaselinePolicy,
 };
 use timezone::BundledTimeZone;
 

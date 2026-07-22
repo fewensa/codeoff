@@ -28,6 +28,7 @@ Minimum scopes:
 app_mentions:read
 im:history
 im:read
+im:write
 chat:write
 users:read
 ```
@@ -42,6 +43,15 @@ groups:read
 mpim:history
 mpim:read
 ```
+
+Schedule target resolver 會在建立或更新 Schedule 前呼叫 Slack Web API 並保存 canonical conversation ID；依啟用的 target kind，最小 bot scopes 為：
+
+- Channel validation：public channel 使用 `channels:read`，private channel 使用 `groups:read`；bot 仍必須加入目標 conversation。
+- Thread parent validation：另需相應的 `channels:history` 或 `groups:history`。
+- DM user lookup 與 user → conversation open：`users:read`、`im:read`、`im:write`。
+- 後續 message delivery：`chat:write`。
+
+這些 scopes 只授權 Slack App；token 仍由既有 `SLACK_BOT_TOKEN` Secret owner 提供。不要把 token、Authorization header 或 Slack 完整錯誤 body 寫入 config、values 或 logs。
 
 若需要 slash command，可另外加入 `commands` scope 並建立 `/codeoff`。
 

@@ -25,8 +25,9 @@ pub use crate::schedule_authorization::{
 };
 pub use crate::schedule_resolution::{
   CapabilityRegistry, CapabilityRequest, ChannelTargetVerifier, DefaultCapabilityRegistry,
-  DefaultTargetResolver, DeliveryTargetRequest, TargetResolver, TargetResolverRegistration,
-  TargetResolverRegistry, TargetVerificationError, VerifiedSlackTargetResolver,
+  DefaultTargetResolver, DeliveryTargetRequest, SlackTargetResolutionRequest, TargetResolver,
+  TargetResolverRegistration, TargetResolverRegistry, TargetVerificationError, VerifiedSlackTarget,
+  VerifiedSlackTargetResolver,
 };
 use crate::schedule_resolution::{
   ResolvedTargetSet, scope_targets, validate_capability_snapshot, validate_resolved_targets,
@@ -38,6 +39,7 @@ pub enum ScheduleServiceError {
   NotVisible,
   InvalidRequest(String),
   ResolverUnavailable,
+  TargetUnavailable,
   ResolverNotAllowed,
   ResolverTimeout,
   CapabilityUnavailable,
@@ -57,6 +59,7 @@ impl fmt::Display for ScheduleServiceError {
       Self::NotVisible => write!(formatter, "schedule was not found or is not visible"),
       Self::InvalidRequest(reason) => write!(formatter, "invalid schedule request: {reason}"),
       Self::ResolverUnavailable => write!(formatter, "target resolver is unavailable"),
+      Self::TargetUnavailable => write!(formatter, "target is unavailable"),
       Self::ResolverNotAllowed => write!(formatter, "target is not allowed"),
       Self::ResolverTimeout => write!(formatter, "target resolver timed out"),
       Self::CapabilityUnavailable => write!(formatter, "capability is unavailable"),
@@ -98,6 +101,7 @@ impl ScheduleServiceError {
       Self::NotVisible => "not_found_or_not_visible",
       Self::InvalidRequest(_) => "validation_failed",
       Self::ResolverUnavailable => "resolver_unavailable",
+      Self::TargetUnavailable => "target_unavailable",
       Self::ResolverNotAllowed => "resolver_not_allowed",
       Self::ResolverTimeout => "resolver_timeout",
       Self::CapabilityUnavailable => "capability_unavailable",
@@ -299,7 +303,7 @@ impl ScheduleService {
         &owner,
         &request.target,
         self
-          .resolve_targets(invocation, &owner, &request.target)
+          .resolve_targets(invocation, &owner, &request.target, request.now)
           .await?,
       )?,
     )?;
@@ -378,7 +382,7 @@ impl ScheduleService {
         &owner,
         &request.target,
         self
-          .resolve_targets(invocation, &owner, &request.target)
+          .resolve_targets(invocation, &owner, &request.target, request.now)
           .await?,
       )?,
     )?;
@@ -657,10 +661,11 @@ impl ScheduleService {
     invocation: &ScheduleInvocation,
     owner: &PrincipalKey,
     target: &DeliveryTargetRequest,
+    now: i64,
   ) -> Result<ResolvedTargetSet, ScheduleServiceError> {
     tokio::time::timeout(
       self.resolver_timeout,
-      self.target_resolver.resolve(invocation, owner, target),
+      self.target_resolver.resolve(invocation, owner, target, now),
     )
     .await
     .map_err(|_| ScheduleServiceError::ResolverTimeout)?

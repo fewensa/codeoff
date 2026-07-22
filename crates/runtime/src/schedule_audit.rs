@@ -97,6 +97,7 @@ fn classify_error(error: &ScheduleServiceError) -> AuditClassification {
     ScheduleServiceError::NotVisible => ("not_visible", "deny"),
     ScheduleServiceError::InvalidRequest(_) => ("validation", "deny"),
     ScheduleServiceError::ResolverUnavailable => ("resolver_unavailable", "error"),
+    ScheduleServiceError::TargetUnavailable => ("target_unavailable", "deny"),
     ScheduleServiceError::ResolverNotAllowed => ("resolver_not_allowed", "deny"),
     ScheduleServiceError::ResolverTimeout => ("resolver_timeout", "error"),
     ScheduleServiceError::CapabilityUnavailable => ("capability_unavailable", "deny"),

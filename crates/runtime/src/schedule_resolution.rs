@@ -37,6 +37,7 @@ pub trait TargetResolver: Send + Sync {
     invocation: &ScheduleInvocation,
     owner: &PrincipalKey,
     target: &DeliveryTargetRequest,
+    now: i64,
   ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError>;
 }
 
@@ -116,6 +117,7 @@ impl TargetResolver for DefaultTargetResolver {
     _invocation: &ScheduleInvocation,
     owner: &PrincipalKey,
     target: &DeliveryTargetRequest,
+    _now: i64,
   ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
     let (provider, connector, tenant, kind, address) = match target {
       DeliveryTargetRequest::None => (
@@ -187,14 +189,15 @@ impl TargetResolverRegistry {
   #[must_use]
   pub fn describe_supported_targets(&self, invocation: &ScheduleInvocation) -> Vec<&'static str> {
     let provider = match invocation.principal.as_ref() {
-      InvocationPrincipalRef::ChannelActor { provider, .. } => provider,
-      InvocationPrincipalRef::Service { .. } => return Vec::new(),
+      InvocationPrincipalRef::ChannelActor { provider, .. } => Some(provider),
+      InvocationPrincipalRef::Service { .. } => None,
     };
     let mut kinds = self
       .registrations
       .iter()
       .filter(|registration| {
-        registration.authority.provider == "none" || registration.authority.provider == provider
+        registration.authority.provider == "none"
+          || provider.is_none_or(|provider| registration.authority.provider == provider)
       })
       .flat_map(|registration| registration.supported_kinds.iter().copied())
       .collect::<Vec<_>>();
@@ -208,17 +211,26 @@ impl TargetResolverRegistry {
     invocation: &ScheduleInvocation,
     owner: &PrincipalKey,
     target: &DeliveryTargetRequest,
+    now: i64,
   ) -> Result<ResolvedTargetSet, ScheduleServiceError> {
     let kind = target_kind(target);
-    let registration = self.registrations.iter().find(|registration| {
-      (registration.authority.provider == "none"
-        || registration.authority.provider == owner.provider())
-        && registration.supported_kinds.contains(&kind)
+    let invocation_provider = match invocation.principal.as_ref() {
+      InvocationPrincipalRef::ChannelActor { provider, .. } => Some(provider),
+      InvocationPrincipalRef::Service { .. } => None,
+    };
+    let mut candidates = self.registrations.iter().filter(|registration| {
+      registration.supported_kinds.contains(&kind)
+        && (registration.authority.provider == "none"
+          || invocation_provider.is_none_or(|provider| registration.authority.provider == provider))
     });
+    let registration = candidates.next();
+    if candidates.next().is_some() {
+      return Err(ScheduleServiceError::ResolverNotAllowed);
+    }
     let registration = registration.ok_or(ScheduleServiceError::ResolverNotAllowed)?;
     let snapshots = registration
       .resolver
-      .resolve(invocation, owner, target)
+      .resolve(invocation, owner, target, now)
       .await?;
     Ok(ResolvedTargetSet {
       authority: registration.authority.clone(),
@@ -229,36 +241,47 @@ impl TargetResolverRegistry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetVerificationError {
+  Invalid,
+  Unauthorized,
   Unavailable,
-  NotAllowed,
+  Transient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlackTargetResolutionRequest {
+  Channel {
+    channel_id: String,
+  },
+  DirectMessageUser {
+    user_id: String,
+  },
+  DirectMessageConversation {
+    channel_id: String,
+  },
+  Thread {
+    channel_id: String,
+    thread_ts: String,
+  },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSlackTarget {
+  pub workspace_id: String,
+  pub kind: String,
+  pub channel_id: String,
+  pub thread_ts: Option<String>,
+  pub authorization_evidence_version: u32,
+  pub authorization_evidence_digest: String,
 }
 
 #[async_trait]
 pub trait ChannelTargetVerifier: Send + Sync {
-  async fn verify_connector(
+  async fn resolve_target(
     &self,
-    workspace_id: &str,
-    actor_id: &str,
-  ) -> Result<(), TargetVerificationError>;
-  async fn verify_channel(
-    &self,
-    workspace_id: &str,
-    actor_id: &str,
-    channel_id: &str,
-  ) -> Result<(), TargetVerificationError>;
-  async fn verify_user(
-    &self,
-    workspace_id: &str,
-    actor_id: &str,
-    user_id: &str,
-  ) -> Result<(), TargetVerificationError>;
-  async fn verify_thread(
-    &self,
-    workspace_id: &str,
-    actor_id: &str,
-    channel_id: &str,
-    thread_id: &str,
-  ) -> Result<(), TargetVerificationError>;
+    workspace_id: Option<&str>,
+    actor_id: Option<&str>,
+    target: &SlackTargetResolutionRequest,
+  ) -> Result<VerifiedSlackTarget, TargetVerificationError>;
 }
 
 pub struct VerifiedSlackTargetResolver {
@@ -295,92 +318,100 @@ impl TargetResolver for VerifiedSlackTargetResolver {
   async fn resolve(
     &self,
     invocation: &ScheduleInvocation,
-    owner: &PrincipalKey,
+    _owner: &PrincipalKey,
     target: &DeliveryTargetRequest,
+    now: i64,
   ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
-    let context = invocation
-      .channel
-      .as_ref()
-      .ok_or(ScheduleServiceError::ResolverNotAllowed)?;
-    ensure_context_matches_owner(context, owner)?;
-    let actor = owner.subject();
-    let (kind, address) = match target {
+    if now < 0 {
+      return Err(ScheduleServiceError::InvalidRequest(
+        "target resolution time must be nonnegative".to_owned(),
+      ));
+    }
+    let (workspace_id, actor_id) = match invocation.principal.as_ref() {
+      InvocationPrincipalRef::ChannelActor {
+        provider,
+        workspace_id,
+        actor_id,
+      } => {
+        if provider != "slack" {
+          return Err(ScheduleServiceError::ResolverNotAllowed);
+        }
+        (Some(workspace_id), Some(actor_id))
+      }
+      InvocationPrincipalRef::Service { .. } => (None, None),
+    };
+    let requested = match target {
       DeliveryTargetRequest::None => return Err(ScheduleServiceError::ResolverNotAllowed),
-      DeliveryTargetRequest::Origin => origin_address(context)?,
-      DeliveryTargetRequest::Channel { channel_id } => (
-        "channel".to_owned(),
-        json!({"channel_id": bounded("channel_id", channel_id)?}),
-      ),
-      DeliveryTargetRequest::DirectMessage { user_id } => (
-        "direct_message".to_owned(),
-        json!({"user_id": bounded("user_id", user_id)?}),
-      ),
+      DeliveryTargetRequest::Origin => origin_resolution_request(
+        invocation
+          .channel
+          .as_ref()
+          .ok_or(ScheduleServiceError::ResolverNotAllowed)?,
+      )?,
+      DeliveryTargetRequest::Channel { channel_id } => SlackTargetResolutionRequest::Channel {
+        channel_id: strict_channel_id(channel_id, false)?,
+      },
+      DeliveryTargetRequest::DirectMessage { user_id } => {
+        SlackTargetResolutionRequest::DirectMessageUser {
+          user_id: strict_slack_user_id(user_id)?,
+        }
+      }
       DeliveryTargetRequest::Thread {
         channel_id,
         thread_id,
-      } => (
-        "thread".to_owned(),
-        json!({"channel_id": bounded("channel_id", channel_id)?, "thread_id": bounded("thread_id", thread_id)?}),
-      ),
+      } => SlackTargetResolutionRequest::Thread {
+        channel_id: strict_channel_id(channel_id, false)?,
+        thread_ts: strict_slack_timestamp("thread_id", thread_id)?,
+      },
     };
-    let verify = async {
+    let requested_identity_digest = digest_json(&resolution_request_json(&requested))?;
+    let verified = match tokio::time::timeout(
+      self.timeout,
       self
         .verifier
-        .verify_connector(owner.tenant(), actor)
-        .await?;
-      match kind.as_str() {
-        "channel" => {
-          self
-            .verifier
-            .verify_channel(
-              owner.tenant(),
-              actor,
-              address["channel_id"].as_str().unwrap_or_default(),
-            )
-            .await
-        }
-        "direct_message" => {
-          if address["user_id"].as_str() != Some(actor) {
-            return Err(TargetVerificationError::NotAllowed);
-          }
-          self
-            .verifier
-            .verify_user(
-              owner.tenant(),
-              actor,
-              address["user_id"].as_str().unwrap_or_default(),
-            )
-            .await
-        }
-        "thread" => {
-          self
-            .verifier
-            .verify_thread(
-              owner.tenant(),
-              actor,
-              address["channel_id"].as_str().unwrap_or_default(),
-              address["thread_id"].as_str().unwrap_or_default(),
-            )
-            .await
-        }
-        _ => Err(TargetVerificationError::NotAllowed),
-      }
-    };
-    match tokio::time::timeout(self.timeout, verify).await {
+        .resolve_target(workspace_id, actor_id, &requested),
+    )
+    .await
+    {
       Err(_) => return Err(ScheduleServiceError::ResolverTimeout),
-      Ok(Err(TargetVerificationError::Unavailable)) => {
-        return Err(ScheduleServiceError::ResolverUnavailable);
+      Ok(Err(TargetVerificationError::Invalid)) => {
+        return Err(ScheduleServiceError::InvalidRequest(
+          "Slack target is invalid".to_owned(),
+        ));
       }
-      Ok(Err(TargetVerificationError::NotAllowed)) => {
+      Ok(Err(TargetVerificationError::Unauthorized)) => {
         return Err(ScheduleServiceError::ResolverNotAllowed);
       }
-      Ok(Ok(())) => {}
-    }
+      Ok(Err(TargetVerificationError::Unavailable)) => {
+        return Err(ScheduleServiceError::TargetUnavailable);
+      }
+      Ok(Err(TargetVerificationError::Transient)) => {
+        return Err(ScheduleServiceError::ResolverUnavailable);
+      }
+      Ok(Ok(verified)) => verified,
+    };
+    validate_verified_slack_target(&verified, workspace_id)?;
+    validate_verified_target_matches_request(&verified, &requested)?;
+    let coordinates = match verified.thread_ts.as_deref() {
+      Some(thread_ts) => json!({"channel_id": verified.channel_id, "thread_ts": thread_ts}),
+      None => json!({"channel_id": verified.channel_id}),
+    };
+    let address = json!({
+      "schema_version": SNAPSHOT_VERSION,
+      "workspace_id": verified.workspace_id,
+      "coordinates": coordinates,
+      "authorization_evidence": {
+        "version": verified.authorization_evidence_version,
+        "digest": verified.authorization_evidence_digest,
+      },
+      "requested_identity_digest": requested_identity_digest,
+      "created_at": now,
+    });
     Ok(vec![build_target_snapshot(
       "slack",
       SLACK_CONNECTOR,
-      owner.tenant(),
-      &kind,
+      &verified.workspace_id,
+      &verified.kind,
       address,
       SNAPSHOT_VERSION,
       SLACK_RESOLVER_DIGEST,
@@ -482,7 +513,7 @@ pub(crate) fn scope_targets(
 
 pub(crate) fn validate_resolved_targets(
   invocation: &ScheduleInvocation,
-  owner: &PrincipalKey,
+  _owner: &PrincipalKey,
   requested: &DeliveryTargetRequest,
   resolved: ResolvedTargetSet,
 ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
@@ -501,11 +532,10 @@ pub(crate) fn validate_resolved_targets(
       .validate()
       .map_err(|_| ScheduleServiceError::ResolverUnavailable)?;
     aggregate = aggregate.saturating_add(target.address_json().len());
-    let expected_address = expected_target_address(invocation, requested)?;
     let expected_provider = if matches!(requested, DeliveryTargetRequest::None) {
       "none"
     } else {
-      owner.provider()
+      authority.provider.as_str()
     };
     let kind_matches = match requested {
       DeliveryTargetRequest::None => target.kind() == "none",
@@ -516,22 +546,27 @@ pub(crate) fn validate_resolved_targets(
     };
     let address = serde_json::from_str::<Value>(target.address_json())
       .map_err(|_| ScheduleServiceError::ResolverUnavailable)?;
+    let invocation_tenant_matches = match invocation.principal.as_ref() {
+      InvocationPrincipalRef::ChannelActor { workspace_id, .. } => target.tenant() == workspace_id,
+      InvocationPrincipalRef::Service { .. } => true,
+    };
+    let identity_address = identity_address(&address)?;
     let expected_identity = digest_json(&json!({
       "provider": target.provider(), "connector": target.connector(), "tenant": target.tenant(),
-      "kind": target.kind(), "address": address,
+      "kind": target.kind(), "address": identity_address,
     }))?;
     if authority.provider != expected_provider
       || target.provider() != authority.provider
       || target.connector() != authority.connector
-      || target.tenant() != owner.tenant()
+      || !invocation_tenant_matches
       || !kind_matches
-      || address != expected_address
       || target.resolver_version() != authority.resolver_version
       || target.resolver_digest() != authority.resolver_digest
       || target.identity_digest() != expected_identity
     {
       return Err(ScheduleServiceError::ResolverUnavailable);
     }
+    validate_address_against_request(invocation, requested, target, &address)?;
   }
   if aggregate > 256 * 1024 {
     return Err(ScheduleServiceError::InvalidRequest(
@@ -541,66 +576,262 @@ pub(crate) fn validate_resolved_targets(
   Ok(targets)
 }
 
-fn expected_target_address(
-  invocation: &ScheduleInvocation,
-  requested: &DeliveryTargetRequest,
-) -> Result<Value, ScheduleServiceError> {
-  match requested {
-    DeliveryTargetRequest::None => Ok(json!({})),
-    DeliveryTargetRequest::Origin => invocation
-      .channel
-      .as_ref()
-      .ok_or(ScheduleServiceError::ResolverNotAllowed)
-      .and_then(origin_address)
-      .map(|(_, address)| address),
-    DeliveryTargetRequest::Channel { channel_id } => {
-      Ok(json!({"channel_id": bounded("channel_id", channel_id)?}))
-    }
-    DeliveryTargetRequest::DirectMessage { user_id } => {
-      Ok(json!({"user_id": bounded("user_id", user_id)?}))
-    }
-    DeliveryTargetRequest::Thread {
-      channel_id,
-      thread_id,
-    } => Ok(json!({
-      "channel_id": bounded("channel_id", channel_id)?,
-      "thread_id": bounded("thread_id", thread_id)?,
-    })),
-  }
-}
-
-fn ensure_context_matches_owner(
+fn origin_resolution_request(
   context: &ChannelTaskContext,
-  owner: &PrincipalKey,
-) -> Result<(), ScheduleServiceError> {
-  if context.provider != owner.provider() || context.workspace_id != owner.tenant() {
-    return Err(ScheduleServiceError::Unauthorized);
+) -> Result<SlackTargetResolutionRequest, ScheduleServiceError> {
+  if context.provider != "slack" {
+    return Err(ScheduleServiceError::ResolverNotAllowed);
   }
-  Ok(())
-}
-
-fn origin_address(context: &ChannelTaskContext) -> Result<(String, Value), ScheduleServiceError> {
   match context.conversation_kind {
-    ConversationKind::Channel => Ok((
-      "channel".to_owned(),
-      json!({"channel_id": required("channel_id", context.channel_id.as_deref())?}),
-    )),
-    ConversationKind::DirectMessage => Ok((
-      "direct_message".to_owned(),
-      json!({"user_id": required("user_id", context.user_id.as_deref())?}),
-    )),
-    ConversationKind::Thread => Ok((
-      "thread".to_owned(),
-      json!({
-        "channel_id": required("channel_id", context.channel_id.as_deref())?,
-        "thread_id": required("thread_id", context.thread_id.as_deref())?,
-      }),
-    )),
+    ConversationKind::Channel => Ok(SlackTargetResolutionRequest::Channel {
+      channel_id: strict_channel_id(
+        required("channel_id", context.channel_id.as_deref())?,
+        false,
+      )?,
+    }),
+    ConversationKind::DirectMessage => {
+      Ok(SlackTargetResolutionRequest::DirectMessageConversation {
+        channel_id: strict_channel_id(
+          required("channel_id", context.channel_id.as_deref())?,
+          true,
+        )?,
+      })
+    }
+    ConversationKind::Thread => Ok(SlackTargetResolutionRequest::Thread {
+      channel_id: strict_channel_id(
+        required("channel_id", context.channel_id.as_deref())?,
+        false,
+      )?,
+      thread_ts: strict_slack_timestamp(
+        "thread_id",
+        required("thread_id", context.thread_id.as_deref())?,
+      )?,
+    }),
   }
 }
 
 fn required<'a>(field: &str, value: Option<&'a str>) -> Result<&'a str, ScheduleServiceError> {
   bounded(field, value.unwrap_or_default())
+}
+
+fn strict_slack_user_id(value: &str) -> Result<String, ScheduleServiceError> {
+  let value = bounded("user_id", value)?;
+  if !(value.starts_with('U') || value.starts_with('W'))
+    || value.len() < 2
+    || !value
+      .bytes()
+      .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+  {
+    return Err(ScheduleServiceError::InvalidRequest(
+      "user_id must be a canonical Slack user id".to_owned(),
+    ));
+  }
+  Ok(value.to_owned())
+}
+
+fn strict_channel_id(value: &str, direct_message: bool) -> Result<String, ScheduleServiceError> {
+  let value = bounded("channel_id", value)?;
+  let allowed_prefix = if direct_message {
+    value.starts_with('D')
+  } else {
+    value.starts_with('C') || value.starts_with('G')
+  };
+  if !allowed_prefix
+    || value.len() < 2
+    || !value
+      .bytes()
+      .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+  {
+    return Err(ScheduleServiceError::InvalidRequest(
+      "channel_id must be a canonical Slack conversation id".to_owned(),
+    ));
+  }
+  Ok(value.to_owned())
+}
+
+fn strict_slack_timestamp(field: &str, value: &str) -> Result<String, ScheduleServiceError> {
+  let value = bounded(field, value)?;
+  let Some((seconds, fraction)) = value.split_once('.') else {
+    return Err(ScheduleServiceError::InvalidRequest(format!(
+      "{field} must be a canonical Slack timestamp"
+    )));
+  };
+  if seconds.is_empty()
+    || fraction.len() != 6
+    || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+    || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+  {
+    return Err(ScheduleServiceError::InvalidRequest(format!(
+      "{field} must be a canonical Slack timestamp"
+    )));
+  }
+  Ok(value.to_owned())
+}
+
+fn resolution_request_json(request: &SlackTargetResolutionRequest) -> Value {
+  match request {
+    SlackTargetResolutionRequest::Channel { channel_id } => {
+      json!({"kind": "channel", "channel_id": channel_id})
+    }
+    SlackTargetResolutionRequest::DirectMessageUser { user_id } => {
+      json!({"kind": "direct_message_user", "user_id": user_id})
+    }
+    SlackTargetResolutionRequest::DirectMessageConversation { channel_id } => {
+      json!({"kind": "direct_message_conversation", "channel_id": channel_id})
+    }
+    SlackTargetResolutionRequest::Thread {
+      channel_id,
+      thread_ts,
+    } => json!({"kind": "thread", "channel_id": channel_id, "thread_ts": thread_ts}),
+  }
+}
+
+fn validate_verified_slack_target(
+  target: &VerifiedSlackTarget,
+  expected_workspace_id: Option<&str>,
+) -> Result<(), ScheduleServiceError> {
+  bounded("workspace_id", &target.workspace_id)?;
+  strict_channel_id(&target.channel_id, target.kind == "direct_message")?;
+  if expected_workspace_id.is_some_and(|workspace_id| workspace_id != target.workspace_id)
+    || !matches!(
+      target.kind.as_str(),
+      "channel" | "direct_message" | "thread"
+    )
+    || (target.kind == "thread") != target.thread_ts.is_some()
+    || target.authorization_evidence_version == 0
+    || target.authorization_evidence_digest.len() != 64
+    || !target
+      .authorization_evidence_digest
+      .bytes()
+      .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+  {
+    return Err(ScheduleServiceError::ResolverUnavailable);
+  }
+  if let Some(thread_ts) = target.thread_ts.as_deref() {
+    strict_slack_timestamp("thread_ts", thread_ts)?;
+  }
+  Ok(())
+}
+
+fn validate_verified_target_matches_request(
+  target: &VerifiedSlackTarget,
+  requested: &SlackTargetResolutionRequest,
+) -> Result<(), ScheduleServiceError> {
+  let matches = match requested {
+    SlackTargetResolutionRequest::Channel { channel_id } => {
+      target.kind == "channel"
+        && target.channel_id == channel_id.as_str()
+        && target.thread_ts.is_none()
+    }
+    SlackTargetResolutionRequest::DirectMessageUser { .. } => {
+      target.kind == "direct_message" && target.thread_ts.is_none()
+    }
+    SlackTargetResolutionRequest::DirectMessageConversation { channel_id } => {
+      target.kind == "direct_message"
+        && target.channel_id == channel_id.as_str()
+        && target.thread_ts.is_none()
+    }
+    SlackTargetResolutionRequest::Thread {
+      channel_id,
+      thread_ts,
+    } => {
+      target.kind == "thread"
+        && target.channel_id == channel_id.as_str()
+        && target.thread_ts.as_deref() == Some(thread_ts.as_str())
+    }
+  };
+  matches
+    .then_some(())
+    .ok_or(ScheduleServiceError::ResolverUnavailable)
+}
+
+fn identity_address(address: &Value) -> Result<Value, ScheduleServiceError> {
+  if address.get("schema_version").is_some() {
+    address
+      .get("coordinates")
+      .cloned()
+      .ok_or(ScheduleServiceError::ResolverUnavailable)
+  } else {
+    Ok(address.clone())
+  }
+}
+
+fn validate_address_against_request(
+  invocation: &ScheduleInvocation,
+  requested: &DeliveryTargetRequest,
+  target: &DeliveryTargetSnapshot,
+  address: &Value,
+) -> Result<(), ScheduleServiceError> {
+  if matches!(requested, DeliveryTargetRequest::None) {
+    return (address == &json!({}))
+      .then_some(())
+      .ok_or(ScheduleServiceError::ResolverUnavailable);
+  }
+  let object = address
+    .as_object()
+    .ok_or(ScheduleServiceError::ResolverUnavailable)?;
+  if object.len() != 6
+    || object.get("schema_version").and_then(Value::as_u64) != Some(u64::from(SNAPSHOT_VERSION))
+    || object.get("workspace_id").and_then(Value::as_str) != Some(target.tenant())
+    || object
+      .get("created_at")
+      .and_then(Value::as_i64)
+      .is_none_or(|value| value < 0)
+    || object
+      .get("authorization_evidence")
+      .and_then(Value::as_object)
+      .is_none_or(|evidence| {
+        evidence.len() != 2
+          || evidence
+            .get("version")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+          || evidence
+            .get("digest")
+            .and_then(Value::as_str)
+            .is_none_or(|digest| {
+              digest.len() != 64
+                || !digest
+                  .bytes()
+                  .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+      })
+  {
+    return Err(ScheduleServiceError::ResolverUnavailable);
+  }
+  let resolution_request = match requested {
+    DeliveryTargetRequest::Origin => origin_resolution_request(
+      invocation
+        .channel
+        .as_ref()
+        .ok_or(ScheduleServiceError::ResolverNotAllowed)?,
+    )?,
+    DeliveryTargetRequest::Channel { channel_id } => SlackTargetResolutionRequest::Channel {
+      channel_id: strict_channel_id(channel_id, false)?,
+    },
+    DeliveryTargetRequest::DirectMessage { user_id } => {
+      SlackTargetResolutionRequest::DirectMessageUser {
+        user_id: strict_slack_user_id(user_id)?,
+      }
+    }
+    DeliveryTargetRequest::Thread {
+      channel_id,
+      thread_id,
+    } => SlackTargetResolutionRequest::Thread {
+      channel_id: strict_channel_id(channel_id, false)?,
+      thread_ts: strict_slack_timestamp("thread_id", thread_id)?,
+    },
+    DeliveryTargetRequest::None => unreachable!("handled above"),
+  };
+  let expected_request_digest = digest_json(&resolution_request_json(&resolution_request))?;
+  if object
+    .get("requested_identity_digest")
+    .and_then(Value::as_str)
+    != Some(expected_request_digest.as_str())
+  {
+    return Err(ScheduleServiceError::ResolverUnavailable);
+  }
+  Ok(())
 }
 
 fn target_kind(target: &DeliveryTargetRequest) -> &'static str {
@@ -623,12 +854,13 @@ fn build_target_snapshot(
   resolver_digest: &str,
 ) -> Result<DeliveryTargetSnapshot, ScheduleServiceError> {
   let address_json = canonical_json(&address)?;
+  let identity_address = identity_address(&address)?;
   let identity_digest = digest_json(&json!({
     "provider": provider,
     "connector": connector,
     "tenant": tenant,
     "kind": kind,
-    "address": address,
+    "address": identity_address,
   }))?;
   DeliveryTargetSnapshot::new(
     format!("target_{}", &identity_digest[..32]),

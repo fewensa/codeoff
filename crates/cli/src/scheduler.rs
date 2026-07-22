@@ -58,10 +58,20 @@ enum PreviousSuccessPolicyInput {
   LatestSuccess,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum DeliveryInput {
   None,
+  SlackChannel {
+    channel_id: String,
+  },
+  SlackDirectMessage {
+    user_id: String,
+  },
+  SlackThread {
+    channel_id: String,
+    thread_ts: String,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +81,7 @@ pub(crate) struct ValidatedSchedulerMutation {
   pub(crate) schedule: ScheduleSpec,
   pub(crate) capability: String,
   pub(crate) previous_success: PreviousSuccessPolicy,
+  pub(crate) target: DeliveryTargetRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,14 +139,32 @@ impl fmt::Display for SchedulerCommandError {
 
 impl std::error::Error for SchedulerCommandError {}
 
-#[allow(clippy::too_many_lines)]
+#[cfg(test)]
 pub(crate) async fn execute_scheduler_command(
   command: SchedulerCommand,
   state: StateStore,
   operator: SchedulerOperatorConfig,
   now: i64,
 ) -> Result<Value, SchedulerCommandError> {
-  let service = build_scheduler_service(state, &operator)
+  execute_scheduler_command_with_resolvers(
+    command,
+    state,
+    operator,
+    std::sync::Arc::new(TargetResolverRegistry::with_defaults()),
+    now,
+  )
+  .await
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn execute_scheduler_command_with_resolvers(
+  command: SchedulerCommand,
+  state: StateStore,
+  operator: SchedulerOperatorConfig,
+  target_resolvers: std::sync::Arc<TargetResolverRegistry>,
+  now: i64,
+) -> Result<Value, SchedulerCommandError> {
+  let service = build_scheduler_service(state, &operator, target_resolvers)
     .map_err(|error| SchedulerCommandError::service(&error))?;
   let result = match command {
     SchedulerCommand::Create { file, format } => {
@@ -149,7 +178,7 @@ pub(crate) async fn execute_scheduler_command(
             instruction: request.instruction,
             previous_success: request.previous_success,
             schedule: request.schedule,
-            target: DeliveryTargetRequest::None,
+            target: request.target,
             capability: request.capability,
             now,
           },
@@ -202,7 +231,7 @@ pub(crate) async fn execute_scheduler_command(
             instruction: request.instruction,
             previous_success: request.previous_success,
             schedule: request.schedule,
-            target: DeliveryTargetRequest::None,
+            target: request.target,
             capability: request.capability,
             now,
           },
@@ -247,6 +276,7 @@ pub(crate) async fn execute_scheduler_command(
 fn build_scheduler_service(
   state: StateStore,
   operator: &SchedulerOperatorConfig,
+  target_resolvers: std::sync::Arc<TargetResolverRegistry>,
 ) -> Result<ScheduleService, ScheduleServiceError> {
   let policy = ConfiguredOperatorIdentityPolicy::new(
     &operator.service_identity,
@@ -255,7 +285,7 @@ fn build_scheduler_service(
   )?;
   Ok(ScheduleService::with_components(
     state,
-    std::sync::Arc::new(TargetResolverRegistry::with_defaults()),
+    target_resolvers,
     std::sync::Arc::new(DefaultCapabilityRegistry),
     std::sync::Arc::new(OperatorAuthorizationPolicy::new(std::sync::Arc::new(
       policy,
@@ -500,13 +530,27 @@ fn validate_scheduler_mutation(
     PreviousSuccessPolicyInput::None => PreviousSuccessPolicy::None,
     PreviousSuccessPolicyInput::LatestSuccess => PreviousSuccessPolicy::LatestSuccess,
   };
-  let DeliveryInput::None = input.delivery;
+  let target = match input.delivery {
+    DeliveryInput::None => DeliveryTargetRequest::None,
+    DeliveryInput::SlackChannel { channel_id } => DeliveryTargetRequest::Channel { channel_id },
+    DeliveryInput::SlackDirectMessage { user_id } => {
+      DeliveryTargetRequest::DirectMessage { user_id }
+    }
+    DeliveryInput::SlackThread {
+      channel_id,
+      thread_ts,
+    } => DeliveryTargetRequest::Thread {
+      channel_id,
+      thread_id: thread_ts,
+    },
+  };
   Ok(ValidatedSchedulerMutation {
     request_id: input.request_id,
     instruction,
     schedule,
     capability: input.capability,
     previous_success,
+    target,
   })
 }
 
@@ -519,8 +563,43 @@ fn parse_rfc3339(value: &str) -> Result<i64, SchedulerInputError> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use async_trait::async_trait;
+  use codeoff_runtime::schedule_service::{
+    ChannelTargetVerifier, SlackTargetResolutionRequest, TargetVerificationError,
+    VerifiedSlackTarget, VerifiedSlackTargetResolver,
+  };
   use codeoff_state::PrincipalKey;
   use std::io::Cursor;
+  use std::sync::Arc;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::time::Duration;
+
+  struct CountingSlackVerifier(Arc<AtomicUsize>);
+
+  #[async_trait]
+  impl ChannelTargetVerifier for CountingSlackVerifier {
+    async fn resolve_target(
+      &self,
+      workspace_id: Option<&str>,
+      actor_id: Option<&str>,
+      target: &SlackTargetResolutionRequest,
+    ) -> Result<VerifiedSlackTarget, TargetVerificationError> {
+      assert_eq!(workspace_id, None, "trusted CLI has no channel workspace");
+      assert_eq!(actor_id, None, "trusted CLI has no channel actor");
+      self.0.fetch_add(1, Ordering::SeqCst);
+      let SlackTargetResolutionRequest::Channel { channel_id } = target else {
+        return Err(TargetVerificationError::Invalid);
+      };
+      Ok(VerifiedSlackTarget {
+        workspace_id: "T00000000".to_owned(),
+        kind: "channel".to_owned(),
+        channel_id: channel_id.clone(),
+        thread_ts: None,
+        authorization_evidence_version: 1,
+        authorization_evidence_digest: "b".repeat(64),
+      })
+    }
+  }
 
   const DEFINITION_VERSION_FOR_TESTS: u32 = 2;
   const VALID_JSON: &str = r#"{
@@ -899,7 +978,12 @@ kind = "none"
       SchedulerFileFormat::Json,
     )
     .expect("request");
-    let service = build_scheduler_service(direct_state, &operator).expect("service");
+    let service = build_scheduler_service(
+      direct_state,
+      &operator,
+      std::sync::Arc::new(TargetResolverRegistry::with_defaults()),
+    )
+    .expect("service");
     let invocation = trusted_operator_invocation(&operator, &request.request_id);
     let direct = service
       .create(
@@ -909,7 +993,7 @@ kind = "none"
           instruction: request.instruction,
           previous_success: request.previous_success,
           schedule: request.schedule,
-          target: DeliveryTargetRequest::None,
+          target: request.target,
           capability: request.capability,
           now: 100,
         },
@@ -917,5 +1001,48 @@ kind = "none"
       .await
       .expect("direct create");
     assert_eq!(cli, direct);
+  }
+
+  #[tokio::test]
+  async fn trusted_cli_uses_shared_slack_resolver_before_persisting_target() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let file = temp.path().join("slack-request.json");
+    let source = VALID_JSON.replace(
+      r#""delivery": {"kind": "none"}"#,
+      r#""delivery": {"kind": "slack_channel", "channel_id": "C2"}"#,
+    );
+    std::fs::write(&file, source).expect("fixture");
+    let operator =
+      SchedulerOperatorConfig::new("ops-a".to_owned(), "realm-a".to_owned()).expect("operator");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    let inspection = state.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut resolvers = TargetResolverRegistry::with_defaults();
+    resolvers.register(VerifiedSlackTargetResolver::registration(
+      Arc::new(CountingSlackVerifier(calls.clone())),
+      Duration::from_millis(50),
+    ));
+
+    let output = execute_scheduler_command_with_resolvers(
+      SchedulerCommand::Create { file, format: None },
+      state,
+      operator,
+      Arc::new(resolvers),
+      100,
+    )
+    .await
+    .expect("CLI create");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let job_id = output["data"]["job_id"].as_str().expect("job id");
+    let targets = inspection
+      .get_scheduled_job_delivery_targets(job_id)
+      .await
+      .expect("targets");
+    assert_eq!(targets[0].provider(), "slack");
+    assert_eq!(targets[0].tenant(), "T00000000");
+    assert!(targets[0].address_json().contains("\"channel_id\":\"C2\""));
   }
 }

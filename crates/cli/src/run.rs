@@ -20,12 +20,12 @@ use codeoff_agent_contract::{
 };
 use codeoff_channel_contract::{
   ChannelContextPage, ChannelContextRequest, ChannelEvent, ChannelMessageReceipt,
-  ChannelReplyTarget, ChannelWorkspaceRequest,
+  ChannelReplyTarget,
 };
 use codeoff_channel_slack::{
   SlackConfigError, SlackDeliveryQueue, SlackIntake, SlackIntakeResult, SlackReqwestWebApiClient,
-  SlackSocketClient, SlackWebApiClient, SlackWebApiError, SocketWorkerAction, SocketWorkerOptions,
-  check_slack_worker, run_socket_worker,
+  SlackScheduleTargetVerifier, SlackSocketClient, SlackWebApiClient, SlackWebApiError,
+  SocketWorkerAction, SocketWorkerOptions, check_slack_worker, run_socket_worker,
 };
 use codeoff_config::{
   CodeoffConfig, ConfigLoadOptions, SlackDirectMessageFeedbackMode, SlackResponseFeedbackMode,
@@ -37,13 +37,12 @@ use codeoff_runtime::{
   StateProcessingStreamManager,
   channel_tools::{
     ChannelContextProvider, ChannelContextProviderError, ChannelDynamicToolHandler,
-    ChannelResourceProvider, ChannelStatusProvider,
+    ChannelResourceProvider,
   },
   dispatch_next_channel_event_with_processing_streams_context_and_locks,
   schedule_service::{
-    ChannelTargetVerifier, DefaultCapabilityRegistry, OwnerOnlyAuthorizationPolicy,
-    ScheduleInvocation, ScheduleService, TargetResolverRegistry, TargetVerificationError,
-    VerifiedSlackTargetResolver,
+    DefaultCapabilityRegistry, OwnerOnlyAuthorizationPolicy, ScheduleInvocation, ScheduleService,
+    TargetResolverRegistry, VerifiedSlackTargetResolver,
   },
   schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler},
   scheduled_execution::{
@@ -56,7 +55,9 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::command::{Cli, Command, ConfigCommand, SchedulerCommand, WorkerCommand};
-use crate::scheduler::{SchedulerCommandError, SchedulerOperatorConfig, execute_scheduler_command};
+use crate::scheduler::{
+  SchedulerCommandError, SchedulerOperatorConfig, execute_scheduler_command_with_resolvers,
+};
 
 /// Parses CLI arguments and runs the selected Codeoff command.
 ///
@@ -95,7 +96,20 @@ fn run_scheduler(
     config.database_url(),
   ))?;
   let now = i64::try_from(now_unix_seconds()).unwrap_or(i64::MAX);
-  let output = runtime.block_on(execute_scheduler_command(command, state, operator, now))?;
+  let mut targets = TargetResolverRegistry::with_defaults();
+  if let Some(provider) = build_channel_address_provider(&config) {
+    targets.register(VerifiedSlackTargetResolver::registration(
+      Arc::new(SlackScheduleTargetVerifier::new(provider)),
+      Duration::from_secs(5),
+    ));
+  }
+  let output = runtime.block_on(execute_scheduler_command_with_resolvers(
+    command,
+    state,
+    operator,
+    Arc::new(targets),
+    now,
+  ))?;
   println!("{}", serde_json::to_string(&output)?);
   Ok(())
 }
@@ -2336,7 +2350,7 @@ fn build_serve_schedule_dynamic_tool_handler(
   let mut targets = TargetResolverRegistry::with_defaults();
   if let Some(provider) = address_provider {
     targets.register(VerifiedSlackTargetResolver::registration(
-      Arc::new(SlackScheduleTargetVerifier { provider }),
+      Arc::new(SlackScheduleTargetVerifier::new(provider)),
       Duration::from_secs(5),
     ));
   }
@@ -2350,93 +2364,6 @@ fn build_serve_schedule_dynamic_tool_handler(
     ),
     None,
   )
-}
-
-struct SlackScheduleTargetVerifier {
-  provider: Arc<SlackWebApiClient<SlackReqwestWebApiClient>>,
-}
-
-#[async_trait]
-impl ChannelTargetVerifier for SlackScheduleTargetVerifier {
-  async fn verify_connector(
-    &self,
-    workspace_id: &str,
-    actor_id: &str,
-  ) -> Result<(), TargetVerificationError> {
-    ChannelStatusProvider::get_connector_status(
-      self.provider.as_ref(),
-      ChannelWorkspaceRequest::new("slack-default", workspace_id)
-        .map_err(|_| TargetVerificationError::NotAllowed)?,
-    )
-    .await
-    .map_err(|_| TargetVerificationError::Unavailable)
-    .and_then(|status| {
-      status
-        .connected
-        .then_some(())
-        .ok_or(TargetVerificationError::NotAllowed)
-    })?;
-    self
-      .provider
-      .get_user(actor_id)
-      .await
-      .map(|_| ())
-      .map_err(|_| TargetVerificationError::Unavailable)
-  }
-
-  async fn verify_channel(
-    &self,
-    workspace_id: &str,
-    actor_id: &str,
-    channel_id: &str,
-  ) -> Result<(), TargetVerificationError> {
-    if self.provider.workspace_summary().workspace_id != workspace_id {
-      return Err(TargetVerificationError::NotAllowed);
-    }
-    self
-      .provider
-      .actor_is_channel_member(actor_id, channel_id)
-      .await
-      .map_err(|_| TargetVerificationError::Unavailable)?
-      .then_some(())
-      .ok_or(TargetVerificationError::NotAllowed)
-  }
-
-  async fn verify_user(
-    &self,
-    workspace_id: &str,
-    actor_id: &str,
-    user_id: &str,
-  ) -> Result<(), TargetVerificationError> {
-    if self.provider.workspace_summary().workspace_id != workspace_id || actor_id != user_id {
-      return Err(TargetVerificationError::NotAllowed);
-    }
-    self
-      .provider
-      .get_user(actor_id)
-      .await
-      .map(|_| ())
-      .map_err(|_| TargetVerificationError::Unavailable)
-  }
-
-  async fn verify_thread(
-    &self,
-    workspace_id: &str,
-    actor_id: &str,
-    channel_id: &str,
-    thread_id: &str,
-  ) -> Result<(), TargetVerificationError> {
-    self
-      .verify_channel(workspace_id, actor_id, channel_id)
-      .await?;
-    self
-      .provider
-      .thread_parent_exists(channel_id, thread_id)
-      .await
-      .map_err(|_| TargetVerificationError::Unavailable)?
-      .then_some(())
-      .ok_or(TargetVerificationError::NotAllowed)
-  }
 }
 
 #[derive(Clone)]

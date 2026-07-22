@@ -786,6 +786,31 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
     Ok(self.to_channel_address(&channel))
   }
 
+  /// Opens or looks up the canonical one-to-one Slack conversation for a user.
+  ///
+  /// # Errors
+  /// Returns an error when Slack rejects the request or omits the canonical conversation id.
+  pub async fn open_direct_message(
+    &self,
+    user_id: &str,
+  ) -> Result<SlackChannelAddress, SlackWebApiError> {
+    let body = serde_json::to_string(&serde_json::json!({"users": user_id})).map_err(|source| {
+      SlackWebApiError::InvalidResponse {
+        message: self.redact(&source.to_string()),
+      }
+    })?;
+    let response = self
+      .post_json("conversations.open", body, &self.bot_token)
+      .await?;
+    let parsed = self.parse_api_response(&response)?;
+    let channel = parsed
+      .channel_object()
+      .ok_or_else(|| SlackWebApiError::InvalidResponse {
+        message: "conversations.open response is missing channel".to_owned(),
+      })?;
+    Ok(self.to_channel_address(&channel))
+  }
+
   /// Proves that a Slack actor belongs to a target conversation.
   ///
   /// The membership cursor is followed to exhaustion with a hard page bound. Missing, repeated,
@@ -855,6 +880,31 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
         .and_then(|message| message.ts.as_deref())
         == Some(thread_id),
     )
+  }
+
+  /// Proves that the supplied timestamp is an accessible root thread parent, never a reply.
+  ///
+  /// # Errors
+  /// Returns an error when Slack rejects the request or returns an invalid response.
+  pub async fn thread_parent_is_root(
+    &self,
+    channel_id: &str,
+    thread_ts: &str,
+  ) -> Result<bool, SlackWebApiError> {
+    let response = self
+      .request(
+        "conversations.replies",
+        vec![
+          ("channel".to_owned(), channel_id.to_owned()),
+          ("ts".to_owned(), thread_ts.to_owned()),
+          ("limit".to_owned(), "1".to_owned()),
+        ],
+      )
+      .await?;
+    let parsed = self.parse_api_response(&response)?;
+    Ok(parsed.messages.first().is_some_and(|message| {
+      message.ts.as_deref() == Some(thread_ts) && message.thread_ts.is_none()
+    }))
   }
 
   /// Resolves a Slack channel id or name into one unambiguous conversation.
@@ -1115,6 +1165,7 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
       is_im: channel.is_im,
       is_mpim: channel.is_mpim,
       is_archived: channel.is_archived,
+      is_member: channel.is_member,
     }
   }
 
@@ -1789,6 +1840,7 @@ pub struct SlackChannelAddress {
   pub is_im: bool,
   pub is_mpim: bool,
   pub is_archived: bool,
+  pub is_member: bool,
 }
 
 impl SlackChannelAddress {
@@ -1887,6 +1939,8 @@ struct SlackChannel {
   is_mpim: bool,
   #[serde(default)]
   is_archived: bool,
+  #[serde(default)]
+  is_member: bool,
 }
 
 impl SlackApiResponse {
@@ -1976,6 +2030,8 @@ fn is_slack_id_character(character: char) -> bool {
 #[derive(Debug, Deserialize)]
 struct SlackMessage {
   ts: Option<String>,
+  #[serde(default)]
+  thread_ts: Option<String>,
   #[serde(default)]
   text: Option<String>,
   #[serde(default)]

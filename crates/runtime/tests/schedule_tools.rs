@@ -7,8 +7,9 @@ use codeoff_runtime::schedule_service::{
   CapabilityRegistry, CapabilityRequest, ChannelTargetVerifier, ConfiguredOperatorIdentityPolicy,
   CreateScheduleRequest, DefaultCapabilityRegistry, DeliveryTargetRequest,
   OperatorAuthorizationPolicy, OwnerOnlyAuthorizationPolicy, PreviousSuccessPolicy,
-  ScheduleService, ScheduleServiceError, TargetResolver, TargetResolverRegistration,
-  TargetResolverRegistry, TargetVerificationError, VerifiedSlackTargetResolver,
+  ScheduleService, ScheduleServiceError, SlackTargetResolutionRequest, TargetResolver,
+  TargetResolverRegistration, TargetResolverRegistry, TargetVerificationError, VerifiedSlackTarget,
+  VerifiedSlackTargetResolver,
 };
 use codeoff_runtime::schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler};
 use codeoff_state::{
@@ -49,6 +50,7 @@ impl TargetResolver for MaliciousTargetResolver {
     _invocation: &ScheduleInvocation,
     owner: &PrincipalKey,
     _target: &DeliveryTargetRequest,
+    _now: i64,
   ) -> Result<Vec<DeliveryTargetSnapshot>, ScheduleServiceError> {
     let address_json = serde_json::to_string(&self.address)
       .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))?;
@@ -121,44 +123,39 @@ impl CapabilityRegistry for InvocationCapabilityRegistry {
 
 #[async_trait]
 impl ChannelTargetVerifier for FakeVerifier {
-  async fn verify_connector(
+  async fn resolve_target(
     &self,
-    _workspace_id: &str,
-    _actor_id: &str,
-  ) -> Result<(), TargetVerificationError> {
+    workspace_id: Option<&str>,
+    _actor_id: Option<&str>,
+    target: &SlackTargetResolutionRequest,
+  ) -> Result<VerifiedSlackTarget, TargetVerificationError> {
     if matches!(self.0, VerifyMode::Slow) {
       tokio::time::sleep(Duration::from_millis(50)).await;
     }
     match self.0 {
-      VerifyMode::Unavailable => Err(TargetVerificationError::Unavailable),
-      VerifyMode::NotAllowed => Err(TargetVerificationError::NotAllowed),
-      _ => Ok(()),
+      VerifyMode::Unavailable => return Err(TargetVerificationError::Transient),
+      VerifyMode::NotAllowed => return Err(TargetVerificationError::Unauthorized),
+      _ => {}
     }
-  }
-  async fn verify_channel(
-    &self,
-    _workspace_id: &str,
-    _actor_id: &str,
-    _channel_id: &str,
-  ) -> Result<(), TargetVerificationError> {
-    Ok(())
-  }
-  async fn verify_user(
-    &self,
-    _workspace_id: &str,
-    _actor_id: &str,
-    _user_id: &str,
-  ) -> Result<(), TargetVerificationError> {
-    Ok(())
-  }
-  async fn verify_thread(
-    &self,
-    _workspace_id: &str,
-    _actor_id: &str,
-    _channel_id: &str,
-    _thread_id: &str,
-  ) -> Result<(), TargetVerificationError> {
-    Ok(())
+    let (kind, channel_id, thread_ts) = match target {
+      SlackTargetResolutionRequest::Channel { channel_id } => ("channel", channel_id.clone(), None),
+      SlackTargetResolutionRequest::DirectMessageUser { .. }
+      | SlackTargetResolutionRequest::DirectMessageConversation { .. } => {
+        ("direct_message", "D1".to_owned(), None)
+      }
+      SlackTargetResolutionRequest::Thread {
+        channel_id,
+        thread_ts,
+      } => ("thread", channel_id.clone(), Some(thread_ts.clone())),
+    };
+    Ok(VerifiedSlackTarget {
+      workspace_id: workspace_id.unwrap_or("W1").to_owned(),
+      kind: kind.to_owned(),
+      channel_id,
+      thread_ts,
+      authorization_evidence_version: 1,
+      authorization_evidence_digest: "a".repeat(64),
+    })
   }
 }
 
@@ -202,8 +199,8 @@ fn invocation_for(provider: &str, workspace_id: &str, actor: &str) -> ScheduleIn
       reply_strategy: ChannelReplyStrategy::DynamicTool,
       message_text: None,
       channel_id: Some("C1".to_owned()),
-      thread_id: Some("T1".to_owned()),
-      message_ts: Some("T1".to_owned()),
+      thread_id: Some("100.000000".to_owned()),
+      message_ts: Some("100.000000".to_owned()),
       user_id: Some(actor.to_owned()),
       recent_context: None,
       conversation_summary: None,
@@ -676,11 +673,12 @@ async fn test_verified_resolver_fails_closed_for_unavailable_not_allowed_and_tim
 }
 
 #[tokio::test]
-async fn test_verified_slack_resolver_rejects_direct_message_to_another_user() {
+async fn test_verified_slack_resolver_persists_direct_message_conversation_not_user() {
   let temp = tempdir().expect("tempdir");
   let store = StateStore::initialize(&temp.path().join("state"), None)
     .await
     .expect("state");
+  let inspection = store.clone();
   let handler = verified_handler(store, VerifyMode::Allow, Duration::from_millis(50));
   let mut arguments = create_arguments("dm-other-user");
   arguments["target"] = json!({"kind": "direct_message", "user_id": "U2"});
@@ -689,8 +687,18 @@ async fn test_verified_slack_resolver_rejects_direct_message_to_another_user() {
     .handle_tool_call_async(&invocation("U1"), "schedule_create", arguments)
     .await;
 
-  assert_eq!(output["success"], false);
-  assert!(output.to_string().contains("resolver_not_allowed"));
+  assert_eq!(output["success"], true, "{output}");
+  let job_id = output_content(&output)["job_id"]
+    .as_str()
+    .expect("job id")
+    .to_owned();
+  let targets = inspection
+    .get_scheduled_job_delivery_targets(&job_id)
+    .await
+    .expect("targets");
+  assert_eq!(targets[0].kind(), "direct_message");
+  assert!(targets[0].address_json().contains("\"channel_id\":\"D1\""));
+  assert!(!targets[0].address_json().contains("U2"));
 }
 
 #[tokio::test]
@@ -876,9 +884,10 @@ async fn test_schedule_tools_resolve_supported_target_variants_to_durable_snapsh
   let owner = invocation("U1");
   let targets = [
     json!({"kind": "none"}),
+    json!({"kind": "origin"}),
     json!({"kind": "channel", "channel_id": "C2"}),
     json!({"kind": "direct_message", "user_id": "U1"}),
-    json!({"kind": "thread", "channel_id": "C2", "thread_id": "T2"}),
+    json!({"kind": "thread", "channel_id": "C2", "thread_id": "200.000000"}),
     json!({"kind": "channel", "channel_id": "C2"}),
   ];
   for (index, target) in targets.into_iter().enumerate() {
@@ -889,6 +898,77 @@ async fn test_schedule_tools_resolve_supported_target_variants_to_durable_snapsh
       .await;
     assert_eq!(output["success"], true, "target {index} failed: {output}");
   }
+}
+
+#[tokio::test]
+async fn test_slack_resolution_is_canonical_stable_and_precedes_schedule_mutation() {
+  let temp = tempdir().expect("tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("state");
+  let inspection = store.clone();
+  let handler = verified_handler(store, VerifyMode::Allow, Duration::from_millis(100));
+  let actor = invocation("U1");
+
+  let mut invalid = create_arguments("canonical-create");
+  invalid["target"] = json!({"kind": "channel", "channel_id": "#general"});
+  let rejected = handler
+    .handle_tool_call_async(&actor, "schedule_create", invalid)
+    .await;
+  assert!(rejected.to_string().contains("canonical Slack"));
+  let owner = PrincipalKey::new("user", "slack", "W1", "U1").expect("owner");
+  assert!(
+    inspection
+      .list_scheduled_jobs_by_owner(&owner, codeoff_state::ScheduledJobStatus::Active, None, 10,)
+      .await
+      .expect("jobs")
+      .job_ids
+      .is_empty(),
+    "resolution failure must not create a schedule"
+  );
+
+  let mut corrected = create_arguments("canonical-create");
+  corrected["target"] = json!({"kind": "channel", "channel_id": "C2"});
+  let created = handler
+    .handle_tool_call_async(&actor, "schedule_create", corrected)
+    .await;
+  assert_eq!(created["success"], true, "{created}");
+  let job_id = output_content(&created)["job_id"]
+    .as_str()
+    .expect("job id")
+    .to_owned();
+  let before = inspection
+    .get_scheduled_job_delivery_targets(&job_id)
+    .await
+    .expect("targets")
+    .remove(0);
+  assert!(!before.address_json().contains("general"));
+  assert!(before.address_json().contains("\"channel_id\":\"C2\""));
+
+  let update = |request_id: &str, instruction: &str| {
+    json!({
+      "request_id": request_id,
+      "job_id": job_id,
+      "expected_generation": 0,
+      "instruction": instruction,
+      "schedule": {"kind": "once", "at": 300},
+      "target": {"kind": "channel", "channel_id": "C2"},
+      "capability": "none"
+    })
+  };
+  let (left, right) = tokio::join!(
+    handler.handle_tool_call_async(&actor, "schedule_update", update("update-left", "left")),
+    handler.handle_tool_call_async(&actor, "schedule_update", update("update-right", "right")),
+  );
+  assert_ne!(left["success"], right["success"], "{left} {right}");
+  assert!(format!("{left}{right}").contains("stale_generation"));
+  let after = inspection
+    .get_scheduled_job_delivery_targets(&job_id)
+    .await
+    .expect("targets")
+    .remove(0);
+  assert_eq!(before.identity_digest(), after.identity_digest());
+  assert_eq!(before.address_json(), after.address_json());
 }
 
 #[test]

@@ -20,10 +20,11 @@ pub use scheduler::{
   ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
   ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority, ScheduledRun,
   ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
-  ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
-  SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
-  SkippedNoneBaselinePolicy, StateValueError, TransactionalMutationOutcome, TransportConvergence,
-  UpdateExecutionBaseline, UpdateScheduledJob,
+  ScheduledRunReconcileCandidate, ScheduledRunReconcileOutcome, ScheduledRunResult,
+  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerOperatorActionSummary,
+  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
+  StateValueError, TransactionalMutationOutcome, TransportConvergence, UpdateExecutionBaseline,
+  UpdateScheduledJob,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::StateStoreTestLock;

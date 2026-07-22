@@ -21,10 +21,11 @@ use super::{
   ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob,
   ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
   ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
-  ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
-  SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorRequest,
-  SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome, UpdateExecutionBaseline,
-  UpdateScheduledJob, Value, invalid_json, invalid_occurrence, invalid_value, materialized_run,
+  ScheduledRunReconcileCandidate, ScheduledRunReconcileOutcome, ScheduledRunResult,
+  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerOperatorActionSummary,
+  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
+  StateError, TransactionalMutationOutcome, UpdateExecutionBaseline, UpdateScheduledJob, Value,
+  invalid_json, invalid_occurrence, invalid_value, materialized_run,
   operator_action_request_digest, operator_delivery_evidence_binding, positive_u32,
   scheduler_error, validate_lowercase_sha256, validate_text,
 };
@@ -2247,7 +2248,7 @@ impl StateStore {
   /// Returns an error for invalid authority, inconsistent persisted attempt authority, or storage
   /// failure.
   #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-  pub async fn reconcile_expired_scheduled_run(
+  async fn reconcile_expired_scheduled_run(
     &self,
     run_id: &str,
     expected_state: ScheduledRunState,
@@ -2378,11 +2379,86 @@ impl StateStore {
     Ok(ScheduledRunReconcileOutcome::Applied(transition.outcome))
   }
 
+  /// Lists one bounded page of exact expired run lease authority for reconcile planning.
+  ///
+  /// The raw lease owner remains private; callers can bind its digest through the candidate's
+  /// canonical plan snapshot and apply only by passing the opaque candidate back to state.
+  ///
+  /// # Errors
+  /// Returns an error for invalid time/limit, malformed persisted authority, or storage failure.
+  pub async fn list_scheduled_run_reconcile_candidates(
+    &self,
+    now: i64,
+    limit: u16,
+  ) -> Result<Vec<ScheduledRunReconcileCandidate>, StateError> {
+    if now < 0 || limit == 0 || limit > 100 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "invalid run reconcile candidate query".to_owned(),
+      });
+    }
+    let rows = sqlx::query(
+      "select run_id, state, attempt, fence, lease_owner, lease_expires_at from scheduled_runs where state in ('leased', 'executing') and lease_expires_at <= ?1 and updated_at <= ?1 order by lease_expires_at, run_id limit ?2",
+    )
+    .bind(now)
+    .bind(i64::from(limit))
+    .fetch_all(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    rows
+      .into_iter()
+      .map(|row| {
+        let state = row
+          .try_get::<String, _>("state")
+          .map_err(scheduler_error)?
+          .parse()?;
+        let lease_owner: String = row.try_get("lease_owner").map_err(scheduler_error)?;
+        validate_text("persisted run reconcile lease owner", &lease_owner)
+          .map_err(invalid_value)?;
+        Ok(ScheduledRunReconcileCandidate {
+          run_id: row.try_get("run_id").map_err(scheduler_error)?,
+          state,
+          attempt: row.try_get("attempt").map_err(scheduler_error)?,
+          fence: row.try_get("fence").map_err(scheduler_error)?,
+          lease_owner,
+          lease_expires_at: row.try_get("lease_expires_at").map_err(scheduler_error)?,
+        })
+      })
+      .collect()
+  }
+
+  /// Applies one opaque exact run reconcile candidate.
+  ///
+  /// # Errors
+  /// Returns an error for invalid policy, inconsistent persisted attempt authority, or storage
+  /// failure.
+  pub async fn reconcile_scheduled_run_candidate(
+    &self,
+    candidate: &ScheduledRunReconcileCandidate,
+    max_attempts: i64,
+    next_attempt_at: i64,
+    now: i64,
+  ) -> Result<ScheduledRunReconcileOutcome, StateError> {
+    self
+      .reconcile_expired_scheduled_run(
+        &candidate.run_id,
+        candidate.state,
+        candidate.attempt,
+        candidate.fence,
+        &candidate.lease_owner,
+        candidate.lease_expires_at,
+        max_attempts,
+        next_attempt_at,
+        now,
+      )
+      .await
+  }
+
   /// Requeues one conclusively terminal run under idempotent trusted-operator authority.
   ///
   /// # Errors
   /// Returns an error for invalid authority, stale CAS, unknown execution outcome, or storage
   /// failure.
+  #[allow(clippy::too_many_lines)]
   pub async fn operator_retry_scheduled_run(
     &self,
     request: &SchedulerOperatorRequest,
@@ -2396,6 +2472,31 @@ impl StateStore {
     if expected_attempt <= 0 || expected_fence <= 0 || next_attempt_at < request.occurred_at {
       return Err(StateError::InvalidSchedulerState {
         reason: "invalid operator run retry authority".to_owned(),
+      });
+    }
+    let request_matches_invocation =
+      ["failed", "timed_out", "cancelled"]
+        .into_iter()
+        .any(|state| {
+          request.request_digest
+            == operator_action_request_digest(
+              "retry_run",
+              "run",
+              run_id,
+              expected_attempt,
+              expected_fence,
+              state,
+              "pending",
+              None,
+              None,
+              None,
+              false,
+              next_attempt_at,
+            )
+        });
+    if !request_matches_invocation {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "operator request digest does not bind the exact run retry invocation".to_owned(),
       });
     }
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
@@ -2503,6 +2604,21 @@ impl StateStore {
         reason: "invalid operator delivery retry authority".to_owned(),
       });
     }
+    let action = OperatorActionInsert {
+      action: "retry_delivery",
+      target_kind: "delivery",
+      target_id: delivery_id,
+      expected_attempt,
+      expected_fence,
+      before_state: "failed_retryable",
+      after_state: "pending",
+      evidence_json: Some(reason_json),
+      evidence_digest: Some(reason_digest),
+      provider_receipt: None,
+      duplicate_risk_acknowledged: false,
+      effective_at: request.occurred_at,
+    };
+    validate_operator_action_request(request, &action)?;
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     if let Some(outcome) = existing_operator_request(&mut transaction, request).await? {
       transaction.commit().await.map_err(scheduler_error)?;
@@ -2521,20 +2637,6 @@ impl StateStore {
     if next_attempt_at.is_none_or(|retry_at| retry_at <= request.occurred_at) {
       return Ok(SchedulerOperatorMutationOutcome::Conflict);
     }
-    let action = OperatorActionInsert {
-      action: "retry_delivery",
-      target_kind: "delivery",
-      target_id: delivery_id,
-      expected_attempt,
-      expected_fence,
-      before_state: "failed_retryable",
-      after_state: "pending",
-      evidence_json: Some(reason_json),
-      evidence_digest: Some(reason_digest),
-      provider_receipt: None,
-      duplicate_risk_acknowledged: false,
-      effective_at: request.occurred_at,
-    };
     match insert_operator_action(&mut transaction, request, &action).await? {
       OperatorActionInsertOutcome::Replay => {
         transaction.commit().await.map_err(scheduler_error)?;
@@ -2585,24 +2687,6 @@ impl StateStore {
     }
     let (action_name, after_state, evidence_json, evidence_digest, provider_receipt, duplicate_ack) =
       action.authority_parts().map_err(invalid_value)?;
-    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
-    if let Some(outcome) = existing_operator_request(&mut transaction, request).await? {
-      transaction.commit().await.map_err(scheduler_error)?;
-      return Ok(outcome);
-    }
-    let target_json: Option<String> = sqlx::query_scalar(
-      "select target_json from scheduled_run_deliveries where delivery_id = ?1 and attempt = ?2 and fence = ?3 and state = 'delivery_unknown' and authority_kind = 'intent_v1' and payload_snapshot is not null",
-    )
-    .bind(delivery_id)
-    .bind(expected_attempt)
-    .bind(expected_fence)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(scheduler_error)?;
-    let Some(target_json) = target_json else {
-      return Ok(SchedulerOperatorMutationOutcome::Conflict);
-    };
-    validate_operator_delivery_target_binding(&target_json, action)?;
     let action_insert = OperatorActionInsert {
       action: action_name,
       target_kind: "delivery",
@@ -2617,6 +2701,28 @@ impl StateStore {
       duplicate_risk_acknowledged: duplicate_ack,
       effective_at: request.occurred_at,
     };
+    validate_operator_action_request(request, &action_insert)?;
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let target: Option<(String, String)> = sqlx::query_as(
+      "select target_json, state from scheduled_run_deliveries where delivery_id = ?1 and attempt = ?2 and fence = ?3 and authority_kind = 'intent_v1' and payload_snapshot is not null",
+    )
+    .bind(delivery_id)
+    .bind(expected_attempt)
+    .bind(expected_fence)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let Some((target_json, state)) = target else {
+      return Ok(SchedulerOperatorMutationOutcome::Conflict);
+    };
+    validate_operator_delivery_target_binding(&target_json, action)?;
+    if let Some(outcome) = existing_operator_request(&mut transaction, request).await? {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(outcome);
+    }
+    if state != "delivery_unknown" {
+      return Ok(SchedulerOperatorMutationOutcome::Conflict);
+    }
     match insert_operator_action(&mut transaction, request, &action_insert).await? {
       OperatorActionInsertOutcome::Replay => {
         transaction.commit().await.map_err(scheduler_error)?;
@@ -4823,17 +4929,24 @@ fn operator_action_digest(action: &OperatorActionInsert<'_>) -> String {
   )
 }
 
+fn validate_operator_action_request(
+  request: &SchedulerOperatorRequest,
+  action: &OperatorActionInsert<'_>,
+) -> Result<(), StateError> {
+  if request.request_digest != operator_action_digest(action) {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "operator request digest does not bind the exact action".to_owned(),
+    });
+  }
+  Ok(())
+}
+
 async fn insert_operator_action(
   transaction: &mut Transaction<'_, Sqlite>,
   request: &SchedulerOperatorRequest,
   action: &OperatorActionInsert<'_>,
 ) -> Result<OperatorActionInsertOutcome, StateError> {
-  let expected_digest = operator_action_digest(action);
-  if request.request_digest != expected_digest {
-    return Err(StateError::InvalidSchedulerState {
-      reason: "operator request digest does not bind the exact action".to_owned(),
-    });
-  }
+  validate_operator_action_request(request, action)?;
   let action_id = sha256_hex(
     format!(
       "scheduler-operator-action-v1\n{}\n{}\n{}\n{}\n{}",

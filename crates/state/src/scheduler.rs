@@ -1423,6 +1423,57 @@ pub enum ScheduledRunReconcileOutcome {
   NotEligible,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScheduledRunReconcileCandidate {
+  run_id: String,
+  state: ScheduledRunState,
+  attempt: i64,
+  fence: i64,
+  lease_owner: String,
+  lease_expires_at: i64,
+}
+
+impl ScheduledRunReconcileCandidate {
+  #[must_use]
+  pub fn run_id(&self) -> &str {
+    &self.run_id
+  }
+
+  #[must_use]
+  pub const fn state(&self) -> ScheduledRunState {
+    self.state
+  }
+
+  #[must_use]
+  pub const fn attempt(&self) -> i64 {
+    self.attempt
+  }
+
+  #[must_use]
+  pub const fn fence(&self) -> i64 {
+    self.fence
+  }
+
+  #[must_use]
+  pub const fn lease_expires_at(&self) -> i64 {
+    self.lease_expires_at
+  }
+
+  /// Returns the canonical, sanitized authority snapshot bound into reconcile plans.
+  #[must_use]
+  pub fn canonical_plan_snapshot(&self) -> String {
+    json!({
+      "attempt": self.attempt,
+      "fence": self.fence,
+      "lease_expires_at": self.lease_expires_at,
+      "lease_owner_digest": sha256_hex(self.lease_owner.as_bytes()),
+      "run_id": self.run_id,
+      "state": self.state.as_str(),
+    })
+    .to_string()
+  }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledRunLateEvidenceKind {
   CompletionAfterLeaseLoss,

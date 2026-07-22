@@ -48,8 +48,13 @@ impl FakeHttp {
 
 #[async_trait]
 impl SlackHttpClient for FakeHttp {
-  async fn get(&self, _request: SlackHttpRequest) -> Result<SlackHttpResponse, String> {
-    Err("unexpected GET".to_owned())
+  async fn get(&self, request: SlackHttpRequest) -> Result<SlackHttpResponse, String> {
+    self.requests.lock().expect("requests").push(request);
+    match self.steps.lock().expect("steps").pop_front() {
+      Some(HttpStep::Response(response)) => Ok(response),
+      Some(HttpStep::Error(error)) => Err(error),
+      None => Err("unexpected request".to_owned()),
+    }
   }
 
   async fn post(&self, request: SlackHttpRequest) -> Result<SlackHttpResponse, String> {
@@ -68,6 +73,24 @@ fn response(status: u16, body: impl Into<String>) -> HttpStep {
     Vec::<(&str, &str)>::new(),
     body,
   ))
+}
+
+fn live_channel(channel_id: &str) -> HttpStep {
+  response(
+    200,
+    json!({
+      "ok": true,
+      "channel": {
+        "id": channel_id,
+        "is_member": true,
+        "context_team_id": "T00000000",
+        "enterprise_id": "E00000000",
+        "conversation_host_id": "T00000000",
+        "shared_team_ids": ["T00000000"],
+      }
+    })
+    .to_string(),
+  )
 }
 
 fn owner() -> PrincipalKey {
@@ -98,13 +121,22 @@ async fn claimed_delivery(
   channel_id: &str,
   thread_ts: Option<&str>,
 ) -> (TempDir, StateStore, ClaimedScheduledDelivery) {
+  claimed_delivery_with_body(kind, channel_id, thread_ts, "exact UTF-8: 測試  \n").await
+}
+
+async fn claimed_delivery_with_body(
+  kind: &str,
+  channel_id: &str,
+  thread_ts: Option<&str>,
+  body: &str,
+) -> (TempDir, StateStore, ClaimedScheduledDelivery) {
   let (temp, store, delivery_id) = completed_delivery_intent(kind, channel_id, thread_ts).await;
   assert!(matches!(
     store
       .prepare_scheduled_delivery(
         &delivery_id,
         "text/markdown; charset=utf-8",
-        "exact UTF-8: 測試  \n",
+        body,
         1,
         121,
         SkippedNoneBaselinePolicy::DoNotAdvance,
@@ -121,10 +153,72 @@ async fn claimed_delivery(
   (temp, store, claim)
 }
 
+#[tokio::test]
+async fn enforces_slack_message_limit_by_unicode_scalar_count_before_http() {
+  let accepted_body = "a".repeat(40_000);
+  let (_temp, _store, accepted) =
+    claimed_delivery_with_body("channel", "C123", None, &accepted_body).await;
+  let accepted_provider = SlackScheduledDeliveryProvider::new(SlackWebApiClient::new(
+    FakeHttp::new([response(
+      200,
+      r#"{"ok":true,"channel":"C123","ts":"200.000001","team_id":"T00000000","message":{"ts":"200.000001"}}"#,
+    )]),
+    "slack-default",
+    "xoxb-secret",
+    SlackConfig::default(),
+    100,
+  ));
+  assert!(matches!(
+    accepted_provider
+      .send(DeliveryProviderRequest {
+        payload: &accepted.payload,
+        target_json: &accepted.target_json,
+        idempotency_key: accepted.binding.idempotency_key(),
+      })
+      .await,
+    DeliveryProviderOutcome::ConfirmedSuccess(_)
+  ));
+  assert_eq!(accepted_provider.http_client().requests().len(), 1);
+
+  for rejected_body in ["a".repeat(40_001), "測".repeat(40_001)] {
+    let (_temp, _store, rejected) =
+      claimed_delivery_with_body("channel", "C123", None, &rejected_body).await;
+    let rejected_provider = SlackScheduledDeliveryProvider::new(SlackWebApiClient::new(
+      FakeHttp::new([]),
+      "slack-default",
+      "xoxb-secret",
+      SlackConfig::default(),
+      100,
+    ));
+    assert_eq!(
+      rejected_provider
+        .send(DeliveryProviderRequest {
+          payload: &rejected.payload,
+          target_json: &rejected.target_json,
+          idempotency_key: rejected.binding.idempotency_key(),
+        })
+        .await,
+      DeliveryProviderOutcome::ConfirmedNoWriteTerminal {
+        error_kind: "payload_too_long".to_owned(),
+      }
+    );
+    assert!(rejected_provider.http_client().requests().is_empty());
+  }
+}
+
 async fn completed_delivery_intent(
   kind: &str,
   channel_id: &str,
   thread_ts: Option<&str>,
+) -> (TempDir, StateStore, String) {
+  completed_delivery_intent_with_body(kind, channel_id, thread_ts, "exact UTF-8: 測試  \n").await
+}
+
+async fn completed_delivery_intent_with_body(
+  kind: &str,
+  channel_id: &str,
+  thread_ts: Option<&str>,
+  result_body: &str,
 ) -> (TempDir, StateStore, String) {
   let temp = tempdir().expect("tempdir");
   let store = StateStore::initialize(&temp.path().join("state"), None)
@@ -194,13 +288,96 @@ async fn completed_delivery_intent(
   store
     .complete_scheduled_run_success(
       &run.binding,
-      &ScheduledRunResult::new("exact UTF-8: 測試  \n", "").expect("result"),
+      &ScheduledRunResult::new(result_body, "").expect("result"),
       120,
     )
     .await
     .expect("complete");
   let delivery_id = delivery_id(run.binding.run_id(), &identity);
   (temp, store, delivery_id)
+}
+
+#[tokio::test]
+async fn runtime_terminalizes_oversized_slack_payload_without_write_retry_or_baseline() {
+  let body = "a".repeat(40_001);
+  let (_temp, store, delivery_id) =
+    completed_delivery_intent_with_body("channel", "C123", None, &body).await;
+  let target_json = store
+    .load_scheduled_delivery_intent_target_snapshot(&delivery_id)
+    .await
+    .expect("target snapshot");
+  let provider = SlackScheduledDeliveryProvider::new(SlackWebApiClient::new(
+    FakeHttp::new([
+      response(
+        200,
+        r#"{"ok":true,"team_id":"T00000000","enterprise_id":"E00000000","user_id":"U123","bot_id":"B123"}"#,
+      ),
+      live_channel("C123"),
+    ]),
+    "slack-default",
+    "xoxb-secret",
+    SlackConfig::default(),
+    100,
+  ));
+  assert_eq!(
+    run_scheduled_delivery_tick(
+      &store,
+      &provider,
+      "oversized-worker",
+      tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .expect("oversized delivery"),
+    ScheduledDeliveryTickOutcome::FailedTerminal
+  );
+  assert_eq!(
+    store
+      .scheduled_delivery_authority_for_tests(&delivery_id)
+      .await
+      .expect("delivery authority"),
+    ("failed_terminal".to_owned(), 1, 1, 1)
+  );
+  assert_eq!(
+    store
+      .scheduled_delivery_run_state_for_tests(&delivery_id)
+      .await
+      .expect("run state"),
+    "succeeded"
+  );
+  let identity = AcceptedDeliveryBaselineIdentity {
+    job_id: "slack-channel-C123".to_owned(),
+    target_identity_digest: target_identity("channel"),
+    target_snapshot_digest_algorithm: "sha256-v1".to_owned(),
+    target_snapshot_digest: sha256_hex(&target_json),
+    delivery_policy_version: 1,
+    render_version: 1,
+    hash_algorithm: "sha256-utf8-exact-v1".to_owned(),
+  };
+  assert!(
+    store
+      .get_accepted_delivery_baseline(&identity)
+      .await
+      .expect("baseline")
+      .is_none()
+  );
+  assert_eq!(
+    run_scheduled_delivery_tick(
+      &store,
+      &provider,
+      "oversized-worker",
+      tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .expect("terminal delivery is not retried"),
+    ScheduledDeliveryTickOutcome::Idle
+  );
+  let requests = provider.http_client().requests();
+  assert_eq!(requests.len(), 2);
+  assert!(
+    requests
+      .iter()
+      .all(|request| request.path() != "chat.postMessage")
+  );
 }
 
 fn delivery_id(run_id: &str, identity: &str) -> String {
@@ -296,6 +473,7 @@ async fn runtime_delivers_slack_result_skips_exact_repeat_and_sends_utf8_change(
         200,
         r#"{"ok":true,"team_id":"T00000000","enterprise_id":"E00000000","user_id":"U123","bot_id":"B123"}"#,
       ),
+      live_channel("C123"),
       response(
         200,
         r#"{"ok":true,"channel":"C123","ts":"200.000001","team_id":"T00000000","message":{"ts":"200.000001"}}"#,
@@ -304,6 +482,7 @@ async fn runtime_delivers_slack_result_skips_exact_repeat_and_sends_utf8_change(
         200,
         r#"{"ok":true,"team_id":"T00000000","enterprise_id":"E00000000","user_id":"U123","bot_id":"B123"}"#,
       ),
+      live_channel("C123"),
       response(
         200,
         r#"{"ok":true,"channel":"C123","ts":"201.000001","team_id":"T00000000","message":{"ts":"201.000001"}}"#,
@@ -400,7 +579,7 @@ async fn runtime_delivers_slack_result_skips_exact_repeat_and_sends_utf8_change(
     .expect("repeat delivery"),
     ScheduledDeliveryTickOutcome::SkippedUnchanged
   );
-  assert_eq!(provider.http_client().requests().len(), 2);
+  assert_eq!(provider.http_client().requests().len(), 3);
 
   let changed_body = "exact UTF-8: 測試 e\u{0301}  \n";
   store
@@ -436,10 +615,10 @@ async fn runtime_delivers_slack_result_skips_exact_repeat_and_sends_utf8_change(
     ScheduledDeliveryTickOutcome::Delivered
   );
   let requests = provider.http_client().requests();
-  assert_eq!(requests.len(), 4);
-  assert_eq!(requests[3].path(), "chat.postMessage");
+  assert_eq!(requests.len(), 6);
+  assert_eq!(requests[5].path(), "chat.postMessage");
   assert_eq!(
-    requests[3].json_value("text").as_deref(),
+    requests[5].json_value("text").as_deref(),
     Some(changed_body)
   );
   assert_eq!(
@@ -666,7 +845,8 @@ async fn authority_preflight_accepts_only_the_configured_workspace() {
 }
 
 #[tokio::test]
-async fn readiness_validates_target_before_auth_and_classifies_auth_availability() {
+#[allow(clippy::too_many_lines)]
+async fn readiness_separates_exact_target_rejection_global_fatal_and_transient_deferral() {
   let (_temp, _store, claim) = claimed_delivery("channel", "C123", None).await;
   let invalid = SlackScheduledDeliveryProvider::new(SlackWebApiClient::new(
     FakeHttp::new([]),
@@ -685,7 +865,7 @@ async fn readiness_validates_target_before_auth_and_classifies_auth_availability
         binding_digest: "digest",
       })
       .await,
-    DeliveryProviderReadiness::Permanent {
+    DeliveryProviderReadiness::RejectDelivery {
       error_kind: "invalid_slack_target".to_owned(),
     }
   );
@@ -708,10 +888,85 @@ async fn readiness_validates_target_before_auth_and_classifies_auth_availability
         binding_digest: "binding",
       })
       .await,
-    DeliveryProviderReadiness::Retryable {
+    DeliveryProviderReadiness::Deferred {
       retry_after_seconds: None,
       error_kind: "slack_authority_unavailable".to_owned(),
     }
   );
   assert_eq!(transient.http_client().requests()[0].path(), "auth.test");
+
+  for target_response in [
+    response(200, r#"{"ok":false,"error":"channel_not_found"}"#),
+    response(200, r#"{"ok":false,"error":"no_permission"}"#),
+    response(
+      200,
+      r#"{"ok":true,"channel":{"id":"C123","is_archived":true,"is_member":true,"context_team_id":"T00000000"}}"#,
+    ),
+  ] {
+    let rejected = SlackScheduledDeliveryProvider::new(SlackWebApiClient::new(
+      FakeHttp::new([
+        response(
+          200,
+          r#"{"ok":true,"team_id":"T00000000","enterprise_id":"E00000000","user_id":"U123","bot_id":"B123"}"#,
+        ),
+        target_response,
+      ]),
+      "slack-default",
+      "xoxb-secret",
+      SlackConfig::default(),
+      100,
+    ));
+    assert!(matches!(
+      rejected
+        .readiness(DeliveryProviderReadinessRequest {
+          delivery_id: claim.binding.delivery_id(),
+          target_json: &claim.target_json,
+          target_digest: claim.payload.target_snapshot_digest(),
+          payload_digest: claim.payload.digest(),
+          binding_digest: "binding",
+        })
+        .await,
+      DeliveryProviderReadiness::RejectDelivery { .. }
+    ));
+    assert_eq!(
+      rejected
+        .http_client()
+        .requests()
+        .iter()
+        .map(SlackHttpRequest::path)
+        .collect::<Vec<_>>(),
+      ["auth.test", "conversations.info"]
+    );
+  }
+
+  for steps in [
+    vec![response(200, r#"{"ok":false,"error":"invalid_auth"}"#)],
+    vec![
+      response(
+        200,
+        r#"{"ok":true,"team_id":"T00000000","enterprise_id":"E00000000","user_id":"U123","bot_id":"B123"}"#,
+      ),
+      response(200, r#"{"ok":false,"error":"missing_scope"}"#),
+    ],
+  ] {
+    let fatal = SlackScheduledDeliveryProvider::new(SlackWebApiClient::new(
+      FakeHttp::new(steps),
+      "slack-default",
+      "xoxb-secret",
+      SlackConfig::default(),
+      100,
+    ));
+    assert!(matches!(
+      fatal
+        .readiness(DeliveryProviderReadinessRequest {
+          delivery_id: claim.binding.delivery_id(),
+          target_json: &claim.target_json,
+          target_digest: claim.payload.target_snapshot_digest(),
+          payload_digest: claim.payload.digest(),
+          binding_digest: "binding",
+        })
+        .await,
+      DeliveryProviderReadiness::FatalProvider { .. }
+    ));
+  }
 }

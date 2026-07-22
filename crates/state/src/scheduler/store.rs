@@ -31,6 +31,8 @@ const MAX_DELIVERY_INTENT_RUN_ID_BYTES: usize = 1050;
 const MAX_DELIVERY_INTENT_KEY_BYTES: usize = 70 + (MAX_DELIVERY_INTENT_RUN_ID_BYTES * 2);
 const MAX_DELIVERY_INTENT_ID_BYTES: usize = "intent:".len() + MAX_DELIVERY_INTENT_KEY_BYTES;
 const MAX_DELIVERY_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
+const READINESS_REJECTION_MESSAGE: &str =
+  "provider rejected exact delivery target during readiness";
 
 impl StateStore {
   /// Reads delivery authority for runtime lifecycle tests.
@@ -62,6 +64,24 @@ impl StateStore {
       .fetch_one(&self.pool)
       .await
       .map_err(scheduler_error)
+  }
+
+  /// Reads the parent run state for a scheduled delivery lifecycle test.
+  ///
+  /// # Errors
+  /// Returns an error when `SQLite` cannot read the delivery or run.
+  #[cfg(any(test, feature = "test-support"))]
+  pub async fn scheduled_delivery_run_state_for_tests(
+    &self,
+    delivery_id: &str,
+  ) -> Result<String, StateError> {
+    sqlx::query_scalar(
+      "select run.state from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id where delivery.delivery_id = ?1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&self.pool)
+    .await
+    .map_err(scheduler_error)
   }
 
   /// Reads the provider receipt for runtime lifecycle tests.
@@ -925,6 +945,44 @@ impl StateStore {
     sqlx::query_scalar::<_, String>(
       "update scheduled_run_deliveries set state = 'skipped_unchanged', claimed_baseline_version = (select baseline.baseline_version from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest), provider_outcome = 'skipped_unchanged', next_attempt_at = null, lease_owner = null, lease_expires_at = null, updated_at = ?1 where delivery_id = ?2 and state = 'pending' and ?3 = 'pending' and authority_kind = 'intent_v1' and payload_snapshot is not null and target_json = ?4 and target_snapshot_digest = ?5 and payload_digest = ?6 and intent_key = ?7 and updated_at <= ?1 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.delivery_id <> scheduled_run_deliveries.delivery_id and active.job_id = scheduled_run_deliveries.job_id and active.target_identity_digest = scheduled_run_deliveries.target_identity_digest and active.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and active.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and active.render_version = scheduled_run_deliveries.render_version and active.hash_algorithm = scheduled_run_deliveries.hash_algorithm) and exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest) returning delivery_id",
     )
+    .bind(now)
+    .bind(authority.delivery_id())
+    .bind(authority.source_state().as_str())
+    .bind(authority.target_json())
+    .bind(authority.target_digest())
+    .bind(authority.payload_digest())
+    .bind(authority.intent_key())
+    .fetch_optional(&self.pool)
+    .await
+    .map(|delivery| delivery.is_some())
+    .map_err(scheduler_error)
+  }
+
+  /// Terminally rejects exactly the due delivery authority checked by provider readiness.
+  ///
+  /// This transition creates no provider attempt and cannot advance an accepted baseline. A stale
+  /// readiness result for a different state, target, payload, or intent binding is a no-op.
+  ///
+  /// # Errors
+  /// Returns an error for invalid authority, invalid redacted evidence, time, or storage failure.
+  pub async fn reject_scheduled_delivery_readiness(
+    &self,
+    authority: &ScheduledDeliveryAuthority,
+    error_kind: &str,
+    now: i64,
+  ) -> Result<bool, StateError> {
+    validate_scheduled_delivery_authority(authority)?;
+    validate_delivery_error(error_kind, Some(READINESS_REJECTION_MESSAGE))?;
+    if now < 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled delivery readiness rejection time must be nonnegative".to_owned(),
+      });
+    }
+    sqlx::query_scalar::<_, String>(
+      "update scheduled_run_deliveries set state = 'failed_terminal', next_attempt_at = null, lease_owner = null, lease_expires_at = null, provider_receipt = null, provider_outcome = 'confirmed_no_write_terminal', error_kind = ?1, error_message = ?2, updated_at = ?3 where delivery_id = ?4 and state = ?5 and authority_kind = 'intent_v1' and payload_snapshot is not null and target_json = ?6 and target_snapshot_digest = ?7 and payload_digest = ?8 and intent_key = ?9 and updated_at <= ?3 and (?5 = 'pending' or (?5 = 'failed_retryable' and next_attempt_at <= ?3)) returning delivery_id",
+    )
+    .bind(error_kind)
+    .bind(READINESS_REJECTION_MESSAGE)
     .bind(now)
     .bind(authority.delivery_id())
     .bind(authority.source_state().as_str())

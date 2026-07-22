@@ -294,7 +294,7 @@ fn canonical_host_id(
 
 fn classify_error(error: SlackWebApiError) -> TargetVerificationError {
   match error {
-    SlackWebApiError::Api { classification } => match classification {
+    SlackWebApiError::Api { classification, .. } => match classification {
       SlackApiErrorClass::Invalid => TargetVerificationError::Invalid,
       SlackApiErrorClass::Unauthorized => TargetVerificationError::Unauthorized,
       SlackApiErrorClass::TargetUnavailable => TargetVerificationError::Unavailable,

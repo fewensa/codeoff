@@ -2,8 +2,8 @@ use std::sync::Mutex;
 
 use codeoff_channel_contract::{ChannelMessageRequest, ChannelReplyTarget};
 use codeoff_channel_slack::{
-  SlackDeliveryQueue, SlackHttpClient, SlackHttpRequest, SlackHttpResponse, SlackWebApiClient,
-  SlackWebApiError,
+  SlackApiErrorScope, SlackDeliveryQueue, SlackHttpClient, SlackHttpRequest, SlackHttpResponse,
+  SlackWebApiClient, SlackWebApiError,
 };
 use codeoff_config::{SlackConfig, SlackUserTokenConfig};
 use codeoff_state::{
@@ -748,6 +748,7 @@ async fn provider_errors_are_reported_without_exposing_the_token() {
     error,
     SlackWebApiError::Api {
       classification: codeoff_channel_slack::SlackApiErrorClass::Unauthorized,
+      scope: SlackApiErrorScope::GlobalProvider,
     }
   );
   assert!(!error.to_string().contains("xoxb-secret-token"));

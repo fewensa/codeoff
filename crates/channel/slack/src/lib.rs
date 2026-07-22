@@ -34,9 +34,9 @@ pub use schedule_target::SlackScheduleTargetVerifier;
 pub use scheduled_delivery::SlackScheduledDeliveryProvider;
 pub use socket_mode::{SlackSocketTransport, SocketModeEnvelope, TransportReceive};
 pub use web_api::{
-  SlackApiErrorClass, SlackAuthIdentity, SlackChannelAddress, SlackConfiguredSender,
-  SlackConnectorStatus, SlackHttpClient, SlackHttpDownloadRequest, SlackHttpRequest,
-  SlackHttpResponse, SlackPostedMessage, SlackReqwestWebApiClient, SlackStreamMessage,
-  SlackStreamStatus, SlackUserAddress, SlackWebApiClient, SlackWebApiError,
+  SlackApiErrorClass, SlackApiErrorScope, SlackAuthIdentity, SlackChannelAddress,
+  SlackConfiguredSender, SlackConnectorStatus, SlackHttpClient, SlackHttpDownloadRequest,
+  SlackHttpRequest, SlackHttpResponse, SlackPostedMessage, SlackReqwestWebApiClient,
+  SlackStreamMessage, SlackStreamStatus, SlackUserAddress, SlackWebApiClient, SlackWebApiError,
 };
 pub use worker::{SocketWorkerAction, SocketWorkerOptions, check_slack_worker, run_socket_worker};

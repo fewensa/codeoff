@@ -412,7 +412,8 @@ async fn missing_scope_channel_is_a_typed_non_retryable_authorization_error() {
   assert!(matches!(
     connector.fetch_context(&request).await,
     Err(SlackWebApiError::Api {
-      classification: SlackApiErrorClass::Unauthorized
+      classification: SlackApiErrorClass::Unauthorized,
+      ..
     })
   ));
 }

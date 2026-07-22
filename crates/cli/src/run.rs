@@ -23,10 +23,10 @@ use codeoff_channel_contract::{
   ChannelReplyTarget,
 };
 use codeoff_channel_slack::{
-  SlackApiErrorClass, SlackConfigError, SlackDeliveryQueue, SlackIntake, SlackIntakeResult,
-  SlackReqwestWebApiClient, SlackScheduleTargetVerifier, SlackScheduledDeliveryProvider,
-  SlackSocketClient, SlackWebApiClient, SlackWebApiError, SocketWorkerAction, SocketWorkerOptions,
-  check_slack_worker, run_socket_worker,
+  SlackConfigError, SlackDeliveryQueue, SlackIntake, SlackIntakeResult, SlackReqwestWebApiClient,
+  SlackScheduleTargetVerifier, SlackScheduledDeliveryProvider, SlackSocketClient,
+  SlackWebApiClient, SlackWebApiError, SocketWorkerAction, SocketWorkerOptions, check_slack_worker,
+  run_socket_worker,
 };
 use codeoff_config::{
   CodeoffConfig, ConfigLoadOptions, SlackConfig, SlackDirectMessageFeedbackMode,
@@ -366,16 +366,10 @@ impl LazySlackScheduledDeliveryProvider {
     ))
   }
 
-  async fn provider(
-    &self,
-  ) -> Result<&SlackScheduledDeliveryProvider<SlackReqwestWebApiClient>, SlackWebApiError> {
+  async fn provider(&self) -> &SlackScheduledDeliveryProvider<SlackReqwestWebApiClient> {
     self
       .provider
-      .get_or_try_init(|| async {
-        let provider = self.configured_provider();
-        provider.verify_authority().await?;
-        Ok(provider)
-      })
+      .get_or_init(|| async { self.configured_provider() })
       .await
   }
 }
@@ -386,74 +380,11 @@ impl DeliveryProvider for LazySlackScheduledDeliveryProvider {
     &self,
     request: DeliveryProviderReadinessRequest<'_>,
   ) -> DeliveryProviderReadiness {
-    if let Err(error_kind) = self
-      .configured_provider()
-      .verify_target_authority(request.target_json)
-    {
-      return DeliveryProviderReadiness::Permanent {
-        error_kind: error_kind.to_owned(),
-      };
-    }
-    match self.provider().await {
-      Ok(_) => DeliveryProviderReadiness::Ready,
-      Err(error) => classify_slack_authority_error(error),
-    }
+    self.provider().await.readiness(request).await
   }
 
   async fn send(&self, request: DeliveryProviderRequest<'_>) -> DeliveryProviderOutcome {
-    match self.provider().await {
-      Ok(provider) => provider.send(request).await,
-      Err(error) => readiness_as_delivery_outcome(classify_slack_authority_error(error)),
-    }
-  }
-}
-
-fn classify_slack_authority_error(error: SlackWebApiError) -> DeliveryProviderReadiness {
-  match error {
-    SlackWebApiError::RateLimited {
-      retry_after_seconds,
-    } => DeliveryProviderReadiness::Retryable {
-      retry_after_seconds,
-      error_kind: "slack_authority_rate_limited".to_owned(),
-    },
-    SlackWebApiError::Request { .. }
-    | SlackWebApiError::InvalidResponse { .. }
-    | SlackWebApiError::Provider { .. }
-    | SlackWebApiError::Deferred { .. }
-    | SlackWebApiError::Api {
-      classification: SlackApiErrorClass::Transient,
-    } => DeliveryProviderReadiness::Retryable {
-      retry_after_seconds: None,
-      error_kind: "slack_authority_unavailable".to_owned(),
-    },
-    SlackWebApiError::Api {
-      classification:
-        SlackApiErrorClass::Invalid
-        | SlackApiErrorClass::Unauthorized
-        | SlackApiErrorClass::TargetUnavailable,
-    }
-    | SlackWebApiError::Unavailable
-    | SlackWebApiError::UnsupportedTarget => DeliveryProviderReadiness::Permanent {
-      error_kind: "slack_authority_rejected".to_owned(),
-    },
-  }
-}
-
-fn readiness_as_delivery_outcome(readiness: DeliveryProviderReadiness) -> DeliveryProviderOutcome {
-  match readiness {
-    DeliveryProviderReadiness::Ready => DeliveryProviderOutcome::AmbiguousPostWrite {
-      error_kind: "slack_authority_state_changed".to_owned(),
-    },
-    DeliveryProviderReadiness::Retryable {
-      retry_after_seconds,
-      error_kind,
-    } => DeliveryProviderOutcome::ConfirmedNoWriteRetryable {
-      retry_after_seconds,
-      error_kind,
-    },
-    DeliveryProviderReadiness::Permanent { error_kind } => {
-      DeliveryProviderOutcome::ConfirmedNoWriteTerminal { error_kind }
-    }
+    self.provider().await.send(request).await
   }
 }
 
@@ -519,7 +450,7 @@ fn channel_context_provider_error(error: SlackWebApiError) -> ChannelContextProv
       ChannelContextProviderError::InvalidResponse { message }
     }
     SlackWebApiError::Provider { message } => ChannelContextProviderError::Provider { message },
-    SlackWebApiError::Api { classification } => ChannelContextProviderError::Provider {
+    SlackWebApiError::Api { classification, .. } => ChannelContextProviderError::Provider {
       message: classification.to_string(),
     },
     SlackWebApiError::UnsupportedTarget => ChannelContextProviderError::UnsupportedTarget,

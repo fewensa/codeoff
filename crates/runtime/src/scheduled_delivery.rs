@@ -43,11 +43,14 @@ pub struct DeliveryProviderReadinessRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryProviderReadiness {
   Ready,
-  Retryable {
+  Deferred {
     retry_after_seconds: Option<u64>,
     error_kind: String,
   },
-  Permanent {
+  RejectDelivery {
+    error_kind: String,
+  },
+  FatalProvider {
     error_kind: String,
   },
 }
@@ -439,7 +442,7 @@ async fn run_scheduled_delivery_tick_with_timeline(
         }
         readiness = &mut readiness => readiness,
         () = tokio::time::sleep(DELIVERY_READINESS_TIMEOUT) => {
-          DeliveryProviderReadiness::Retryable {
+          DeliveryProviderReadiness::Deferred {
             retry_after_seconds: None,
             error_kind: "provider_readiness_timeout".to_owned(),
           }
@@ -447,7 +450,7 @@ async fn run_scheduled_delivery_tick_with_timeline(
       };
       match readiness {
         DeliveryProviderReadiness::Ready => worker_state.readiness_ready(),
-        DeliveryProviderReadiness::Retryable {
+        DeliveryProviderReadiness::Deferred {
           retry_after_seconds,
           error_kind: _,
         } => {
@@ -455,9 +458,18 @@ async fn run_scheduled_delivery_tick_with_timeline(
             retry_after: worker_state.readiness_retry(retry_after_seconds),
           });
         }
-        DeliveryProviderReadiness::Permanent { error_kind: _ } => {
+        DeliveryProviderReadiness::RejectDelivery { error_kind } => {
+          if state
+            .reject_scheduled_delivery_readiness(&authority, &error_kind, timeline.fresh_now())
+            .await?
+          {
+            return Ok(ScheduledDeliveryTickOutcome::FailedTerminal);
+          }
+          return Ok(ScheduledDeliveryTickOutcome::Idle);
+        }
+        DeliveryProviderReadiness::FatalProvider { error_kind: _ } => {
           return Err(StateError::InvalidSchedulerState {
-            reason: "scheduled delivery provider readiness failed permanently".to_owned(),
+            reason: "scheduled delivery provider readiness failed fatally".to_owned(),
           });
         }
       }

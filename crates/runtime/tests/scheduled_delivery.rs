@@ -811,7 +811,7 @@ async fn transient_readiness_preserves_authority_then_recovery_claims_once() {
   let (_temp, store, delivery_id, _) =
     prepared_delivery("delivery-readiness-recovery", "body").await;
   let provider = FakeProvider::new([success()]).with_readiness([
-    DeliveryProviderReadiness::Retryable {
+    DeliveryProviderReadiness::Deferred {
       retry_after_seconds: Some(17),
       error_kind: "provider_unavailable".to_owned(),
     },
@@ -851,7 +851,7 @@ async fn transient_readiness_preserves_authority_then_recovery_claims_once() {
 async fn oversized_readiness_retry_after_is_capped_without_delivery_mutation() {
   let (_temp, store, delivery_id, _) =
     prepared_delivery("delivery-readiness-oversized-retry-after", "body").await;
-  let provider = FakeProvider::new([]).with_readiness([DeliveryProviderReadiness::Retryable {
+  let provider = FakeProvider::new([]).with_readiness([DeliveryProviderReadiness::Deferred {
     retry_after_seconds: Some(u64::MAX),
     error_kind: "provider_unavailable".to_owned(),
   }]);
@@ -875,25 +875,85 @@ async fn oversized_readiness_retry_after_is_capped_without_delivery_mutation() {
 }
 
 #[tokio::test]
-async fn permanent_readiness_failure_surfaces_without_delivery_mutation() {
-  let (_temp, store, delivery_id, _) =
-    prepared_delivery("delivery-readiness-permanent", "body").await;
-  let provider = FakeProvider::new([]).with_readiness([DeliveryProviderReadiness::Permanent {
+async fn fatal_provider_readiness_surfaces_without_mutating_any_delivery() {
+  let (_temp, store, delivery_id, _) = prepared_delivery("delivery-readiness-fatal", "body").await;
+  let next_id = prepare_next_delivery(&store, "delivery-readiness-fatal", "next").await;
+  let provider = FakeProvider::new([]).with_readiness([DeliveryProviderReadiness::FatalProvider {
     error_kind: "invalid_auth".to_owned(),
   }]);
   let error =
     run_scheduled_delivery_tick_with_clock(&store, &provider, "worker", clock(122), shutdown())
       .await
-      .expect_err("permanent readiness must fail lifecycle");
-  assert!(error.to_string().contains("readiness failed permanently"));
+      .expect_err("fatal readiness must fail lifecycle");
+  assert!(error.to_string().contains("readiness failed fatally"));
+  for pending_id in [&delivery_id, &next_id] {
+    assert_eq!(
+      store
+        .scheduled_delivery_authority_for_tests(pending_id)
+        .await
+        .expect("authority"),
+      ("pending".to_owned(), 0, 0, 0)
+    );
+  }
+  assert!(provider.observed().is_empty());
+}
+
+#[tokio::test]
+async fn exact_target_readiness_rejection_terminalizes_one_delivery_then_continues_queue() {
+  let (_temp, store, rejected_id, rejected_payload) =
+    prepared_delivery("delivery-readiness-reject", "rejected").await;
+  let delivered_id = prepare_next_delivery(&store, "delivery-readiness-reject", "valid").await;
+  let provider = FakeProvider::new([success()]).with_readiness([
+    DeliveryProviderReadiness::RejectDelivery {
+      error_kind: "target_unavailable".to_owned(),
+    },
+    DeliveryProviderReadiness::Ready,
+  ]);
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(&store, &provider, "worker-a", clock(132), shutdown(),)
+      .await
+      .expect("reject exact delivery"),
+    ScheduledDeliveryTickOutcome::FailedTerminal
+  );
   assert_eq!(
     store
-      .scheduled_delivery_authority_for_tests(&delivery_id)
+      .scheduled_delivery_authority_for_tests(&rejected_id)
       .await
-      .expect("authority"),
-    ("pending".to_owned(), 0, 0, 0)
+      .expect("rejected authority"),
+    ("failed_terminal".to_owned(), 0, 0, 0)
+  );
+  assert_eq!(
+    store
+      .scheduled_delivery_run_state_for_tests(&rejected_id)
+      .await
+      .expect("rejected parent run"),
+    "succeeded"
+  );
+  assert!(
+    store
+      .get_accepted_delivery_baseline(&baseline_identity(
+        "delivery-readiness-reject",
+        &rejected_payload,
+      ))
+      .await
+      .expect("rejected baseline")
+      .is_none()
   );
   assert!(provider.observed().is_empty());
+  assert_eq!(
+    run_scheduled_delivery_tick_with_clock(&store, &provider, "worker-b", clock(133), shutdown(),)
+      .await
+      .expect("continue queue"),
+    ScheduledDeliveryTickOutcome::Delivered
+  );
+  assert_eq!(
+    store
+      .scheduled_delivery_authority_for_tests(&delivered_id)
+      .await
+      .expect("delivered authority"),
+    ("delivered".to_owned(), 1, 1, 1)
+  );
+  assert_eq!(provider.observed().len(), 1);
 }
 
 #[tokio::test]
@@ -939,7 +999,7 @@ async fn provider_outage_does_not_block_expired_reclaim_or_start_a_new_attempt()
   for (suffix, readiness, permanent) in [
     (
       "transient",
-      DeliveryProviderReadiness::Retryable {
+      DeliveryProviderReadiness::Deferred {
         retry_after_seconds: None,
         error_kind: "unavailable".to_owned(),
       },
@@ -947,7 +1007,7 @@ async fn provider_outage_does_not_block_expired_reclaim_or_start_a_new_attempt()
     ),
     (
       "permanent",
-      DeliveryProviderReadiness::Permanent {
+      DeliveryProviderReadiness::FatalProvider {
         error_kind: "invalid_auth".to_owned(),
       },
       true,
@@ -970,7 +1030,7 @@ async fn provider_outage_does_not_block_expired_reclaim_or_start_a_new_attempt()
         result
           .expect_err("permanent readiness")
           .to_string()
-          .contains("readiness failed permanently")
+          .contains("readiness failed fatally")
       );
     } else {
       assert_eq!(

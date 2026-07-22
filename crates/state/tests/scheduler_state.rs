@@ -10,8 +10,8 @@ use codeoff_state::{
   ExpiredRunReclaimOutcome, LateEvidenceAppendOutcome, MaterializationOutcome, OccurrenceError,
   PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey,
   ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryFailure, ScheduledDeliveryState,
-  ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJobDefinition,
-  ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
+  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
+  ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
   ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunResult,
   ScheduledRunSuccessOutcome, SkippedNoneBaselinePolicy, StateError, StateStore, StateValueError,
   TransactionalMutationOutcome, TransportConvergence, UpdateScheduledJob,
@@ -633,6 +633,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
         "20260721030000_scheduler_execution_hardening.sql"
           | "20260721040000_scheduler_delivery_intents.sql"
           | "20260722000000_scheduler_delivery_authority.sql"
+          | "20260722010000_scheduler_delivery_readiness.sql"
       )
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
@@ -952,6 +953,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
     if entry.file_name() != "20260721030000_scheduler_execution_hardening.sql"
       && entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
+      && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1030,6 +1032,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
     if entry.file_name() != "20260721030000_scheduler_execution_hardening.sql"
       && entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
+      && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1105,7 +1108,9 @@ async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_pay
   let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
   for entry in std::fs::read_dir(source).expect("read migrations") {
     let entry = entry.expect("migration entry");
-    if entry.file_name() != "20260722000000_scheduler_delivery_authority.sql" {
+    if entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
+      && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
+    {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy issue-06 migration");
     }
@@ -1278,6 +1283,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
     let entry = entry.expect("migration entry");
     if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
+      && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1519,6 +1525,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
     let entry = entry.expect("migration entry");
     if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
+      && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1587,6 +1594,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
     let entry = entry.expect("migration entry");
     if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
+      && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1668,6 +1676,7 @@ async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_ident
     let entry = entry.expect("migration entry");
     if entry.file_name() != "20260721040000_scheduler_delivery_intents.sql"
       && entry.file_name() != "20260722000000_scheduler_delivery_authority.sql"
+      && entry.file_name() != "20260722010000_scheduler_delivery_readiness.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -4384,6 +4393,175 @@ async fn test_skipped_none_advances_only_accepted_delivery_baseline_with_exact_p
       .expect("claim queue")
       .is_none()
   );
+}
+
+#[tokio::test]
+async fn test_schema_rejects_non_none_skipped_none_without_baseline_or_retention_authority() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let mut request = create_request("skipped-none-schema-guard", ScheduleSpec::once(110), 100);
+  request.targets = vec![second_target("skipped-none-schema-guard")];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  let run = complete_due_run(&store, "skipped-none-schema-guard", 110, 120).await;
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let delivery_id: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("delivery id");
+  assert!(matches!(
+    store
+      .prepare_scheduled_delivery(
+        &delivery_id,
+        "text/markdown; charset=utf-8",
+        "non-none body",
+        1,
+        121,
+        SkippedNoneBaselinePolicy::Accept,
+      )
+      .await
+      .expect("prepare Slack delivery"),
+    PreparedScheduledDelivery::Pending(_)
+  ));
+  let rejected = sqlx::query(
+    "update scheduled_run_deliveries set state = 'skipped_none', provider_outcome = 'skipped_none', updated_at = 122 where delivery_id = ?1",
+  )
+  .bind(&delivery_id)
+  .execute(&pool)
+  .await
+  .expect_err("non-none target cannot enter skipped_none");
+  assert!(
+    rejected
+      .to_string()
+      .contains("skipped none delivery requires exact none policy authority")
+  );
+  let authority: (String, i64, i64) = sqlx::query_as(
+    "select state, (select count(*) from scheduled_delivery_baselines), (select count(*) from scheduled_delivery_retention_audit) from scheduled_run_deliveries where delivery_id = ?1",
+  )
+  .bind(&delivery_id)
+  .fetch_one(&pool)
+  .await
+  .expect("unchanged authority");
+  assert_eq!(authority, ("pending".to_owned(), 0, 0));
+}
+
+async fn assert_direct_readiness_rejection_is_blocked(pool: &SqlitePool, delivery_id: &str) {
+  let bypass = sqlx::query(
+    "update scheduled_run_deliveries set state = 'failed_terminal', provider_outcome = 'confirmed_no_write_terminal', error_kind = 'target_rejected', updated_at = 130 where delivery_id = ?1",
+  )
+  .bind(delivery_id)
+  .execute(pool)
+  .await
+  .expect_err("direct terminal bypass must be rejected");
+  assert!(
+    bypass
+      .to_string()
+      .contains("readiness rejection requires exact unclaimed delivery authority")
+  );
+}
+
+#[tokio::test]
+async fn test_readiness_rejection_cas_terminalizes_pending_and_due_retry_without_new_attempt() {
+  for (suffix, make_retryable, expected_attempts) in [("pending", false, 0), ("retryable", true, 1)]
+  {
+    let temp = tempdir().expect("create tempdir");
+    let state_dir = temp.path().join("state");
+    let store = StateStore::initialize(&state_dir, None)
+      .await
+      .expect("initialize store");
+    let job_id = format!("readiness-rejection-{suffix}");
+    let mut request = create_request(&job_id, ScheduleSpec::once(110), 100);
+    request.targets = vec![second_target(&job_id)];
+    store
+      .create_scheduled_job(&request)
+      .await
+      .expect("create job");
+    let run = complete_due_run(&store, &job_id, 110, 120).await;
+    let pool = SqlitePool::connect(&database_url(&state_dir))
+      .await
+      .expect("connect database");
+    let delivery_id: String =
+      sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+        .bind(run.binding.run_id())
+        .fetch_one(&pool)
+        .await
+        .expect("delivery id");
+    store
+      .prepare_scheduled_delivery(
+        &delivery_id,
+        "text/markdown; charset=utf-8",
+        "body",
+        1,
+        121,
+        SkippedNoneBaselinePolicy::DoNotAdvance,
+      )
+      .await
+      .expect("prepare");
+    if !make_retryable {
+      assert_direct_readiness_rejection_is_blocked(&pool, &delivery_id).await;
+    }
+    if make_retryable {
+      let claim = store
+        .claim_next_scheduled_delivery("first-attempt", 122, 200)
+        .await
+        .expect("claim")
+        .expect("delivery claim");
+      store
+        .complete_scheduled_delivery_failure(
+          &claim.binding,
+          &ScheduledDeliveryFailure::ConfirmedNoWriteRetryable {
+            error_kind: "transient".to_owned(),
+            redacted_message: None,
+            next_attempt_at: 130,
+          },
+          123,
+        )
+        .await
+        .expect("retryable failure");
+    }
+    let ScheduledDeliveryWork::ProviderRequired(authority) =
+      store.peek_scheduled_delivery_work(130).await.expect("work")
+    else {
+      panic!("provider work must be due");
+    };
+    assert!(
+      store
+        .reject_scheduled_delivery_readiness(&authority, "target_rejected", 130,)
+        .await
+        .expect("reject exact authority")
+    );
+    assert!(
+      !store
+        .reject_scheduled_delivery_readiness(&authority, "target_rejected", 131,)
+        .await
+        .expect("stale authority is a no-op")
+    );
+    let final_authority: (String, i64, i64, i64) = sqlx::query_as(
+      "select state, attempt, fence, (select count(*) from scheduled_delivery_attempts where delivery_id = ?1) from scheduled_run_deliveries where delivery_id = ?1",
+    )
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("authority");
+    assert_eq!(
+      final_authority,
+      (
+        "failed_terminal".to_owned(),
+        expected_attempts,
+        expected_attempts,
+        expected_attempts,
+      )
+    );
+  }
 }
 
 #[tokio::test]

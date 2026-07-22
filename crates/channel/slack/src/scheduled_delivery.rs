@@ -5,7 +5,12 @@ use codeoff_runtime::scheduled_delivery::{
 };
 use serde::Deserialize;
 
-use crate::{SlackApiErrorClass, SlackHttpClient, SlackWebApiClient, SlackWebApiError};
+use crate::{
+  SlackApiErrorClass, SlackApiErrorScope, SlackAuthIdentity, SlackChannelAddress, SlackHttpClient,
+  SlackWebApiClient, SlackWebApiError,
+};
+
+const SLACK_MESSAGE_MAX_CHARACTERS: usize = 40_000;
 
 pub struct SlackScheduledDeliveryProvider<H> {
   api: SlackWebApiClient<H>,
@@ -40,6 +45,7 @@ impl<H: SlackHttpClient + Sync> SlackScheduledDeliveryProvider<H> {
     if identity.team_id != self.workspace_id {
       return Err(SlackWebApiError::Api {
         classification: SlackApiErrorClass::Unauthorized,
+        scope: SlackApiErrorScope::GlobalProvider,
       });
     }
     Ok(())
@@ -60,18 +66,61 @@ impl<H: SlackHttpClient + Sync + Send> DeliveryProvider for SlackScheduledDelive
     &self,
     request: DeliveryProviderReadinessRequest<'_>,
   ) -> DeliveryProviderReadiness {
-    if let Err(error_kind) = self.verify_target_authority(request.target_json) {
-      return DeliveryProviderReadiness::Permanent {
+    let target = match parse_target(request.target_json, &self.connector_id, &self.workspace_id) {
+      Ok(target) => target,
+      Err(error_kind) => {
+        return DeliveryProviderReadiness::RejectDelivery {
+          error_kind: error_kind.to_owned(),
+        };
+      }
+    };
+    let authentication = match self.api.authenticate_bot().await {
+      Ok(authentication) if authentication.team_id == self.workspace_id => authentication,
+      Ok(_) => {
+        return DeliveryProviderReadiness::FatalProvider {
+          error_kind: "slack_token_workspace_mismatch".to_owned(),
+        };
+      }
+      Err(error) => return classify_global_readiness_error(error),
+    };
+    let channel = match self.api.get_channel(&target.channel_id).await {
+      Ok(channel) => channel,
+      Err(error) => return classify_target_readiness_error(error),
+    };
+    if let Err(error_kind) = validate_live_target(&target, &channel, &authentication) {
+      return DeliveryProviderReadiness::RejectDelivery {
         error_kind: error_kind.to_owned(),
       };
     }
-    match self.verify_authority().await {
-      Ok(()) => DeliveryProviderReadiness::Ready,
-      Err(error) => classify_readiness_error(error),
+    if target.kind == SlackCanonicalTargetKind::Thread {
+      let Some(thread_ts) = target.thread_ts.as_deref() else {
+        return DeliveryProviderReadiness::RejectDelivery {
+          error_kind: "invalid_slack_target_route".to_owned(),
+        };
+      };
+      match self
+        .api
+        .thread_parent_is_root(&target.channel_id, thread_ts)
+        .await
+      {
+        Ok(true) => {}
+        Ok(false) => {
+          return DeliveryProviderReadiness::RejectDelivery {
+            error_kind: "slack_thread_unavailable".to_owned(),
+          };
+        }
+        Err(error) => return classify_target_readiness_error(error),
+      }
     }
+    DeliveryProviderReadiness::Ready
   }
 
   async fn send(&self, request: DeliveryProviderRequest<'_>) -> DeliveryProviderOutcome {
+    if request.payload.body().chars().count() > SLACK_MESSAGE_MAX_CHARACTERS {
+      return DeliveryProviderOutcome::ConfirmedNoWriteTerminal {
+        error_kind: "payload_too_long".to_owned(),
+      };
+    }
     let target = match parse_target(request.target_json, &self.connector_id, &self.workspace_id) {
       Ok(target) => target,
       Err(kind) => {
@@ -106,40 +155,99 @@ impl<H: SlackHttpClient + Sync + Send> DeliveryProvider for SlackScheduledDelive
   }
 }
 
-fn classify_readiness_error(error: SlackWebApiError) -> DeliveryProviderReadiness {
+fn classify_global_readiness_error(error: SlackWebApiError) -> DeliveryProviderReadiness {
   match error {
     SlackWebApiError::RateLimited {
       retry_after_seconds,
-    } => DeliveryProviderReadiness::Retryable {
+    } => DeliveryProviderReadiness::Deferred {
       retry_after_seconds,
       error_kind: "slack_authority_rate_limited".to_owned(),
     },
     SlackWebApiError::Request { .. }
-    | SlackWebApiError::InvalidResponse { .. }
-    | SlackWebApiError::Provider { .. }
     | SlackWebApiError::Deferred { .. }
     | SlackWebApiError::Api {
       classification: SlackApiErrorClass::Transient,
-    } => DeliveryProviderReadiness::Retryable {
+      ..
+    } => DeliveryProviderReadiness::Deferred {
       retry_after_seconds: None,
       error_kind: "slack_authority_unavailable".to_owned(),
     },
-    SlackWebApiError::Api {
-      classification:
-        SlackApiErrorClass::Invalid
-        | SlackApiErrorClass::Unauthorized
-        | SlackApiErrorClass::TargetUnavailable,
-    }
+    SlackWebApiError::Api { .. }
     | SlackWebApiError::Unavailable
-    | SlackWebApiError::UnsupportedTarget => DeliveryProviderReadiness::Permanent {
+    | SlackWebApiError::UnsupportedTarget
+    | SlackWebApiError::InvalidResponse { .. }
+    | SlackWebApiError::Provider { .. } => DeliveryProviderReadiness::FatalProvider {
       error_kind: "slack_authority_rejected".to_owned(),
     },
   }
 }
 
+fn classify_target_readiness_error(error: SlackWebApiError) -> DeliveryProviderReadiness {
+  match error {
+    SlackWebApiError::RateLimited {
+      retry_after_seconds,
+    } => DeliveryProviderReadiness::Deferred {
+      retry_after_seconds,
+      error_kind: "slack_target_rate_limited".to_owned(),
+    },
+    SlackWebApiError::Request { .. }
+    | SlackWebApiError::Deferred { .. }
+    | SlackWebApiError::Api {
+      classification: SlackApiErrorClass::Transient,
+      ..
+    } => DeliveryProviderReadiness::Deferred {
+      retry_after_seconds: None,
+      error_kind: "slack_target_unavailable_transient".to_owned(),
+    },
+    SlackWebApiError::Api {
+      scope: SlackApiErrorScope::Target,
+      ..
+    } => DeliveryProviderReadiness::RejectDelivery {
+      error_kind: "slack_target_rejected".to_owned(),
+    },
+    SlackWebApiError::Api { .. }
+    | SlackWebApiError::Unavailable
+    | SlackWebApiError::UnsupportedTarget
+    | SlackWebApiError::InvalidResponse { .. }
+    | SlackWebApiError::Provider { .. } => DeliveryProviderReadiness::FatalProvider {
+      error_kind: "slack_provider_authority_rejected".to_owned(),
+    },
+  }
+}
+
 struct SlackCanonicalTarget {
+  kind: SlackCanonicalTargetKind,
   channel_id: String,
   thread_ts: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlackCanonicalTargetKind {
+  Channel,
+  DirectMessage,
+  Thread,
+}
+
+fn validate_live_target(
+  target: &SlackCanonicalTarget,
+  channel: &SlackChannelAddress,
+  authentication: &SlackAuthIdentity,
+) -> Result<(), &'static str> {
+  if channel.channel_id != target.channel_id
+    || channel.workspace_id != authentication.team_id
+    || channel.context_team_id.as_deref() != Some(authentication.team_id.as_str())
+    || channel.is_archived
+  {
+    return Err("slack_target_unavailable");
+  }
+  match target.kind {
+    SlackCanonicalTargetKind::Channel | SlackCanonicalTargetKind::Thread
+      if !channel.is_im && !channel.is_mpim && channel.is_member => {}
+    SlackCanonicalTargetKind::DirectMessage
+      if channel.is_im && !channel.is_mpim && channel.channel_id.starts_with('D') => {}
+    _ => return Err("slack_target_permission_rejected"),
+  }
+  Ok(())
 }
 
 fn valid_posted_route(
@@ -185,18 +293,28 @@ fn parse_target(
   }
   let channel_id = target.address.coordinates.channel_id;
   let thread_ts = target.address.coordinates.thread_ts;
-  match target.kind.as_str() {
+  let kind = match target.kind.as_str() {
     "channel"
-      if channel_id.starts_with('C') && thread_ts.is_none() && valid_slack_id(&channel_id) => {}
+      if channel_id.starts_with('C') && thread_ts.is_none() && valid_slack_id(&channel_id) =>
+    {
+      SlackCanonicalTargetKind::Channel
+    }
     "direct_message"
-      if channel_id.starts_with('D') && thread_ts.is_none() && valid_slack_id(&channel_id) => {}
+      if channel_id.starts_with('D') && thread_ts.is_none() && valid_slack_id(&channel_id) =>
+    {
+      SlackCanonicalTargetKind::DirectMessage
+    }
     "thread"
       if channel_id.starts_with('C')
         && thread_ts.as_deref().is_some_and(valid_slack_timestamp)
-        && valid_slack_id(&channel_id) => {}
+        && valid_slack_id(&channel_id) =>
+    {
+      SlackCanonicalTargetKind::Thread
+    }
     _ => return Err("invalid_slack_target_route"),
-  }
+  };
   Ok(SlackCanonicalTarget {
+    kind,
     channel_id,
     thread_ts,
   })
@@ -215,6 +333,7 @@ fn classify_error(error: SlackWebApiError) -> DeliveryProviderOutcome {
         SlackApiErrorClass::Invalid
         | SlackApiErrorClass::Unauthorized
         | SlackApiErrorClass::TargetUnavailable,
+      ..
     }
     | SlackWebApiError::Unavailable
     | SlackWebApiError::UnsupportedTarget => DeliveryProviderOutcome::ConfirmedNoWriteTerminal {
@@ -229,6 +348,7 @@ fn classify_error(error: SlackWebApiError) -> DeliveryProviderOutcome {
     | SlackWebApiError::Provider { .. }
     | SlackWebApiError::Api {
       classification: SlackApiErrorClass::Transient,
+      ..
     } => DeliveryProviderOutcome::AmbiguousPostWrite {
       error_kind: "slack_write_outcome_unknown".to_owned(),
     },

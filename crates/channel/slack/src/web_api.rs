@@ -518,7 +518,10 @@ pub enum SlackWebApiError {
   Provider { message: String },
 
   #[error("slack web api rejected the request: {classification}")]
-  Api { classification: SlackApiErrorClass },
+  Api {
+    classification: SlackApiErrorClass,
+    scope: SlackApiErrorScope,
+  },
 
   #[error("slack context target is unsupported")]
   UnsupportedTarget,
@@ -535,7 +538,8 @@ impl SlackWebApiError {
       Self::Request { .. }
         | Self::RateLimited { .. }
         | Self::Api {
-          classification: SlackApiErrorClass::Transient
+          classification: SlackApiErrorClass::Transient,
+          ..
         }
     )
   }
@@ -548,6 +552,14 @@ pub enum SlackApiErrorClass {
   Unauthorized,
   TargetUnavailable,
   Transient,
+}
+
+/// Stable authority scope for Slack API rejections without retaining provider response text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlackApiErrorScope {
+  GlobalProvider,
+  Target,
+  Unknown,
 }
 
 impl fmt::Display for SlackApiErrorClass {
@@ -891,6 +903,7 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
     if !looks_like_slack_dm_id(&opened.id) {
       return Err(SlackWebApiError::Api {
         classification: SlackApiErrorClass::Invalid,
+        scope: SlackApiErrorScope::Target,
       });
     }
     let canonical = self.get_channel(&opened.id).await?;
@@ -1141,6 +1154,7 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
     if !(200..300).contains(&response.status) {
       return Err(SlackWebApiError::Api {
         classification: classify_http_status(response.status),
+        scope: classify_http_status_scope(response.status),
       });
     }
     Ok(response)
@@ -1181,8 +1195,10 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
     if parsed.ok {
       Ok(parsed)
     } else {
+      let (classification, scope) = classify_slack_api_error(parsed.error.as_deref());
       Err(SlackWebApiError::Api {
-        classification: classify_slack_api_error(parsed.error.as_deref()),
+        classification,
+        scope,
       })
     }
   }
@@ -1198,8 +1214,10 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
     if parsed.ok {
       Ok(parsed)
     } else {
+      let (classification, scope) = classify_slack_api_error(parsed.error.as_deref());
       Err(SlackWebApiError::Api {
-        classification: classify_slack_api_error(parsed.error.as_deref()),
+        classification,
+        scope,
       })
     }
   }
@@ -1844,6 +1862,7 @@ impl<H: SlackHttpClient + Sync> SlackWebApiClient<H> {
     if !(200..300).contains(&response.status) {
       return Err(SlackWebApiError::Api {
         classification: classify_http_status(response.status),
+        scope: classify_http_status_scope(response.status),
       });
     }
     Ok(response)
@@ -2024,7 +2043,7 @@ pub struct SlackConnectorStatus {
 }
 
 #[allow(clippy::match_same_arms)]
-fn classify_slack_api_error(error: Option<&str>) -> SlackApiErrorClass {
+fn classify_slack_api_error(error: Option<&str>) -> (SlackApiErrorClass, SlackApiErrorScope) {
   let code = error
     .and_then(|error| error.split_ascii_whitespace().next())
     .unwrap_or("unknown_error");
@@ -2045,37 +2064,52 @@ fn classify_slack_api_error(error: Option<&str>) -> SlackApiErrorClass {
     | "users_list_not_supplied"
     | "user_not_found"
     | "channel_not_found"
-    | "thread_not_found" => SlackApiErrorClass::Invalid,
+    | "thread_not_found" => (SlackApiErrorClass::Invalid, SlackApiErrorScope::Target),
+    "no_permission" | "not_in_channel" | "user_not_visible" => {
+      (SlackApiErrorClass::Unauthorized, SlackApiErrorScope::Target)
+    }
     "access_denied"
     | "account_inactive"
     | "enterprise_is_restricted"
     | "invalid_auth"
     | "missing_scope"
-    | "no_permission"
     | "not_allowed_token_type"
     | "not_authed"
-    | "not_in_channel"
     | "restricted_action"
     | "team_access_not_granted"
     | "token_expired"
     | "token_revoked"
     | "two_factor_setup_required"
-    | "user_disabled"
-    | "user_not_visible" => SlackApiErrorClass::Unauthorized,
+    | "user_disabled" => (
+      SlackApiErrorClass::Unauthorized,
+      SlackApiErrorScope::GlobalProvider,
+    ),
     "fatal_error"
     | "internal_error"
     | "ratelimited"
     | "request_timeout"
     | "service_unavailable"
-    | "team_added_to_org" => SlackApiErrorClass::Transient,
+    | "team_added_to_org" => (SlackApiErrorClass::Transient, SlackApiErrorScope::Unknown),
+    "is_archived" => (
+      SlackApiErrorClass::TargetUnavailable,
+      SlackApiErrorScope::Target,
+    ),
     "accesslimited"
     | "deprecated_endpoint"
     | "ekm_access_denied"
-    | "is_archived"
     | "method_deprecated"
-    | "org_login_required"
-    | "unknown_error" => SlackApiErrorClass::TargetUnavailable,
-    _ => SlackApiErrorClass::TargetUnavailable,
+    | "org_login_required" => (
+      SlackApiErrorClass::TargetUnavailable,
+      SlackApiErrorScope::GlobalProvider,
+    ),
+    "unknown_error" => (
+      SlackApiErrorClass::TargetUnavailable,
+      SlackApiErrorScope::Unknown,
+    ),
+    _ => (
+      SlackApiErrorClass::TargetUnavailable,
+      SlackApiErrorScope::Unknown,
+    ),
   }
 }
 
@@ -2085,6 +2119,14 @@ const fn classify_http_status(status: u16) -> SlackApiErrorClass {
     400 | 404 | 405 | 409 | 422 => SlackApiErrorClass::Invalid,
     408 | 425 | 500..=599 => SlackApiErrorClass::Transient,
     _ => SlackApiErrorClass::TargetUnavailable,
+  }
+}
+
+const fn classify_http_status_scope(status: u16) -> SlackApiErrorScope {
+  match status {
+    401 | 403 => SlackApiErrorScope::GlobalProvider,
+    400 | 404 | 405 | 409 | 422 => SlackApiErrorScope::Target,
+    _ => SlackApiErrorScope::Unknown,
   }
 }
 
@@ -2569,7 +2611,7 @@ fn channel_resource_provider_error(error: SlackWebApiError) -> ChannelResourcePr
       ChannelResourceProviderError::InvalidResponse { message }
     }
     SlackWebApiError::Provider { message } => ChannelResourceProviderError::Provider { message },
-    SlackWebApiError::Api { classification } => ChannelResourceProviderError::Provider {
+    SlackWebApiError::Api { classification, .. } => ChannelResourceProviderError::Provider {
       message: classification.to_string(),
     },
     SlackWebApiError::UnsupportedTarget => ChannelResourceProviderError::UnsupportedResource,
@@ -2592,7 +2634,7 @@ fn channel_context_provider_error(error: SlackWebApiError) -> ChannelContextProv
       ChannelContextProviderError::InvalidResponse { message }
     }
     SlackWebApiError::Provider { message } => ChannelContextProviderError::Provider { message },
-    SlackWebApiError::Api { classification } => ChannelContextProviderError::Provider {
+    SlackWebApiError::Api { classification, .. } => ChannelContextProviderError::Provider {
       message: classification.to_string(),
     },
     SlackWebApiError::UnsupportedTarget => ChannelContextProviderError::UnsupportedTarget,

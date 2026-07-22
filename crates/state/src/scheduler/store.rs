@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -801,8 +802,16 @@ impl StateStore {
     now: i64,
     lease_expires_at: i64,
   ) -> Result<Option<ClaimedScheduledRun>, StateError> {
+    let cancellation = AtomicBool::new(false);
     self
-      .claim_next_scheduled_run_inner(lease_owner, now, lease_expires_at, None, &|| now)
+      .claim_next_scheduled_run_inner(
+        lease_owner,
+        now,
+        lease_expires_at,
+        None,
+        &|| now,
+        &cancellation,
+      )
       .await
   }
 
@@ -818,12 +827,24 @@ impl StateStore {
     lease_expires_at: i64,
     admission: &ScheduledExecutorAdmission,
     clock: &(dyn Fn() -> i64 + Send + Sync),
+    cancellation: &AtomicBool,
   ) -> Result<Option<ClaimedScheduledRun>, StateError> {
     self
-      .claim_next_scheduled_run_inner(lease_owner, now, lease_expires_at, Some(admission), clock)
+      .claim_next_scheduled_run_inner(
+        lease_owner,
+        now,
+        lease_expires_at,
+        Some(admission),
+        clock,
+        cancellation,
+      )
       .await
   }
 
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps claim mutation and its before-commit executor admission in one transaction"
+  )]
   async fn claim_next_scheduled_run_inner(
     &self,
     lease_owner: &str,
@@ -831,6 +852,7 @@ impl StateStore {
     lease_expires_at: i64,
     admission: Option<&ScheduledExecutorAdmission>,
     clock: &(dyn Fn() -> i64 + Send + Sync),
+    cancellation: &AtomicBool,
   ) -> Result<Option<ClaimedScheduledRun>, StateError> {
     validate_text("scheduled run lease owner", lease_owner).map_err(invalid_value)?;
     if lease_expires_at <= now {
@@ -838,8 +860,14 @@ impl StateStore {
         reason: "scheduled run lease must expire after claim time".to_owned(),
       });
     }
-    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let mut transaction = self
+      .pool
+      .begin()
+      .await
+      .map_err(scheduler_error)
+      .map_err(|error| executor_admission_storage_error(error, admission))?;
     acquire_and_validate_executor_admission(&mut transaction, admission, clock).await?;
+    ensure_executor_admission_not_cancelled(admission, cancellation)?;
     let row = sqlx::query(
       "update scheduled_runs set state = 'leased', attempt = attempt + 1, fence = fence + 1, next_attempt_at = null, lease_owner = ?1, lease_expires_at = ?2, updated_at = ?3 where run_id = (select run_id from scheduled_runs indexed by idx_scheduled_runs_claim where state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 order by scheduled_for, run_id limit 1) and state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?3) and attempt < 9223372036854775807 and fence < 9223372036854775807 returning run_id, job_id, schedule_id, job_generation, schedule_generation, scheduled_for, coalesced_through, definition_version, definition_json, capability_schema_version, capability_digest, capability_json, targets_json, execution_baseline_json, attempt, fence",
     )
@@ -860,8 +888,13 @@ impl StateStore {
       if exhausted != 0 {
         return Err(StateError::ScheduledRunCounterExhausted);
       }
+      #[cfg(feature = "test-support")]
+      self.run_scheduled_executor_before_commit_hook_for_tests();
+      ensure_executor_admission_not_cancelled(admission, cancellation)?;
       revalidate_executor_admission(&mut transaction, admission, clock).await?;
       transaction.commit().await.map_err(scheduler_error)?;
+      #[cfg(feature = "test-support")]
+      self.run_scheduled_executor_after_commit_hook_for_tests();
       return Ok(None);
     };
     let run_id: String = row.try_get("run_id").map_err(scheduler_error)?;
@@ -916,8 +949,13 @@ impl StateStore {
       targets_json: row.try_get("targets_json").map_err(scheduler_error)?,
       execution_baseline_json,
     };
+    #[cfg(feature = "test-support")]
+    self.run_scheduled_executor_before_commit_hook_for_tests();
+    ensure_executor_admission_not_cancelled(admission, cancellation)?;
     revalidate_executor_admission(&mut transaction, admission, clock).await?;
     transaction.commit().await.map_err(scheduler_error)?;
+    #[cfg(feature = "test-support")]
+    self.run_scheduled_executor_after_commit_hook_for_tests();
     Ok(Some(claimed))
   }
 
@@ -3965,8 +4003,16 @@ where run.run_id = ?2
     expected_generation: i64,
     now: i64,
   ) -> Result<MaterializationOutcome, StateError> {
+    let cancellation = AtomicBool::new(false);
     self
-      .materialize_due_schedule_inner(job_id, expected_generation, now, None, &|| now)
+      .materialize_due_schedule_inner(
+        job_id,
+        expected_generation,
+        now,
+        None,
+        &|| now,
+        &cancellation,
+      )
       .await
   }
 
@@ -3982,9 +4028,17 @@ where run.run_id = ?2
     now: i64,
     admission: &ScheduledExecutorAdmission,
     clock: &(dyn Fn() -> i64 + Send + Sync),
+    cancellation: &AtomicBool,
   ) -> Result<MaterializationOutcome, StateError> {
     self
-      .materialize_due_schedule_inner(job_id, expected_generation, now, Some(admission), clock)
+      .materialize_due_schedule_inner(
+        job_id,
+        expected_generation,
+        now,
+        Some(admission),
+        clock,
+        cancellation,
+      )
       .await
   }
 
@@ -3999,9 +4053,16 @@ where run.run_id = ?2
     now: i64,
     admission: Option<&ScheduledExecutorAdmission>,
     clock: &(dyn Fn() -> i64 + Send + Sync),
+    cancellation: &AtomicBool,
   ) -> Result<MaterializationOutcome, StateError> {
-    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let mut transaction = self
+      .pool
+      .begin()
+      .await
+      .map_err(scheduler_error)
+      .map_err(|error| executor_admission_storage_error(error, admission))?;
     acquire_and_validate_executor_admission(&mut transaction, admission, clock).await?;
+    ensure_executor_admission_not_cancelled(admission, cancellation)?;
     let row = sqlx::query(
       "select j.definition_version, j.definition_json, j.capability_schema_version, j.capability_digest, j.capability_json, j.status, j.generation, s.schedule_id, s.generation as schedule_generation, s.kind, s.canonical_spec, s.timezone, s.once_at, s.anchor_at, s.interval_seconds, s.next_run_at from scheduled_jobs j join schedules s on s.job_id = j.job_id where j.job_id = ?1",
     )
@@ -4096,8 +4157,13 @@ where run.run_id = ?2
       .await
       .map_err(scheduler_error)?;
     }
+    #[cfg(feature = "test-support")]
+    self.run_scheduled_executor_before_commit_hook_for_tests();
+    ensure_executor_admission_not_cancelled(admission, cancellation)?;
     revalidate_executor_admission(&mut transaction, admission, clock).await?;
     transaction.commit().await.map_err(scheduler_error)?;
+    #[cfg(feature = "test-support")]
+    self.run_scheduled_executor_after_commit_hook_for_tests();
     Ok(materialized_run(run_id, job_id, window))
   }
 
@@ -4162,11 +4228,39 @@ async fn acquire_and_validate_executor_admission(
   )
   .execute(&mut **transaction)
   .await
-  .map_err(scheduler_error)?;
+  .map_err(scheduler_error)
+  .map_err(|error| executor_admission_storage_error(error, Some(admission)))?;
   if locked.rows_affected() != 1 {
     return Err(StateError::ScheduledExecutorAdmissionUnavailable);
   }
   revalidate_executor_admission(transaction, Some(admission), clock).await
+}
+
+fn ensure_executor_admission_not_cancelled(
+  admission: Option<&ScheduledExecutorAdmission>,
+  cancellation: &AtomicBool,
+) -> Result<(), StateError> {
+  if admission.is_some() && cancellation.load(Ordering::Acquire) {
+    return Err(StateError::ScheduledExecutorAdmissionUnavailable);
+  }
+  Ok(())
+}
+
+fn executor_admission_storage_error(
+  error: StateError,
+  admission: Option<&ScheduledExecutorAdmission>,
+) -> StateError {
+  let pool_timed_out = matches!(
+    &error,
+    StateError::Scheduler {
+      source: sqlx::Error::PoolTimedOut
+    }
+  );
+  if admission.is_some() && (pool_timed_out || error.is_transient_storage_contention()) {
+    StateError::ScheduledExecutorAdmissionUnavailable
+  } else {
+    error
+  }
 }
 
 async fn revalidate_executor_admission(

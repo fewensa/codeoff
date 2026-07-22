@@ -78,7 +78,9 @@ pub struct StateStore {
 #[cfg(feature = "test-support")]
 #[derive(Default)]
 struct StateStoreTestHooks {
-  scheduled_retention_after_scan: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+  retention_after_scan: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+  executor_before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+  executor_after_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1793,7 +1795,7 @@ do update set summary = excluded.summary, updated_at = datetime('now')
   ) {
     *self
       .test_hooks
-      .scheduled_retention_after_scan
+      .retention_after_scan
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
   }
@@ -1802,7 +1804,59 @@ do update set summary = excluded.summary, updated_at = datetime('now')
   pub(crate) fn run_scheduled_retention_after_scan_hook_for_tests(&self) {
     let hook = self
       .test_hooks
-      .scheduled_retention_after_scan
+      .retention_after_scan
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .take();
+    if let Some(hook) = hook {
+      hook();
+    }
+  }
+
+  /// Installs a one-shot callback immediately before admitted scheduler commit validation.
+  #[cfg(feature = "test-support")]
+  pub fn set_scheduled_executor_before_commit_hook_for_tests(
+    &self,
+    hook: impl FnOnce() + Send + 'static,
+  ) {
+    *self
+      .test_hooks
+      .executor_before_commit
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+  }
+
+  #[cfg(feature = "test-support")]
+  pub(crate) fn run_scheduled_executor_before_commit_hook_for_tests(&self) {
+    let hook = self
+      .test_hooks
+      .executor_before_commit
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .take();
+    if let Some(hook) = hook {
+      hook();
+    }
+  }
+
+  /// Installs a one-shot callback after commit completes but before its outcome is returned.
+  #[cfg(feature = "test-support")]
+  pub fn set_scheduled_executor_after_commit_hook_for_tests(
+    &self,
+    hook: impl FnOnce() + Send + 'static,
+  ) {
+    *self
+      .test_hooks
+      .executor_after_commit
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+  }
+
+  #[cfg(feature = "test-support")]
+  pub(crate) fn run_scheduled_executor_after_commit_hook_for_tests(&self) {
+    let hook = self
+      .test_hooks
+      .executor_after_commit
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner)
       .take();

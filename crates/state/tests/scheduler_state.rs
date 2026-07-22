@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use codeoff_state::{
@@ -363,7 +363,7 @@ async fn scheduled_execution_permit_retention_is_bounded_and_preserves_authority
 }
 
 #[tokio::test]
-async fn scheduled_executor_admission_rolls_back_clock_jump_and_rotation_without_deltas() {
+async fn scheduled_executor_materialization_admission_rolls_back_clock_jump_and_rotation() {
   let temp = tempdir().expect("tempdir");
   let store = StateStore::initialize(&temp.path().join("state"), None)
     .await
@@ -379,6 +379,7 @@ async fn scheduled_executor_admission_rolls_back_clock_jump_and_rotation_without
     .await
     .expect("epoch one");
   let admission_one = executor_admission(&epoch_one, 150);
+  let cancellation = AtomicBool::new(false);
   let calls = AtomicUsize::new(0);
   let jumping_clock = || {
     if calls.fetch_add(1, Ordering::AcqRel) == 0 {
@@ -389,7 +390,14 @@ async fn scheduled_executor_admission_rolls_back_clock_jump_and_rotation_without
   };
   assert!(matches!(
     store
-      .materialize_due_schedule_with_admission(job_id, 0, 120, &admission_one, &jumping_clock)
+      .materialize_due_schedule_with_admission(
+        job_id,
+        0,
+        120,
+        &admission_one,
+        &jumping_clock,
+        &cancellation,
+      )
       .await,
     Err(StateError::ScheduledExecutorAdmissionUnavailable)
   ));
@@ -407,18 +415,56 @@ async fn scheduled_executor_admission_rolls_back_clock_jump_and_rotation_without
     .expect("epoch two");
   assert!(matches!(
     store
-      .materialize_due_schedule_with_admission(job_id, 0, 121, &admission_one, &|| 121)
+      .materialize_due_schedule_with_admission(
+        job_id,
+        0,
+        121,
+        &admission_one,
+        &|| 121,
+        &cancellation,
+      )
       .await,
     Err(StateError::ScheduledExecutorAdmissionUnavailable)
   ));
   let admission_two = executor_admission(&epoch_two, 160);
   assert!(matches!(
     store
-      .materialize_due_schedule_with_admission(job_id, 0, 122, &admission_two, &|| 122)
+      .materialize_due_schedule_with_admission(
+        job_id,
+        0,
+        122,
+        &admission_two,
+        &|| 122,
+        &cancellation,
+      )
       .await
       .expect("recovered materialization"),
     MaterializationOutcome::Created(_)
   ));
+}
+
+#[tokio::test]
+async fn scheduled_executor_claim_admission_rolls_back_clock_jump_without_counter_delta() {
+  let temp = tempdir().expect("tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("state");
+  let job_id = "atomic-executor-claim-admission";
+  store
+    .create_scheduled_job(&create_request(job_id, ScheduleSpec::once(110), 100))
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule(job_id, 0, 120)
+    .await
+    .expect("materialize run");
+  let epoch_two = executor_epoch(2, '4');
+  store
+    .register_scheduled_executor_epoch(&epoch_two, 121)
+    .await
+    .expect("register epoch");
+  let admission_two = executor_admission(&epoch_two, 160);
+  let cancellation = AtomicBool::new(false);
 
   let claim_calls = AtomicUsize::new(0);
   let claim_clock = || {
@@ -436,6 +482,7 @@ async fn scheduled_executor_admission_rolls_back_clock_jump_and_rotation_without
         140,
         &admission_two,
         &claim_clock,
+        &cancellation,
       )
       .await,
     Err(StateError::ScheduledExecutorAdmissionUnavailable)
@@ -447,6 +494,7 @@ async fn scheduled_executor_admission_rolls_back_clock_jump_and_rotation_without
       141,
       &executor_admission(&epoch_two, 170),
       &|| 124,
+      &cancellation,
     )
     .await
     .expect("recovered claim")

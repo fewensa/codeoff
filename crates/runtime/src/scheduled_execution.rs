@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,7 +31,6 @@ use crate::scheduler_observability::{
 static PREPARE_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SCHEDULER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_LOG_ERROR_BYTES: usize = 512;
-const ADMISSION_OPERATION_MAX_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct GlobalTurnBudget {
@@ -395,7 +395,6 @@ async fn run_scheduled_worker_tick(
       return Ok(TickOutcome::Unavailable);
     }
     let clock = Arc::clone(&orchestrator.clock);
-    let clock_read = || clock.now();
     let materialization = match &admission {
       RefreshedExecutorAdmission::Unavailable => unreachable!(),
       RefreshedExecutorAdmission::Ready => tokio::select! {
@@ -403,28 +402,38 @@ async fn run_scheduled_worker_tick(
         () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
       },
       RefreshedExecutorAdmission::Authority(authority) => {
-        let Some(timeout) = admission_operation_timeout(authority, clock.now()) else {
-          return Ok(TickOutcome::Unavailable);
-        };
-        let operation = tokio::time::timeout(
-          timeout,
-          state.materialize_due_schedule_with_admission(
-            &job_id,
-            job.generation,
-            now,
-            authority,
-            &clock_read,
-          ),
-        );
-        match tokio::select! {
-          result = operation => result,
-          () = cancellation_requested(shutdown.clone()) => {
-            return Ok(TickOutcome::Cancelled);
+        let state = state.clone();
+        let job_id = job_id.clone();
+        let authority = authority.clone();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let task_cancellation = Arc::clone(&cancellation);
+        let joined = join_admitted_state_mutation(
+          async move {
+            let clock_read = || clock.now();
+            state
+              .materialize_due_schedule_with_admission(
+                &job_id,
+                job.generation,
+                now,
+                &authority,
+                &clock_read,
+                task_cancellation.as_ref(),
+              )
+              .await
+          },
+          cancellation,
+          shutdown.clone(),
+        )
+        .await?;
+        if joined.cancellation_requested {
+          match joined.result {
+            Ok(_) | Err(StateError::ScheduledExecutorAdmissionUnavailable) => {
+              return Ok(TickOutcome::Cancelled);
+            }
+            Err(error) => return Err(error),
           }
-        } {
-          Ok(result) => result,
-          Err(_) => return Ok(TickOutcome::Unavailable),
         }
+        joined.result
       }
     };
     match materialization {
@@ -460,6 +469,41 @@ async fn cancellation_requested(mut shutdown: watch::Receiver<bool>) {
   }
 }
 
+struct JoinedAdmissionMutation<T> {
+  result: Result<T, StateError>,
+  cancellation_requested: bool,
+}
+
+async fn join_admitted_state_mutation<T>(
+  mutation: impl Future<Output = Result<T, StateError>> + Send + 'static,
+  cancellation: Arc<AtomicBool>,
+  shutdown: watch::Receiver<bool>,
+) -> Result<JoinedAdmissionMutation<T>, StateError>
+where
+  T: Send + 'static,
+{
+  let mut task = tokio::spawn(mutation);
+  tokio::select! {
+    result = &mut task => Ok(JoinedAdmissionMutation {
+      result: result.map_err(admitted_mutation_join_error)?,
+      cancellation_requested: false,
+    }),
+    () = cancellation_requested(shutdown) => {
+      cancellation.store(true, Ordering::Release);
+      Ok(JoinedAdmissionMutation {
+        result: task.await.map_err(admitted_mutation_join_error)?,
+        cancellation_requested: true,
+      })
+    }
+  }
+}
+
+fn admitted_mutation_join_error(error: tokio::task::JoinError) -> StateError {
+  StateError::InvalidSchedulerState {
+    reason: format!("scheduled admitted state mutation task failed: {error}"),
+  }
+}
+
 fn bounded_log_error(error: &StateError) -> String {
   let message = error.to_string();
   if message.len() <= MAX_LOG_ERROR_BYTES {
@@ -470,18 +514,6 @@ fn bounded_log_error(error: &StateError) -> String {
     end -= 1;
   }
   format!("{}…", &message[..end])
-}
-
-fn admission_operation_timeout(
-  admission: &ScheduledExecutorAdmission,
-  now: i64,
-) -> Option<Duration> {
-  let remaining = admission.operation_deadline.checked_sub(now)?;
-  let seconds = u64::try_from(remaining).ok()?;
-  if seconds == 0 || admission.operation_deadline >= admission.signed_not_after {
-    return None;
-  }
-  Some(ADMISSION_OPERATION_MAX_DURATION.min(Duration::from_secs(seconds)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -938,47 +970,58 @@ impl ScheduledRunOrchestrator {
       })?;
     let now = self.clock.now();
     let lease_expires_at = checked_add(now, self.policy.lease_seconds, "lease expiry")?;
-    let clock = Arc::clone(&self.clock);
-    let clock_read = || clock.now();
-    let claim_future = async {
-      match &admission {
-        RefreshedExecutorAdmission::Unavailable => Ok(None),
-        RefreshedExecutorAdmission::Ready => {
-          self
-            .state
-            .claim_next_scheduled_run(&self.lease_owner, now, lease_expires_at)
-            .await
-        }
-        RefreshedExecutorAdmission::Authority(authority) => {
-          let Some(timeout) = admission_operation_timeout(authority, clock.now()) else {
-            return Err(StateError::ScheduledExecutorAdmissionUnavailable);
-          };
-          tokio::time::timeout(
-            timeout,
-            self.state.claim_next_scheduled_run_with_admission(
-              &self.lease_owner,
-              now,
-              lease_expires_at,
-              authority,
-              &clock_read,
-            ),
-          )
-          .await
-          .map_err(|_| StateError::ScheduledExecutorAdmissionUnavailable)?
+    let claim_result = match &admission {
+      RefreshedExecutorAdmission::Unavailable => Ok(None),
+      RefreshedExecutorAdmission::Ready => tokio::select! {
+        result = self
+          .state
+          .claim_next_scheduled_run(&self.lease_owner, now, lease_expires_at) => result,
+        () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
+      },
+      RefreshedExecutorAdmission::Authority(authority) => {
+        let state = self.state.clone();
+        let lease_owner = self.lease_owner.clone();
+        let authority = authority.clone();
+        let clock = Arc::clone(&self.clock);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let task_cancellation = Arc::clone(&cancellation);
+        let joined = join_admitted_state_mutation(
+          async move {
+            let clock_read = || clock.now();
+            state
+              .claim_next_scheduled_run_with_admission(
+                &lease_owner,
+                now,
+                lease_expires_at,
+                &authority,
+                &clock_read,
+                task_cancellation.as_ref(),
+              )
+              .await
+          },
+          cancellation,
+          shutdown.clone(),
+        )
+        .await?;
+        if joined.cancellation_requested {
+          match joined.result {
+            Ok(Some(claim)) => Ok(Some(claim)),
+            Ok(None) | Err(StateError::ScheduledExecutorAdmissionUnavailable) => {
+              return Ok(TickOutcome::Cancelled);
+            }
+            Err(error) => return Err(error),
+          }
+        } else {
+          joined.result
         }
       }
     };
-    let claim = tokio::select! {
-      result = claim_future => {
-        match result {
-          Ok(claim) => claim,
-          Err(StateError::ScheduledExecutorAdmissionUnavailable) => {
-            return Ok(TickOutcome::Unavailable);
-          }
-          Err(error) => return Err(error),
-        }
-      },
-      () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
+    let claim = match claim_result {
+      Ok(claim) => claim,
+      Err(StateError::ScheduledExecutorAdmissionUnavailable) => {
+        return Ok(TickOutcome::Unavailable);
+      }
+      Err(error) => return Err(error),
     };
     let Some(claim) = claim else {
       return Ok(TickOutcome::Idle);
@@ -1678,9 +1721,8 @@ fn sha256_hex(value: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-  use std::sync::Barrier;
-  use std::sync::Mutex;
   use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize};
+  use std::sync::{Barrier, Mutex, mpsc};
 
   use codeoff_agent_contract::{InvocationPrincipalRef, InvocationSource};
   use codeoff_state::{
@@ -2012,6 +2054,34 @@ mod tests {
       .expect("create job");
   }
 
+  fn install_executor_commit_gate(
+    store: &StateStore,
+    before_commit: bool,
+  ) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+    let (reached_tx, reached_rx) = mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+    let hook = move || {
+      reached_tx.send(()).expect("report commit gate");
+      resume_rx.recv().expect("resume commit gate");
+    };
+    if before_commit {
+      store.set_scheduled_executor_before_commit_hook_for_tests(hook);
+    } else {
+      store.set_scheduled_executor_after_commit_hook_for_tests(hook);
+    }
+    (reached_rx, resume_tx)
+  }
+
+  async fn wait_for_admitted_mutation_cancellation(cancellation: &AtomicBool) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+      while !cancellation.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("admitted mutation cancellation");
+  }
+
   fn orchestrator(
     state: StateStore,
     backend: Arc<dyn ScheduledExecutionBackend>,
@@ -2238,6 +2308,262 @@ mod tests {
         .expect("rotated admission tick"),
       TickOutcome::Completed
     );
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn test_materialization_cancellation_before_commit_rolls_back_and_recovers() {
+    let temp = tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    create_job(&state, "materialize-pre-commit-cancel", 110).await;
+    let authority = test_executor_authority(1, 'a');
+    state
+      .register_scheduled_executor_epoch(&authority, 105)
+      .await
+      .expect("register authority");
+    let admission = test_executor_admission(&authority, 150);
+    let (reached, resume) = install_executor_commit_gate(&state, true);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let task_cancellation = Arc::clone(&cancellation);
+    let helper_cancellation = Arc::clone(&cancellation);
+    let task_state = state.clone();
+    let task_admission = admission.clone();
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let caller = tokio::spawn(join_admitted_state_mutation(
+      async move {
+        task_state
+          .materialize_due_schedule_with_admission(
+            "materialize-pre-commit-cancel",
+            0,
+            111,
+            &task_admission,
+            &|| 111,
+            task_cancellation.as_ref(),
+          )
+          .await
+      },
+      helper_cancellation,
+      shutdown_rx,
+    ));
+
+    reached
+      .recv_timeout(Duration::from_secs(1))
+      .expect("pre-commit gate");
+    shutdown.send(true).expect("cancel materialization");
+    wait_for_admitted_mutation_cancellation(cancellation.as_ref()).await;
+    assert!(!caller.is_finished());
+    resume.send(()).expect("resume materialization");
+    let joined = caller
+      .await
+      .expect("caller join")
+      .expect("mutation task join");
+    assert!(joined.cancellation_requested);
+    assert!(matches!(
+      joined.result,
+      Err(StateError::ScheduledExecutorAdmissionUnavailable)
+    ));
+    let snapshot = state
+      .scheduler_observability_snapshot(111, 10, 100)
+      .await
+      .expect("rolled-back snapshot");
+    assert_eq!(snapshot.due_jobs.value, 1);
+    assert_eq!(snapshot.pending_runs.value, 0);
+
+    assert!(matches!(
+      state
+        .materialize_due_schedule_with_admission(
+          "materialize-pre-commit-cancel",
+          0,
+          111,
+          &admission,
+          &|| 111,
+          &AtomicBool::new(false),
+        )
+        .await
+        .expect("recovered materialization"),
+      MaterializationOutcome::Created(_)
+    ));
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn test_materialization_cancellation_after_commit_returns_committed_outcome() {
+    let temp = tempdir().expect("tempdir");
+    let state = StateStore::initialize(&temp.path().join("state"), None)
+      .await
+      .expect("state");
+    create_job(&state, "materialize-post-commit-cancel", 110).await;
+    let authority = test_executor_authority(1, 'b');
+    state
+      .register_scheduled_executor_epoch(&authority, 105)
+      .await
+      .expect("register authority");
+    let admission = test_executor_admission(&authority, 150);
+    let (reached, resume) = install_executor_commit_gate(&state, false);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let task_cancellation = Arc::clone(&cancellation);
+    let helper_cancellation = Arc::clone(&cancellation);
+    let task_state = state.clone();
+    let task_admission = admission;
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let caller = tokio::spawn(join_admitted_state_mutation(
+      async move {
+        task_state
+          .materialize_due_schedule_with_admission(
+            "materialize-post-commit-cancel",
+            0,
+            111,
+            &task_admission,
+            &|| 111,
+            task_cancellation.as_ref(),
+          )
+          .await
+      },
+      helper_cancellation,
+      shutdown_rx,
+    ));
+
+    reached
+      .recv_timeout(Duration::from_secs(1))
+      .expect("post-commit gate");
+    shutdown.send(true).expect("cancel materialization");
+    wait_for_admitted_mutation_cancellation(cancellation.as_ref()).await;
+    assert!(!caller.is_finished());
+    resume.send(()).expect("return committed outcome");
+    let joined = caller
+      .await
+      .expect("caller join")
+      .expect("mutation task join");
+    assert!(joined.cancellation_requested);
+    assert!(matches!(
+      joined.result,
+      Ok(MaterializationOutcome::Created(_))
+    ));
+    let snapshot = state
+      .scheduler_observability_snapshot(111, 10, 100)
+      .await
+      .expect("committed snapshot");
+    assert_eq!(snapshot.due_jobs.value, 0);
+    assert_eq!(snapshot.pending_runs.value, 1);
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn test_claim_cancellation_before_commit_rolls_back_counters_and_recovers() {
+    let (_temp, state) = fixture(&[("claim-pre-commit-cancel", 110)]).await;
+    let authority = test_executor_authority(1, 'c');
+    state
+      .register_scheduled_executor_epoch(&authority, 105)
+      .await
+      .expect("register authority");
+    let admission = test_executor_admission(&authority, 150);
+    let (reached, resume) = install_executor_commit_gate(&state, true);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let task_cancellation = Arc::clone(&cancellation);
+    let helper_cancellation = Arc::clone(&cancellation);
+    let task_state = state.clone();
+    let task_admission = admission.clone();
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let caller = tokio::spawn(join_admitted_state_mutation(
+      async move {
+        task_state
+          .claim_next_scheduled_run_with_admission(
+            "claim-pre-commit",
+            111,
+            130,
+            &task_admission,
+            &|| 111,
+            task_cancellation.as_ref(),
+          )
+          .await
+      },
+      helper_cancellation,
+      shutdown_rx,
+    ));
+
+    reached
+      .recv_timeout(Duration::from_secs(1))
+      .expect("pre-commit gate");
+    shutdown.send(true).expect("cancel claim");
+    wait_for_admitted_mutation_cancellation(cancellation.as_ref()).await;
+    assert!(!caller.is_finished());
+    resume.send(()).expect("resume claim");
+    let joined = caller
+      .await
+      .expect("caller join")
+      .expect("mutation task join");
+    assert!(joined.cancellation_requested);
+    assert!(matches!(
+      joined.result,
+      Err(StateError::ScheduledExecutorAdmissionUnavailable)
+    ));
+
+    let claim = state
+      .claim_next_scheduled_run_with_admission(
+        "claim-recovery",
+        112,
+        131,
+        &admission,
+        &|| 112,
+        &AtomicBool::new(false),
+      )
+      .await
+      .expect("recovered claim")
+      .expect("pending run");
+    assert_eq!(claim.binding.attempt(), 1);
+    assert_eq!(claim.binding.fence(), 1);
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn test_claim_cancellation_after_commit_returns_committed_counters() {
+    let (_temp, state) = fixture(&[("claim-post-commit-cancel", 110)]).await;
+    let authority = test_executor_authority(1, 'd');
+    state
+      .register_scheduled_executor_epoch(&authority, 105)
+      .await
+      .expect("register authority");
+    let admission = test_executor_admission(&authority, 150);
+    let (reached, resume) = install_executor_commit_gate(&state, false);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let task_cancellation = Arc::clone(&cancellation);
+    let helper_cancellation = Arc::clone(&cancellation);
+    let task_state = state.clone();
+    let task_admission = admission;
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let caller = tokio::spawn(join_admitted_state_mutation(
+      async move {
+        task_state
+          .claim_next_scheduled_run_with_admission(
+            "claim-post-commit",
+            111,
+            130,
+            &task_admission,
+            &|| 111,
+            task_cancellation.as_ref(),
+          )
+          .await
+      },
+      helper_cancellation,
+      shutdown_rx,
+    ));
+
+    reached
+      .recv_timeout(Duration::from_secs(1))
+      .expect("post-commit gate");
+    shutdown.send(true).expect("cancel claim");
+    wait_for_admitted_mutation_cancellation(cancellation.as_ref()).await;
+    assert!(!caller.is_finished());
+    resume.send(()).expect("return committed claim");
+    let joined = caller
+      .await
+      .expect("caller join")
+      .expect("mutation task join");
+    assert!(joined.cancellation_requested);
+    let claim = joined
+      .result
+      .expect("committed claim outcome")
+      .expect("committed claim");
+    assert_eq!(claim.binding.attempt(), 1);
+    assert_eq!(claim.binding.fence(), 1);
   }
 
   #[tokio::test]

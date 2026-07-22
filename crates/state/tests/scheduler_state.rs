@@ -575,6 +575,7 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
+      && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1198,6 +1199,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
           | "20260722070000_scheduler_observability.sql"
           | "20260722080000_scheduler_retention.sql"
           | "20260722090000_scheduler_delivery_retention_completion.sql"
+          | "20260722100000_scheduler_delivery_retention_null_safety.sql"
       )
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
@@ -1351,12 +1353,12 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
     .await
     .expect("connect upgraded database");
   let scheduler_migrations: i64 = sqlx::query_scalar(
-    "select count(*) from _sqlx_migrations where version in (20260721020000, 20260721030000, 20260722080000, 20260722090000) and success = true",
+    "select count(*) from _sqlx_migrations where version in (20260721020000, 20260721030000, 20260722080000, 20260722090000, 20260722100000) and success = true",
   )
   .fetch_one(&pool)
   .await
   .expect("query scheduler migration");
-  assert_eq!(scheduler_migrations, 4);
+  assert_eq!(scheduler_migrations, 5);
   let upgraded: Vec<(String, String, i64)> = sqlx::query_as(
     "select r.run_id, r.state, (select count(*) from scheduled_run_attempts a where a.run_id = r.run_id) from scheduled_runs r where r.run_id like 'upgrade-run-%' order by r.run_id",
   )
@@ -1548,6 +1550,15 @@ async fn test_delivery_retention_completion_migration_backfills_one_time_ledger(
     "drop trigger trg_scheduled_run_late_evidence_retention_delete_guard",
     "drop trigger trg_scheduled_run_attempt_retention_delete_guard",
     "drop trigger trg_scheduled_run_retention_delete_guard",
+    "drop trigger trg_scheduled_delivery_retention_audit_null_safe_insert",
+    "drop trigger trg_scheduled_delivery_retention_audit_null_safe_update",
+    "drop trigger trg_scheduled_delivery_retention_ledger_null_safe_insert",
+    "drop trigger trg_scheduled_delivery_retention_delete_null_safe_guard",
+    "drop trigger trg_scheduled_delivery_attempt_retention_delete_null_safe_guard",
+    "drop trigger trg_scheduled_run_result_artifacts_retention_delete_null_safe_guard",
+    "drop trigger trg_scheduled_run_late_evidence_retention_delete_null_safe_guard",
+    "drop trigger trg_scheduled_run_attempt_retention_delete_null_safe_guard",
+    "drop trigger trg_scheduled_run_retention_delete_null_safe_guard",
   ] {
     sqlx::query(statement)
       .execute(&pool)
@@ -1580,6 +1591,10 @@ async fn test_delivery_retention_completion_migration_backfills_one_time_ledger(
     .execute(&pool)
     .await
     .expect("restore pre-completion migration history");
+  sqlx::query("delete from _sqlx_migrations where version = 20260722100000")
+    .execute(&pool)
+    .await
+    .expect("restore pre-null-safety migration history");
 
   for operation_id in ["a-completed-operation", "z-completed-operation"] {
     sqlx::query(
@@ -1630,11 +1645,35 @@ async fn test_delivery_retention_completion_migration_backfills_one_time_ledger(
       .await
       .expect("restore historical retention guard name");
   }
+  let pre_null_migrations = temp.path().join("pre-null-migrations");
+  std::fs::create_dir(&pre_null_migrations).expect("create pre-null migration fixture");
+  let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+  for entry in std::fs::read_dir(source).expect("read migrations") {
+    let entry = entry.expect("migration entry");
+    if entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql" {
+      std::fs::copy(entry.path(), pre_null_migrations.join(entry.file_name()))
+        .expect("copy pre-null migration");
+    }
+  }
+  Migrator::new(pre_null_migrations)
+    .await
+    .expect("load pre-null migrator")
+    .run(&pool)
+    .await
+    .expect("apply delivery retention completion migration");
+  let open_ledger_before_upgrade: Option<i64> = sqlx::query_scalar(
+    "select completed_at from scheduled_delivery_retention_ledger where delivery_id = ?1",
+  )
+  .bind(open_delivery)
+  .fetch_one(&pool)
+  .await
+  .expect("read legacy open ledger before null-safety migration");
+  assert_eq!(open_ledger_before_upgrade, None);
   pool.close().await;
 
   let upgraded = StateStore::initialize(&state_dir, None)
     .await
-    .expect("apply delivery retention completion migration");
+    .expect("apply delivery retention null-safety migration");
   let pool = SqlitePool::connect(&database_url(&state_dir))
     .await
     .expect("connect upgraded database");
@@ -1655,28 +1694,32 @@ async fn test_delivery_retention_completion_migration_backfills_one_time_ledger(
   .fetch_all(&pool)
   .await
   .expect("read backfilled retention ledger");
-  assert_eq!(ledgers.len(), 2);
+  assert_eq!(ledgers.len(), 1);
   let completed_ledger = ledgers
     .iter()
     .find(|(delivery_id, _, _)| delivery_id == completed_delivery)
     .expect("completed backfilled ledger");
   assert_eq!(completed_ledger.1, "a-completed-operation");
   assert_eq!(completed_ledger.2, Some(141));
-  let open_ledger = ledgers
-    .iter()
-    .find(|(delivery_id, _, _)| delivery_id == open_delivery)
-    .expect("open backfilled ledger");
-  assert_eq!(open_ledger.1, "a-open-operation");
-  assert_eq!(open_ledger.2, None);
   assert!(
     sqlx::query(
-      "update scheduled_delivery_retention_ledger set completed_at = 150 where delivery_id = ?1",
+      "update scheduled_delivery_retention_audit set attempts_deleted = 1, completed_at = 150 where operation_id = 'z-open-operation' and delivery_id = ?1",
     )
     .bind(open_delivery)
     .execute(&pool)
     .await
     .is_err(),
-    "one open historical audit must keep the delivery ledger open"
+    "legacy nullable audit must reject forged completion"
+  );
+  assert!(
+    sqlx::query(
+      "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) select delivery_id, 'z-open-operation', run_id, job_id, 140 from scheduled_run_deliveries where delivery_id = ?1",
+    )
+    .bind(open_delivery)
+    .execute(&pool)
+    .await
+    .is_err(),
+    "legacy nullable audit must not recreate its retired ledger claim"
   );
   assert!(
     sqlx::query("delete from scheduled_delivery_attempts where delivery_id = ?1")
@@ -1686,17 +1729,54 @@ async fn test_delivery_retention_completion_migration_backfills_one_time_ledger(
       .is_err(),
     "an unchosen open historical audit must not authorize deletion"
   );
-  for (operation_id, run_id) in [
-    ("post-upgrade-completed-replay", &completed_run),
-    ("post-upgrade-open-replay", &open_run),
-  ] {
-    assert!(matches!(
-      upgraded
-        .prune_scheduled_delivery_history(operation_id, run_id, 150)
-        .await,
-      Err(StateError::ScheduledDeliveryRetentionConflict)
-    ));
-  }
+  assert!(matches!(
+    upgraded
+      .prune_scheduled_delivery_history("post-upgrade-completed-replay", &completed_run, 150,)
+      .await,
+    Err(StateError::ScheduledDeliveryRetentionConflict)
+  ));
+  let recovered = upgraded
+    .prune_scheduled_delivery_history("post-upgrade-open-recovery", &open_run, 150)
+    .await
+    .expect("new canonical operation must replace retired legacy open claim");
+  assert_eq!(recovered.deliveries, 1);
+  assert_eq!(recovered.delivery_attempts, 1);
+  assert_eq!(recovered.run_attempts, 1);
+  assert_eq!(recovered.result_artifacts, 1);
+  assert_eq!(recovered.runs, 1);
+  assert!(
+    sqlx::query(
+      "update scheduled_delivery_retention_audit set attempts_deleted = 1, completed_at = 151 where operation_id = 'z-open-operation' and delivery_id = ?1",
+    )
+    .bind(open_delivery)
+    .execute(&pool)
+    .await
+    .is_err(),
+    "legacy nullable audit must remain historical after graph deletion"
+  );
+  let retired_ledger_completion = sqlx::query(
+    "update scheduled_delivery_retention_ledger set completed_at = 151 where operation_id = 'z-open-operation' and delivery_id = ?1",
+  )
+  .bind(open_delivery)
+  .execute(&pool)
+  .await
+  .expect("probe retired legacy ledger completion");
+  assert_eq!(
+    retired_ledger_completion.rows_affected(),
+    0,
+    "retired legacy ledger claim must not remain closable"
+  );
+  let recovered_ledger: (String, Option<i64>) = sqlx::query_as(
+    "select operation_id, completed_at from scheduled_delivery_retention_ledger where delivery_id = ?1",
+  )
+  .bind(open_delivery)
+  .fetch_one(&pool)
+  .await
+  .expect("read recovered canonical ledger");
+  assert_eq!(
+    recovered_ledger,
+    ("post-upgrade-open-recovery".to_owned(), Some(150))
+  );
   let graphs: (i64, i64) = sqlx::query_as(
     "select (select count(*) from scheduled_runs where run_id = ?1), (select count(*) from scheduled_runs where run_id = ?2)",
   )
@@ -1705,7 +1785,7 @@ async fn test_delivery_retention_completion_migration_backfills_one_time_ledger(
   .fetch_one(&pool)
   .await
   .expect("read replay-protected upgraded graphs");
-  assert_eq!(graphs, (1, 1));
+  assert_eq!(graphs, (1, 0));
 }
 
 #[tokio::test]
@@ -1729,6 +1809,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
+      && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1816,6 +1897,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
+      && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1901,6 +1983,7 @@ async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_pay
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
+      && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy issue-06 migration");
@@ -2083,6 +2166,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
+      && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2333,6 +2417,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
+      && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2410,6 +2495,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
+      && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2500,6 +2586,7 @@ async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_ident
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
+      && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -7693,6 +7780,61 @@ async fn test_succeeded_automatic_retention_preserves_delivery_baseline_and_audi
       .await
       .expect("read baseline after restart");
   assert_eq!(after_restart, 2);
+}
+
+#[tokio::test]
+async fn test_delivery_retention_audit_rejects_null_authority_field_matrix() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let (run_id, deliveries) = prepare_succeeded_retention_candidate(
+    &store,
+    &pool,
+    "retention-null-matrix",
+    vec![second_target("retention-null-matrix")],
+  )
+  .await;
+  let delivery_id = deliveries.first().expect("retention delivery");
+  for field in [
+    "job_generation",
+    "schedule_generation",
+    "run_terminal_at",
+    "run_cutoff_at",
+    "delivery_cutoff_at",
+    "expected_deliveries_deleted",
+    "expected_delivery_attempts_deleted",
+    "expected_run_attempts_deleted",
+    "expected_late_evidence_deleted",
+    "expected_result_artifacts_deleted",
+    "expected_runs_deleted",
+  ] {
+    let operation_id = format!("null-matrix-{field}");
+    assert!(
+      sqlx::query(
+        "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at, expected_deliveries_deleted, expected_delivery_attempts_deleted, expected_run_attempts_deleted, expected_late_evidence_deleted, expected_result_artifacts_deleted, expected_runs_deleted) select ?1, delivery.delivery_id, delivery.run_id, delivery.job_id, delivery.state, delivery.payload_digest, 140, case when ?2 = 'job_generation' then null else run.job_generation end, case when ?2 = 'schedule_generation' then null else run.schedule_generation end, case when ?2 = 'run_terminal_at' then null else attempt.completed_at end, case when ?2 = 'run_cutoff_at' then null else 140 end, case when ?2 = 'delivery_cutoff_at' then null else 140 end, case when ?2 = 'expected_deliveries_deleted' then null else (select count(*) from scheduled_run_deliveries item where item.run_id = run.run_id) end, case when ?2 = 'expected_delivery_attempts_deleted' then null else (select count(*) from scheduled_delivery_attempts item where item.delivery_id in (select target.delivery_id from scheduled_run_deliveries target where target.run_id = run.run_id)) end, case when ?2 = 'expected_run_attempts_deleted' then null else (select count(*) from scheduled_run_attempts item where item.run_id = run.run_id) end, case when ?2 = 'expected_late_evidence_deleted' then null else (select count(*) from scheduled_run_late_evidence item where item.run_id = run.run_id) end, case when ?2 = 'expected_result_artifacts_deleted' then null else (select count(*) from scheduled_run_result_artifacts item where item.run_id = run.run_id) end, case when ?2 = 'expected_runs_deleted' then null else 1 end from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id join scheduled_run_attempts attempt on attempt.run_id = run.run_id and attempt.job_id = run.job_id and attempt.attempt = run.attempt and attempt.fence = run.fence where delivery.delivery_id = ?3",
+      )
+      .bind(&operation_id)
+      .bind(field)
+      .bind(delivery_id)
+      .execute(&pool)
+      .await
+      .is_err(),
+      "nullable authority field {field} must be rejected"
+    );
+  }
+  let persisted: (i64, i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduled_delivery_retention_audit where run_id = ?1), (select count(*) from scheduled_delivery_retention_ledger where run_id = ?1), (select count(*) from scheduled_runs where run_id = ?1)",
+  )
+  .bind(&run_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read null-matrix authority");
+  assert_eq!(persisted, (0, 0, 1));
 }
 
 #[tokio::test]

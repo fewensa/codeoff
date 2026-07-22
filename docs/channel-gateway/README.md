@@ -38,7 +38,7 @@ Codex owns the agent side:
 
 - `en/overview.md`: product boundary and responsibility split.
 - `en/runtime.md`: single-daemon process, SQLite state, dispatcher, and local MCP surface.
-- `en/observability.md`: deferred observability direction for HTTP admin/read-only API, Prometheus metrics, and structured logs.
+- `en/observability.md`: implemented operational health/readiness/metrics, scheduler telemetry, and structured tracing surface.
 - `en/deployment.md`: Docker image and runtime deployment notes.
 - `en/channels.md`: Slack channel gateway model and connector constraints.
 - `en/agents.md`: Codex App Server dispatch boundary; Codeoff is not an agent runtime.
@@ -50,7 +50,7 @@ Codex owns the agent side:
 
 - `zh-TW/overview.md`: product boundary and responsibility split.
 - `zh-TW/runtime.md`: single-daemon process, SQLite state, dispatcher, and local MCP surface.
-- `zh-TW/observability.md`: deferred observability direction for HTTP admin/read-only API, Prometheus metrics, and structured logs.
+- `zh-TW/observability.md`: 已實作的運維 health/readiness/metrics、scheduler telemetry 與結構化 tracing 介面。
 - `zh-TW/deployment.md`: Docker image and runtime deployment notes.
 - `zh-TW/channels.md`: Slack channel gateway model and connector constraints.
 - `zh-TW/agents.md`: Codex App Server dispatch boundary; Codeoff is not an agent runtime.

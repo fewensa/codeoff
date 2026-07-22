@@ -11,5 +11,5 @@ This does not replace the documents it links to.
 ## Channel Gateway
 
 - `channel-gateway/README.md`: current product boundary, daemon runtime, Slack gateway, Codex App Server dispatch, and MCP channel tools.
-- `channel-gateway/en/observability.md`: deferred observability direction for HTTP admin/read-only API, Prometheus metrics, and structured logs.
+- `channel-gateway/en/observability.md`: implemented operational health/readiness/metrics, scheduler telemetry, and structured tracing surface.
 - `channel-gateway/en/deployment.md`: container image and runtime deployment notes.

@@ -557,6 +557,12 @@ impl OperationalHttpServer {
             break;
           }
         }
+        joined = connections.join_next(), if !connections.is_empty() => {
+          let Some(joined) = joined else {
+            continue;
+          };
+          joined.map_err(io::Error::other)?;
+        }
         accepted = self.listener.accept() => {
           let (stream, _) = accepted?;
           let Ok(permit) = permits.clone().try_acquire_owned() else {
@@ -583,12 +589,6 @@ impl OperationalHttpServer {
             let _ = tokio::time::timeout(CONNECTION_TIMEOUT, connection).await;
             drop(permit);
           });
-        }
-        joined = connections.join_next(), if !connections.is_empty() => {
-          let Some(joined) = joined else {
-            continue;
-          };
-          joined.map_err(io::Error::other)?;
         }
       }
     }
@@ -1142,6 +1142,86 @@ mod tests {
       .expect("connection panic propagation deadline")
       .expect("server task")
       .expect_err("connection panic must be fatal");
+
+    assert!(error.to_string().contains("panicked"));
+  }
+
+  #[tokio::test]
+  async fn test_operational_http_connection_panic_is_not_starved_by_accept_pressure() {
+    let (_temp, state) = test_state().await;
+    let telemetry =
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+    let server = OperationalHttpServer::bind("127.0.0.1:0", telemetry, state)
+      .await
+      .expect("bind server");
+    let address = server.local_addr().expect("server address");
+    server.panic_next_connection();
+    let mut preloaded = Vec::new();
+    for _ in 0..16 {
+      preloaded.push(
+        tokio::net::TcpStream::connect(address)
+          .await
+          .expect("preload connection"),
+      );
+    }
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut pressure = JoinSet::new();
+    for _ in 0..8 {
+      let attempts = attempts.clone();
+      pressure.spawn(async move {
+        while let Ok(stream) = tokio::net::TcpStream::connect(address).await {
+          attempts.fetch_add(1, Ordering::SeqCst);
+          drop(stream);
+        }
+      });
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+      while attempts.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("accept pressure startup deadline");
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(server.run_until(shutdown_rx));
+
+    let error = tokio::time::timeout(Duration::from_secs(1), task)
+      .await
+      .expect("pressured panic propagation deadline")
+      .expect("server task")
+      .expect_err("connection panic must be fatal under accept pressure");
+
+    assert!(error.to_string().contains("panicked"));
+    assert!(attempts.load(Ordering::SeqCst) > 0);
+    drop(preloaded);
+    while let Some(joined) = pressure.join_next().await {
+      joined.expect("pressure task");
+    }
+  }
+
+  #[tokio::test]
+  async fn test_operational_http_shutdown_surfaces_completed_connection_panic() {
+    let (_temp, state) = test_state().await;
+    let telemetry =
+      PrometheusSchedulerTelemetry::new(&scheduler_config(false, false, false), false);
+    let server = OperationalHttpServer::bind("127.0.0.1:0", telemetry, state)
+      .await
+      .expect("bind server");
+    let address = server.local_addr().expect("server address");
+    server.panic_next_connection();
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(server.run_until(shutdown_rx));
+    let _connection = tokio::net::TcpStream::connect(address)
+      .await
+      .expect("connect fault-injected request");
+    tokio::task::yield_now().await;
+    let _ = shutdown.send(true);
+
+    let error = tokio::time::timeout(Duration::from_secs(1), task)
+      .await
+      .expect("shutdown panic propagation deadline")
+      .expect("server task")
+      .expect_err("shutdown must not hide connection panic");
 
     assert!(error.to_string().contains("panicked"));
   }

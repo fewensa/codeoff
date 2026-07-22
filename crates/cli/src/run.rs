@@ -3627,7 +3627,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn operational_http_connection_panic_reaches_serve_lifecycle_without_later_traffic() {
+  async fn operational_http_connection_panic_reaches_lifecycle_under_accept_pressure() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state = StateStore::initialize(&temp.path().join("state"), None)
       .await
@@ -3639,15 +3639,37 @@ mod tests {
       .expect("bind operational server");
     let address = server.local_addr().expect("operational address");
     server.panic_next_connection();
+    let mut preloaded = Vec::new();
+    for _ in 0..16 {
+      preloaded.push(
+        tokio::net::TcpStream::connect(address)
+          .await
+          .expect("preload connection"),
+      );
+    }
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut pressure = JoinSet::new();
+    for _ in 0..8 {
+      let attempts = attempts.clone();
+      pressure.spawn(async move {
+        while let Ok(stream) = tokio::net::TcpStream::connect(address).await {
+          attempts.fetch_add(1, Ordering::SeqCst);
+          drop(stream);
+        }
+      });
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+      while attempts.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("accept pressure startup deadline");
     let mut lifecycle = ServeLifecycle {
       scheduled_worker: None,
       background_tasks: ServeTaskGroup::new(),
     };
     lifecycle.spawn_operational_http_server(server);
-
-    let _connection = tokio::net::TcpStream::connect(address)
-      .await
-      .expect("connect fault-injected request");
     let failure = tokio::time::timeout(
       Duration::from_secs(1),
       lifecycle.background_tasks.wait_for_failure(),
@@ -3660,6 +3682,11 @@ mod tests {
         .to_string()
         .contains("operational HTTP server failed")
     );
+    assert!(attempts.load(Ordering::SeqCst) > 0);
+    drop(preloaded);
+    while let Some(joined) = pressure.join_next().await {
+      joined.expect("pressure task");
+    }
     lifecycle
       .finish(Err(failure))
       .await

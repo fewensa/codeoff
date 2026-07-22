@@ -1855,14 +1855,44 @@ order by delivery.delivery_id
     if rows.is_empty() || i64::try_from(rows.len()).ok() != Some(total_deliveries) {
       return Err(StateError::ScheduledDeliveryRetentionConflict);
     }
+    let expected: (i64, i64, i64, i64, i64) = sqlx::query_as(
+      "select (select count(*) from scheduled_delivery_attempts where delivery_id in (select delivery_id from scheduled_run_deliveries where run_id = ?1)), (select count(*) from scheduled_run_attempts where run_id = ?1), (select count(*) from scheduled_run_late_evidence where run_id = ?1), (select count(*) from scheduled_run_result_artifacts where run_id = ?1), (select count(*) from scheduled_runs where run_id = ?1)",
+    )
+    .bind(run_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if expected.3 != 1 || expected.4 != 1 {
+      return Err(StateError::ScheduledDeliveryRetentionConflict);
+    }
     for row in &rows {
+      let delivery_id = row
+        .try_get::<String, _>("delivery_id")
+        .map_err(scheduler_error)?;
+      let job_id = row
+        .try_get::<String, _>("job_id")
+        .map_err(scheduler_error)?;
+      let ledger = sqlx::query(
+        "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) values (?1, ?2, ?3, ?4, ?5) on conflict(delivery_id) do nothing",
+      )
+      .bind(&delivery_id)
+      .bind(operation_id)
+      .bind(run_id)
+      .bind(&job_id)
+      .bind(now)
+      .execute(&mut *transaction)
+      .await
+      .map_err(scheduler_error)?;
+      if ledger.rows_affected() != 1 {
+        return Err(StateError::ScheduledDeliveryRetentionConflict);
+      }
       sqlx::query(
-        "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at, expected_deliveries_deleted, expected_delivery_attempts_deleted, expected_run_attempts_deleted, expected_late_evidence_deleted, expected_result_artifacts_deleted, expected_runs_deleted) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
       )
       .bind(operation_id)
-      .bind(row.try_get::<String, _>("delivery_id").map_err(scheduler_error)?)
+      .bind(&delivery_id)
       .bind(run_id)
-      .bind(row.try_get::<String, _>("job_id").map_err(scheduler_error)?)
+      .bind(&job_id)
       .bind(row.try_get::<String, _>("state").map_err(scheduler_error)?)
       .bind(row.try_get::<String, _>("payload_digest").map_err(scheduler_error)?)
       .bind(now)
@@ -1875,6 +1905,12 @@ order by delivery.delivery_id
       .bind(row.try_get::<i64, _>("terminal_at").map_err(scheduler_error)?)
       .bind(run_cutoff)
       .bind(delivery_cutoff)
+      .bind(total_deliveries)
+      .bind(expected.0)
+      .bind(expected.1)
+      .bind(expected.2)
+      .bind(expected.3)
+      .bind(expected.4)
       .execute(&mut *transaction)
       .await
       .map_err(scheduler_error)?;
@@ -1925,9 +1961,14 @@ order by delivery.delivery_id
       return Err(StateError::ScheduledDeliveryRetentionConflict);
     }
     let completion = sqlx::query(
-      "update scheduled_delivery_retention_audit set attempts_deleted = ?1, completed_at = ?2 where operation_id = ?3 and run_id = ?4 and completed_at is null",
+      "update scheduled_delivery_retention_audit set attempts_deleted = ?1, deliveries_deleted = ?2, run_attempts_deleted = ?3, late_evidence_deleted = ?4, result_artifacts_deleted = ?5, runs_deleted = ?6, completed_at = ?7 where operation_id = ?8 and run_id = ?9 and completed_at is null",
     )
     .bind(i64::try_from(delivery_attempts).unwrap_or(i64::MAX))
+    .bind(i64::try_from(deliveries).unwrap_or(i64::MAX))
+    .bind(i64::try_from(run_attempts).unwrap_or(i64::MAX))
+    .bind(i64::try_from(late_evidence).unwrap_or(i64::MAX))
+    .bind(i64::try_from(result_artifacts).unwrap_or(i64::MAX))
+    .bind(i64::try_from(runs).unwrap_or(i64::MAX))
     .bind(now)
     .bind(operation_id)
     .bind(run_id)
@@ -1935,6 +1976,18 @@ order by delivery.delivery_id
     .await
     .map_err(scheduler_error)?;
     if completion.rows_affected() != deliveries {
+      return Err(StateError::ScheduledDeliveryRetentionConflict);
+    }
+    let ledger_completion = sqlx::query(
+      "update scheduled_delivery_retention_ledger set completed_at = ?1 where operation_id = ?2 and run_id = ?3 and completed_at is null",
+    )
+    .bind(now)
+    .bind(operation_id)
+    .bind(run_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if ledger_completion.rows_affected() != deliveries {
       return Err(StateError::ScheduledDeliveryRetentionConflict);
     }
     transaction.commit().await.map_err(scheduler_error)?;

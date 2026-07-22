@@ -22,6 +22,7 @@ use codeoff_state::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use sqlx::SqliteConnection;
 use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -573,6 +574,7 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
+      && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1195,6 +1197,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
           | "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
           | "20260722070000_scheduler_observability.sql"
           | "20260722080000_scheduler_retention.sql"
+          | "20260722090000_scheduler_delivery_retention_completion.sql"
       )
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
@@ -1348,12 +1351,12 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
     .await
     .expect("connect upgraded database");
   let scheduler_migrations: i64 = sqlx::query_scalar(
-    "select count(*) from _sqlx_migrations where version in (20260721020000, 20260721030000, 20260722080000) and success = true",
+    "select count(*) from _sqlx_migrations where version in (20260721020000, 20260721030000, 20260722080000, 20260722090000) and success = true",
   )
   .fetch_one(&pool)
   .await
   .expect("query scheduler migration");
-  assert_eq!(scheduler_migrations, 3);
+  assert_eq!(scheduler_migrations, 4);
   let upgraded: Vec<(String, String, i64)> = sqlx::query_as(
     "select r.run_id, r.state, (select count(*) from scheduled_run_attempts a where a.run_id = r.run_id) from scheduled_runs r where r.run_id like 'upgrade-run-%' order by r.run_id",
   )
@@ -1504,6 +1507,181 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn test_delivery_retention_completion_migration_backfills_one_time_ledger() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize current store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect current database");
+  let (completed_run, completed_deliveries) = prepare_succeeded_retention_candidate(
+    &store,
+    &pool,
+    "retention-backfill-completed",
+    vec![second_target("retention-backfill-completed")],
+  )
+  .await;
+  let (open_run, open_deliveries) = prepare_succeeded_retention_candidate(
+    &store,
+    &pool,
+    "retention-backfill-open",
+    vec![second_target("retention-backfill-open")],
+  )
+  .await;
+  let completed_delivery = completed_deliveries
+    .first()
+    .expect("completed historical delivery");
+  let open_delivery = open_deliveries.first().expect("open historical delivery");
+  drop(store);
+
+  for statement in [
+    "drop trigger trg_scheduled_delivery_retention_audit_acceptance",
+    "drop trigger trg_scheduled_delivery_retention_audit_update",
+    "drop trigger trg_scheduled_delivery_retention_ledger_update",
+    "drop trigger trg_scheduled_delivery_retention_ledger_delete",
+  ] {
+    sqlx::query(statement)
+      .execute(&pool)
+      .await
+      .expect("drop current retention trigger");
+  }
+  sqlx::query("drop table scheduled_delivery_retention_ledger")
+    .execute(&pool)
+    .await
+    .expect("remove current retention ledger fixture");
+  for statement in [
+    "alter table scheduled_delivery_retention_audit drop column expected_deliveries_deleted",
+    "alter table scheduled_delivery_retention_audit drop column expected_delivery_attempts_deleted",
+    "alter table scheduled_delivery_retention_audit drop column expected_run_attempts_deleted",
+    "alter table scheduled_delivery_retention_audit drop column expected_late_evidence_deleted",
+    "alter table scheduled_delivery_retention_audit drop column expected_result_artifacts_deleted",
+    "alter table scheduled_delivery_retention_audit drop column expected_runs_deleted",
+    "alter table scheduled_delivery_retention_audit drop column deliveries_deleted",
+    "alter table scheduled_delivery_retention_audit drop column run_attempts_deleted",
+    "alter table scheduled_delivery_retention_audit drop column late_evidence_deleted",
+    "alter table scheduled_delivery_retention_audit drop column result_artifacts_deleted",
+    "alter table scheduled_delivery_retention_audit drop column runs_deleted",
+  ] {
+    sqlx::query(statement)
+      .execute(&pool)
+      .await
+      .expect("restore pre-completion audit shape");
+  }
+  sqlx::query("delete from _sqlx_migrations where version = 20260722090000")
+    .execute(&pool)
+    .await
+    .expect("restore pre-completion migration history");
+
+  for operation_id in ["a-completed-operation", "z-completed-operation"] {
+    sqlx::query(
+      "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, attempts_deleted, completed_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at) select ?1, delivery.delivery_id, delivery.run_id, delivery.job_id, delivery.state, delivery.payload_digest, 140, 1, 141, run.job_generation, run.schedule_generation, attempt.completed_at, 140, 140 from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id join scheduled_run_attempts attempt on attempt.run_id = run.run_id and attempt.attempt = run.attempt and attempt.fence = run.fence where delivery.delivery_id = ?2",
+    )
+    .bind(operation_id)
+    .bind(completed_delivery)
+    .execute(&pool)
+    .await
+    .expect("insert completed historical audit");
+  }
+  for (operation_id, completed_at) in [
+    ("a-open-operation", Some(141_i64)),
+    ("z-open-operation", None),
+  ] {
+    sqlx::query(
+      "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, attempts_deleted, completed_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at) select ?1, delivery.delivery_id, delivery.run_id, delivery.job_id, delivery.state, delivery.payload_digest, 140, case when ?2 is null then 0 else 1 end, ?2, run.job_generation, run.schedule_generation, attempt.completed_at, 140, 140 from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id join scheduled_run_attempts attempt on attempt.run_id = run.run_id and attempt.attempt = run.attempt and attempt.fence = run.fence where delivery.delivery_id = ?3",
+    )
+    .bind(operation_id)
+    .bind(completed_at)
+    .bind(open_delivery)
+    .execute(&pool)
+    .await
+    .expect("insert open historical audit set");
+  }
+  sqlx::query(
+    "create trigger trg_scheduled_delivery_retention_audit_acceptance before insert on scheduled_delivery_retention_audit when 0 begin select 1; end",
+  )
+  .execute(&pool)
+  .await
+  .expect("restore historical acceptance trigger name");
+  sqlx::query(
+    "create trigger trg_scheduled_delivery_retention_audit_update before update on scheduled_delivery_retention_audit when 0 begin select 1; end",
+  )
+  .execute(&pool)
+  .await
+  .expect("restore historical update trigger name");
+  pool.close().await;
+
+  let upgraded = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("apply delivery retention completion migration");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect upgraded database");
+  let audits: i64 = sqlx::query_scalar(
+    "select count(*) from scheduled_delivery_retention_audit where delivery_id in (?1, ?2)",
+  )
+  .bind(completed_delivery)
+  .bind(open_delivery)
+  .fetch_one(&pool)
+  .await
+  .expect("count preserved historical audits");
+  assert_eq!(audits, 4);
+  let ledgers: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+    "select delivery_id, operation_id, completed_at from scheduled_delivery_retention_ledger where delivery_id in (?1, ?2) order by delivery_id",
+  )
+  .bind(completed_delivery)
+  .bind(open_delivery)
+  .fetch_all(&pool)
+  .await
+  .expect("read backfilled retention ledger");
+  assert_eq!(ledgers.len(), 2);
+  let completed_ledger = ledgers
+    .iter()
+    .find(|(delivery_id, _, _)| delivery_id == completed_delivery)
+    .expect("completed backfilled ledger");
+  assert_eq!(completed_ledger.1, "a-completed-operation");
+  assert_eq!(completed_ledger.2, Some(141));
+  let open_ledger = ledgers
+    .iter()
+    .find(|(delivery_id, _, _)| delivery_id == open_delivery)
+    .expect("open backfilled ledger");
+  assert_eq!(open_ledger.1, "a-open-operation");
+  assert_eq!(open_ledger.2, None);
+  assert!(
+    sqlx::query(
+      "update scheduled_delivery_retention_ledger set completed_at = 150 where delivery_id = ?1",
+    )
+    .bind(open_delivery)
+    .execute(&pool)
+    .await
+    .is_err(),
+    "one open historical audit must keep the delivery ledger open"
+  );
+  for (operation_id, run_id) in [
+    ("post-upgrade-completed-replay", &completed_run),
+    ("post-upgrade-open-replay", &open_run),
+  ] {
+    assert!(matches!(
+      upgraded
+        .prune_scheduled_delivery_history(operation_id, run_id, 150)
+        .await,
+      Err(StateError::ScheduledDeliveryRetentionConflict)
+    ));
+  }
+  let graphs: (i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduled_runs where run_id = ?1), (select count(*) from scheduled_runs where run_id = ?2)",
+  )
+  .bind(&completed_run)
+  .bind(&open_run)
+  .fetch_one(&pool)
+  .await
+  .expect("read replay-protected upgraded graphs");
+  assert_eq!(graphs, (1, 1));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_execution_hardening_migration_rejects_mismatched_current_attempt() {
   let temp = tempdir().expect("create tempdir");
   let old_migrations = temp.path().join("old-migrations");
@@ -1522,6 +1700,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
+      && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1608,6 +1787,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
+      && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1692,6 +1872,7 @@ async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_pay
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
+      && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy issue-06 migration");
@@ -1873,6 +2054,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
+      && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2122,6 +2304,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
+      && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2198,6 +2381,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
+      && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2287,6 +2471,7 @@ async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_ident
       && entry.file_name() != "20260722060000_scheduler_operator_delivery_resolution_authority.sql"
       && entry.file_name() != "20260722070000_scheduler_observability.sql"
       && entry.file_name() != "20260722080000_scheduler_retention.sql"
+      && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -4069,6 +4254,98 @@ async fn complete_due_run(
     .await
     .expect("complete occurrence");
   claim
+}
+
+async fn prepare_succeeded_retention_candidate(
+  store: &StateStore,
+  pool: &SqlitePool,
+  job_id: &str,
+  targets: Vec<DeliveryTargetSnapshot>,
+) -> (String, Vec<String>) {
+  let mut request = create_request(
+    job_id,
+    ScheduleSpec::fixed_interval(110, 10).expect("interval"),
+    100,
+  );
+  request.targets = targets;
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create retention candidate job");
+  let first = complete_due_run(store, job_id, 110, 120).await;
+  let deliveries: Vec<(String, String)> = sqlx::query_as(
+    "select delivery_id, json_extract(target_json, '$.kind') from scheduled_run_deliveries where run_id = ?1 order by delivery_id",
+  )
+  .bind(first.binding.run_id())
+  .fetch_all(pool)
+  .await
+  .expect("read retention candidate deliveries");
+  for (delivery_id, kind) in &deliveries {
+    let prepared = store
+      .prepare_scheduled_delivery(
+        delivery_id,
+        "text/plain; charset=utf-8",
+        &format!("retention payload for {kind}"),
+        1,
+        121,
+        SkippedNoneBaselinePolicy::Accept,
+      )
+      .await
+      .expect("prepare retention candidate delivery");
+    if kind == "none" {
+      assert!(matches!(
+        prepared,
+        PreparedScheduledDelivery::SkippedNone(_)
+      ));
+    } else {
+      assert!(matches!(prepared, PreparedScheduledDelivery::Pending(_)));
+    }
+  }
+  if deliveries.iter().any(|(_, kind)| kind != "none") {
+    let claim = store
+      .claim_next_scheduled_delivery("retention-authority-worker", 122, 200)
+      .await
+      .expect("claim retention candidate delivery")
+      .expect("retention candidate delivery claim");
+    store
+      .complete_scheduled_delivery_delivered(&claim.binding, "retention-receipt", 123)
+      .await
+      .expect("complete retention candidate delivery");
+  }
+  complete_due_run(store, job_id, 120, 130).await;
+  (
+    first.binding.run_id().to_owned(),
+    deliveries
+      .into_iter()
+      .map(|(delivery_id, _)| delivery_id)
+      .collect(),
+  )
+}
+
+async fn insert_open_delivery_retention_authority(
+  connection: &mut SqliteConnection,
+  operation_id: &str,
+  delivery_id: &str,
+  authorized_at: i64,
+) {
+  sqlx::query(
+    "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) select delivery_id, ?1, run_id, job_id, ?2 from scheduled_run_deliveries where delivery_id = ?3",
+  )
+  .bind(operation_id)
+  .bind(authorized_at)
+  .bind(delivery_id)
+  .execute(&mut *connection)
+  .await
+  .expect("claim test retention ledger");
+  sqlx::query(
+    "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at, expected_deliveries_deleted, expected_delivery_attempts_deleted, expected_run_attempts_deleted, expected_late_evidence_deleted, expected_result_artifacts_deleted, expected_runs_deleted) select ?1, delivery.delivery_id, delivery.run_id, delivery.job_id, delivery.state, delivery.payload_digest, ?2, run.job_generation, run.schedule_generation, attempt.completed_at, ?2, ?2, (select count(*) from scheduled_run_deliveries item where item.run_id = run.run_id), (select count(*) from scheduled_delivery_attempts item where item.delivery_id in (select target.delivery_id from scheduled_run_deliveries target where target.run_id = run.run_id)), (select count(*) from scheduled_run_attempts item where item.run_id = run.run_id), (select count(*) from scheduled_run_late_evidence item where item.run_id = run.run_id), (select count(*) from scheduled_run_result_artifacts item where item.run_id = run.run_id), 1 from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id join scheduled_run_attempts attempt on attempt.run_id = run.run_id and attempt.job_id = run.job_id and attempt.attempt = run.attempt and attempt.fence = run.fence where delivery.delivery_id = ?3",
+  )
+  .bind(operation_id)
+  .bind(authorized_at)
+  .bind(delivery_id)
+  .execute(&mut *connection)
+  .await
+  .expect("insert test retention audit");
 }
 
 async fn fail_due_run(store: &StateStore, job_id: &str, due_at: i64, completed_at: i64) -> String {
@@ -7272,6 +7549,7 @@ async fn test_scheduler_retention_cleans_every_conclusive_run_terminal() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_succeeded_automatic_retention_preserves_delivery_baseline_and_audit() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -7287,21 +7565,45 @@ async fn test_succeeded_automatic_retention_preserves_delivery_baseline_and_audi
     ScheduleSpec::fixed_interval(110, 10).expect("interval"),
     100,
   );
-  request.targets = vec![second_target(job_id)];
+  request.targets = vec![target(job_id), second_target(job_id)];
   store
     .create_scheduled_job(&request)
     .await
     .expect("create succeeded retention job");
   let first = complete_due_run(&store, job_id, 110, 120).await;
-  let delivery_id: String =
-    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
-      .bind(first.binding.run_id())
-      .fetch_one(&pool)
+  let deliveries: Vec<(String, String)> = sqlx::query_as(
+    "select delivery_id, json_extract(target_json, '$.kind') from scheduled_run_deliveries where run_id = ?1 order by delivery_id",
+  )
+  .bind(first.binding.run_id())
+  .fetch_all(&pool)
+  .await
+  .expect("first deliveries");
+  assert_eq!(deliveries.len(), 2);
+  let none_delivery = deliveries
+    .iter()
+    .find(|(_, kind)| kind == "none")
+    .expect("none delivery");
+  let slack_delivery = deliveries
+    .iter()
+    .find(|(_, kind)| kind == "channel")
+    .expect("Slack delivery");
+  assert!(matches!(
+    store
+      .prepare_scheduled_delivery(
+        &none_delivery.0,
+        "text/plain; charset=utf-8",
+        "accepted none payload",
+        1,
+        121,
+        SkippedNoneBaselinePolicy::Accept,
+      )
       .await
-      .expect("first delivery");
+      .expect("prepare none delivery"),
+    PreparedScheduledDelivery::SkippedNone(_)
+  ));
   store
     .prepare_scheduled_delivery(
-      &delivery_id,
+      &slack_delivery.0,
       "text/plain; charset=utf-8",
       "accepted payload",
       1,
@@ -7334,16 +7636,16 @@ async fn test_succeeded_automatic_retention_preserves_delivery_baseline_and_audi
     .await
     .expect("clean succeeded history");
   assert_eq!(report.scheduled_runs_deleted, 1);
-  assert_eq!(report.scheduled_rows_deleted, 5);
-  let persisted: (i64, i64, i64, i64) = sqlx::query_as(
-    "select (select count(*) from scheduled_runs where run_id = ?1), (select count(*) from scheduled_delivery_baselines where job_id = ?2), (select count(*) from scheduled_delivery_retention_audit where run_id = ?1 and completed_at is not null), (select count(*) from scheduled_execution_baselines where job_id = ?2 and source_run_id != ?1)",
+  assert_eq!(report.scheduled_rows_deleted, 6);
+  let persisted: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduled_runs where run_id = ?1), (select count(*) from scheduled_delivery_baselines where job_id = ?2), (select count(*) from scheduled_delivery_retention_audit where run_id = ?1 and completed_at is not null), (select count(*) from scheduled_execution_baselines where job_id = ?2 and source_run_id != ?1), (select count(*) from scheduled_delivery_retention_ledger where run_id = ?1 and completed_at is not null), (select count(*) from scheduled_delivery_retention_audit where run_id = ?1 and expected_deliveries_deleted = 2 and deliveries_deleted = 2 and expected_delivery_attempts_deleted = 1 and attempts_deleted = 1 and expected_run_attempts_deleted = 1 and run_attempts_deleted = 1 and expected_late_evidence_deleted = 0 and late_evidence_deleted = 0 and expected_result_artifacts_deleted = 1 and result_artifacts_deleted = 1 and expected_runs_deleted = 1 and runs_deleted = 1)",
   )
   .bind(first.binding.run_id())
   .bind(job_id)
   .fetch_one(&pool)
   .await
   .expect("read retained baseline authority");
-  assert_eq!(persisted, (0, 1, 1, 1));
+  assert_eq!(persisted, (0, 2, 2, 1, 2, 2));
   StateStore::initialize(&state_dir, None)
     .await
     .expect("restart store");
@@ -7353,7 +7655,155 @@ async fn test_succeeded_automatic_retention_preserves_delivery_baseline_and_audi
       .fetch_one(&pool)
       .await
       .expect("read baseline after restart");
-  assert_eq!(after_restart, 1);
+  assert_eq!(after_restart, 2);
+}
+
+#[tokio::test]
+async fn test_delivery_retention_completion_requires_deleted_graph_and_exact_counts() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let (run_id, deliveries) = prepare_succeeded_retention_candidate(
+    &store,
+    &pool,
+    "retention-completion-guard",
+    vec![second_target("retention-completion-guard")],
+  )
+  .await;
+  let delivery_id = deliveries.first().expect("retention delivery");
+
+  let mut transaction = pool.begin().await.expect("begin premature transaction");
+  insert_open_delivery_retention_authority(
+    &mut transaction,
+    "premature-completion",
+    delivery_id,
+    140,
+  )
+  .await;
+  assert!(
+    sqlx::query(
+      "update scheduled_delivery_retention_audit set attempts_deleted = expected_delivery_attempts_deleted, deliveries_deleted = expected_deliveries_deleted, run_attempts_deleted = expected_run_attempts_deleted, late_evidence_deleted = expected_late_evidence_deleted, result_artifacts_deleted = expected_result_artifacts_deleted, runs_deleted = expected_runs_deleted, completed_at = 141 where operation_id = 'premature-completion' and delivery_id = ?1",
+    )
+    .bind(delivery_id)
+    .execute(&mut *transaction)
+    .await
+    .is_err(),
+    "completion must fail while the retained graph still exists"
+  );
+  transaction
+    .rollback()
+    .await
+    .expect("rollback premature transaction");
+
+  let mut transaction = pool.begin().await.expect("begin forged transaction");
+  insert_open_delivery_retention_authority(&mut transaction, "forged-completion", delivery_id, 140)
+    .await;
+  sqlx::query("delete from scheduled_delivery_attempts where delivery_id = ?1")
+    .bind(delivery_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("delete delivery attempt with authority");
+  sqlx::query("delete from scheduled_run_deliveries where run_id = ?1")
+    .bind(&run_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("delete delivery with authority");
+  sqlx::query("delete from scheduled_run_late_evidence where run_id = ?1")
+    .bind(&run_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("delete late evidence with authority");
+  sqlx::query("delete from scheduled_run_result_artifacts where run_id = ?1")
+    .bind(&run_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("delete result artifact with authority");
+  sqlx::query("delete from scheduled_run_attempts where run_id = ?1")
+    .bind(&run_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("delete run attempt with authority");
+  sqlx::query("delete from scheduled_runs where run_id = ?1")
+    .bind(&run_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("delete run with authority");
+  assert!(
+    sqlx::query(
+      "update scheduled_delivery_retention_audit set attempts_deleted = expected_delivery_attempts_deleted + 1, deliveries_deleted = expected_deliveries_deleted, run_attempts_deleted = expected_run_attempts_deleted, late_evidence_deleted = expected_late_evidence_deleted, result_artifacts_deleted = expected_result_artifacts_deleted, runs_deleted = expected_runs_deleted, completed_at = 141 where operation_id = 'forged-completion' and delivery_id = ?1",
+    )
+    .bind(delivery_id)
+    .execute(&mut *transaction)
+    .await
+    .is_err(),
+    "completion must reject forged deletion counts"
+  );
+  transaction
+    .rollback()
+    .await
+    .expect("rollback forged transaction");
+
+  let persisted: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduled_runs where run_id = ?1), (select count(*) from scheduled_run_deliveries where run_id = ?1), (select count(*) from scheduled_delivery_attempts where delivery_id = ?2), (select count(*) from scheduled_run_attempts where run_id = ?1), (select count(*) from scheduled_run_result_artifacts where run_id = ?1), (select count(*) from scheduled_delivery_retention_audit where run_id = ?1), (select count(*) from scheduled_delivery_retention_ledger where run_id = ?1)",
+  )
+  .bind(&run_id)
+  .bind(delivery_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read rolled-back retention graph");
+  assert_eq!(persisted, (1, 1, 1, 1, 1, 0, 0));
+}
+
+#[tokio::test]
+async fn test_delivery_retention_replay_conflict_rolls_back_prior_target_claims() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let job_id = "retention-replay-rollback";
+  let (run_id, deliveries) = prepare_succeeded_retention_candidate(
+    &store,
+    &pool,
+    job_id,
+    vec![target(job_id), second_target(job_id)],
+  )
+  .await;
+  let blocked_delivery = deliveries.last().expect("second ordered delivery");
+  sqlx::query(
+    "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) values (?1, 'historical-operation', ?2, ?3, 140)",
+  )
+  .bind(blocked_delivery)
+  .bind(&run_id)
+  .bind(job_id)
+  .execute(&pool)
+  .await
+  .expect("insert historical delivery claim");
+
+  for operation_id in ["replay-operation-one", "replay-operation-two"] {
+    assert!(matches!(
+      store
+        .prune_scheduled_delivery_history(operation_id, &run_id, 141)
+        .await,
+      Err(StateError::ScheduledDeliveryRetentionConflict)
+    ));
+  }
+  let persisted: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    "select (select count(*) from scheduled_runs where run_id = ?1), (select count(*) from scheduled_run_deliveries where run_id = ?1), (select count(*) from scheduled_delivery_attempts where delivery_id in (select delivery_id from scheduled_run_deliveries where run_id = ?1)), (select count(*) from scheduled_run_attempts where run_id = ?1), (select count(*) from scheduled_run_result_artifacts where run_id = ?1), (select count(*) from scheduled_delivery_retention_audit where run_id = ?1), (select count(*) from scheduled_delivery_retention_ledger where run_id = ?1)",
+  )
+  .bind(&run_id)
+  .fetch_one(&pool)
+  .await
+  .expect("read replay-protected graph");
+  assert_eq!(persisted, (1, 2, 1, 1, 1, 0, 1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7952,7 +8402,14 @@ async fn test_retention_guards_reject_dynamic_nonterminal_and_latest_source_dele
     .expect("complete first dynamic delivery");
   let _second_dynamic_run = complete_due_run(&store, dynamic_job, 220, 230).await;
   sqlx::query(
-    "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at) select 'dynamic-authority', delivery.delivery_id, delivery.run_id, delivery.job_id, delivery.state, delivery.payload_digest, 231, run.job_generation, run.schedule_generation, attempt.completed_at, 231, 231 from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id join scheduled_run_attempts attempt on attempt.run_id = run.run_id and attempt.attempt = run.attempt and attempt.fence = run.fence where delivery.delivery_id = ?1",
+    "insert into scheduled_delivery_retention_ledger (delivery_id, operation_id, run_id, job_id, claimed_at) select delivery_id, 'dynamic-authority', run_id, job_id, 231 from scheduled_run_deliveries where delivery_id = ?1",
+  )
+  .bind(&first_dynamic_delivery)
+  .execute(&pool)
+  .await
+  .expect("claim dynamic retention ledger");
+  sqlx::query(
+    "insert into scheduled_delivery_retention_audit (operation_id, delivery_id, run_id, job_id, delivery_state, payload_digest, authorized_at, job_generation, schedule_generation, run_terminal_at, run_cutoff_at, delivery_cutoff_at, expected_deliveries_deleted, expected_delivery_attempts_deleted, expected_run_attempts_deleted, expected_late_evidence_deleted, expected_result_artifacts_deleted, expected_runs_deleted) select 'dynamic-authority', delivery.delivery_id, delivery.run_id, delivery.job_id, delivery.state, delivery.payload_digest, 231, run.job_generation, run.schedule_generation, attempt.completed_at, 231, 231, (select count(*) from scheduled_run_deliveries item where item.run_id = run.run_id), (select count(*) from scheduled_delivery_attempts item where item.delivery_id in (select target.delivery_id from scheduled_run_deliveries target where target.run_id = run.run_id)), (select count(*) from scheduled_run_attempts item where item.run_id = run.run_id), (select count(*) from scheduled_run_late_evidence item where item.run_id = run.run_id), (select count(*) from scheduled_run_result_artifacts item where item.run_id = run.run_id), 1 from scheduled_run_deliveries delivery join scheduled_runs run on run.run_id = delivery.run_id and run.job_id = delivery.job_id join scheduled_run_attempts attempt on attempt.run_id = run.run_id and attempt.attempt = run.attempt and attempt.fence = run.fence where delivery.delivery_id = ?1",
   )
   .bind(&first_dynamic_delivery)
   .execute(&pool)

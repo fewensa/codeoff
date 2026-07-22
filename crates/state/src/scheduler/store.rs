@@ -16,17 +16,17 @@ use super::{
   PreparedScheduledDelivery, PrincipalKey, RunLeaseBinding, ScheduleAuditSummary,
   ScheduleMutationAudit, ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryAuthority,
   ScheduledDeliveryBinding, ScheduledDeliveryFailure, ScheduledDeliveryOperatorProjection,
-  ScheduledDeliveryRenderInput, ScheduledDeliveryRetentionReport, ScheduledDeliveryState,
-  ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
-  ScheduledExecutionTerminal, ScheduledJob, ScheduledJobDefinition, ScheduledJobListPage,
-  ScheduledJobMutation, ScheduledJobStatus, ScheduledRunExecutionOutcome,
-  ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection, ScheduledRunResult,
-  ScheduledRunSuccessOutcome, SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome,
-  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome,
-  UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
-  invalid_value, materialized_run, operator_action_request_digest,
-  operator_delivery_evidence_binding, positive_u32, scheduler_error, validate_lowercase_sha256,
-  validate_text,
+  ScheduledDeliveryReconcileOutcome, ScheduledDeliveryRenderInput,
+  ScheduledDeliveryRetentionReport, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
+  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledJob,
+  ScheduledJobDefinition, ScheduledJobListPage, ScheduledJobMutation, ScheduledJobStatus,
+  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection,
+  ScheduledRunResult, ScheduledRunSuccessOutcome, SchedulerOperatorActionSummary,
+  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
+  StateError, TransactionalMutationOutcome, UpdateExecutionBaseline, UpdateScheduledJob, Value,
+  invalid_json, invalid_occurrence, invalid_value, materialized_run,
+  operator_action_request_digest, operator_delivery_evidence_binding, positive_u32,
+  scheduler_error, validate_lowercase_sha256, validate_text,
 };
 use crate::StateStore;
 
@@ -1255,6 +1255,111 @@ impl StateStore {
       return Err(StateError::ScheduledDeliveryLostLease);
     }
     transaction.commit().await.map_err(scheduler_error)
+  }
+
+  /// Reconciles one exact expired delivery lease using caller-observed CAS authority.
+  ///
+  /// An eligible in-flight send converges to `delivery_unknown`; this method never retries the
+  /// payload or advances its accepted baseline.
+  ///
+  /// # Errors
+  /// Returns an error for invalid authority, inconsistent persisted attempt authority, or storage
+  /// failure.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn reconcile_expired_scheduled_delivery(
+    &self,
+    delivery_id: &str,
+    expected_state: ScheduledDeliveryState,
+    expected_attempt: i64,
+    expected_fence: i64,
+    expected_lease_expires_at: i64,
+    now: i64,
+  ) -> Result<ScheduledDeliveryReconcileOutcome, StateError> {
+    validate_text("scheduled delivery reconciliation id", delivery_id).map_err(invalid_value)?;
+    if expected_state != ScheduledDeliveryState::Sending
+      || expected_attempt <= 0
+      || expected_fence <= 0
+      || expected_lease_expires_at < 0
+      || now < 0
+    {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "invalid exact scheduled delivery reconciliation authority".to_owned(),
+      });
+    }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let row = sqlx::query(
+      "select state, attempt, fence, lease_owner, idempotency_key, lease_expires_at, updated_at from scheduled_run_deliveries where delivery_id = ?1 and authority_kind = 'intent_v1' and payload_snapshot is not null",
+    )
+    .bind(delivery_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(row) = row else {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ScheduledDeliveryReconcileOutcome::Stale);
+    };
+    let state: String = row.try_get("state").map_err(scheduler_error)?;
+    let attempt: i64 = row.try_get("attempt").map_err(scheduler_error)?;
+    let fence: i64 = row.try_get("fence").map_err(scheduler_error)?;
+    let lease_expires_at: Option<i64> = row.try_get("lease_expires_at").map_err(scheduler_error)?;
+    if state != "sending" {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ScheduledDeliveryReconcileOutcome::Stale);
+    }
+    if attempt != expected_attempt
+      || fence != expected_fence
+      || lease_expires_at != Some(expected_lease_expires_at)
+    {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ScheduledDeliveryReconcileOutcome::Stale);
+    }
+    if expected_lease_expires_at > now
+      || row
+        .try_get::<i64, _>("updated_at")
+        .map_err(scheduler_error)?
+        > now
+    {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ScheduledDeliveryReconcileOutcome::NotEligible);
+    }
+    let lease_owner: String = row.try_get("lease_owner").map_err(scheduler_error)?;
+    let idempotency_key: String = row.try_get("idempotency_key").map_err(scheduler_error)?;
+    let delivery = sqlx::query(
+      "update scheduled_run_deliveries set state = 'delivery_unknown', lease_owner = null, lease_expires_at = null, provider_outcome = 'ambiguous_post_write', error_kind = 'delivery_lease_expired', error_message = 'provider write outcome is unknown after delivery lease expiry', updated_at = ?1 where delivery_id = ?2 and attempt = ?3 and fence = ?4 and lease_owner = ?5 and idempotency_key = ?6 and lease_expires_at = ?7 and state = 'sending' and authority_kind = 'intent_v1' and payload_snapshot is not null and lease_expires_at <= ?1 and updated_at <= ?1",
+    )
+    .bind(now)
+    .bind(delivery_id)
+    .bind(expected_attempt)
+    .bind(expected_fence)
+    .bind(&lease_owner)
+    .bind(&idempotency_key)
+    .bind(expected_lease_expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    let attempt_updated = sqlx::query(
+      "update scheduled_delivery_attempts set state = 'delivery_unknown', provider_outcome = 'ambiguous_post_write', error_kind = 'delivery_lease_expired', error_message = 'provider write outcome is unknown after delivery lease expiry', completed_at = ?1 where delivery_id = ?2 and attempt = ?3 and fence = ?4 and lease_owner = ?5 and idempotency_key = ?6 and lease_expires_at = ?7 and state = 'sending' and lease_expires_at <= ?1 and started_at <= ?1",
+    )
+    .bind(now)
+    .bind(delivery_id)
+    .bind(expected_attempt)
+    .bind(expected_fence)
+    .bind(&lease_owner)
+    .bind(&idempotency_key)
+    .bind(expected_lease_expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?;
+    if delivery.rows_affected() != 1 || attempt_updated.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      return Ok(ScheduledDeliveryReconcileOutcome::Stale);
+    }
+    transaction.commit().await.map_err(scheduler_error)?;
+    Ok(ScheduledDeliveryReconcileOutcome::Applied {
+      delivery_id: delivery_id.to_owned(),
+      attempt: expected_attempt,
+      fence: expected_fence,
+    })
   }
 
   /// Converts expired in-flight sends to durable unknown outcomes without retrying them.

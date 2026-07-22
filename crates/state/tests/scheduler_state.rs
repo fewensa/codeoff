@@ -9,14 +9,14 @@ use codeoff_state::{
   ClaimedScheduledDelivery, ClaimedScheduledRun, CreateScheduledJob, DeliveryTargetSnapshot,
   ExpiredRunReclaimOutcome, LateEvidenceAppendOutcome, MaterializationOutcome, OccurrenceError,
   PreflightFailureDisposition, PreparedScheduledDelivery, PrincipalKey,
-  ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryFailure, ScheduledDeliveryState,
-  ScheduledDeliveryUnknownAction, ScheduledDeliveryWork, ScheduledExecutionDisposition,
-  ScheduledExecutionTerminal, ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus,
-  ScheduledPrepareAuthority, ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind,
-  ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
-  SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
-  StateError, StateStore, StateValueError, TransactionalMutationOutcome, TransportConvergence,
-  UpdateScheduledJob,
+  ScheduleMutationIdempotency, ScheduleSpec, ScheduledDeliveryFailure,
+  ScheduledDeliveryReconcileOutcome, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
+  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
+  ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
+  ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunResult,
+  ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerOperatorMutationOutcome,
+  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, StateStore, StateValueError,
+  TransactionalMutationOutcome, TransportConvergence, UpdateScheduledJob,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -6609,7 +6609,7 @@ async fn test_ambiguous_post_write_becomes_unknown_without_retry_or_baseline() {
   assert_eq!(claim.payload.digest(), payload.digest());
 }
 
-async fn prepare_operator_unknown_delivery_with_target(
+async fn prepare_operator_sending_delivery_with_target(
   store: &StateStore,
   job_id: &str,
   scheduled_for: i64,
@@ -6670,7 +6670,7 @@ async fn prepare_operator_unknown_delivery_with_target(
   else {
     panic!("Slack delivery must remain pending");
   };
-  let claim = store
+  store
     .claim_next_scheduled_delivery(
       "operator-delivery-worker",
       scheduled_for + 5,
@@ -6678,7 +6678,17 @@ async fn prepare_operator_unknown_delivery_with_target(
     )
     .await
     .expect("claim delivery")
-    .expect("delivery");
+    .expect("delivery")
+}
+
+async fn prepare_operator_unknown_delivery_with_target(
+  store: &StateStore,
+  job_id: &str,
+  scheduled_for: i64,
+  target: DeliveryTargetSnapshot,
+) -> ClaimedScheduledDelivery {
+  let claim =
+    prepare_operator_sending_delivery_with_target(store, job_id, scheduled_for, target).await;
   store
     .complete_scheduled_delivery_failure(
       &claim.binding,
@@ -6693,6 +6703,20 @@ async fn prepare_operator_unknown_delivery_with_target(
   claim
 }
 
+async fn prepare_operator_sending_delivery(
+  store: &StateStore,
+  job_id: &str,
+  scheduled_for: i64,
+) -> ClaimedScheduledDelivery {
+  prepare_operator_sending_delivery_with_target(
+    store,
+    job_id,
+    scheduled_for,
+    resolved_slack_target(job_id, "channel", "C1", None),
+  )
+  .await
+}
+
 async fn prepare_operator_unknown_delivery(
   store: &StateStore,
   job_id: &str,
@@ -6705,6 +6729,195 @@ async fn prepare_operator_unknown_delivery(
     resolved_slack_target(job_id, "channel", "C1", None),
   )
   .await
+}
+
+async fn reconcile_delivery_after_barrier(
+  store: StateStore,
+  barrier: Arc<Barrier>,
+  delivery_id: String,
+  attempt: i64,
+  fence: i64,
+  lease_expires_at: i64,
+  now: i64,
+) -> Result<ScheduledDeliveryReconcileOutcome, StateError> {
+  barrier.wait().await;
+  for _ in 0..20 {
+    match store
+      .reconcile_expired_scheduled_delivery(
+        &delivery_id,
+        ScheduledDeliveryState::Sending,
+        attempt,
+        fence,
+        lease_expires_at,
+        now,
+      )
+      .await
+    {
+      Err(error) if error.is_transient_storage_contention() => {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+      }
+      result => return result,
+    }
+  }
+  store
+    .reconcile_expired_scheduled_delivery(
+      &delivery_id,
+      ScheduledDeliveryState::Sending,
+      attempt,
+      fence,
+      lease_expires_at,
+      now,
+    )
+    .await
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_exact_delivery_reconciliation_is_cas_bound_and_has_one_winner() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let first = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize first store");
+  let second = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize second store");
+  let claim = prepare_operator_sending_delivery(&first, "exact-delivery-reconcile", 110).await;
+  assert_eq!(
+    first
+      .reconcile_expired_scheduled_delivery(
+        claim.binding.delivery_id(),
+        ScheduledDeliveryState::Sending,
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        210,
+        209,
+      )
+      .await
+      .expect("live lease is not eligible"),
+    ScheduledDeliveryReconcileOutcome::NotEligible
+  );
+  assert_eq!(
+    first
+      .reconcile_expired_scheduled_delivery(
+        claim.binding.delivery_id(),
+        ScheduledDeliveryState::Sending,
+        claim.binding.attempt(),
+        claim.binding.fence() + 1,
+        210,
+        210,
+      )
+      .await
+      .expect("stale fence"),
+    ScheduledDeliveryReconcileOutcome::Stale
+  );
+  let barrier = Arc::new(Barrier::new(3));
+  let first_task = tokio::spawn(reconcile_delivery_after_barrier(
+    first,
+    Arc::clone(&barrier),
+    claim.binding.delivery_id().to_owned(),
+    claim.binding.attempt(),
+    claim.binding.fence(),
+    210,
+    210,
+  ));
+  let second_task = tokio::spawn(reconcile_delivery_after_barrier(
+    second,
+    Arc::clone(&barrier),
+    claim.binding.delivery_id().to_owned(),
+    claim.binding.attempt(),
+    claim.binding.fence(),
+    210,
+    210,
+  ));
+  barrier.wait().await;
+  let outcomes = [
+    first_task
+      .await
+      .expect("first task")
+      .expect("first reconcile"),
+    second_task
+      .await
+      .expect("second task")
+      .expect("second reconcile"),
+  ];
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| matches!(outcome, ScheduledDeliveryReconcileOutcome::Applied { .. }))
+      .count(),
+    1
+  );
+  assert_eq!(
+    outcomes
+      .iter()
+      .filter(|outcome| **outcome == ScheduledDeliveryReconcileOutcome::Stale)
+      .count(),
+    1
+  );
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("reopen store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let authority: (String, String, i64) = sqlx::query_as(
+    "select delivery.state, attempt.state, (select count(*) from scheduled_delivery_baselines where job_id = 'exact-delivery-reconcile') from scheduled_run_deliveries delivery join scheduled_delivery_attempts attempt on attempt.delivery_id = delivery.delivery_id and attempt.attempt = delivery.attempt and attempt.fence = delivery.fence where delivery.delivery_id = ?1",
+  )
+  .bind(claim.binding.delivery_id())
+  .fetch_one(&pool)
+  .await
+  .expect("reconciled authority");
+  assert_eq!(
+    authority,
+    (
+      "delivery_unknown".to_owned(),
+      "delivery_unknown".to_owned(),
+      0
+    )
+  );
+  assert!(
+    store
+      .claim_next_scheduled_delivery("must-not-resend", 211, 300)
+      .await
+      .expect("claim scan")
+      .is_none()
+  );
+
+  let heartbeat_claim =
+    prepare_operator_sending_delivery(&store, "exact-delivery-heartbeat", 230).await;
+  store
+    .heartbeat_scheduled_delivery(&heartbeat_claim.binding, 236, 340)
+    .await
+    .expect("extend delivery lease");
+  assert_eq!(
+    store
+      .reconcile_expired_scheduled_delivery(
+        heartbeat_claim.binding.delivery_id(),
+        ScheduledDeliveryState::Sending,
+        heartbeat_claim.binding.attempt(),
+        heartbeat_claim.binding.fence(),
+        330,
+        341,
+      )
+      .await
+      .expect("reject stale lease snapshot"),
+    ScheduledDeliveryReconcileOutcome::Stale
+  );
+  assert!(matches!(
+    store
+      .reconcile_expired_scheduled_delivery(
+        heartbeat_claim.binding.delivery_id(),
+        ScheduledDeliveryState::Sending,
+        heartbeat_claim.binding.attempt(),
+        heartbeat_claim.binding.fence(),
+        340,
+        341,
+      )
+      .await
+      .expect("reconcile extended lease"),
+    ScheduledDeliveryReconcileOutcome::Applied { .. }
+  ));
 }
 
 #[tokio::test]

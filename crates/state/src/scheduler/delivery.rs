@@ -18,6 +18,17 @@ pub enum ScheduledDeliveryState {
   SkippedUnchanged,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduledDeliveryReconcileOutcome {
+  Applied {
+    delivery_id: String,
+    attempt: i64,
+    fence: i64,
+  },
+  Stale,
+  NotEligible,
+}
+
 impl ScheduledDeliveryState {
   #[must_use]
   pub const fn as_str(self) -> &'static str {

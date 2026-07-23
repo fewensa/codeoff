@@ -12,6 +12,13 @@ use sha2::{Digest, Sha256};
 
 use crate::scheduled::RequestedCapabilityProfile;
 
+#[cfg_attr(
+  not(test),
+  allow(
+    dead_code,
+    reason = "used only by the disabled local verifier test seam"
+  )
+)]
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_ATTESTATION_BYTES: u64 = 64 * 1024;
 const MAX_TRUST_BUNDLE_BYTES: u64 = 64 * 1024;
@@ -35,12 +42,26 @@ pub(super) struct VerifiedScheduledArtifacts {
     reason = "retains the verified attestation inode for the executor lifetime"
   )]
   attestation: File,
+  #[cfg_attr(
+    not(test),
+    allow(
+      dead_code,
+      reason = "used only by the disabled local verifier test seam"
+    )
+  )]
   pub attestation_contents: String,
   #[allow(
     dead_code,
     reason = "retains the verified trust bundle inode for the executor lifetime"
   )]
   trust_bundle: File,
+  #[cfg_attr(
+    not(test),
+    allow(
+      dead_code,
+      reason = "used only by the disabled local verifier test seam"
+    )
+  )]
   pub trust_bundle_contents: String,
 }
 
@@ -53,18 +74,17 @@ struct ArtifactTrustPolicy {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(
+  not(test),
+  allow(
+    dead_code,
+    reason = "executable verification is retained only for tests"
+  )
+)]
 enum ArtifactKind {
   Directory { immutable: bool },
   ReadOnlyFile,
   Executable,
-}
-
-pub(super) fn verify_scheduled_artifacts(
-  config: &ScheduledCodexConfig,
-  profile: &RequestedCapabilityProfile,
-) -> Result<VerifiedScheduledArtifacts, String> {
-  let policy = observed_trust_policy(config)?;
-  verify_scheduled_artifacts_with_policy(config, profile, policy)
 }
 
 pub(super) fn read_verified_scheduled_authority_material(
@@ -135,6 +155,13 @@ fn trust_policy_for_identity(
   })
 }
 
+#[cfg_attr(
+  not(test),
+  allow(
+    dead_code,
+    reason = "production remote backend is intentionally not wired"
+  )
+)]
 fn verify_scheduled_artifacts_with_policy(
   config: &ScheduledCodexConfig,
   profile: &RequestedCapabilityProfile,
@@ -373,6 +400,13 @@ fn runtime_has(
   mode & (permission << shift) != 0
 }
 
+#[cfg_attr(
+  not(test),
+  allow(
+    dead_code,
+    reason = "production remote backend is intentionally not wired"
+  )
+)]
 fn verify_digest(file: &File, expected: &str, error: &str) -> Result<(), String> {
   let mut file = file
     .try_clone()
@@ -415,6 +449,13 @@ fn read_utf8(file: &File, limit: u64, label: &str) -> Result<String, String> {
   String::from_utf8(bytes).map_err(|_| format!("{label}_not_utf8"))
 }
 
+#[cfg_attr(
+  not(test),
+  allow(
+    dead_code,
+    reason = "production remote backend is intentionally not wired"
+  )
+)]
 fn sha256_hex(bytes: &[u8]) -> String {
   format!("{:x}", Sha256::digest(bytes))
 }

@@ -3,6 +3,7 @@
 mod config;
 mod error;
 
+pub use codeoff_core::{CredentialRevision, RunnerWorkloadIdentity};
 pub use config::{
   AgentConfig, CodeoffConfig, ConfigLoadOptions, DataRetentionConfig, DatabaseConfig,
   ScheduledCodexConfig, SchedulerRuntimeConfig, ServerConfig, SlackConfig,

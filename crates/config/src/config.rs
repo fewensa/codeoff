@@ -4,7 +4,10 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use codeoff_core::{SCHEDULER_OPERATIONAL_POLICY_VERSION, SchedulerOperationalPolicy};
+use codeoff_core::{
+  CredentialRevision, RunnerWorkloadIdentity, SCHEDULER_OPERATIONAL_POLICY_VERSION,
+  SchedulerOperationalPolicy,
+};
 use serde::Deserialize;
 
 use crate::ConfigError;
@@ -425,19 +428,23 @@ impl ScheduledCodexConfig {
         "scheduled_codex.config_revision",
         self.config_revision.as_str(),
       ),
-      (
-        "scheduled_codex.runner_workload_identity",
-        self.runner_workload_identity.as_str(),
-      ),
-      (
-        "scheduled_codex.credential_revision",
-        self.credential_revision.as_str(),
-      ),
     ] {
       if value.is_empty() || value != value.trim() {
         return Err(invalid(field, "must be non-empty and trimmed"));
       }
     }
+    RunnerWorkloadIdentity::parse(&self.runner_workload_identity).map_err(|_| {
+      invalid(
+        "scheduled_codex.runner_workload_identity",
+        "must be a canonical SPIFFE workload identity",
+      )
+    })?;
+    CredentialRevision::parse(&self.credential_revision).map_err(|_| {
+      invalid(
+        "scheduled_codex.credential_revision",
+        "must be a bounded lowercase credential revision",
+      )
+    })?;
     for (field, value) in [
       (
         "scheduled_codex.codex_program_sha256",

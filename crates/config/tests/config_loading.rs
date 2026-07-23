@@ -455,6 +455,27 @@ fn test_scheduled_codex_rejects_unsafe_paths_digests_keys_and_urls() {
   ));
 
   let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.runner_workload_identity =
+    "spiffe://Codeoff/runner/production".to_owned();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.runner_workload_identity",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.credential_revision = "GitHub-Readonly".to_owned();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.credential_revision",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
   config.agent.scheduled_codex.github_mcp_url = "http://token@127.0.0.1:8090/mcp".to_owned();
   assert!(matches!(
     config.validate(),

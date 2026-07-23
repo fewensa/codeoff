@@ -23,7 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use codeoff_agent_contract::{AgentTask, InvocationSource, SessionMode, ToolPolicy};
-use codeoff_config::ScheduledCodexConfig;
+use codeoff_config::{CredentialRevision, RunnerWorkloadIdentity, ScheduledCodexConfig};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -40,7 +40,6 @@ use nix::unistd::Pid;
 #[cfg(unix)]
 use crate::scheduled_artifacts::{
   VerifiedScheduledArtifacts, read_verified_scheduled_authority_material,
-  verify_scheduled_artifacts,
 };
 #[cfg(all(unix, test))]
 use crate::scheduled_artifacts::{test_artifacts, verify_scheduled_artifacts_for_test};
@@ -181,12 +180,14 @@ impl RequestedCapabilityProfile {
         return Err(preflight("scheduled_deployment_image_digest_invalid"));
       }
     }
-    require_non_empty("runner_workload_identity", &self.runner_workload_identity)?;
+    RunnerWorkloadIdentity::parse(&self.runner_workload_identity)
+      .map_err(|_| preflight("runner_workload_identity_invalid"))?;
     require_sha256(
       "runner_client_cert_public_key_fingerprint",
       &self.runner_client_cert_public_key_fingerprint,
     )?;
-    require_non_empty("credential_revision", &self.credential_revision)?;
+    CredentialRevision::parse(&self.credential_revision)
+      .map_err(|_| preflight("credential_revision_invalid"))?;
     Ok(())
   }
 }
@@ -832,31 +833,7 @@ pub fn build_production_scheduled_codex_executor(
 ) -> Result<BuiltScheduledCodexExecutor, ScheduledFailure> {
   let profile = requested_profile(config);
   profile.validate()?;
-  #[cfg(unix)]
-  let artifacts = Arc::new(
-    verify_scheduled_artifacts(config, &profile)
-      .map_err(|error| preflight(format!("scheduled_artifact_verification_failed:{error}")))?,
-  );
-  #[cfg(unix)]
-  verify_codex_version(&artifacts)?;
-  #[cfg(unix)]
-  let authority = load_signed_isolation_authority_contents(
-    &profile,
-    &artifacts.attestation_contents,
-    &artifacts.trust_bundle_contents,
-  )?;
-  #[cfg(unix)]
-  let executor = ScheduledCodexExecutor::new(move |profile| {
-    spawn_production_transport(profile, Arc::clone(&artifacts))
-  });
-  #[cfg(not(unix))]
-  return Err(preflight("scheduled_executor_requires_unix_process_groups"));
-  #[cfg(unix)]
-  Ok(BuiltScheduledCodexExecutor {
-    profile,
-    authority,
-    executor: Arc::new(executor),
-  })
+  Err(preflight("scheduled_remote_backend_not_wired"))
 }
 
 /// Reloads and verifies the currently deployed signed execution authority from its trusted path.
@@ -896,26 +873,7 @@ fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfil
   }
 }
 
-#[cfg(unix)]
-#[allow(
-  clippy::needless_pass_by_value,
-  reason = "the transport factory trait consumes an owned capability profile"
-)]
-fn spawn_production_transport(
-  profile: RequestedCapabilityProfile,
-  artifacts: Arc<VerifiedScheduledArtifacts>,
-) -> Result<StdioScheduledJsonlTransport, String> {
-  let runtime_evidence = ScheduledRuntimeEvidence {
-    codex_version: CODEX_CLI_VERSION.to_owned(),
-    app_server_schema_sha256: CODEX_APP_SERVER_SCHEMA_SHA256.to_owned(),
-    codex_program_sha256: profile.codex_program_sha256.clone(),
-    config_sha256: profile.config_sha256.clone(),
-    runner_image_digest: profile.runner_image_digest.clone(),
-  };
-  StdioScheduledJsonlTransport::spawn(&profile, runtime_evidence, &artifacts)
-}
-
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn verify_codex_version(
   artifacts: &Arc<VerifiedScheduledArtifacts>,
 ) -> Result<(), ScheduledFailure> {
@@ -2429,6 +2387,36 @@ mod tests {
     profile
   }
 
+  fn remote_config(profile: &RequestedCapabilityProfile) -> ScheduledCodexConfig {
+    ScheduledCodexConfig {
+      codex_program: profile.codex_program.clone(),
+      codex_program_sha256: profile.codex_program_sha256.clone(),
+      codex_home: profile.codex_home.clone(),
+      cwd: profile.cwd.clone(),
+      github_mcp_url: profile.github_mcp_url.clone(),
+      github_mcp_artifact_path: "/opt/codeoff/bin/github-mcp-server".into(),
+      github_mcp_artifact_sha256: profile.github_mcp_artifact_sha256.clone(),
+      github_mcp_endpoint_identity: profile.github_mcp_endpoint_identity.clone(),
+      credential_reference: profile.credential_reference.clone(),
+      permission_policy_revision: profile.permission_policy_revision.clone(),
+      config_revision: profile.config_revision.clone(),
+      config_sha256: profile.config_sha256.clone(),
+      gateway_image_digest: profile.gateway_image_digest.clone(),
+      runner_image_digest: profile.runner_image_digest.clone(),
+      runner_workload_identity: profile.runner_workload_identity.clone(),
+      runner_client_cert_public_key_fingerprint: profile
+        .runner_client_cert_public_key_fingerprint
+        .clone(),
+      credential_revision: profile.credential_revision.clone(),
+      isolation_attestation_path: "/var/run/codeoff/isolation-attestation.json".into(),
+      isolation_trust_bundle_path: "/opt/codeoff/attestation/isolation-trust-bundle.json".into(),
+      trusted_owner_uid: 0,
+      trusted_owner_gid: 0,
+      runtime_uid: 65_534,
+      runtime_gid: 65_534,
+    }
+  }
+
   fn evidence(profile: &RequestedCapabilityProfile) -> ScheduledRuntimeEvidence {
     ScheduledRuntimeEvidence {
       codex_version: CODEX_CLI_VERSION.to_owned(),
@@ -2729,6 +2717,18 @@ mod tests {
         ..
       })
     ));
+  }
+
+  #[test]
+  fn configured_runner_identity_cannot_enable_the_unwired_remote_backend() {
+    let mut profile = profile();
+    profile.runner_workload_identity = "spiffe://codeoff/runner/fake".to_owned();
+    profile.runner_client_cert_public_key_fingerprint = "9".repeat(64);
+    let config = remote_config(&profile);
+    let Err(failure) = build_production_scheduled_codex_executor(&config) else {
+      panic!("configured values are not observed remote attestation");
+    };
+    assert_eq!(failure.message, "scheduled_remote_backend_not_wired");
   }
 
   #[test]

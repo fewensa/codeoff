@@ -319,7 +319,7 @@ pub struct ScheduledRunnerFramed<S> {
 }
 
 impl<S> ScheduledRunnerFramed<S> {
-  fn new(stream: S, read_timeout: Duration, write_timeout: Duration) -> Self {
+  pub(crate) fn new(stream: S, read_timeout: Duration, write_timeout: Duration) -> Self {
     Self {
       stream,
       read_timeout,

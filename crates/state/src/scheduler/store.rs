@@ -52,6 +52,7 @@ pub(crate) struct ScheduledHistoryCleanup {
   pub(crate) protected: u64,
   pub(crate) rows_deleted: u64,
   pub(crate) permit_consumptions_deleted: u64,
+  pub(crate) transition_cursors_deleted: u64,
 }
 const SCHEDULER_OBSERVABILITY_QUERY: &str = r"
 select
@@ -436,6 +437,56 @@ impl StateStore {
       .fetch_one(&self.pool)
       .await
       .map_err(scheduler_error)
+  }
+
+  /// Reads persisted run snapshots for runtime validation tests.
+  ///
+  /// # Errors
+  /// Returns an error when `SQLite` cannot read the run snapshots.
+  #[cfg(any(test, feature = "test-support"))]
+  pub async fn scheduled_run_snapshots_for_tests(
+    &self,
+    job_id: &str,
+  ) -> Result<(String, String, String), StateError> {
+    sqlx::query_as(
+      "select definition_json, targets_json, execution_baseline_json from scheduled_runs where job_id = ?1",
+    )
+    .bind(job_id)
+    .fetch_one(&self.pool)
+    .await
+    .map_err(scheduler_error)
+  }
+
+  /// Replaces one persisted run snapshot for runtime validation tests.
+  ///
+  /// # Errors
+  /// Returns an error when the snapshot name is unsupported or `SQLite` cannot update the run.
+  #[cfg(any(test, feature = "test-support"))]
+  pub async fn replace_scheduled_run_snapshot_for_tests(
+    &self,
+    job_id: &str,
+    snapshot: &str,
+    value: &str,
+  ) -> Result<(), StateError> {
+    let query = match snapshot {
+      "definition_json" => "update scheduled_runs set definition_json = ?1 where job_id = ?2",
+      "targets_json" => "update scheduled_runs set targets_json = ?1 where job_id = ?2",
+      "execution_baseline_json" => {
+        "update scheduled_runs set execution_baseline_json = ?1 where job_id = ?2"
+      }
+      _ => {
+        return Err(StateError::InvalidSchedulerState {
+          reason: "unsupported scheduled run snapshot".to_owned(),
+        });
+      }
+    };
+    sqlx::query(query)
+      .bind(value)
+      .bind(job_id)
+      .execute(&self.pool)
+      .await
+      .map_err(scheduler_error)?;
+    Ok(())
   }
 
   /// Reads the parent run state for a scheduled delivery lifecycle test.
@@ -2739,6 +2790,7 @@ limit ?3
       protected: 0,
       rows_deleted: 0,
       permit_consumptions_deleted: 0,
+      transition_cursors_deleted: 0,
     };
     for candidate in candidates {
       let run_id = candidate
@@ -2814,10 +2866,42 @@ limit ?3
     }
     cleanup.permit_consumptions_deleted =
       self.cleanup_scheduled_execution_permits(now, limit).await?;
+    cleanup.transition_cursors_deleted = self
+      .cleanup_scheduler_transition_cursors(run_cutoff, limit)
+      .await?;
     cleanup.rows_deleted = cleanup
       .rows_deleted
-      .saturating_add(cleanup.permit_consumptions_deleted);
+      .saturating_add(cleanup.permit_consumptions_deleted)
+      .saturating_add(cleanup.transition_cursors_deleted);
     Ok(cleanup)
+  }
+
+  async fn cleanup_scheduler_transition_cursors(
+    &self,
+    cutoff_at: i64,
+    limit: u32,
+  ) -> Result<u64, StateError> {
+    let deleted = sqlx::query(
+      r"
+delete from scheduler_transition_cursors
+where job_id in (
+  select job.job_id
+  from scheduled_jobs job indexed by idx_scheduled_jobs_transition_cursor_retention
+  join scheduler_transition_cursors cursor on cursor.job_id = job.job_id
+  where job.status in ('completed', 'deleted')
+    and coalesce(job.deleted_at, job.updated_at) <= ?1
+  order by coalesce(job.deleted_at, job.updated_at), job.job_id
+  limit ?2
+)
+",
+    )
+    .bind(cutoff_at)
+    .bind(i64::from(limit))
+    .execute(&self.pool)
+    .await
+    .map_err(scheduler_error)?
+    .rows_affected();
+    Ok(deleted)
   }
 
   async fn cleanup_scheduled_execution_permits(
@@ -5104,10 +5188,12 @@ where run.run_id = ?2
     .map_err(scheduler_error)?;
     if blocked != 0 {
       let recorded = sqlx::query(
-        "insert into scheduler_transition_cursors (kind, entity_id, cursor_value) values ('overlap_suppressed', ?1, ?2) on conflict(kind, entity_id) do update set cursor_value = excluded.cursor_value where excluded.cursor_value > scheduler_transition_cursors.cursor_value",
+        "insert into scheduler_transition_cursors (kind, job_id, job_generation, cursor_value, created_at, updated_at) values ('overlap_suppressed', ?1, ?2, ?3, ?4, ?4) on conflict(kind, job_id) do update set job_generation = excluded.job_generation, cursor_value = excluded.cursor_value, created_at = case when excluded.job_generation != scheduler_transition_cursors.job_generation then excluded.created_at else scheduler_transition_cursors.created_at end, updated_at = excluded.updated_at where excluded.job_generation > scheduler_transition_cursors.job_generation or (excluded.job_generation = scheduler_transition_cursors.job_generation and excluded.cursor_value > scheduler_transition_cursors.cursor_value)",
       )
       .bind(job_id)
+      .bind(generation)
       .bind(due)
+      .bind(now)
       .execute(&mut *transaction)
       .await
       .map_err(scheduler_error)?;
@@ -6523,6 +6609,11 @@ async fn apply_update(
     request.now,
   )
   .await?;
+  sqlx::query("delete from scheduler_transition_cursors where job_id = ?1")
+    .bind(&request.job_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(scheduler_error)?;
   let (kind, canonical_spec, timezone, once_at, anchor_at, interval_seconds) =
     request.schedule.storage_parts();
   sqlx::query(

@@ -1047,7 +1047,7 @@ impl ScheduledRunOrchestrator {
         Ok(authority) => authority,
         Err(error) => {
           let outcome = self
-            .record_preflight_failure(&claim, PrepareFailure::fatal(error.to_string()))
+            .record_preflight_failure(&claim, PrepareFailure::artifact(error.to_string()))
             .await;
           stop_heartbeat(&mut heartbeat).await;
           return outcome;
@@ -1606,7 +1606,7 @@ fn task_from_claim(
     tool_policy: ToolPolicy::None,
     feedback_target: None,
   };
-  task.validate().map_err(PrepareFailure::fatal)?;
+  task.validate().map_err(PrepareFailure::artifact)?;
   Ok(task)
 }
 
@@ -3079,6 +3079,96 @@ mod tests {
       ),
     ] {
       assert_eq!(failure.kind, expected);
+    }
+  }
+
+  #[tokio::test]
+  async fn test_malformed_persisted_snapshots_are_artifact_failures_before_agent_start() {
+    for (case, column, snapshot_index) in [
+      ("definition", "definition_json", 0),
+      ("targets", "targets_json", 1),
+      ("baseline", "execution_baseline_json", 2),
+    ] {
+      let (temp, state) = fixture(&[(case, 110)]).await;
+      let snapshots = state
+        .scheduled_run_snapshots_for_tests(case)
+        .await
+        .expect("read persisted snapshots");
+      let canonical = match snapshot_index {
+        0 => snapshots.0,
+        1 => snapshots.1,
+        2 => snapshots.2,
+        _ => unreachable!("fixed snapshot matrix"),
+      };
+      let malformed = serde_json::to_string_pretty(
+        &serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical snapshot JSON"),
+      )
+      .expect("format noncanonical snapshot");
+      assert_ne!(canonical, malformed);
+      state
+        .replace_scheduled_run_snapshot_for_tests(case, column, &malformed)
+        .await
+        .expect("tamper persisted snapshot");
+      let backend = Arc::new(FakeBackend::new(ExecutionResult::Completed {
+        summary: "must not execute".to_owned(),
+      }));
+      let runtime = orchestrator(
+        state.clone(),
+        backend.clone(),
+        Arc::new(TestClock(AtomicI64::new(111), 1)),
+        1,
+      );
+      assert_eq!(
+        runtime.run_once().await.expect("execution tick"),
+        TickOutcome::Failed
+      );
+      assert!(backend.seen.lock().expect("seen tasks").is_empty());
+      let first = state
+        .scheduler_observability_snapshot(112, 100, 1_000)
+        .await
+        .expect("first artifact metric");
+      let second = state
+        .scheduler_observability_snapshot(112, 100, 1_000)
+        .await
+        .expect("second artifact metric");
+      assert_eq!(first.transition_totals, second.transition_totals);
+      assert_eq!(
+        first
+          .transition_totals
+          .iter()
+          .find(
+            |total| total.kind == codeoff_state::SchedulerTransitionKind::ArtifactValidationFailed
+          )
+          .expect("artifact metric")
+          .value,
+        1,
+        "case={case}"
+      );
+      for kind in [
+        codeoff_state::SchedulerTransitionKind::ProfileValidationFailed,
+        codeoff_state::SchedulerTransitionKind::ToolListValidationFailed,
+      ] {
+        assert_eq!(
+          first
+            .transition_totals
+            .iter()
+            .find(|total| total.kind == kind)
+            .expect("validation metric")
+            .value,
+          0,
+          "case={case} kind={kind:?}"
+        );
+      }
+      drop(runtime);
+      drop(state);
+      let restarted = StateStore::initialize(&temp.path().join("state"), None)
+        .await
+        .expect("restart state");
+      let after_restart = restarted
+        .scheduler_observability_snapshot(113, 100, 1_000)
+        .await
+        .expect("restart artifact metric");
+      assert_eq!(first.transition_totals, after_restart.transition_totals);
     }
   }
 

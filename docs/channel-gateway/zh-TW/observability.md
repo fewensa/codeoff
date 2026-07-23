@@ -52,10 +52,13 @@ Counter 只會在 authoritative transaction 接受 outcome 後遞增；rollback 
 不會重複計數。特別是 `delivery_retry` 為 durable 且不依賴 Agent execution，因此可直接驗證
 no-Agent delivery retry invariant。
 
-Decision counter 使用 durable identity，而不是 poll 次數。`overlap_suppressed` 對每個新的
-`(job, scheduled_for)` decision 只遞增一次，restart 後亦同。Counter exhaustion policy limit
-對每個受影響的 run 或 delivery 只遞增一次；request policy limit 對每組 scoped principal、
-operation 與 `request_id` 只遞增一次；terminal deadline/retry limit 則與已接受的 terminal
+Decision counter 使用 durable authority，而不是 poll 次數。`overlap_suppressed` 對每個新的
+`(job generation, scheduled_for)` decision 只遞增一次，restart 後亦同。其 cursor 透過
+cascading foreign key 歸 job 所有，accepted schedule update 會重設 cursor；active 與 paused
+job 的 cursor 會保留，completed 與 deleted job 的 cursor 則由 bounded retention batch 清除。
+Counter exhaustion policy limit 對每個受影響的 run 或 delivery 只遞增一次；request policy
+limit 對每一筆已接受的 typed audit row 遞增一次。真正的 idempotent replay 不會插入新的
+audit row，因此不會遞增 counter；terminal deadline/retry limit 則與已接受的 terminal
 transition 一起遞增一次。
 `stale_fence_rejected` 對每個被拒絕的 authoritative CAS、stale exact reconcile，或只能接受為
 diagnostic evidence 的 late completion/failure 遞增一次。重複送出的 stale attempt 是新的拒絕

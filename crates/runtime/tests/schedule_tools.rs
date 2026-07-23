@@ -560,7 +560,8 @@ async fn test_schedule_tools_deny_untrusted_sources_and_unknown_fields() {
 #[tokio::test]
 async fn test_direct_schedule_service_call_records_exactly_one_attempt_audit() {
   let temp = tempdir().expect("tempdir");
-  let store = StateStore::initialize(&temp.path().join("state"), None)
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
     .await
     .expect("state");
   let audit_store = store.clone();
@@ -571,6 +572,10 @@ async fn test_direct_schedule_service_call_records_exactly_one_attempt_audit() {
     run_id: "run-1".to_owned(),
     scheduled_for: "200".to_owned(),
   };
+  let before = audit_store
+    .scheduler_observability_snapshot(100, 10, 100)
+    .await
+    .expect("unauthorized metric before attempt");
 
   let error = service
     .create(
@@ -595,10 +600,38 @@ async fn test_direct_schedule_service_call_records_exactly_one_attempt_audit() {
   assert_eq!(audit.len(), 1);
   assert_eq!(audit[0].outcome, "denied");
   assert_eq!(audit[0].decision, "deny");
+  let after = audit_store
+    .scheduler_observability_snapshot(100, 10, 100)
+    .await
+    .expect("unauthorized metric after attempt");
+  let total = |snapshot: &codeoff_state::SchedulerObservabilitySnapshot| {
+    snapshot
+      .transition_totals
+      .iter()
+      .find(|total| total.kind == SchedulerTransitionKind::UnauthorizedSchedulerMutation)
+      .expect("unauthorized metric")
+      .value
+  };
+  assert_eq!(total(&after), total(&before) + 1);
+  let repeated_scrape = audit_store
+    .scheduler_observability_snapshot(100, 10, 100)
+    .await
+    .expect("repeat unauthorized metric scrape");
+  assert_eq!(after.transition_totals, repeated_scrape.transition_totals);
+  drop(service);
+  drop(audit_store);
+  let restarted = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("restart state");
+  let after_restart = restarted
+    .scheduler_observability_snapshot(101, 10, 100)
+    .await
+    .expect("unauthorized metric after restart");
+  assert_eq!(after.transition_totals, after_restart.transition_totals);
 }
 
 #[tokio::test]
-async fn test_policy_limit_metric_deduplicates_request_replay_and_survives_restart() {
+async fn test_policy_limit_metric_follows_exact_audit_rows_and_survives_restart() {
   let temp = tempdir().expect("tempdir");
   let state_dir = temp.path().join("state");
   let policy = SchedulerOperationalPolicy {
@@ -661,7 +694,7 @@ async fn test_policy_limit_metric_deduplicates_request_replay_and_survives_resta
       .find(|total| total.kind == SchedulerTransitionKind::PolicyLimitRejected)
       .expect("policy metric kind")
       .value,
-    3
+    4
   );
   drop(service);
   drop(store);
@@ -679,7 +712,7 @@ async fn test_policy_limit_metric_deduplicates_request_replay_and_survives_resta
       .find(|total| total.kind == SchedulerTransitionKind::PolicyLimitRejected)
       .expect("policy metric kind")
       .value,
-    3
+    4
   );
 }
 

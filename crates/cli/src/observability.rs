@@ -791,7 +791,12 @@ mod tests {
   use std::sync::Mutex;
   use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+  use codeoff_runtime::scheduled_delivery::run_scheduled_delivery_preparation_worker;
   use codeoff_runtime::scheduler_observability::SchedulerTelemetryErrorKind;
+  use codeoff_state::{
+    AttestedExecutionProfileSnapshot, CapabilityProfileSnapshot, CreateScheduledJob,
+    DeliveryTargetSnapshot, PrincipalKey, ScheduleSpec, ScheduledJobDefinition, ScheduledRunResult,
+  };
   use http_body_util::BodyExt as _;
   use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -863,6 +868,63 @@ mod tests {
       .await
       .expect("state");
     (temp, state)
+  }
+
+  async fn seed_unprepared_none_delivery(state: &codeoff_state::StateStore) {
+    let principal = PrincipalKey::new("user", "test", "tenant", "owner").expect("principal");
+    state
+      .create_scheduled_job(&CreateScheduledJob {
+        job_id: "preparation-worker-lifecycle".to_owned(),
+        schedule_id: "schedule-preparation-worker-lifecycle".to_owned(),
+        definition: ScheduledJobDefinition::new(1, r#"{"prompt":"check"}"#).expect("definition"),
+        creator: principal.clone(),
+        owner: principal,
+        capability: CapabilityProfileSnapshot::new(1, "profile-v1", r#"{"tools":["github.read"]}"#)
+          .expect("capability"),
+        targets: vec![
+          DeliveryTargetSnapshot::new(
+            "target-preparation-worker-lifecycle",
+            "none",
+            "none",
+            "none",
+            "none",
+            "{}",
+            1,
+            "resolver-v1",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+          )
+          .expect("none target"),
+        ],
+        schedule: ScheduleSpec::once(110),
+        now: 100,
+      })
+      .await
+      .expect("create preparation job");
+    state
+      .materialize_due_schedule("preparation-worker-lifecycle", 0, 110)
+      .await
+      .expect("materialize preparation run");
+    let run = state
+      .claim_next_scheduled_run("preparation-seed", 111, 200)
+      .await
+      .expect("claim preparation run")
+      .expect("preparation run");
+    state
+      .mark_scheduled_run_executing(
+        &run.binding,
+        &AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile"),
+        112,
+      )
+      .await
+      .expect("execute preparation run");
+    state
+      .complete_scheduled_run_success(
+        &run.binding,
+        &ScheduledRunResult::new("payload", "").expect("result"),
+        113,
+      )
+      .await
+      .expect("complete preparation run");
   }
 
   fn scheduler_config(
@@ -1292,6 +1354,69 @@ mod tests {
         )));
       }
     }
+  }
+
+  #[tokio::test]
+  async fn test_real_preparation_worker_cancel_restores_available_capacity() {
+    let (_temp, state) = test_state().await;
+    seed_unprepared_none_delivery(&state).await;
+    let lock = state
+      .acquire_exclusive_storage_lock_for_tests()
+      .await
+      .expect("hold preparation write authority");
+    let telemetry =
+      PrometheusSchedulerTelemetry::new(&scheduler_config(true, true, true), false, true);
+    let initial = telemetry.encode_metrics().expect("initial worker metrics");
+    assert!(
+      initial.contains("codeoff_scheduler_worker_capacity{worker=\"delivery_preparation\"} 1")
+    );
+    assert!(
+      initial
+        .contains("codeoff_scheduler_worker_available_slots{worker=\"delivery_preparation\"} 1")
+    );
+
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let worker_telemetry: Arc<dyn SchedulerTelemetry> = telemetry.clone();
+    let worker = tokio::spawn(run_scheduled_delivery_preparation_worker(
+      state.clone(),
+      shutdown_rx,
+      worker_telemetry,
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+      loop {
+        let metrics = telemetry.encode_metrics().expect("busy worker metrics");
+        if metrics
+          .contains("codeoff_scheduler_worker_available_slots{worker=\"delivery_preparation\"} 0")
+        {
+          break;
+        }
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("preparation worker must become busy");
+
+    shutdown.send(true).expect("cancel preparation worker");
+    tokio::time::timeout(Duration::from_secs(1), worker)
+      .await
+      .expect("preparation worker cancellation deadline")
+      .expect("preparation worker task")
+      .expect("preparation worker shutdown");
+    let available = telemetry.encode_metrics().expect("restored worker metrics");
+    assert!(
+      available
+        .contains("codeoff_scheduler_worker_available_slots{worker=\"delivery_preparation\"} 1")
+    );
+    for status in ["started", "cancelled"] {
+      assert!(available.lines().any(|line| {
+        line.contains("codeoff_scheduler_events_total")
+          && line.contains("worker=\"delivery_preparation\"")
+          && line.contains("operation=\"tick\"")
+          && line.contains(&format!("status=\"{status}\""))
+          && line.ends_with(" 1")
+      }));
+    }
+    drop(lock);
   }
 
   #[tokio::test]

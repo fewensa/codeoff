@@ -52,11 +52,14 @@ advance only after the authoritative transaction accepts the outcome. Rollback a
 scrapes do not increment them. In particular, `delivery_retry` is durable and independent of an
 Agent execution, so the no-Agent delivery retry invariant can be checked directly.
 
-Decision counters use durable identity rather than polling frequency. `overlap_suppressed` advances
-once for each new `(job, scheduled_for)` decision, even across restart. Counter-exhaustion policy
-limits advance once per affected run or delivery; request policy limits advance once per scoped
-principal, operation, and `request_id`; terminal deadline/retry limits advance once with the
-accepted terminal transition.
+Decision counters use durable authority rather than polling frequency. `overlap_suppressed`
+advances once for each new `(job generation, scheduled_for)` decision, even across restart. Its
+cursor is owned by the job through a cascading foreign key, resets on an accepted schedule update,
+and retains active and paused jobs. Cursors for completed and deleted jobs are removed by bounded
+retention batches. Counter-exhaustion policy limits advance once per affected run or delivery;
+request policy limits advance once for each accepted typed audit row. A true idempotent replay does
+not insert another audit row and therefore does not advance the counter. Terminal deadline/retry
+limits advance once with the accepted terminal transition.
 `stale_fence_rejected` advances once for each rejected authoritative CAS, stale exact reconcile, or
 late completion/failure that is accepted only as diagnostic evidence. A repeated stale attempt is a
 new rejected attempt and therefore advances again.

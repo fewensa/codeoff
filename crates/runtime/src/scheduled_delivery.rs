@@ -636,6 +636,15 @@ async fn dispatch_claimed_delivery(
 ) -> Result<ScheduledDeliveryTickOutcome, StateError> {
   let started_at = Instant::now();
   let attempt = u32::try_from(claim.binding.attempt()).unwrap_or(u32::MAX);
+  record_delivery_event(
+    telemetry,
+    SchedulerWorker::Delivery,
+    SchedulerOperation::Attempt,
+    SchedulerOperationStatus::Started,
+    None,
+    Duration::ZERO,
+    Some(attempt),
+  );
   let result = dispatch_claimed_delivery_inner(state, provider, claim, timeline, shutdown).await;
   record_delivery_event(
     telemetry,

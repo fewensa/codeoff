@@ -758,11 +758,26 @@ pub struct PrepareFailure {
 impl PrepareFailure {
   #[must_use]
   pub fn fatal(message: impl Into<String>) -> Self {
+    let message = message.into();
     Self {
       retryable: false,
-      kind: "preflight_rejected".to_owned(),
-      message: message.into(),
+      kind: prepare_failure_kind(&message).to_owned(),
+      message,
     }
+  }
+}
+
+fn prepare_failure_kind(message: &str) -> &'static str {
+  if message.contains("profile") {
+    "profile_validation_failed"
+  } else if message.contains("artifact") || message.contains("prepared_authority") {
+    "artifact_validation_failed"
+  } else if message.contains("capability_tool_list")
+    || message == "scheduled_capability_exposes_dynamic_tools"
+  {
+    "tool_list_validation_failed"
+  } else {
+    "preflight_rejected"
   }
 }
 
@@ -854,25 +869,31 @@ impl ScheduledRunOrchestrator {
     let telemetry = self.telemetry.clone();
     let attempt = AtomicU64::new(0);
     let started_at = Instant::now();
+    record_execution_event(
+      telemetry.as_ref(),
+      SchedulerOperation::Attempt,
+      SchedulerOperationStatus::Started,
+      None,
+      Duration::ZERO,
+      None,
+    );
     let result = self.run_supervised_inner(shutdown, &attempt).await;
     let attempt = attempt.load(Ordering::Acquire);
-    if attempt > 0 {
-      let attempt = u32::try_from(attempt).unwrap_or(u32::MAX);
-      record_execution_event(
-        telemetry.as_ref(),
-        SchedulerOperation::Attempt,
-        match &result {
-          Ok(outcome) => execution_tick_status(*outcome),
-          Err(_) => SchedulerOperationStatus::Failed,
-        },
-        result
-          .as_ref()
-          .err()
-          .map(|_| SchedulerTelemetryErrorKind::State),
-        started_at.elapsed(),
-        Some(attempt),
-      );
-    }
+    let attempt = (attempt > 0).then(|| u32::try_from(attempt).unwrap_or(u32::MAX));
+    record_execution_event(
+      telemetry.as_ref(),
+      SchedulerOperation::Attempt,
+      match &result {
+        Ok(outcome) => execution_tick_status(*outcome),
+        Err(_) => SchedulerOperationStatus::Failed,
+      },
+      result
+        .as_ref()
+        .err()
+        .map(|_| SchedulerTelemetryErrorKind::State),
+      started_at.elapsed(),
+      attempt,
+    );
     result
   }
 
@@ -1579,7 +1600,7 @@ fn task_from_claim(
 
 fn reject_dynamic_tool_exposure(capability_json: &str) -> Result<(), PrepareFailure> {
   let capability: Value = serde_json::from_str(capability_json)
-    .map_err(|error| PrepareFailure::fatal(error.to_string()))?;
+    .map_err(|_| PrepareFailure::fatal("scheduled_capability_tool_list_invalid"))?;
   let prohibited = CHANNEL_DYNAMIC_TOOL_NAMES
     .iter()
     .chain(SCHEDULE_DYNAMIC_TOOL_NAMES)
@@ -2116,12 +2137,14 @@ mod tests {
       TickOutcome::Completed
     );
     let events = telemetry.events.lock().expect("telemetry events");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].worker, SchedulerWorker::Execution);
-    assert_eq!(events[0].operation, SchedulerOperation::Attempt);
-    assert_eq!(events[0].status, SchedulerOperationStatus::Completed);
-    assert_eq!(events[0].attempt, Some(1));
-    assert_eq!(events[0].error_kind, None);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].status, SchedulerOperationStatus::Started);
+    assert_eq!(events[0].attempt, None);
+    assert_eq!(events[1].worker, SchedulerWorker::Execution);
+    assert_eq!(events[1].operation, SchedulerOperation::Attempt);
+    assert_eq!(events[1].status, SchedulerOperationStatus::Completed);
+    assert_eq!(events[1].attempt, Some(1));
+    assert_eq!(events[1].error_kind, None);
   }
 
   #[tokio::test]
@@ -3021,6 +3044,24 @@ mod tests {
       reject_dynamic_tool_exposure(r#"{"nested":{"tool":"channel_reply_to_event"}}"#).is_err()
     );
     assert!(reject_dynamic_tool_exposure(r#"{"tools":["github.get_issue"]}"#).is_ok());
+  }
+
+  #[test]
+  fn test_prepare_validation_failure_kinds_are_fixed_and_sanitized() {
+    for (message, expected) in [
+      (
+        "scheduled_attested_profile_schema_missing",
+        "profile_validation_failed",
+      ),
+      ("prepared_authority_mismatch", "artifact_validation_failed"),
+      (
+        "scheduled_capability_exposes_dynamic_tools",
+        "tool_list_validation_failed",
+      ),
+      ("provider-specific text", "preflight_rejected"),
+    ] {
+      assert_eq!(PrepareFailure::fatal(message).kind, expected);
+    }
   }
 
   #[tokio::test]

@@ -38,12 +38,25 @@ Metrics endpoint 提供 low-cardinality scheduler telemetry，包括：
 - `codeoff_scheduler_events_total`，使用固定 worker、operation、status 與 stable error kind labels；
 - `codeoff_scheduler_operation_duration_seconds`；
 - `codeoff_scheduler_last_attempt`；
+- `codeoff_scheduler_transitions_total`，使用固定 `kind` vocabulary。這些 totals 會與已接受的
+  state/audit transition 在同一個 SQLite transaction 內遞增，daemon restart 後仍會保留；
+- `codeoff_scheduler_worker_capacity` 與 `codeoff_scheduler_worker_available_slots`，使用固定 worker；
 - due jobs、pending/leased/executing/unknown runs、unprepared/pending/sending/retryable/unknown deliveries 與 oldest work ages 的 bounded gauges；
 - snapshot success、age 與 saturation gauges。
 
+Durable transition kinds 涵蓋 materialization/coalescing/overlap 決策；run claim、terminal、
+recovery、stale-fence 與 policy-limit outcomes；delivery claim、success、retry、failure、unknown、
+skip 與 forced-unknown resend outcomes；彼此獨立的 execution baseline 與 accepted-delivery
+baseline advances；executor validation categories；以及 unauthorized scheduler mutations。
+Counter 只會在 authoritative transaction 接受 outcome 後遞增；rollback 與重複 metrics scrape
+不會重複計數。特別是 `delivery_retry` 為 durable 且不依賴 Agent execution，因此可直接驗證
+no-Agent delivery retry invariant。
+
 SQLite snapshot 每 5 秒 refresh，count 上限為 100,000、age 上限為 30 天，timeout 為 500 ms。Refresh 失敗時會保留上一份 bounded gauge values，但 readiness 會將 snapshot 視為 unavailable。
 
-Labels 不包含 job id、run id、delivery id、Slack id、instruction、payload、receipt 或 raw error string。
+Labels 不包含 job、run、delivery、owner、channel、user、thread、Slack 或 Codex id；instruction、
+prompt、result、payload、token、secret、receipt 與 raw error string 也全部排除。Metric labels
+只會從固定 enum 中選取。
 
 ## Structured Scheduler Tracing
 

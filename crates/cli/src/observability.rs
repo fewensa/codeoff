@@ -54,6 +54,11 @@ struct WorkerLabels {
   worker: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct TransitionLabels {
+  kind: &'static str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoopHealth {
   Disabled,
@@ -106,6 +111,9 @@ struct StateMetrics {
   saturated_fields: Gauge,
   snapshot_refresh_success: Gauge,
   snapshot_age_seconds: Gauge,
+  transitions: Family<TransitionLabels, Counter>,
+  worker_capacity: Family<WorkerLabels, Gauge>,
+  worker_available_slots: Family<WorkerLabels, Gauge>,
 }
 
 pub(crate) struct PrometheusSchedulerTelemetry {
@@ -161,6 +169,29 @@ impl PrometheusSchedulerTelemetry {
       last_attempt.clone(),
     );
     state_metrics.register(&mut registry);
+    for worker in [
+      SchedulerWorker::Execution,
+      SchedulerWorker::DeliveryPreparation,
+      SchedulerWorker::Delivery,
+    ] {
+      let labels = WorkerLabels {
+        worker: worker_name(worker),
+      };
+      let capacity = i64::from(match worker {
+        SchedulerWorker::Execution => scheduler.enabled && scheduler.run_claims_enabled,
+        SchedulerWorker::DeliveryPreparation | SchedulerWorker::Delivery => {
+          scheduler.enabled && scheduler.delivery_claims_enabled
+        }
+      });
+      state_metrics
+        .worker_capacity
+        .get_or_create(&labels)
+        .set(capacity);
+      state_metrics
+        .worker_available_slots
+        .get_or_create(&labels)
+        .set(capacity);
+    }
     Arc::new(Self {
       registry,
       events,
@@ -244,6 +275,15 @@ impl PrometheusSchedulerTelemetry {
       snapshot.oldest_pending_delivery_age.as_ref(),
     );
     metrics.saturated_fields.set(saturated);
+    for total in &snapshot.transition_totals {
+      let counter = metrics.transitions.get_or_create(&TransitionLabels {
+        kind: total.kind.as_str(),
+      });
+      let current = counter.get();
+      if total.value > current {
+        counter.inc_by(total.value - current);
+      }
+    }
     metrics.snapshot_refresh_success.set(1);
     let mut readiness = self.readiness.write().expect("scheduler readiness");
     readiness.snapshot_last_success = Some(Instant::now());
@@ -357,12 +397,37 @@ impl SchedulerTelemetry for PrometheusSchedulerTelemetry {
         }
       }
     }
+    if event.operation == SchedulerOperation::Attempt {
+      let available = i64::from(event.status != SchedulerOperationStatus::Started);
+      self
+        .state_metrics
+        .worker_available_slots
+        .get_or_create(&WorkerLabels {
+          worker: worker_name(event.worker),
+        })
+        .set(available);
+    }
     self.tracing.record(event);
   }
 }
 
 impl StateMetrics {
   fn register(&self, registry: &mut Registry) {
+    registry.register(
+      "codeoff_scheduler_transitions",
+      "Restart-safe accepted scheduler transitions by fixed kind.",
+      self.transitions.clone(),
+    );
+    registry.register(
+      "codeoff_scheduler_worker_capacity",
+      "Configured scheduler worker capacity by fixed worker kind.",
+      self.worker_capacity.clone(),
+    );
+    registry.register(
+      "codeoff_scheduler_worker_available_slots",
+      "Currently available scheduler worker slots by fixed worker kind.",
+      self.worker_available_slots.clone(),
+    );
     for (name, help, gauge) in [
       (
         "codeoff_scheduler_due_jobs",
@@ -854,6 +919,7 @@ mod tests {
       oldest_pending_run_age: None,
       oldest_unprepared_delivery_intent_age: None,
       oldest_pending_delivery_age: None,
+      transition_totals: Vec::new(),
     }
   }
 
@@ -1096,6 +1162,53 @@ mod tests {
     assert!(metrics.contains("error_kind=\"state\""));
     assert!(metrics.contains("codeoff_scheduler_last_attempt{worker=\"delivery\"} 42"));
     assert!(!metrics.contains("attempt=\"42\""));
+  }
+
+  #[test]
+  fn test_durable_transition_metrics_are_absolute_fixed_and_restart_seeded() {
+    let telemetry =
+      PrometheusSchedulerTelemetry::new(&scheduler_config(true, true, true), true, true);
+    let mut snapshot = empty_snapshot(0);
+    snapshot.transition_totals = codeoff_state::SchedulerTransitionKind::ALL
+      .into_iter()
+      .map(|kind| codeoff_state::SchedulerTransitionTotal { kind, value: 0 })
+      .collect();
+    snapshot.transition_totals[0].value = 7;
+    telemetry.apply_snapshot(&snapshot);
+    telemetry.apply_snapshot(&snapshot);
+
+    let metrics = telemetry.encode_metrics().expect("metrics");
+    assert!(
+      metrics.contains("codeoff_scheduler_transitions_total{kind=\"occurrences_materialized\"} 7")
+    );
+    assert!(metrics.contains("codeoff_scheduler_worker_capacity{worker=\"execution\"} 1"));
+    assert!(metrics.contains("codeoff_scheduler_worker_available_slots{worker=\"execution\"} 1"));
+    for forbidden in [
+      "job_id",
+      "run_id",
+      "delivery_id",
+      "owner",
+      "channel",
+      "user",
+      "thread",
+      "prompt",
+      "result",
+      "token",
+      "secret",
+    ] {
+      assert!(!metrics.contains(forbidden), "forbidden label: {forbidden}");
+    }
+
+    telemetry.record(SchedulerTelemetryEvent {
+      worker: SchedulerWorker::Execution,
+      operation: SchedulerOperation::Attempt,
+      status: SchedulerOperationStatus::Started,
+      error_kind: None,
+      duration: Duration::ZERO,
+      attempt: None,
+    });
+    let busy = telemetry.encode_metrics().expect("busy metrics");
+    assert!(busy.contains("codeoff_scheduler_worker_available_slots{worker=\"execution\"} 0"));
   }
 
   #[tokio::test]

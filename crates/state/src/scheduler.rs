@@ -1065,6 +1065,105 @@ pub struct BoundedSchedulerAge {
   pub saturated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerTransitionKind {
+  OccurrencesMaterialized,
+  MisfireCoalescedSkipped,
+  OverlapSuppressed,
+  RunClaimed,
+  RunCompleted,
+  RunFailed,
+  RunTimedOut,
+  RunCancelled,
+  RunOutcomeUnknown,
+  RunObserveOnlyReexecution,
+  RunLeaseReclaimed,
+  StaleFenceRejected,
+  PolicyLimitRejected,
+  DeliveryClaimed,
+  DeliveryDelivered,
+  DeliveryRetry,
+  DeliveryFailure,
+  DeliveryUnknown,
+  DeliverySkipped,
+  DeliveryForcedUnknownResend,
+  ExecutionBaselineAdvanced,
+  AcceptedDeliveryBaselineAdvanced,
+  ProfileValidationFailed,
+  ArtifactValidationFailed,
+  ToolListValidationFailed,
+  UnauthorizedSchedulerMutation,
+}
+
+impl SchedulerTransitionKind {
+  pub const ALL: [Self; 26] = [
+    Self::OccurrencesMaterialized,
+    Self::MisfireCoalescedSkipped,
+    Self::OverlapSuppressed,
+    Self::RunClaimed,
+    Self::RunCompleted,
+    Self::RunFailed,
+    Self::RunTimedOut,
+    Self::RunCancelled,
+    Self::RunOutcomeUnknown,
+    Self::RunObserveOnlyReexecution,
+    Self::RunLeaseReclaimed,
+    Self::StaleFenceRejected,
+    Self::PolicyLimitRejected,
+    Self::DeliveryClaimed,
+    Self::DeliveryDelivered,
+    Self::DeliveryRetry,
+    Self::DeliveryFailure,
+    Self::DeliveryUnknown,
+    Self::DeliverySkipped,
+    Self::DeliveryForcedUnknownResend,
+    Self::ExecutionBaselineAdvanced,
+    Self::AcceptedDeliveryBaselineAdvanced,
+    Self::ProfileValidationFailed,
+    Self::ArtifactValidationFailed,
+    Self::ToolListValidationFailed,
+    Self::UnauthorizedSchedulerMutation,
+  ];
+
+  #[must_use]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::OccurrencesMaterialized => "occurrences_materialized",
+      Self::MisfireCoalescedSkipped => "misfire_coalesced_skipped",
+      Self::OverlapSuppressed => "overlap_suppressed",
+      Self::RunClaimed => "run_claimed",
+      Self::RunCompleted => "run_completed",
+      Self::RunFailed => "run_failed",
+      Self::RunTimedOut => "run_timed_out",
+      Self::RunCancelled => "run_cancelled",
+      Self::RunOutcomeUnknown => "run_outcome_unknown",
+      Self::RunObserveOnlyReexecution => "run_observe_only_reexecution",
+      Self::RunLeaseReclaimed => "run_lease_reclaimed",
+      Self::StaleFenceRejected => "stale_fence_rejected",
+      Self::PolicyLimitRejected => "policy_limit_rejected",
+      Self::DeliveryClaimed => "delivery_claimed",
+      Self::DeliveryDelivered => "delivery_delivered",
+      Self::DeliveryRetry => "delivery_retry",
+      Self::DeliveryFailure => "delivery_failure",
+      Self::DeliveryUnknown => "delivery_unknown",
+      Self::DeliverySkipped => "delivery_skipped",
+      Self::DeliveryForcedUnknownResend => "delivery_forced_unknown_resend",
+      Self::ExecutionBaselineAdvanced => "execution_baseline_advanced",
+      Self::AcceptedDeliveryBaselineAdvanced => "accepted_delivery_baseline_advanced",
+      Self::ProfileValidationFailed => "profile_validation_failed",
+      Self::ArtifactValidationFailed => "artifact_validation_failed",
+      Self::ToolListValidationFailed => "tool_list_validation_failed",
+      Self::UnauthorizedSchedulerMutation => "unauthorized_scheduler_mutation",
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerTransitionTotal {
+  pub kind: SchedulerTransitionKind,
+  pub value: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerObservabilitySnapshot {
   pub due_jobs: BoundedSchedulerGauge,
@@ -1080,6 +1179,7 @@ pub struct SchedulerObservabilitySnapshot {
   pub oldest_pending_run_age: Option<BoundedSchedulerAge>,
   pub oldest_unprepared_delivery_intent_age: Option<BoundedSchedulerAge>,
   pub oldest_pending_delivery_age: Option<BoundedSchedulerAge>,
+  pub transition_totals: Vec<SchedulerTransitionTotal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

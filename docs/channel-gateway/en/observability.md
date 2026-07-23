@@ -38,12 +38,25 @@ The metrics endpoint exposes low-cardinality scheduler telemetry, including:
 - `codeoff_scheduler_events_total` by fixed worker, operation, status, and stable error kind;
 - `codeoff_scheduler_operation_duration_seconds`;
 - `codeoff_scheduler_last_attempt`;
+- `codeoff_scheduler_transitions_total` by a fixed `kind` vocabulary. These totals are advanced in
+  the same SQLite transaction as the accepted state/audit transition and survive daemon restarts;
+- `codeoff_scheduler_worker_capacity` and `codeoff_scheduler_worker_available_slots` by fixed worker;
 - bounded gauges for due jobs, pending/leased/executing/unknown runs, unprepared/pending/sending/retryable/unknown deliveries, and oldest work ages;
 - snapshot success, age, and saturation gauges.
 
+The durable transition kinds cover materialization/coalescing/overlap decisions; run claim,
+terminal, recovery, stale-fence, and policy-limit outcomes; delivery claim, success, retry, failure,
+unknown, skip, and forced-unknown resend outcomes; independent execution and accepted-delivery
+baseline advances; executor validation categories; and unauthorized scheduler mutations. Counters
+advance only after the authoritative transaction accepts the outcome. Rollback and repeated metric
+scrapes do not increment them. In particular, `delivery_retry` is durable and independent of an
+Agent execution, so the no-Agent delivery retry invariant can be checked directly.
+
 The SQLite snapshot refreshes every 5 seconds, is capped at 100,000 rows/counts and 30 days of age, and has a 500 ms timeout. A failed refresh preserves the last bounded gauge values but marks the snapshot unavailable for readiness.
 
-Labels never contain job ids, run ids, delivery ids, Slack ids, instructions, payloads, receipts, or raw error strings.
+Labels never contain job, run, delivery, owner, channel, user, thread, Slack, or Codex ids;
+instructions, prompts, results, payloads, tokens, secrets, receipts, and raw error strings are also
+excluded. Metric labels are selected only from fixed enums.
 
 ## Structured Scheduler Tracing
 

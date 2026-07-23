@@ -25,8 +25,9 @@ pub use scheduler::{
   ScheduledRunReconcileCandidate, ScheduledRunReconcileOutcome, ScheduledRunResult,
   ScheduledRunState, ScheduledRunSuccessOutcome, SchedulerObservabilitySnapshot,
   SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome, SchedulerOperatorReplayTiming,
-  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateValueError,
-  TransactionalMutationOutcome, TransportConvergence, UpdateExecutionBaseline, UpdateScheduledJob,
+  SchedulerOperatorRequest, SchedulerTransitionKind, SchedulerTransitionTotal,
+  SkippedNoneBaselinePolicy, StateValueError, TransactionalMutationOutcome, TransportConvergence,
+  UpdateExecutionBaseline, UpdateScheduledJob,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::StateStoreTestLock;

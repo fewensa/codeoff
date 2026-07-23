@@ -27,9 +27,10 @@ use super::{
   ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection, ScheduledRunReconcileCandidate,
   ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
   SchedulerObservabilitySnapshot, SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome,
-  SchedulerOperatorReplayTiming, SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError,
-  TransactionalMutationOutcome, UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json,
-  invalid_occurrence, invalid_value, materialized_run, operator_action_request_digest,
+  SchedulerOperatorReplayTiming, SchedulerOperatorRequest, SchedulerTransitionKind,
+  SchedulerTransitionTotal, SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome,
+  UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
+  invalid_value, materialized_run, operator_action_request_digest,
   operator_delivery_evidence_binding, positive_u32, scheduler_error, validate_lowercase_sha256,
   validate_text,
 };
@@ -135,8 +136,31 @@ const fn bounded_gauge(value: u64, cap: u64) -> BoundedSchedulerGauge {
   }
 }
 
+async fn increment_scheduler_transition_total(
+  transaction: &mut Transaction<'_, Sqlite>,
+  kind: SchedulerTransitionKind,
+  amount: u64,
+) -> Result<(), StateError> {
+  let amount = i64::try_from(amount).unwrap_or(i64::MAX);
+  let updated = sqlx::query(
+    "update scheduler_transition_totals set value = value + min(?1, 9223372036854775807 - value) where kind = ?2",
+  )
+  .bind(amount)
+  .bind(kind.as_str())
+  .execute(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  if updated.rows_affected() != 1 {
+    return Err(StateError::InvalidSchedulerState {
+      reason: "scheduler transition metric vocabulary is incomplete".to_owned(),
+    });
+  }
+  Ok(())
+}
+
 fn observability_snapshot_from_row(
   row: &SqliteRow,
+  transition_totals: Vec<SchedulerTransitionTotal>,
   now: i64,
   count_cap: u64,
   age_cap_seconds: u64,
@@ -184,7 +208,17 @@ fn observability_snapshot_from_row(
       .map(|created_at| bounded_age(now, created_at, age_cap_seconds)),
     oldest_pending_delivery_age: oldest_delivery
       .map(|created_at| bounded_age(now, created_at, age_cap_seconds)),
+    transition_totals,
   })
+}
+
+fn scheduler_transition_kind(value: &str) -> Result<SchedulerTransitionKind, StateError> {
+  SchedulerTransitionKind::ALL
+    .into_iter()
+    .find(|kind| kind.as_str() == value)
+    .ok_or_else(|| StateError::InvalidSchedulerState {
+      reason: "unknown scheduler transition metric kind".to_owned(),
+    })
 }
 
 impl StateStore {
@@ -322,13 +356,40 @@ impl StateStore {
     }
     let count_cap = count_cap.clamp(1, MAX_OBSERVABILITY_COUNT_CAP);
     let age_cap_seconds = age_cap_seconds.clamp(1, MAX_OBSERVABILITY_AGE_CAP_SECONDS);
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let row = sqlx::query(SCHEDULER_OBSERVABILITY_QUERY)
       .bind(now)
       .bind(i64::try_from(count_cap.saturating_add(1)).unwrap_or(i64::MAX))
-      .fetch_one(&self.pool)
+      .fetch_one(&mut *transaction)
       .await
       .map_err(scheduler_error)?;
-    observability_snapshot_from_row(&row, now, count_cap, age_cap_seconds)
+    let total_rows =
+      sqlx::query("select kind, value from scheduler_transition_totals order by kind")
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(scheduler_error)?;
+    let mut transition_totals = Vec::with_capacity(SchedulerTransitionKind::ALL.len());
+    for total in total_rows {
+      let kind = scheduler_transition_kind(
+        &total
+          .try_get::<String, _>("kind")
+          .map_err(scheduler_error)?,
+      )?;
+      let value = total.try_get::<i64, _>("value").map_err(scheduler_error)?;
+      transition_totals.push(SchedulerTransitionTotal {
+        kind,
+        value: u64::try_from(value).map_err(|_| StateError::InvalidSchedulerState {
+          reason: "invalid scheduler transition metric value".to_owned(),
+        })?,
+      });
+    }
+    if transition_totals.len() != SchedulerTransitionKind::ALL.len() {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduler transition metric vocabulary is incomplete".to_owned(),
+      });
+    }
+    transaction.commit().await.map_err(scheduler_error)?;
+    observability_snapshot_from_row(&row, transition_totals, now, count_cap, age_cap_seconds)
   }
 
   /// Reads delivery authority for runtime lifecycle tests.
@@ -980,6 +1041,15 @@ impl StateStore {
       .await
       .map_err(scheduler_error)?;
       if exhausted != 0 {
+        increment_scheduler_transition_total(
+          &mut transaction,
+          SchedulerTransitionKind::PolicyLimitRejected,
+          1,
+        )
+        .await?;
+        ensure_executor_admission_not_cancelled(admission, cancellation)?;
+        revalidate_executor_admission(&mut transaction, admission, clock).await?;
+        transaction.commit().await.map_err(scheduler_error)?;
         return Err(StateError::ScheduledRunCounterExhausted);
       }
       #[cfg(feature = "test-support")]
@@ -1484,6 +1554,10 @@ impl StateStore {
   ///
   /// # Errors
   /// Returns an error for an invalid lease, exhausted counters, or storage failure.
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps delivery claim and its durable rejection metric in one transaction"
+  )]
   pub async fn claim_next_scheduled_delivery(
     &self,
     lease_owner: &str,
@@ -1524,6 +1598,14 @@ impl StateStore {
       .fetch_one(&mut *transaction)
       .await
       .map_err(scheduler_error)?;
+      if exhausted != 0 {
+        increment_scheduler_transition_total(
+          &mut transaction,
+          SchedulerTransitionKind::PolicyLimitRejected,
+          1,
+        )
+        .await?;
+      }
       transaction.commit().await.map_err(scheduler_error)?;
       if exhausted != 0 {
         return Err(StateError::ScheduledDeliveryCounterExhausted);
@@ -1666,6 +1748,14 @@ impl StateStore {
       .fetch_one(&mut *transaction)
       .await
       .map_err(scheduler_error)?;
+      if exhausted != 0 {
+        increment_scheduler_transition_total(
+          &mut transaction,
+          SchedulerTransitionKind::PolicyLimitRejected,
+          1,
+        )
+        .await?;
+      }
       transaction.commit().await.map_err(scheduler_error)?;
       if exhausted != 0 {
         return Err(StateError::ScheduledDeliveryCounterExhausted);
@@ -1829,7 +1919,11 @@ impl StateStore {
   /// # Errors
   /// Returns an error for invalid authority, inconsistent persisted attempt authority, or storage
   /// failure.
-  #[allow(clippy::too_many_arguments)]
+  #[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "keeps exact reconciliation and its durable decision metric in one transaction"
+  )]
   pub async fn reconcile_expired_scheduled_delivery(
     &self,
     delivery_id: &str,
@@ -1859,6 +1953,12 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     let Some(row) = row else {
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::StaleFenceRejected,
+        1,
+      )
+      .await?;
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledDeliveryReconcileOutcome::Stale);
     };
@@ -1867,6 +1967,12 @@ impl StateStore {
     let fence: i64 = row.try_get("fence").map_err(scheduler_error)?;
     let lease_expires_at: Option<i64> = row.try_get("lease_expires_at").map_err(scheduler_error)?;
     if state != "sending" {
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::StaleFenceRejected,
+        1,
+      )
+      .await?;
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledDeliveryReconcileOutcome::Stale);
     }
@@ -1874,6 +1980,12 @@ impl StateStore {
       || fence != expected_fence
       || lease_expires_at != Some(expected_lease_expires_at)
     {
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::StaleFenceRejected,
+        1,
+      )
+      .await?;
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledDeliveryReconcileOutcome::Stale);
     }
@@ -1902,7 +2014,13 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     if delivery.rows_affected() != 1 {
-      transaction.rollback().await.map_err(scheduler_error)?;
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::StaleFenceRejected,
+        1,
+      )
+      .await?;
+      transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledDeliveryReconcileOutcome::Stale);
     }
     let attempt_updated = sqlx::query(
@@ -3529,6 +3647,20 @@ where run.run_id = ?2
     if attempt_updated.rows_affected() != 1 {
       return Err(StateError::ScheduledRunLostLease);
     }
+    increment_scheduler_transition_total(
+      &mut transaction,
+      SchedulerTransitionKind::RunLeaseReclaimed,
+      1,
+    )
+    .await?;
+    if state == "executing" && safe_execution_retry {
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::RunObserveOnlyReexecution,
+        1,
+      )
+      .await?;
+    }
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(transition.outcome)
   }
@@ -3578,6 +3710,12 @@ where run.run_id = ?2
     .await
     .map_err(scheduler_error)?;
     let Some(row) = row else {
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::StaleFenceRejected,
+        1,
+      )
+      .await?;
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledRunReconcileOutcome::Stale);
     };
@@ -3592,6 +3730,12 @@ where run.run_id = ?2
       || lease_owner.as_deref() != Some(expected_lease_owner)
       || lease_expires_at != Some(expected_lease_expires_at)
     {
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::StaleFenceRejected,
+        1,
+      )
+      .await?;
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledRunReconcileOutcome::Stale);
     }
@@ -3629,6 +3773,12 @@ where run.run_id = ?2
       now,
     );
     if next_attempt_at != expected_next_attempt_at {
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::StaleFenceRejected,
+        1,
+      )
+      .await?;
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledRunReconcileOutcome::Stale);
     }
@@ -3663,7 +3813,13 @@ where run.run_id = ?2
     .await
     .map_err(scheduler_error)?;
     if run.rows_affected() != 1 {
-      transaction.rollback().await.map_err(scheduler_error)?;
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::StaleFenceRejected,
+        1,
+      )
+      .await?;
+      transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledRunReconcileOutcome::Stale);
     }
     let attempt_updated = sqlx::query(
@@ -3687,6 +3843,20 @@ where run.run_id = ?2
       return Err(StateError::InvalidSchedulerState {
         reason: "exact run reconciliation found inconsistent attempt authority".to_owned(),
       });
+    }
+    increment_scheduler_transition_total(
+      &mut transaction,
+      SchedulerTransitionKind::RunLeaseReclaimed,
+      1,
+    )
+    .await?;
+    if state == "executing" && safe_execution_retry {
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::RunObserveOnlyReexecution,
+        1,
+      )
+      .await?;
     }
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(ScheduledRunReconcileOutcome::Applied(transition.outcome))
@@ -4816,6 +4986,13 @@ where run.run_id = ?2
     .await
     .map_err(scheduler_error)?;
     if blocked != 0 {
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::OverlapSuppressed,
+        1,
+      )
+      .await?;
+      transaction.commit().await.map_err(scheduler_error)?;
       return Ok(MaterializationOutcome::Blocked);
     }
     let due = required_due(next_run_at)?;

@@ -40,6 +40,7 @@ use nix::unistd::Pid;
 #[cfg(unix)]
 use crate::scheduled_artifacts::{
   VerifiedScheduledArtifacts, read_verified_scheduled_authority_material,
+  verify_scheduled_artifacts,
 };
 #[cfg(all(unix, test))]
 use crate::scheduled_artifacts::{test_artifacts, verify_scheduled_artifacts_for_test};
@@ -993,7 +994,45 @@ pub fn build_production_scheduled_codex_executor(
 ) -> Result<BuiltScheduledCodexExecutor, ScheduledFailure> {
   let profile = requested_profile(config);
   profile.validate()?;
-  Err(preflight("scheduled_remote_backend_not_wired"))
+  #[cfg(unix)]
+  {
+    let artifacts = Arc::new(
+      verify_scheduled_artifacts(config, &profile)
+        .map_err(|error| preflight(format!("scheduled_artifact_verification_failed:{error}")))?,
+    );
+    verify_codex_version(&artifacts)?;
+    let authority = load_signed_isolation_authority_contents(
+      &profile,
+      &artifacts.attestation_contents,
+      &artifacts.trust_bundle_contents,
+    )?;
+    let runtime_evidence = ScheduledRuntimeEvidence {
+      codex_version: CODEX_CLI_VERSION.to_owned(),
+      app_server_schema_sha256: CODEX_APP_SERVER_SCHEMA_SHA256.to_owned(),
+      codex_program_sha256: profile.codex_program_sha256.clone(),
+      config_sha256: profile.config_sha256.clone(),
+      runner_image_digest: profile.runner_image_digest.clone(),
+    };
+    let executor_artifacts = Arc::clone(&artifacts);
+    let executor_evidence = runtime_evidence.clone();
+    let executor = ScheduledCodexExecutor::new(move |requested: RequestedCapabilityProfile| {
+      StdioScheduledJsonlTransport::spawn(
+        &requested,
+        executor_evidence.clone(),
+        &executor_artifacts,
+      )
+    });
+    Ok(BuiltScheduledCodexExecutor {
+      profile,
+      authority,
+      executor: Arc::new(executor),
+    })
+  }
+  #[cfg(not(unix))]
+  {
+    let _ = config;
+    Err(preflight("scheduled_executor_requires_unix"))
+  }
 }
 
 /// Reloads and verifies the currently deployed signed execution authority from its trusted path.
@@ -1033,7 +1072,7 @@ fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfil
   }
 }
 
-#[cfg(all(unix, test))]
+#[cfg(unix)]
 fn verify_codex_version(
   artifacts: &Arc<VerifiedScheduledArtifacts>,
 ) -> Result<(), ScheduledFailure> {
@@ -2882,15 +2921,18 @@ mod tests {
   }
 
   #[test]
-  fn configured_runner_identity_cannot_enable_the_unwired_remote_backend() {
+  fn production_executor_requires_the_observed_unprivileged_runtime_identity() {
     let mut profile = profile();
     profile.runner_workload_identity = "spiffe://codeoff/runner/fake".to_owned();
     profile.runner_client_cert_public_key_fingerprint = "9".repeat(64);
     let config = remote_config(&profile);
     let Err(failure) = build_production_scheduled_codex_executor(&config) else {
-      panic!("configured values are not observed remote attestation");
+      panic!("configured values cannot replace the observed process identity");
     };
-    assert_eq!(failure.message, "scheduled_remote_backend_not_wired");
+    assert_eq!(
+      failure.message,
+      "scheduled_artifact_verification_failed:scheduled_runtime_identity_mismatch"
+    );
   }
 
   #[test]

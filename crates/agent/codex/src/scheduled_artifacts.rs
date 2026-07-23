@@ -155,13 +155,6 @@ fn trust_policy_for_identity(
   })
 }
 
-#[cfg_attr(
-  not(test),
-  allow(
-    dead_code,
-    reason = "production remote backend is intentionally not wired"
-  )
-)]
 fn verify_scheduled_artifacts_with_policy(
   config: &ScheduledCodexConfig,
   profile: &RequestedCapabilityProfile,
@@ -235,6 +228,13 @@ fn verify_scheduled_artifacts_with_policy(
     trust_bundle,
     trust_bundle_contents,
   })
+}
+
+pub(super) fn verify_scheduled_artifacts(
+  config: &ScheduledCodexConfig,
+  profile: &RequestedCapabilityProfile,
+) -> Result<VerifiedScheduledArtifacts, String> {
+  verify_scheduled_artifacts_with_policy(config, profile, observed_trust_policy(config)?)
 }
 
 #[cfg(test)]

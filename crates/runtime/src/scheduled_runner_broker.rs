@@ -1311,10 +1311,22 @@ mod tests {
       github_mcp_version: "test-mcp".to_owned(),
       github_mcp_artifact_sha256: "3".repeat(64),
       github_mcp_endpoint_identity: "test-endpoint".to_owned(),
-      github_tools: ["issue_read", "list_issues", "search_issues", "search_orgs"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
+      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
+      github_mcp_health_checked_at_unix_seconds: 1,
+      github_mcp_health_credential_revision: config.credential_revision.clone(),
+      github_mcp_health_result_sha256: "8".repeat(64),
+      github_mcp_health_tool: "get_me".to_owned(),
+      github_tools: [
+        "get_me",
+        "issue_read",
+        "list_issues",
+        "search_issues",
+        "search_orgs",
+      ]
+      .into_iter()
+      .map(str::to_owned)
+      .collect(),
       credential_reference: "test-credential".to_owned(),
       permission_policy_revision: "test-policy".to_owned(),
       config_revision: "test-config".to_owned(),

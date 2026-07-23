@@ -61,6 +61,9 @@ pub const GITHUB_MCP_ARTIFACT_SHA256_ARM64: &str =
 
 const GITHUB_MCP_NAME: &str = "github";
 const GITHUB_MCP_SERVER_INFO_NAME: &str = "github-mcp-server";
+const GITHUB_MCP_HEALTH_TOOL: &str = "get_me";
+pub const GITHUB_MCP_ACCESS_TOKEN_ENV: &str = "CODEOFF_SCHEDULED_GITHUB_MCP_BEARER_TOKEN";
+const GITHUB_MCP_ACCESS_AUTH_MODE: &str = "bearer-token-env-v1";
 const OUTPUT_SCHEMA_REVISION: &str = "scheduled-result-v1";
 const OUTPUT_SCHEMA_VERSION: u64 = 1;
 const CREDENTIAL_DENY_POLICY_REVISION: &str = "scheduled-credential-isolation-v1";
@@ -69,6 +72,10 @@ const MAX_FAILURE_BYTES: usize = 2 * 1024;
 const MAX_FINAL_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_FINAL_SUMMARY_BYTES: usize = 32 * 1024;
 const MAX_FINAL_ITEM_COUNT: usize = 16;
+const MAX_MCP_HEALTH_RESULT_BYTES: usize = 64 * 1024;
+const MAX_MCP_HEALTH_RESULT_DEPTH: usize = 16;
+const MIN_MCP_ACCESS_TOKEN_BYTES: usize = 32;
+const MAX_MCP_ACCESS_TOKEN_BYTES: usize = 4 * 1024;
 const MAX_ITEM_ID_BYTES: usize = 256;
 const MAX_INSTRUCTION_BYTES: usize = 64 * 1024;
 #[cfg_attr(
@@ -100,8 +107,13 @@ const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
   allow(dead_code, reason = "reserved for the issue 09 deployment verifier")
 )]
 const CHILD_LOCALE: &str = "C.UTF-8";
-const EXPECTED_GITHUB_TOOLS: [&str; 4] =
-  ["issue_read", "list_issues", "search_issues", "search_orgs"];
+const EXPECTED_GITHUB_TOOLS: [&str; 5] = [
+  "get_me",
+  "issue_read",
+  "list_issues",
+  "search_issues",
+  "search_orgs",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestedCapabilityProfile {
@@ -112,6 +124,8 @@ pub struct RequestedCapabilityProfile {
   pub github_mcp_url: String,
   pub github_mcp_artifact_sha256: String,
   pub github_mcp_endpoint_identity: String,
+  pub github_mcp_access_auth_mode: String,
+  pub github_mcp_access_token_revision: String,
   pub credential_reference: String,
   pub permission_policy_revision: String,
   pub config_revision: String,
@@ -137,8 +151,9 @@ impl RequestedCapabilityProfile {
       .collect::<Vec<_>>()
       .join(", ");
     format!(
-      "web_search = \"disabled\"\n\n[mcp_servers.{GITHUB_MCP_NAME}]\nurl = {url:?}\nenabled = true\nrequired = true\nenabled_tools = [{tools}]\n",
+      "web_search = \"disabled\"\n\n[mcp_servers.{GITHUB_MCP_NAME}]\nurl = {url:?}\nenabled = true\nrequired = true\nbearer_token_env_var = {token_env:?}\nenabled_tools = [{tools}]\n",
       url = self.github_mcp_url,
+      token_env = GITHUB_MCP_ACCESS_TOKEN_ENV,
     )
   }
 
@@ -163,6 +178,11 @@ impl RequestedCapabilityProfile {
       "github_mcp_endpoint_identity",
       &self.github_mcp_endpoint_identity,
     )?;
+    if self.github_mcp_access_auth_mode != GITHUB_MCP_ACCESS_AUTH_MODE {
+      return Err(preflight("github_mcp_access_auth_mode_invalid"));
+    }
+    CredentialRevision::parse(&self.github_mcp_access_token_revision)
+      .map_err(|_| preflight("github_mcp_access_token_revision_invalid"))?;
     require_non_empty("credential_reference", &self.credential_reference)?;
     require_non_empty(
       "permission_policy_revision",
@@ -616,6 +636,7 @@ impl StdioScheduledJsonlTransport {
     runtime_evidence: ScheduledRuntimeEvidence,
     artifacts: &Arc<VerifiedScheduledArtifacts>,
     child_identity: Option<(u32, u32)>,
+    github_mcp_access_token: &str,
   ) -> Result<Self, String> {
     profile.validate().map_err(|failure| failure.message)?;
     if profile.codex_program_sha256 != runtime_evidence.codex_program_sha256 {
@@ -632,6 +653,7 @@ impl StdioScheduledJsonlTransport {
     )?;
     verified
       .command
+      .env(GITHUB_MCP_ACCESS_TOKEN_ENV, github_mcp_access_token)
       .stdin(Stdio::piped())
       .stdout(Stdio::piped())
       .stderr(Stdio::null())
@@ -1091,12 +1113,14 @@ fn build_production_scheduled_codex_executor_with_identity(
     };
     let executor_artifacts = Arc::clone(&artifacts);
     let executor_evidence = runtime_evidence.clone();
+    let github_mcp_access_token = load_github_mcp_access_token()?;
     let executor = ScheduledCodexExecutor::new(move |requested: RequestedCapabilityProfile| {
       StdioScheduledJsonlTransport::spawn(
         &requested,
         executor_evidence.clone(),
         &executor_artifacts,
         child_identity,
+        &github_mcp_access_token,
       )
     });
     Ok(BuiltScheduledCodexExecutor {
@@ -1110,6 +1134,22 @@ fn build_production_scheduled_codex_executor_with_identity(
     let _ = config;
     Err(preflight("scheduled_executor_requires_unix"))
   }
+}
+
+fn load_github_mcp_access_token() -> Result<String, ScheduledFailure> {
+  let token = std::env::var(GITHUB_MCP_ACCESS_TOKEN_ENV)
+    .map_err(|_| preflight("github_mcp_access_token_missing"))?;
+  validate_github_mcp_access_token(&token)?;
+  Ok(token)
+}
+
+fn validate_github_mcp_access_token(token: &str) -> Result<(), ScheduledFailure> {
+  if !(MIN_MCP_ACCESS_TOKEN_BYTES..=MAX_MCP_ACCESS_TOKEN_BYTES).contains(&token.len())
+    || !token.bytes().all(|byte| byte.is_ascii_graphic())
+  {
+    return Err(preflight("github_mcp_access_token_invalid"));
+  }
+  Ok(())
 }
 
 /// Reloads and verifies the currently deployed signed execution authority from its trusted path.
@@ -1151,6 +1191,8 @@ fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfil
     github_mcp_url: config.github_mcp_url.clone(),
     github_mcp_artifact_sha256: config.github_mcp_artifact_sha256.clone(),
     github_mcp_endpoint_identity: config.github_mcp_endpoint_identity.clone(),
+    github_mcp_access_auth_mode: config.github_mcp_access_auth_mode.clone(),
+    github_mcp_access_token_revision: config.github_mcp_access_token_revision.clone(),
     credential_reference: config.credential_reference.clone(),
     permission_policy_revision: config.permission_policy_revision.clone(),
     config_revision: config.config_revision.clone(),
@@ -1379,6 +1421,12 @@ fn attest_runtime(
     github_mcp_version: GITHUB_MCP_SERVER_VERSION.to_owned(),
     github_mcp_artifact_sha256: requested.github_mcp_artifact_sha256.clone(),
     github_mcp_endpoint_identity: requested.github_mcp_endpoint_identity.clone(),
+    github_mcp_access_auth_mode: requested.github_mcp_access_auth_mode.clone(),
+    github_mcp_access_token_revision: requested.github_mcp_access_token_revision.clone(),
+    github_mcp_health_checked_at_unix_seconds: 0,
+    github_mcp_health_credential_revision: String::new(),
+    github_mcp_health_result_sha256: String::new(),
+    github_mcp_health_tool: GITHUB_MCP_HEALTH_TOOL.to_owned(),
     github_tools: RequestedCapabilityProfile::github_tool_inventory(),
     credential_reference: requested.credential_reference.clone(),
     permission_policy_revision: requested.permission_policy_revision.clone(),
@@ -1478,6 +1526,7 @@ fn prepare_protocol<T: ScheduledJsonlTransport + Send + 'static>(
           "url": request.profile.github_mcp_url,
           "enabled": true,
           "required": true,
+          "bearer_token_env_var": GITHUB_MCP_ACCESS_TOKEN_ENV,
           "enabled_tools": EXPECTED_GITHUB_TOOLS,
         }
       }
@@ -1519,6 +1568,17 @@ fn prepare_protocol<T: ScheduledJsonlTransport + Send + 'static>(
       ScheduledExecutionResult::PreflightRejected(failure),
     );
   }
+  let (health_digest, checked_at) =
+    match attest_github_mcp_health(&mut transport, &request, &thread_id, deadline) {
+      Ok(attestation) => attestation,
+      Err(failure) => return reject_preparation(transport, &request, *failure),
+    };
+  attested_profile.github_mcp_health_checked_at_unix_seconds = checked_at;
+  attested_profile
+    .github_mcp_health_credential_revision
+    .clone_from(&request.profile.credential_revision);
+  attested_profile.github_mcp_health_result_sha256 = health_digest;
+  attested_profile.attested_at_unix_seconds = checked_at;
   attested_profile.profile_sha256 = attested_profile.computed_profile_sha256();
   Ok(Box::new(PreparedCodexExecution {
     transport,
@@ -1527,6 +1587,31 @@ fn prepare_protocol<T: ScheduledJsonlTransport + Send + 'static>(
     thread_id,
     deadline,
   }))
+}
+
+fn attest_github_mcp_health<T: ScheduledJsonlTransport>(
+  transport: &mut T,
+  request: &ScheduledCodexRequest,
+  thread_id: &str,
+  deadline: Instant,
+) -> Result<(String, u64), Box<ScheduledExecutionResult>> {
+  let health = scheduled_request(
+    transport,
+    4,
+    "mcpServer/tool/call",
+    &json!({
+      "arguments": {},
+      "server": GITHUB_MCP_NAME,
+      "threadId": thread_id,
+      "tool": GITHUB_MCP_HEALTH_TOOL,
+    }),
+    deadline,
+    &request.cancellation,
+  )
+  .map_err(|failure| Box::new(protocol_failure(failure)))?;
+  let digest = attest_mcp_health(&health)
+    .map_err(|failure| Box::new(ScheduledExecutionResult::PreflightRejected(failure)))?;
+  Ok((digest, now_unix_seconds()))
 }
 
 fn execute_prepared_protocol<T: ScheduledJsonlTransport>(
@@ -1553,7 +1638,7 @@ fn execute_prepared_protocol<T: ScheduledJsonlTransport>(
   });
   let turn = match scheduled_request(
     transport,
-    4,
+    5,
     "turn/start",
     &turn_params,
     deadline,
@@ -1670,8 +1755,8 @@ fn attest_mcp_inventory(inventory: &Value) -> Result<(), ScheduledFailure> {
   if server["name"].as_str() != Some(GITHUB_MCP_NAME) {
     return Err(capability("unexpected_mcp_server"));
   }
-  if server["authStatus"].as_str() != Some("unsupported") {
-    return Err(capability("github_mcp_client_auth_must_be_unsupported"));
+  if server["authStatus"].as_str() != Some("bearerToken") {
+    return Err(capability("github_mcp_bearer_channel_auth_missing"));
   }
   if server["serverInfo"]["name"].as_str() != Some(GITHUB_MCP_SERVER_INFO_NAME)
     || server["serverInfo"]["version"].as_str() != Some(GITHUB_MCP_SERVER_VERSION)
@@ -1700,6 +1785,53 @@ fn attest_mcp_inventory(inventory: &Value) -> Result<(), ScheduledFailure> {
     }
   }
   Ok(())
+}
+
+fn attest_mcp_health(health: &Value) -> Result<String, ScheduledFailure> {
+  let bytes =
+    serde_json::to_vec(health).map_err(|_| capability("github_mcp_health_not_serializable"))?;
+  if bytes.len() > MAX_MCP_HEALTH_RESULT_BYTES || json_depth(health) > MAX_MCP_HEALTH_RESULT_DEPTH {
+    return Err(capability("github_mcp_health_result_exceeds_hard_limit"));
+  }
+  let object = health
+    .as_object()
+    .filter(|object| {
+      object.contains_key("content")
+        && object.keys().all(|field| {
+          matches!(
+            field.as_str(),
+            "_meta" | "content" | "isError" | "structuredContent"
+          )
+        })
+    })
+    .ok_or_else(|| capability("github_mcp_health_response_malformed"))?;
+  if let Some(is_error) = object.get("isError") {
+    match is_error.as_bool() {
+      Some(false) => {}
+      Some(true) => return Err(capability("github_mcp_health_reported_error")),
+      None => return Err(capability("github_mcp_health_response_malformed")),
+    }
+  }
+  let content = object
+    .get("content")
+    .and_then(Value::as_array)
+    .filter(|content| !content.is_empty() && content.len() <= 16)
+    .ok_or_else(|| capability("github_mcp_health_content_missing"))?;
+  let has_nonempty_text = content.iter().any(|item| {
+    item.get("type").and_then(Value::as_str) == Some("text")
+      && item
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty())
+  });
+  let has_structured_identity = object
+    .get("structuredContent")
+    .and_then(Value::as_object)
+    .is_some_and(|identity| !identity.is_empty());
+  if !has_nonempty_text && !has_structured_identity {
+    return Err(capability("github_mcp_health_identity_missing"));
+  }
+  Ok(sha256_hex(health.to_string().as_bytes()))
 }
 
 #[allow(
@@ -2653,6 +2785,8 @@ mod tests {
       github_mcp_url: "http://127.0.0.1:18081/mcp".to_owned(),
       github_mcp_artifact_sha256: GITHUB_MCP_ARTIFACT_SHA256_X86_64.to_owned(),
       github_mcp_endpoint_identity: "github-readonly-sidecar".to_owned(),
+      github_mcp_access_auth_mode: GITHUB_MCP_ACCESS_AUTH_MODE.to_owned(),
+      github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       credential_reference: "github-readonly-service-account".to_owned(),
       permission_policy_revision: "github-issues-read-v1".to_owned(),
       config_revision: "scheduled-codex-v1".to_owned(),
@@ -2679,6 +2813,8 @@ mod tests {
       github_mcp_artifact_path: "/opt/codeoff/bin/github-mcp-server".into(),
       github_mcp_artifact_sha256: profile.github_mcp_artifact_sha256.clone(),
       github_mcp_endpoint_identity: profile.github_mcp_endpoint_identity.clone(),
+      github_mcp_access_auth_mode: profile.github_mcp_access_auth_mode.clone(),
+      github_mcp_access_token_revision: profile.github_mcp_access_token_revision.clone(),
       credential_reference: profile.credential_reference.clone(),
       permission_policy_revision: profile.permission_policy_revision.clone(),
       config_revision: profile.config_revision.clone(),
@@ -2823,7 +2959,7 @@ mod tests {
     json!({
       "data": [{
         "name": GITHUB_MCP_NAME,
-        "authStatus": "unsupported",
+        "authStatus": "bearerToken",
         "serverInfo": {"name": GITHUB_MCP_SERVER_INFO_NAME, "version": GITHUB_MCP_SERVER_VERSION},
         "tools": tools,
         "resources": [],
@@ -2833,12 +2969,21 @@ mod tests {
     })
   }
 
+  fn health() -> Value {
+    json!({
+      "content": [{"type": "text", "text": "authenticated as codeoff-test"}],
+      "isError": false,
+      "structuredContent": {"login": "codeoff-test"},
+    })
+  }
+
   fn successful_reads() -> VecDeque<TimedRead> {
     VecDeque::from([
       response(1, json!({"server": "codex-app-server"})),
       response(2, json!({"thread": {"id": "thread-1"}})),
       response(3, inventory()),
-      response(4, json!({"turn": {"id": "turn-1"}})),
+      response(4, health()),
+      response(5, json!({"turn": {"id": "turn-1"}})),
       TimedRead::Message(json!({
         "jsonrpc": "2.0",
         "method": "item/completed",
@@ -2869,7 +3014,7 @@ mod tests {
 
   fn reads_with_final_text(text: &str) -> VecDeque<TimedRead> {
     let mut reads = successful_reads();
-    reads[5] = TimedRead::Message(json!({
+    reads[6] = TimedRead::Message(json!({
       "jsonrpc": "2.0",
       "method": "turn/completed",
       "params": {
@@ -2953,6 +3098,26 @@ mod tests {
     assert_eq!(output.summary, "Last");
     assert_eq!(usage.input, Some(10));
     assert!(!attested_profile.profile_sha256.is_empty());
+    assert_eq!(
+      attested_profile.github_mcp_access_auth_mode,
+      GITHUB_MCP_ACCESS_AUTH_MODE
+    );
+    assert_eq!(
+      attested_profile.github_mcp_access_token_revision,
+      "mcp-channel-v1"
+    );
+    assert_eq!(
+      attested_profile.github_mcp_health_checked_at_unix_seconds,
+      attested_profile.attested_at_unix_seconds
+    );
+    assert_eq!(
+      attested_profile.github_mcp_health_credential_revision,
+      attested_profile.credential_revision
+    );
+    assert_eq!(
+      attested_profile.github_mcp_health_result_sha256,
+      sha256_hex(health().to_string().as_bytes())
+    );
     let writes = &actions.lock().expect("actions").writes;
     let methods: Vec<_> = writes
       .iter()
@@ -2965,6 +3130,7 @@ mod tests {
         "initialized",
         "thread/start",
         "mcpServerStatus/list",
+        "mcpServer/tool/call",
         "turn/start"
       ]
     );
@@ -3008,6 +3174,9 @@ mod tests {
     let permit = issue_test_isolation_permit(&scheduled_request);
     let mut observed = attest_runtime(&requested, &evidence(&requested), permit)
       .expect("production attested profile");
+    observed.github_mcp_health_checked_at_unix_seconds = observed.attested_at_unix_seconds;
+    observed.github_mcp_health_credential_revision = observed.credential_revision.clone();
+    observed.github_mcp_health_result_sha256 = "8".repeat(64);
     observed.profile_sha256 = observed.computed_profile_sha256();
     observed.validate().expect("canonical profile");
     let authority =
@@ -3298,6 +3467,8 @@ mod tests {
       github_mcp_artifact_path: github_mcp_artifact.clone(),
       github_mcp_artifact_sha256: sha256_file(&github_mcp_artifact).expect("MCP digest"),
       github_mcp_endpoint_identity: "github-readonly-sidecar".to_owned(),
+      github_mcp_access_auth_mode: GITHUB_MCP_ACCESS_AUTH_MODE.to_owned(),
+      github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       credential_reference: "github-readonly-service-account".to_owned(),
       permission_policy_revision: "github-issues-read-v1".to_owned(),
       config_revision: "scheduled-codex-v1".to_owned(),
@@ -3425,7 +3596,8 @@ mod tests {
       response(1, json!({"server": "codex-app-server"})),
       response(2, json!({"thread": {"id": "thread-1"}})),
       response(3, inventory()),
-      response(4, json!({"turn": {"id": "turn-1"}})),
+      response(4, health()),
+      response(5, json!({"turn": {"id": "turn-1"}})),
       TimedRead::Message(json!({
         "jsonrpc": "2.0",
         "method": "item/started",
@@ -3654,11 +3826,64 @@ mod tests {
     assert!(config.contains("web_search = \"disabled\""));
     assert!(config.contains("[mcp_servers.github]"));
     assert!(config.contains("required = true"));
-    assert!(!config.contains("token"));
+    assert!(config.contains(&format!(
+      "bearer_token_env_var = \"{GITHUB_MCP_ACCESS_TOKEN_ENV}\""
+    )));
+    assert!(!config.contains("github-readonly-service-account"));
     assert!(!config.contains("slack"));
     for tool in EXPECTED_GITHUB_TOOLS {
       assert!(config.contains(tool));
     }
+  }
+
+  #[test]
+  fn github_mcp_bearer_token_and_health_proof_are_strictly_bounded() {
+    for valid in [
+      "x".repeat(MIN_MCP_ACCESS_TOKEN_BYTES),
+      "x".repeat(MAX_MCP_ACCESS_TOKEN_BYTES),
+    ] {
+      assert!(validate_github_mcp_access_token(&valid).is_ok());
+    }
+    for invalid in [
+      String::new(),
+      "x".repeat(MIN_MCP_ACCESS_TOKEN_BYTES - 1),
+      "x".repeat(MAX_MCP_ACCESS_TOKEN_BYTES + 1),
+      format!("{} ", "x".repeat(MIN_MCP_ACCESS_TOKEN_BYTES)),
+    ] {
+      assert!(validate_github_mcp_access_token(&invalid).is_err());
+    }
+
+    let valid_health = health();
+    assert_eq!(
+      attest_mcp_health(&valid_health).expect("valid health proof"),
+      sha256_hex(valid_health.to_string().as_bytes())
+    );
+    for invalid in [
+      json!({}),
+      json!({"content": []}),
+      json!({"content": [{"type": "text", "text": "   "}]}),
+      json!({"content": [{"type": "text", "text": "identity"}], "isError": true}),
+      json!({"content": [{"type": "text", "text": "identity"}], "isError": "false"}),
+      json!({"content": [{"type": "text", "text": "identity"}], "isError": null}),
+      json!({"content": [{"type": "text", "text": "identity"}], "unexpected": true}),
+    ] {
+      assert!(attest_mcp_health(&invalid).is_err(), "invalid={invalid}");
+    }
+    let oversized = json!({
+      "content": [{"type": "text", "text": "x".repeat(MAX_MCP_HEALTH_RESULT_BYTES)}]
+    });
+    assert!(attest_mcp_health(&oversized).is_err());
+    let mut deep = json!({"identity": "codeoff-test"});
+    for _ in 0..=MAX_MCP_HEALTH_RESULT_DEPTH {
+      deep = json!({"nested": deep});
+    }
+    assert!(
+      attest_mcp_health(&json!({
+        "content": [{"type": "text", "text": "identity"}],
+        "structuredContent": deep,
+      }))
+      .is_err()
+    );
   }
 
   #[test]
@@ -3726,7 +3951,7 @@ mod tests {
             "resources": [],
             "resourceTemplates": [],
           })),
-        "auth" => inventory["data"][0]["authStatus"] = json!("bearerToken"),
+        "auth" => inventory["data"][0]["authStatus"] = json!("unsupported"),
         "version" => inventory["data"][0]["serverInfo"]["version"] = json!("1.7.0"),
         _ => unreachable!(),
       }
@@ -3884,8 +4109,14 @@ mod tests {
     let runtime = evidence(&profile);
     let started = Instant::now();
     let artifacts = Arc::new(test_artifacts(&program, &codex_home, &cwd));
-    let transport =
-      StdioScheduledJsonlTransport::spawn(&profile, runtime, &artifacts, None).expect("spawn");
+    let transport = StdioScheduledJsonlTransport::spawn(
+      &profile,
+      runtime,
+      &artifacts,
+      None,
+      &"t".repeat(MIN_MCP_ACCESS_TOKEN_BYTES),
+    )
+    .expect("spawn");
     let pid_deadline = Instant::now() + Duration::from_secs(2);
     while !pid_file.exists() && Instant::now() < pid_deadline {
       thread::sleep(Duration::from_millis(5));

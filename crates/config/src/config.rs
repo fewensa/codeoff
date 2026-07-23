@@ -376,36 +376,7 @@ impl SchedulerRuntimeConfig {
 impl ScheduledCodexConfig {
   fn validate(&self) -> Result<(), ConfigError> {
     let invalid = |field, reason| ConfigError::InvalidScheduler { field, reason };
-    for (field, path) in [
-      ("scheduled_codex.codex_program", &self.codex_program),
-      ("scheduled_codex.codex_home", &self.codex_home),
-      ("scheduled_codex.cwd", &self.cwd),
-      (
-        "scheduled_codex.github_mcp_artifact_path",
-        &self.github_mcp_artifact_path,
-      ),
-      (
-        "scheduled_codex.isolation_attestation_path",
-        &self.isolation_attestation_path,
-      ),
-      (
-        "scheduled_codex.isolation_trust_bundle_path",
-        &self.isolation_trust_bundle_path,
-      ),
-    ] {
-      if !path.is_absolute() {
-        return Err(invalid(field, "must be an absolute path"));
-      }
-    }
-    if self.codex_home == self.cwd
-      || self.cwd.starts_with(&self.codex_home)
-      || self.codex_home.starts_with(&self.cwd)
-    {
-      return Err(invalid(
-        "scheduled_codex.cwd",
-        "must not overlap the dedicated CODEX_HOME",
-      ));
-    }
+    self.validate_paths()?;
     if self.trusted_owner_uid == self.runtime_uid || self.trusted_owner_gid == self.runtime_gid {
       return Err(invalid(
         "scheduled_codex.runtime_uid",
@@ -416,6 +387,14 @@ impl ScheduledCodexConfig {
       (
         "scheduled_codex.github_mcp_endpoint_identity",
         self.github_mcp_endpoint_identity.as_str(),
+      ),
+      (
+        "scheduled_codex.github_mcp_access_auth_mode",
+        self.github_mcp_access_auth_mode.as_str(),
+      ),
+      (
+        "scheduled_codex.github_mcp_access_token_revision",
+        self.github_mcp_access_token_revision.as_str(),
       ),
       (
         "scheduled_codex.credential_reference",
@@ -446,6 +425,7 @@ impl ScheduledCodexConfig {
         "must be a bounded lowercase credential revision",
       )
     })?;
+    self.validate_github_mcp_access()?;
     for (field, value) in [
       (
         "scheduled_codex.codex_program_sha256",
@@ -468,6 +448,58 @@ impl ScheduledCodexConfig {
         "must be a credential-free loopback HTTP MCP URL",
       ));
     }
+    Ok(())
+  }
+
+  fn validate_paths(&self) -> Result<(), ConfigError> {
+    let invalid = |field, reason| ConfigError::InvalidScheduler { field, reason };
+    for (field, path) in [
+      ("scheduled_codex.codex_program", &self.codex_program),
+      ("scheduled_codex.codex_home", &self.codex_home),
+      ("scheduled_codex.cwd", &self.cwd),
+      (
+        "scheduled_codex.github_mcp_artifact_path",
+        &self.github_mcp_artifact_path,
+      ),
+      (
+        "scheduled_codex.isolation_attestation_path",
+        &self.isolation_attestation_path,
+      ),
+      (
+        "scheduled_codex.isolation_trust_bundle_path",
+        &self.isolation_trust_bundle_path,
+      ),
+    ] {
+      if !path.is_absolute() {
+        return Err(invalid(field, "must be an absolute path"));
+      }
+    }
+    if self.codex_home == self.cwd
+      || self.cwd.starts_with(&self.codex_home)
+      || self.codex_home.starts_with(&self.cwd)
+    {
+      return Err(invalid(
+        "scheduled_codex.cwd",
+        "must not overlap the dedicated CODEX_HOME",
+      ));
+    }
+    Ok(())
+  }
+
+  fn validate_github_mcp_access(&self) -> Result<(), ConfigError> {
+    let invalid = |field, reason| ConfigError::InvalidScheduler { field, reason };
+    if self.github_mcp_access_auth_mode != "bearer-token-env-v1" {
+      return Err(invalid(
+        "scheduled_codex.github_mcp_access_auth_mode",
+        "must be bearer-token-env-v1",
+      ));
+    }
+    CredentialRevision::parse(&self.github_mcp_access_token_revision).map_err(|_| {
+      invalid(
+        "scheduled_codex.github_mcp_access_token_revision",
+        "must be a bounded lowercase credential revision",
+      )
+    })?;
     Ok(())
   }
 
@@ -1193,6 +1225,8 @@ pub struct ScheduledCodexConfig {
   pub github_mcp_artifact_path: PathBuf,
   pub github_mcp_artifact_sha256: String,
   pub github_mcp_endpoint_identity: String,
+  pub github_mcp_access_auth_mode: String,
+  pub github_mcp_access_token_revision: String,
   pub credential_reference: String,
   pub permission_policy_revision: String,
   pub config_revision: String,

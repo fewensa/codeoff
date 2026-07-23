@@ -4,8 +4,15 @@ use std::fmt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-const EXPECTED_GITHUB_TOOLS: [&str; 4] =
-  ["issue_read", "list_issues", "search_issues", "search_orgs"];
+use crate::scheduled_identity::CredentialRevision;
+
+const EXPECTED_GITHUB_TOOLS: [&str; 5] = [
+  "get_me",
+  "issue_read",
+  "list_issues",
+  "search_issues",
+  "search_orgs",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestedCapabilityProfile {
@@ -15,6 +22,12 @@ pub struct AttestedCapabilityProfile {
   pub github_mcp_version: String,
   pub github_mcp_artifact_sha256: String,
   pub github_mcp_endpoint_identity: String,
+  pub github_mcp_access_auth_mode: String,
+  pub github_mcp_access_token_revision: String,
+  pub github_mcp_health_checked_at_unix_seconds: u64,
+  pub github_mcp_health_credential_revision: String,
+  pub github_mcp_health_result_sha256: String,
+  pub github_mcp_health_tool: String,
   pub github_tools: BTreeSet<String>,
   pub credential_reference: String,
   pub permission_policy_revision: String,
@@ -67,7 +80,13 @@ impl AttestedCapabilityProfile {
       "credential_revision": self.credential_revision,
       "gateway_image_digest": self.gateway_image_digest,
       "github_mcp_artifact_sha256": self.github_mcp_artifact_sha256,
+      "github_mcp_access_auth_mode": self.github_mcp_access_auth_mode,
+      "github_mcp_access_token_revision": self.github_mcp_access_token_revision,
       "github_mcp_endpoint_identity": self.github_mcp_endpoint_identity,
+      "github_mcp_health_checked_at_unix_seconds": self.github_mcp_health_checked_at_unix_seconds,
+      "github_mcp_health_credential_revision": self.github_mcp_health_credential_revision,
+      "github_mcp_health_result_sha256": self.github_mcp_health_result_sha256,
+      "github_mcp_health_tool": self.github_mcp_health_tool,
       "github_mcp_version": self.github_mcp_version,
       "github_tools": tools,
       "negative_test_revision": self.negative_test_revision,
@@ -96,7 +115,13 @@ impl AttestedCapabilityProfile {
       "credential_revision": self.credential_revision,
       "gateway_image_digest": self.gateway_image_digest,
       "github_mcp_artifact_sha256": self.github_mcp_artifact_sha256,
+      "github_mcp_access_auth_mode": self.github_mcp_access_auth_mode,
+      "github_mcp_access_token_revision": self.github_mcp_access_token_revision,
       "github_mcp_endpoint_identity": self.github_mcp_endpoint_identity,
+      "github_mcp_health_checked_at_unix_seconds": self.github_mcp_health_checked_at_unix_seconds,
+      "github_mcp_health_credential_revision": self.github_mcp_health_credential_revision,
+      "github_mcp_health_result_sha256": self.github_mcp_health_result_sha256,
+      "github_mcp_health_tool": self.github_mcp_health_tool,
       "github_mcp_version": self.github_mcp_version,
       "github_tools": tools,
       "negative_test_revision": self.negative_test_revision,
@@ -115,6 +140,11 @@ impl AttestedCapabilityProfile {
   /// Returns an error when a required field, digest, image identity, or tool inventory is invalid.
   pub fn validate(&self) -> Result<(), AttestedCapabilityProfileError> {
     if self.attested_at_unix_seconds == 0
+      || self.github_mcp_health_checked_at_unix_seconds != self.attested_at_unix_seconds
+      || self.github_mcp_access_auth_mode != "bearer-token-env-v1"
+      || self.github_mcp_health_tool != "get_me"
+      || self.github_mcp_health_credential_revision != self.credential_revision
+      || CredentialRevision::parse(&self.github_mcp_access_token_revision).is_err()
       || self.profile_sha256 != self.computed_profile_sha256()
       || self.text_fields().iter().any(|value| value.is_empty())
       || self.github_tools
@@ -130,6 +160,7 @@ impl AttestedCapabilityProfile {
       &self.codex_program_sha256,
       &self.config_sha256,
       &self.github_mcp_artifact_sha256,
+      &self.github_mcp_health_result_sha256,
       &self.profile_sha256,
       &self.runner_client_cert_public_key_fingerprint,
     ] {
@@ -160,7 +191,7 @@ impl AttestedCapabilityProfile {
     }
     let object = parsed
       .as_object()
-      .filter(|object| object.len() == 22)
+      .filter(|object| object.len() == 28)
       .ok_or(AttestedCapabilityProfileError::InvalidShape)?;
     let string = |field: &str| {
       object
@@ -197,7 +228,16 @@ impl AttestedCapabilityProfile {
       credential_revision: string("credential_revision")?,
       gateway_image_digest: string("gateway_image_digest")?,
       github_mcp_artifact_sha256: string("github_mcp_artifact_sha256")?,
+      github_mcp_access_auth_mode: string("github_mcp_access_auth_mode")?,
+      github_mcp_access_token_revision: string("github_mcp_access_token_revision")?,
       github_mcp_endpoint_identity: string("github_mcp_endpoint_identity")?,
+      github_mcp_health_checked_at_unix_seconds: object
+        .get("github_mcp_health_checked_at_unix_seconds")
+        .and_then(Value::as_u64)
+        .ok_or(AttestedCapabilityProfileError::InvalidField)?,
+      github_mcp_health_credential_revision: string("github_mcp_health_credential_revision")?,
+      github_mcp_health_result_sha256: string("github_mcp_health_result_sha256")?,
+      github_mcp_health_tool: string("github_mcp_health_tool")?,
       github_mcp_version: string("github_mcp_version")?,
       github_tools: tools,
       negative_test_revision: string("negative_test_revision")?,
@@ -214,11 +254,15 @@ impl AttestedCapabilityProfile {
     Ok(profile)
   }
 
-  fn text_fields(&self) -> [&str; 15] {
+  fn text_fields(&self) -> [&str; 19] {
     [
       &self.codex_version,
       &self.github_mcp_version,
       &self.github_mcp_endpoint_identity,
+      &self.github_mcp_access_auth_mode,
+      &self.github_mcp_access_token_revision,
+      &self.github_mcp_health_credential_revision,
+      &self.github_mcp_health_tool,
       &self.credential_reference,
       &self.permission_policy_revision,
       &self.config_revision,

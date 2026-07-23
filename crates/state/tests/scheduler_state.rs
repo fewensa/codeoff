@@ -752,10 +752,22 @@ fn recovery_capability_profile_json() -> String {
     github_mcp_version: "test-mcp".to_owned(),
     github_mcp_artifact_sha256: "4".repeat(64),
     github_mcp_endpoint_identity: "test-github-mcp".to_owned(),
-    github_tools: ["issue_read", "list_issues", "search_issues", "search_orgs"]
-      .into_iter()
-      .map(str::to_owned)
-      .collect::<BTreeSet<_>>(),
+    github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+    github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
+    github_mcp_health_checked_at_unix_seconds: 100,
+    github_mcp_health_credential_revision: "credential-v1".to_owned(),
+    github_mcp_health_result_sha256: "8".repeat(64),
+    github_mcp_health_tool: "get_me".to_owned(),
+    github_tools: [
+      "get_me",
+      "issue_read",
+      "list_issues",
+      "search_issues",
+      "search_orgs",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>(),
     credential_reference: "test-read-only-credential".to_owned(),
     permission_policy_revision: "test-read-only-v1".to_owned(),
     config_revision: "test-config-v1".to_owned(),

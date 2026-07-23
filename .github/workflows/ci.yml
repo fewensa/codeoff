@@ -7,6 +7,12 @@ on:
       - main
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact commit SHA to publish without moving latest
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -45,11 +51,27 @@ jobs:
     name: Release Image
     runs-on: ubuntu-latest
     needs: check
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+
+      - name: Resolve immutable source revision
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_REF: ${{ inputs.ref }}
+        run: |
+          resolved_sha="$(git rev-parse HEAD)"
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUESTED_REF" != "$resolved_sha" ]; then
+            echo "workflow_dispatch ref must be the exact 40-character commit SHA" >&2
+            exit 1
+          fi
+          echo "sha=$resolved_sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short=7 "$resolved_sha")" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -66,10 +88,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/codeoff
+          flavor: |
+            latest=false
           tags: |
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=tag
+            type=raw,value=sha-${{ steps.source.outputs.short_sha }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=ref,event=tag,enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -80,5 +106,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max

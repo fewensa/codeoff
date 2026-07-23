@@ -39,7 +39,8 @@ use nix::unistd::Pid;
 
 #[cfg(unix)]
 use crate::scheduled_artifacts::{
-  VerifiedScheduledArtifacts, read_verified_scheduled_attestation, verify_scheduled_artifacts,
+  VerifiedScheduledArtifacts, read_verified_scheduled_authority_material,
+  verify_scheduled_artifacts,
 };
 #[cfg(all(unix, test))]
 use crate::scheduled_artifacts::{test_artifacts, verify_scheduled_artifacts_for_test};
@@ -110,6 +111,7 @@ pub struct RequestedCapabilityProfile {
   pub permission_policy_revision: String,
   pub config_revision: String,
   pub config_sha256: String,
+  pub runtime_image_digest: String,
 }
 
 impl RequestedCapabilityProfile {
@@ -169,6 +171,12 @@ impl RequestedCapabilityProfile {
     if self.config_sha256 != actual_config_hash {
       return Err(preflight("scheduled_config_digest_mismatch"));
     }
+    if self.runtime_image_digest.len() != 71
+      || !self.runtime_image_digest.starts_with("sha256:")
+      || !is_lowercase_hex(&self.runtime_image_digest[7..], 64)
+    {
+      return Err(preflight("scheduled_runtime_image_digest_invalid"));
+    }
     Ok(())
   }
 }
@@ -186,6 +194,7 @@ pub struct ScheduledRuntimeEvidence {
   pub app_server_schema_sha256: String,
   pub codex_program_sha256: String,
   pub config_sha256: String,
+  pub runtime_image_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -290,6 +299,7 @@ pub struct AttestedCapabilityProfile {
   pub permission_policy_revision: String,
   pub config_revision: String,
   pub config_sha256: String,
+  pub runtime_image_digest: String,
   pub credential_isolation_revision: String,
   pub credential_deny_policy_revision: String,
   pub negative_test_revision: String,
@@ -319,6 +329,7 @@ impl AttestedCapabilityProfile {
       "negative_test_revision": self.negative_test_revision,
       "output_schema_revision": self.output_schema_revision,
       "permission_policy_revision": self.permission_policy_revision,
+      "runtime_image_digest": self.runtime_image_digest,
       "profile_sha256": self.profile_sha256,
     })
     .to_string()
@@ -813,7 +824,7 @@ pub fn build_production_scheduled_codex_executor(
   let authority = load_signed_isolation_authority_contents(
     &profile,
     &artifacts.attestation_contents,
-    &config.isolation_verifier_public_key,
+    &artifacts.verifier_public_key_contents,
   )?;
   #[cfg(unix)]
   let executor = ScheduledCodexExecutor::new(move |profile| {
@@ -838,13 +849,9 @@ pub fn load_current_scheduled_deployment_authority(
   config: &ScheduledCodexConfig,
   profile: &RequestedCapabilityProfile,
 ) -> Result<ScheduledDeploymentAuthority, ScheduledFailure> {
-  let contents = read_verified_scheduled_attestation(config)
+  let (contents, verifier_public_key) = read_verified_scheduled_authority_material(config)
     .map_err(|error| preflight(format!("scheduled_attestation_reload_failed:{error}")))?;
-  load_signed_isolation_authority_contents(
-    profile,
-    &contents,
-    &config.isolation_verifier_public_key,
-  )
+  load_signed_isolation_authority_contents(profile, &contents, &verifier_public_key)
 }
 
 fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfile {
@@ -860,6 +867,7 @@ fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfil
     permission_policy_revision: config.permission_policy_revision.clone(),
     config_revision: config.config_revision.clone(),
     config_sha256: config.config_sha256.clone(),
+    runtime_image_digest: config.runtime_image_digest.clone(),
   }
 }
 
@@ -877,6 +885,7 @@ fn spawn_production_transport(
     app_server_schema_sha256: CODEX_APP_SERVER_SCHEMA_SHA256.to_owned(),
     codex_program_sha256: profile.codex_program_sha256.clone(),
     config_sha256: profile.config_sha256.clone(),
+    runtime_image_digest: profile.runtime_image_digest.clone(),
   };
   StdioScheduledJsonlTransport::spawn(&profile, runtime_evidence, &artifacts)
 }
@@ -1080,6 +1089,9 @@ fn attest_runtime(
   if evidence.config_sha256 != requested.config_sha256 {
     return Err(capability("scheduled_config_runtime_digest_mismatch"));
   }
+  if evidence.runtime_image_digest != requested.runtime_image_digest {
+    return Err(capability("scheduled_runtime_image_digest_mismatch"));
+  }
   Ok(AttestedCapabilityProfile {
     codex_version: evidence.codex_version.clone(),
     app_server_schema_sha256: evidence.app_server_schema_sha256.clone(),
@@ -1092,6 +1104,7 @@ fn attest_runtime(
     permission_policy_revision: requested.permission_policy_revision.clone(),
     config_revision: requested.config_revision.clone(),
     config_sha256: requested.config_sha256.clone(),
+    runtime_image_digest: requested.runtime_image_digest.clone(),
     credential_isolation_revision: isolation_permit.isolation_revision,
     credential_deny_policy_revision: CREDENTIAL_DENY_POLICY_REVISION.to_owned(),
     negative_test_revision: NEGATIVE_TEST_REVISION.to_owned(),
@@ -1767,6 +1780,7 @@ fn profile_sha256(profile: &AttestedCapabilityProfile) -> String {
     "negative_test_revision": profile.negative_test_revision,
     "output_schema_revision": profile.output_schema_revision,
     "permission_policy_revision": profile.permission_policy_revision,
+    "runtime_image_digest": profile.runtime_image_digest,
   });
   sha256_hex(canonical.to_string().as_bytes())
 }
@@ -2233,6 +2247,7 @@ mod tests {
       permission_policy_revision: "github-issues-read-v1".to_owned(),
       config_revision: "scheduled-codex-v1".to_owned(),
       config_sha256: String::new(),
+      runtime_image_digest: format!("sha256:{}", "e".repeat(64)),
     };
     profile.config_sha256 = sha256_hex(profile.dedicated_config().as_bytes());
     profile
@@ -2244,6 +2259,7 @@ mod tests {
       app_server_schema_sha256: CODEX_APP_SERVER_SCHEMA_SHA256.to_owned(),
       codex_program_sha256: profile.codex_program_sha256.clone(),
       config_sha256: profile.config_sha256.clone(),
+      runtime_image_digest: profile.runtime_image_digest.clone(),
     }
   }
 
@@ -2643,6 +2659,14 @@ mod tests {
     fs::set_permissions(&cwd, fs::Permissions::from_mode(0o555)).expect("protect workspace");
     let attestation_path = temp.path().join("isolation-attestation.json");
     let key = signing_key();
+    let verifier_public_key_path = temp.path().join("isolation-verifier-public-key");
+    fs::write(
+      &verifier_public_key_path,
+      lowercase_hex(key.public_key().as_ref()),
+    )
+    .expect("write verifier public key");
+    fs::set_permissions(&verifier_public_key_path, fs::Permissions::from_mode(0o444))
+      .expect("protect verifier public key");
     let mut config = ScheduledCodexConfig {
       codex_program: codex_program.clone(),
       codex_program_sha256: sha256_file(&codex_program).expect("program digest"),
@@ -2656,8 +2680,10 @@ mod tests {
       permission_policy_revision: "github-issues-read-v1".to_owned(),
       config_revision: "scheduled-codex-v1".to_owned(),
       config_sha256: String::new(),
+      runtime_image_digest: format!("sha256:{}", "e".repeat(64)),
       isolation_attestation_path: attestation_path.clone(),
-      isolation_verifier_public_key: lowercase_hex(key.public_key().as_ref()),
+      isolation_verifier_public_key: String::new(),
+      isolation_verifier_public_key_path: verifier_public_key_path,
       trusted_owner_uid: fs::metadata(&codex_program)
         .expect("program metadata")
         .uid(),
@@ -2683,7 +2709,7 @@ mod tests {
     let authority = load_signed_isolation_authority_contents(
       &requested,
       &artifacts.attestation_contents,
-      &config.isolation_verifier_public_key,
+      &artifacts.verifier_public_key_contents,
     )
     .expect("signed authority");
     assert_eq!(authority.deployment_epoch, 1);
@@ -3005,14 +3031,15 @@ mod tests {
   }
 
   #[test]
-  fn runtime_version_schema_and_executable_drift_fail_closed() {
-    for field in ["version", "schema", "executable"] {
+  fn runtime_version_schema_executable_and_image_drift_fail_closed() {
+    for field in ["version", "schema", "executable", "image"] {
       let profile = profile();
       let mut runtime = evidence(&profile);
       match field {
         "version" => runtime.codex_version = "0.145.0".to_owned(),
         "schema" => runtime.app_server_schema_sha256 = "b".repeat(64),
         "executable" => runtime.codex_program_sha256 = "c".repeat(64),
+        "image" => runtime.runtime_image_digest = format!("sha256:{}", "d".repeat(64)),
         _ => unreachable!(),
       }
       let actions = Arc::new(Mutex::new(Actions::default()));

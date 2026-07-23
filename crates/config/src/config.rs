@@ -389,6 +389,7 @@ impl ScheduledCodexConfig {
         return Err(invalid(field, "must be an absolute path"));
       }
     }
+    self.validate_isolation_verifier()?;
     if self.codex_home == self.cwd
       || self.cwd.starts_with(&self.codex_home)
       || self.codex_home.starts_with(&self.cwd)
@@ -441,16 +442,47 @@ impl ScheduledCodexConfig {
         return Err(invalid(field, "must be a lowercase SHA-256 digest"));
       }
     }
-    if !is_lowercase_hex(&self.isolation_verifier_public_key, 64) {
+    if self.runtime_image_digest.len() != 71
+      || !self.runtime_image_digest.starts_with("sha256:")
+      || !is_lowercase_hex(&self.runtime_image_digest[7..], 64)
+    {
       return Err(invalid(
-        "scheduled_codex.isolation_verifier_public_key",
-        "must be a lowercase Ed25519 public key",
+        "scheduled_codex.runtime_image_digest",
+        "must be an immutable sha256 OCI image digest",
       ));
     }
     if !is_loopback_mcp_url(&self.github_mcp_url) {
       return Err(invalid(
         "scheduled_codex.github_mcp_url",
         "must be a credential-free loopback HTTP MCP URL",
+      ));
+    }
+    Ok(())
+  }
+
+  fn validate_isolation_verifier(&self) -> Result<(), ConfigError> {
+    let invalid = |field, reason| ConfigError::InvalidScheduler { field, reason };
+    let inline = !self.isolation_verifier_public_key.is_empty();
+    let from_file = !self
+      .isolation_verifier_public_key_path
+      .as_os_str()
+      .is_empty();
+    if inline == from_file {
+      return Err(invalid(
+        "scheduled_codex.isolation_verifier_public_key",
+        "must configure exactly one inline key or public key path",
+      ));
+    }
+    if from_file && !self.isolation_verifier_public_key_path.is_absolute() {
+      return Err(invalid(
+        "scheduled_codex.isolation_verifier_public_key_path",
+        "must be an absolute path",
+      ));
+    }
+    if inline && !is_lowercase_hex(&self.isolation_verifier_public_key, 64) {
+      return Err(invalid(
+        "scheduled_codex.isolation_verifier_public_key",
+        "must be a lowercase Ed25519 public key",
       ));
     }
     Ok(())
@@ -694,8 +726,10 @@ pub struct ScheduledCodexConfig {
   pub permission_policy_revision: String,
   pub config_revision: String,
   pub config_sha256: String,
+  pub runtime_image_digest: String,
   pub isolation_attestation_path: PathBuf,
   pub isolation_verifier_public_key: String,
+  pub isolation_verifier_public_key_path: PathBuf,
   pub trusted_owner_uid: u32,
   pub trusted_owner_gid: u32,
   pub runtime_uid: u32,

@@ -257,6 +257,7 @@ credential_reference = "kubernetes:codeoff/github-mcp"
 permission_policy_revision = "scheduled-read-only-v1"
 config_revision = "scheduled-codex-v1"
 config_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+runtime_image_digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 isolation_attestation_path = "/var/run/codeoff/isolation-attestation.json"
 isolation_verifier_public_key = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 trusted_owner_uid = 0
@@ -375,8 +376,10 @@ fn valid_scheduled_codex_config() -> ScheduledCodexConfig {
     permission_policy_revision: "scheduled-read-only-v1".to_owned(),
     config_revision: "scheduled-codex-v1".to_owned(),
     config_sha256: "c".repeat(64),
+    runtime_image_digest: format!("sha256:{}", "e".repeat(64)),
     isolation_attestation_path: "/var/run/codeoff/isolation-attestation.json".into(),
     isolation_verifier_public_key: "d".repeat(64),
+    isolation_verifier_public_key_path: PathBuf::new(),
     trusted_owner_uid: 0,
     trusted_owner_gid: 0,
     runtime_uid: 65_534,
@@ -405,6 +408,33 @@ fn test_scheduled_codex_rejects_unsafe_paths_digests_keys_and_urls() {
   ));
 
   let mut config = scheduler_with_valid_scheduled_codex();
+  config
+    .agent
+    .scheduled_codex
+    .isolation_verifier_public_key
+    .clear();
+  config
+    .agent
+    .scheduled_codex
+    .isolation_verifier_public_key_path =
+    "/opt/codeoff/attestation/isolation-verifier-public-key".into();
+  config.validate().expect("public key path");
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config
+    .agent
+    .scheduled_codex
+    .isolation_verifier_public_key_path =
+    "/opt/codeoff/attestation/isolation-verifier-public-key".into();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.isolation_verifier_public_key",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
   config.agent.scheduled_codex.cwd = config.agent.scheduled_codex.codex_home.join("workspace");
   assert!(matches!(
     config.validate(),
@@ -420,6 +450,16 @@ fn test_scheduled_codex_rejects_unsafe_paths_digests_keys_and_urls() {
     config.validate(),
     Err(ConfigError::InvalidScheduler {
       field: "scheduled_codex.config_sha256",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.runtime_image_digest = "sha-f375909".to_owned();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.runtime_image_digest",
       ..
     })
   ));

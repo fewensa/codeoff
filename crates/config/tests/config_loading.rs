@@ -439,8 +439,8 @@ fn executor_config() -> ScheduledRunnerExecutorConfig {
     local_socket_path: "/run/codeoff/runner/executor.sock".into(),
     expected_control_uid: 0,
     expected_control_gid: 0,
-    codex_child_uid: 65_532,
-    codex_child_gid: 65_532,
+    codex_child_uid: 65_534,
+    codex_child_gid: 65_534,
     accept_timeout_ms: 5_000,
     frame_timeout_ms: 30_000,
   }

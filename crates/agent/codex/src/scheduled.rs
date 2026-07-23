@@ -39,8 +39,8 @@ use nix::unistd::Pid;
 
 #[cfg(unix)]
 use crate::scheduled_artifacts::{
-  VerifiedScheduledArtifacts, read_verified_scheduled_authority_material,
-  verify_scheduled_artifacts,
+  VerifiedScheduledArtifacts, read_trusted_owner_scheduled_authority_material,
+  read_verified_scheduled_authority_material, verify_scheduled_artifacts,
 };
 #[cfg(all(unix, test))]
 use crate::scheduled_artifacts::{test_artifacts, verify_scheduled_artifacts_for_test};
@@ -1047,6 +1047,22 @@ pub fn load_current_scheduled_deployment_authority(
   let (contents, trust_bundle) = read_verified_scheduled_authority_material(config)
     .map_err(|error| preflight(format!("scheduled_attestation_reload_failed:{error}")))?;
   load_signed_isolation_authority_contents(profile, &contents, &trust_bundle)
+}
+
+/// Loads the signed deployment authority from the credential-owning trusted process identity.
+///
+/// # Errors
+/// Returns a fail-closed error when process identity, artifact ownership, signature, freshness, or
+/// exact profile binding is invalid.
+pub fn load_trusted_owner_scheduled_deployment_authority(
+  config: &ScheduledCodexConfig,
+) -> Result<(RequestedCapabilityProfile, ScheduledDeploymentAuthority), ScheduledFailure> {
+  let profile = requested_profile(config);
+  profile.validate()?;
+  let (contents, trust_bundle) = read_trusted_owner_scheduled_authority_material(config)
+    .map_err(|error| preflight(format!("scheduled_trusted_authority_load_failed:{error}")))?;
+  let authority = load_signed_isolation_authority_contents(&profile, &contents, &trust_bundle)?;
+  Ok((profile, authority))
 }
 
 fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfile {

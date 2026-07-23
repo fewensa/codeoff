@@ -1065,14 +1065,14 @@ impl ScheduledRunnerExecutorConfig {
     }
     if self.codex_child_uid == 0
       || self.codex_child_gid == 0
-      || self.codex_child_uid == deployment.runtime_uid
-      || self.codex_child_gid == deployment.runtime_gid
+      || self.codex_child_uid != deployment.runtime_uid
+      || self.codex_child_gid != deployment.runtime_gid
       || self.codex_child_uid == self.expected_control_uid
       || self.codex_child_gid == self.expected_control_gid
     {
       return Err(invalid_scheduled_codex(
         "scheduled_codex.remote_runner.executor.codex_child_uid",
-        "must identify a distinct nonroot Codex child identity",
+        "must match the isolated nonroot scheduled_codex runtime identity",
       ));
     }
     validate_milliseconds(

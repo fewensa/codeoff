@@ -69,6 +69,9 @@ use crate::observability::{
   refresh_scheduler_snapshot,
 };
 use crate::scheduled_codex::CodexScheduledExecutionBackend;
+use crate::scheduled_runner::{
+  run_control as run_scheduled_runner_control, run_executor as run_scheduled_runner_executor,
+};
 use crate::scheduler::{
   SchedulerCommandError, SchedulerOperatorConfig, UnavailableSchedulerAuthorityVerifier,
   execute_scheduler_command_with_policy_and_verifier, render_scheduler_human,
@@ -3007,6 +3010,15 @@ fn run_worker(
         None => println!("no pending channel events"),
       }
       Ok(())
+    }
+    WorkerCommand::ScheduledRunnerControl => {
+      let child_config_path = config_path.clone();
+      let config = load_config(config_path, state_dir)?;
+      run_scheduled_runner_control(config, child_config_path)
+    }
+    WorkerCommand::ScheduledRunnerExecutor => {
+      let config = load_config(config_path, state_dir)?;
+      run_scheduled_runner_executor(config)
     }
   }
 }

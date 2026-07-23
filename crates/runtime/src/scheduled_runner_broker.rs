@@ -578,7 +578,7 @@ async fn drive_prepare(
   if state.is_some() {
     return Err(ScheduledRunnerBrokerError::SessionBusy);
   }
-  let mut session = RemoteSessionState::new(ready.session_nonce.clone(), authority)
+  let mut session = RemoteSessionState::new(ready.session_nonce.clone(), authority.clone())
     .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
   session
     .accept(RemoteSessionRole::Runner, ready.clone(), unix_millis()?)
@@ -634,7 +634,19 @@ async fn drive_prepare(
       .accept(RemoteSessionRole::Runner, frame.clone(), unix_millis()?)
       .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
     match frame.message {
-      RemoteMessage::Prepared(prepared) => {
+      RemoteMessage::Prepared(mut prepared) => {
+        let RemoteMessage::Ready(ready_identity) = &ready.message else {
+          return Err(ScheduledRunnerBrokerError::ProtocolRejected);
+        };
+        let recovery = authority
+          .remote_recovery_attestation_json(
+            &prepared.attested_profile_json,
+            &ready_identity.profile_digest,
+            ready_identity.deployment_epoch,
+          )
+          .map_err(|_| ScheduledRunnerBrokerError::RunnerRejected)?;
+        prepared.attested_profile_digest = format!("{:x}", Sha256::digest(recovery.as_bytes()));
+        prepared.attested_profile_json = recovery;
         *state = Some(session);
         return Ok(prepared);
       }
@@ -940,20 +952,31 @@ fn remote_execution_result(result: ResultFrame) -> ExecutionResult {
   match result.kind {
     RemoteResultKind::Completed => {
       let value: Result<Value, _> = serde_json::from_str(&result.result_json);
-      let summary = value.ok().and_then(|value| {
-        let object = value.as_object()?;
-        if object.len() != 2 || object.get("schema_version")?.as_u64()? != 1 {
-          return None;
-        }
-        object.get("summary")?.as_str().map(str::to_owned)
-      });
-      summary.map_or_else(
-        || ExecutionResult::Failed {
-          kind: "remote_result_invalid".to_owned(),
-          message: "scheduled remote result did not match schema".to_owned(),
-        },
-        |summary| ExecutionResult::Completed { summary },
-      )
+      let Some(object) = value.ok().and_then(|value| value.as_object().cloned()) else {
+        return invalid_remote_result();
+      };
+      if object.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return invalid_remote_result();
+      }
+      if object.len() == 2
+        && let Some(summary) = object.get("summary").and_then(Value::as_str)
+      {
+        return ExecutionResult::Completed {
+          summary: summary.to_owned(),
+        };
+      }
+      if object.len() == 3
+        && let (Some(kind), Some(message)) = (
+          object.get("failure_kind").and_then(Value::as_str),
+          object.get("message").and_then(Value::as_str),
+        )
+      {
+        return ExecutionResult::Failed {
+          kind: kind.to_owned(),
+          message: message.to_owned(),
+        };
+      }
+      invalid_remote_result()
     }
     RemoteResultKind::FailedBeforeStart => ExecutionResult::Interrupted {
       transport_converged: true,
@@ -961,6 +984,13 @@ fn remote_execution_result(result: ResultFrame) -> ExecutionResult {
     RemoteResultKind::OutcomeUnknown => ExecutionResult::TransportLost {
       message: "scheduled remote runner reported outcome unknown".to_owned(),
     },
+  }
+}
+
+fn invalid_remote_result() -> ExecutionResult {
+  ExecutionResult::Failed {
+    kind: "remote_result_invalid".to_owned(),
+    message: "scheduled remote result did not match schema".to_owned(),
   }
 }
 
@@ -1271,6 +1301,11 @@ mod tests {
     assert!(matches!(
       result(r#"{"schema_version":1,"summary":"done"}"#),
       ExecutionResult::Completed { summary } if summary == "done"
+    ));
+    assert!(matches!(
+      result(r#"{"failure_kind":"turn_failed","message":"turn rejected","schema_version":1}"#),
+      ExecutionResult::Failed { kind, message }
+        if kind == "turn_failed" && message == "turn rejected"
     ));
     for invalid in [
       r#"{"schema_version":2,"summary":"done"}"#,

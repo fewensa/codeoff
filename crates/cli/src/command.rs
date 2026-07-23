@@ -297,7 +297,7 @@ pub enum SchedulerFileFormat {
   Toml,
 }
 
-#[derive(Debug, Copy, Clone, Subcommand)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Subcommand)]
 pub enum WorkerCommand {
   Slack {
     #[arg(long)]
@@ -307,6 +307,10 @@ pub enum WorkerCommand {
     #[arg(long)]
     dry_run: bool,
   },
+  /// Runs the credential-owning remote scheduled-runner control process.
+  ScheduledRunnerControl,
+  /// Runs the unprivileged scheduled-runner executor process.
+  ScheduledRunnerExecutor,
 }
 
 #[derive(Debug, Copy, Clone, Subcommand)]
@@ -317,6 +321,37 @@ pub enum ConfigCommand {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use clap::CommandFactory;
+
+  #[test]
+  fn scheduled_runner_workers_have_only_canonical_kebab_case_commands() {
+    for (name, expected) in [
+      (
+        "scheduled-runner-control",
+        WorkerCommand::ScheduledRunnerControl,
+      ),
+      (
+        "scheduled-runner-executor",
+        WorkerCommand::ScheduledRunnerExecutor,
+      ),
+    ] {
+      let cli = Cli::try_parse_from(["codeoff", "worker", name]).expect("canonical worker");
+      let Command::Worker { command } = cli.command else {
+        panic!("worker command");
+      };
+      assert_eq!(command, expected);
+    }
+    assert!(Cli::try_parse_from(["codeoff", "worker", "runner-control"]).is_err());
+    assert!(Cli::try_parse_from(["codeoff", "worker", "scheduled_runner_executor"]).is_err());
+    let mut command = Cli::command();
+    let help = command
+      .find_subcommand_mut("worker")
+      .expect("worker help")
+      .render_long_help()
+      .to_string();
+    assert!(help.contains("scheduled-runner-control"));
+    assert!(help.contains("scheduled-runner-executor"));
+  }
 
   #[test]
   fn scheduler_diagnostic_output_mode_follows_each_json_flag() {

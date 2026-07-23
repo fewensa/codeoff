@@ -7,6 +7,7 @@ use std::time::Duration;
 use codeoff_agent_contract::{
   AgentTask, InvocationPrincipal, InvocationSource, PreviousSuccessContext, SessionMode, ToolPolicy,
 };
+use nix::unistd::{getegid, geteuid};
 use serde_json::{Map, Value};
 use tokio::net::{UnixStream, unix::UCred};
 
@@ -169,6 +170,15 @@ pub struct ScheduledRunnerControlPeer {
   pub uid: u32,
   pub gid: u32,
   pub pid: Option<u32>,
+}
+
+#[must_use]
+pub fn current_process_credentials() -> ScheduledRunnerControlPeer {
+  ScheduledRunnerControlPeer {
+    uid: geteuid().as_raw(),
+    gid: getegid().as_raw(),
+    pid: Some(std::process::id()),
+  }
 }
 
 impl ScheduledRunnerExecutorConnection {

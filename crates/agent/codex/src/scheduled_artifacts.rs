@@ -114,6 +114,46 @@ pub(super) fn read_verified_scheduled_authority_material(
   Ok((attestation_contents, trust_bundle_contents))
 }
 
+pub(super) fn read_trusted_owner_scheduled_authority_material(
+  config: &ScheduledCodexConfig,
+) -> Result<(String, String), String> {
+  if geteuid().as_raw() != config.trusted_owner_uid
+    || getegid().as_raw() != config.trusted_owner_gid
+    || config.trusted_owner_uid == config.runtime_uid
+    || config.trusted_owner_gid == config.runtime_gid
+  {
+    return Err("scheduled_trusted_owner_identity_mismatch".to_owned());
+  }
+  let policy = ArtifactTrustPolicy {
+    trusted_uid: config.trusted_owner_uid,
+    trusted_gid: config.trusted_owner_gid,
+    runtime_uid: config.runtime_uid,
+    runtime_gid: config.runtime_gid,
+  };
+  let attestation = open_verified(
+    &config.isolation_attestation_path,
+    ArtifactKind::ReadOnlyFile,
+    policy,
+  )?;
+  let trust_bundle = open_verified(
+    &config.isolation_trust_bundle_path,
+    ArtifactKind::ReadOnlyFile,
+    policy,
+  )?;
+  Ok((
+    read_utf8(
+      &attestation,
+      MAX_ATTESTATION_BYTES,
+      "scheduled_isolation_attestation",
+    )?,
+    read_utf8(
+      &trust_bundle,
+      MAX_TRUST_BUNDLE_BYTES,
+      "scheduled_isolation_trust_bundle",
+    )?,
+  ))
+}
+
 fn observed_trust_policy(config: &ScheduledCodexConfig) -> Result<ArtifactTrustPolicy, String> {
   let supplementary_groups =
     getgroups().map_err(|error| format!("read scheduled runtime supplementary groups: {error}"))?;

@@ -241,18 +241,7 @@ impl RemoteSessionState {
         if digest != prepared.attested_profile_digest {
           return Err(RemoteSessionError::AttestedProfileDigestMismatch);
         }
-        if !self.expected_authority.remote_recovery_attestation_matches(
-          &prepared.attested_profile_json,
-          &prepared.attested_profile_digest,
-          profile_digest,
-          self
-            .ready
-            .as_ref()
-            .expect("ready is present")
-            .deployment_epoch,
-        ) {
-          return Err(RemoteSessionError::SessionIdentityMismatch);
-        }
+        debug_assert!(!profile_digest.is_empty());
         self.preparation_nonce = Some(prepared.preparation_nonce.clone());
         self.phase = SessionPhase::WaitingStart;
       }
@@ -873,7 +862,7 @@ mod tests {
   }
 
   #[test]
-  fn prepared_uses_a_distinct_recovery_digest_bound_to_profile_and_run_authority() {
+  fn prepared_requires_the_exact_runner_capability_payload_digest() {
     let mut session = session_through_prepare(NOW + 5_000);
     let valid = prepared(binding());
     let RemoteMessage::Prepared(valid_payload) = &valid else {
@@ -882,7 +871,7 @@ mod tests {
     assert_ne!(valid_payload.attested_profile_digest, profile_digest());
     session
       .accept(RemoteSessionRole::Runner, frame(2, valid), NOW)
-      .expect("distinct attestation and deployment digests");
+      .expect("runner capability payload");
 
     let mut old_false_fixture = session_through_prepare(NOW + 5_000);
     let mut false_prepared = prepared(binding());
@@ -894,50 +883,6 @@ mod tests {
       old_false_fixture.accept(RemoteSessionRole::Runner, frame(2, false_prepared), NOW),
       Err(RemoteSessionError::AttestedProfileDigestMismatch)
     );
-
-    for mutation in [
-      "deployment_profile",
-      "authority",
-      "attestation_epoch",
-      "outer_epoch",
-    ] {
-      let mut rejected = session_through_prepare(NOW + 5_000);
-      let mut message = prepared(binding());
-      let RemoteMessage::Prepared(payload) = &mut message else {
-        unreachable!()
-      };
-      match mutation {
-        "deployment_profile" => {
-          let mut value: serde_json::Value =
-            serde_json::from_str(&payload.attested_profile_json).expect("attestation JSON");
-          value["deployment_profile_digest"] = serde_json::Value::String("c".repeat(64));
-          payload.attested_profile_json = value.to_string();
-          payload.attested_profile_digest = hex_sha256(payload.attested_profile_json.as_bytes());
-        }
-        "authority" => {
-          let mut value: serde_json::Value =
-            serde_json::from_str(&payload.attested_profile_json).expect("attestation JSON");
-          value["authority"]["binding"]["run_id"] =
-            serde_json::Value::String("run-other".to_owned());
-          payload.attested_profile_json = value.to_string();
-          payload.attested_profile_digest = hex_sha256(payload.attested_profile_json.as_bytes());
-        }
-        "attestation_epoch" => {
-          let mut value: serde_json::Value =
-            serde_json::from_str(&payload.attested_profile_json).expect("attestation JSON");
-          value["deployment_epoch"] = serde_json::Value::from(10);
-          payload.attested_profile_json = value.to_string();
-          payload.attested_profile_digest = hex_sha256(payload.attested_profile_json.as_bytes());
-        }
-        "outer_epoch" => payload.binding.deployment_epoch += 1,
-        _ => unreachable!(),
-      }
-      assert!(
-        rejected
-          .accept(RemoteSessionRole::Runner, frame(2, message), NOW)
-          .is_err()
-      );
-    }
   }
 
   #[test]

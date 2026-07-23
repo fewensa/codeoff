@@ -12,6 +12,8 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::unistd::{Gid, chown};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::scheduled_runner_tls::ScheduledRunnerFramed;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledRunnerControlConfig {
   pub socket_path: PathBuf,
@@ -85,6 +87,15 @@ impl ProtectedScheduledExecutorConnection {
   #[must_use]
   pub fn into_inner(self) -> UnixStream {
     self.stream
+  }
+
+  #[must_use]
+  pub fn into_framed(
+    self,
+    read_timeout: Duration,
+    write_timeout: Duration,
+  ) -> ScheduledRunnerFramed<UnixStream> {
+    ScheduledRunnerFramed::new(self.stream, read_timeout, write_timeout)
   }
 }
 

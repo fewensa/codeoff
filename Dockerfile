@@ -85,6 +85,9 @@ RUN apt-get update \
   && grep -Fq 'approvalPolicy?: AskForApproval | null' "${codex_typescript_dir}/v2/ThreadStartParams.ts" \
   && grep -Fq 'outputSchema?: JsonValue | null' "${codex_typescript_dir}/v2/TurnStartParams.ts" \
   && grep -Fq 'sandboxPolicy?: SandboxPolicy | null' "${codex_typescript_dir}/v2/TurnStartParams.ts" \
+  && chown root:root /usr/local/lib/node_modules/@openai/codex/bin/codex.js \
+  && chmod 0555 /usr/local/lib/node_modules/@openai/codex/bin/codex.js \
+  && test "$(stat -c '%u:%g:%a' /usr/local/lib/node_modules/@openai/codex/bin/codex.js)" = "0:0:555" \
   && git lfs install --system \
   && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
   && ln -sf /usr/bin/batcat /usr/local/bin/bat \
@@ -115,6 +118,9 @@ RUN set -eux; \
     | jq -r '[.result.tools[] | select(.annotations.readOnlyHint == true) | .name] | sort | join(",")' \
   )"; \
   test "${github_mcp_inventory}" = "issue_read,list_issues,search_issues,search_orgs"; \
+  chown root:root /usr/local/bin/github-mcp-server; \
+  chmod 0555 /usr/local/bin/github-mcp-server; \
+  test "$(stat -c '%u:%g:%a' /usr/local/bin/github-mcp-server)" = "0:0:555"; \
   rm -f "${github_mcp_archive}" /tmp/github-mcp-server
 
 RUN set -eux; \

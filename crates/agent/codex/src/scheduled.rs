@@ -1,10 +1,12 @@
 //! Fail-closed Codex execution boundary for scheduled tasks.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(all(unix, test))]
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -27,22 +29,28 @@ use codeoff_agent_contract::{
 };
 use codeoff_config::{CredentialRevision, RunnerWorkloadIdentity, ScheduledCodexConfig};
 use codeoff_core::AttestedCapabilityProfile;
+#[cfg(unix)]
+use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use tempfile::TempDir as RuntimeTempDir;
+use tempfile::TempDir;
 
 #[cfg(unix)]
 use nix::errno::Errno;
 #[cfg(unix)]
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl, openat};
 #[cfg(unix)]
 use nix::sys::signal::{Signal, killpg};
 #[cfg(unix)]
-use nix::unistd::Pid;
+use nix::sys::stat::{Mode, SFlag, fchmod, fstat, mkdirat};
 #[cfg(unix)]
-use nix::unistd::{Gid, Uid, chown};
+use nix::unistd::Pid;
+#[cfg(all(unix, test))]
+use nix::unistd::chown;
+#[cfg(unix)]
+use nix::unistd::{Gid, Uid, fchown};
 
 #[cfg(unix)]
 use crate::scheduled_artifacts::{
@@ -617,7 +625,34 @@ pub(crate) struct StdioScheduledJsonlTransport {
   receiver: Receiver<ReaderEvent>,
   process_group: Pid,
   runtime_evidence: ScheduledRuntimeEvidence,
-  state_home: Option<RuntimeTempDir>,
+  state_home: Option<RuntimeStateHome>,
+}
+
+#[cfg(unix)]
+struct RuntimeStateHome {
+  directory: TempDir,
+  #[allow(
+    dead_code,
+    reason = "anchors the verified runtime home inode until cleanup"
+  )]
+  directory_handle: File,
+  #[allow(
+    dead_code,
+    reason = "anchors the attested effective config inode until cleanup"
+  )]
+  config_file: File,
+  config_sha256: String,
+}
+
+#[cfg(unix)]
+impl RuntimeStateHome {
+  fn path(&self) -> &Path {
+    self.directory.path()
+  }
+
+  fn keep(self) -> PathBuf {
+    self.directory.keep()
+  }
 }
 
 #[cfg(unix)]
@@ -649,6 +684,9 @@ impl StdioScheduledJsonlTransport {
     let child_identity =
       child_identity.ok_or_else(|| "scheduled_codex_state_home_requires_supervisor".to_owned())?;
     let state_home = create_runtime_state_home(profile, artifacts, child_identity)?;
+    if state_home.config_sha256 != runtime_evidence.config_sha256 {
+      return Err("scheduled_runtime_config_digest_mismatch".to_owned());
+    }
     let mut verified = verified_command(
       artifacts,
       &["codex", "app-server", "--listen", "stdio://"],
@@ -883,56 +921,171 @@ fn create_runtime_state_home(
   profile: &RequestedCapabilityProfile,
   artifacts: &Arc<VerifiedScheduledArtifacts>,
   child_identity: (u32, u32),
-) -> Result<RuntimeTempDir, String> {
+) -> Result<RuntimeStateHome, String> {
+  let owner = (Uid::effective().as_raw(), Gid::effective().as_raw());
+  if child_identity.0 == owner.0 || child_identity.1 == owner.1 {
+    return Err("scheduled_codex_child_identity_not_distinct".to_owned());
+  }
   let state_home = tempfile::Builder::new()
     .prefix("session-")
     .tempdir_in(profile.codex_home.join("state"))
     .map_err(|error| format!("create scheduled Codex state home: {error}"))?;
-  let runtime_config = state_home.path().join("config.toml");
-  let mut config = OpenOptions::new()
-    .write(true)
-    .create_new(true)
-    .open(&runtime_config)
-    .map_err(|error| format!("create scheduled runtime config: {error}"))?;
+  let directory_handle = File::open(state_home.path())
+    .map_err(|error| format!("open scheduled Codex state home: {error}"))?;
+  let create_file = |name: &str| {
+    openat(
+      &directory_handle,
+      name,
+      OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_RDWR | OFlag::O_CLOEXEC,
+      Mode::from_bits_truncate(0o600),
+    )
+    .map(File::from)
+    .map_err(|error| format!("create scheduled runtime file: {error}"))
+  };
+  let mut config = create_file("config.toml")?;
   config
     .write_all(artifacts.config_contents.as_bytes())
     .map_err(|error| format!("write scheduled runtime config: {error}"))?;
   config
     .sync_all()
     .map_err(|error| format!("sync scheduled runtime config: {error}"))?;
-  drop(config);
-  for path in [
-    state_home.path().to_path_buf(),
-    state_home.path().join("sqlite"),
-    state_home.path().join("log"),
-  ] {
-    if path != state_home.path() {
-      fs::create_dir(&path)
-        .map_err(|error| format!("create scheduled Codex state subdirectory: {error}"))?;
-    }
-    chown(
-      &path,
+  let mut installation_id = create_file("installation_id")?;
+  installation_id
+    .write_all(runtime_installation_id()?.as_bytes())
+    .map_err(|error| format!("write scheduled installation id: {error}"))?;
+  installation_id
+    .sync_all()
+    .map_err(|error| format!("sync scheduled installation id: {error}"))?;
+  let personality_migration = create_file(".personality_migration")?;
+  personality_migration
+    .sync_all()
+    .map_err(|error| format!("sync scheduled personality migration marker: {error}"))?;
+  for name in ["sqlite", "log", "tmp"] {
+    mkdirat(&directory_handle, name, Mode::from_bits_truncate(0o700))
+      .map_err(|error| format!("create scheduled Codex state subdirectory: {error}"))?;
+    let directory = openat(
+      &directory_handle,
+      name,
+      OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+      Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| format!("open scheduled Codex state subdirectory: {error}"))?;
+    fchown(
+      &directory,
       Some(Uid::from_raw(child_identity.0)),
       Some(Gid::from_raw(child_identity.1)),
     )
     .map_err(|error| format!("own scheduled Codex state directory: {error}"))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+    fchmod(&directory, Mode::from_bits_truncate(0o700))
       .map_err(|error| format!("protect scheduled Codex state directory: {error}"))?;
+    if !opened_metadata_matches(&directory, child_identity, 0o700, true, None) {
+      return Err("scheduled_runtime_state_directory_integrity_unproven".to_owned());
+    }
   }
-  chown(
-    &runtime_config,
+  fchmod(&config, Mode::from_bits_truncate(0o444))
+    .map_err(|error| format!("protect scheduled runtime config: {error}"))?;
+  fchown(
+    &installation_id,
     Some(Uid::from_raw(child_identity.0)),
     Some(Gid::from_raw(child_identity.1)),
   )
-  .map_err(|error| format!("own scheduled runtime config: {error}"))?;
-  fs::set_permissions(&runtime_config, fs::Permissions::from_mode(0o600))
-    .map_err(|error| format!("protect scheduled runtime config: {error}"))?;
-  Ok(state_home)
+  .map_err(|error| format!("own scheduled installation id: {error}"))?;
+  fchmod(&installation_id, Mode::from_bits_truncate(0o600))
+    .map_err(|error| format!("protect scheduled installation id: {error}"))?;
+  fchmod(&personality_migration, Mode::from_bits_truncate(0o444))
+    .map_err(|error| format!("protect scheduled personality migration marker: {error}"))?;
+  fchmod(&directory_handle, Mode::from_bits_truncate(0o555))
+    .map_err(|error| format!("protect scheduled runtime home: {error}"))?;
+  let config_sha256 = sha256_opened_file(&config)?;
+  if config_sha256 != profile.config_sha256
+    || !opened_metadata_matches(&directory_handle, owner, 0o555, true, None)
+    || !opened_metadata_matches(&config, owner, 0o444, false, Some(1))
+    || !opened_metadata_matches(&personality_migration, owner, 0o444, false, Some(1))
+    || !opened_metadata_matches(&installation_id, child_identity, 0o600, false, Some(1))
+  {
+    return Err("scheduled_runtime_config_integrity_unproven".to_owned());
+  }
+  Ok(RuntimeStateHome {
+    directory: state_home,
+    directory_handle,
+    config_file: config,
+    config_sha256,
+  })
+}
+
+#[cfg(unix)]
+fn sha256_opened_file(file: &File) -> Result<String, String> {
+  let mut file = file
+    .try_clone()
+    .map_err(|error| format!("clone scheduled runtime config: {error}"))?;
+  file
+    .seek(SeekFrom::Start(0))
+    .map_err(|error| format!("seek scheduled runtime config: {error}"))?;
+  let mut contents = Vec::new();
+  file
+    .take(64 * 1024 + 1)
+    .read_to_end(&mut contents)
+    .map_err(|error| format!("read scheduled runtime config: {error}"))?;
+  if contents.len() > 64 * 1024 {
+    return Err("scheduled_runtime_config_too_large".to_owned());
+  }
+  Ok(sha256_hex(&contents))
+}
+
+#[cfg(unix)]
+fn opened_metadata_matches(
+  file: &File,
+  owner: (u32, u32),
+  mode: u32,
+  directory: bool,
+  links: Option<u64>,
+) -> bool {
+  fstat(file).is_ok_and(|metadata| {
+    metadata.st_uid == owner.0
+      && metadata.st_gid == owner.1
+      && metadata.st_mode & 0o777 == mode
+      && SFlag::from_bits_truncate(metadata.st_mode).contains(if directory {
+        SFlag::S_IFDIR
+      } else {
+        SFlag::S_IFREG
+      })
+      && links.is_none_or(|links| metadata.st_nlink == links)
+  })
+}
+
+#[cfg(unix)]
+fn runtime_installation_id() -> Result<String, String> {
+  let mut bytes = [0_u8; 16];
+  SystemRandom::new()
+    .fill(&mut bytes)
+    .map_err(|_| "generate scheduled installation id".to_owned())?;
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  Ok(format!(
+    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+    bytes[0],
+    bytes[1],
+    bytes[2],
+    bytes[3],
+    bytes[4],
+    bytes[5],
+    bytes[6],
+    bytes[7],
+    bytes[8],
+    bytes[9],
+    bytes[10],
+    bytes[11],
+    bytes[12],
+    bytes[13],
+    bytes[14],
+    bytes[15],
+  ))
 }
 
 #[cfg(unix)]
 fn finalize_runtime_state_home(
-  state_home: &mut Option<RuntimeTempDir>,
+  state_home: &mut Option<RuntimeStateHome>,
   process_exit: ProcessExit,
 ) -> Option<PathBuf> {
   let state_home = state_home.take()?;
@@ -2969,7 +3122,6 @@ mod tests {
   use std::collections::VecDeque;
   use std::io::Read as _;
   use std::net::{SocketAddr, TcpListener, TcpStream};
-  use std::os::unix::fs::MetadataExt;
   use std::sync::{Arc, Mutex};
   use std::thread::JoinHandle as ThreadJoinHandle;
 
@@ -4401,6 +4553,57 @@ mod tests {
       .executor
       .prepare(scheduled_request, permit)
       .expect("real production App Server preparation");
+    let sessions = fs::read_dir(&state_root)
+      .expect("read live state root")
+      .collect::<Result<Vec<_>, _>>()
+      .expect("live session entries");
+    assert_eq!(sessions.len(), 1);
+    let session_home = sessions[0].path();
+    let session_metadata = fs::metadata(&session_home).expect("live session metadata");
+    assert_eq!(
+      (session_metadata.uid(), session_metadata.gid()),
+      (config.trusted_owner_uid, config.trusted_owner_gid)
+    );
+    assert_eq!(session_metadata.mode() & 0o777, 0o555);
+    for (name, owner, mode) in [
+      (
+        "config.toml",
+        (config.trusted_owner_uid, config.trusted_owner_gid),
+        0o444,
+      ),
+      (
+        ".personality_migration",
+        (config.trusted_owner_uid, config.trusted_owner_gid),
+        0o444,
+      ),
+      // Pinned Codex normalizes this untrusted runtime-owned identifier to 0644 after opening it.
+      (
+        "installation_id",
+        (config.runtime_uid, config.runtime_gid),
+        0o644,
+      ),
+    ] {
+      let metadata = fs::symlink_metadata(session_home.join(name)).expect("live state file");
+      assert!(metadata.is_file());
+      assert!(!metadata.file_type().is_symlink());
+      assert_eq!((metadata.uid(), metadata.gid()), owner);
+      assert_eq!(metadata.mode() & 0o777, mode);
+      assert_eq!(metadata.nlink(), 1);
+    }
+    for name in ["sqlite", "log", "tmp"] {
+      let metadata = fs::symlink_metadata(session_home.join(name)).expect("live state directory");
+      assert!(metadata.is_dir());
+      assert!(!metadata.file_type().is_symlink());
+      assert_eq!(
+        (metadata.uid(), metadata.gid()),
+        (config.runtime_uid, config.runtime_gid)
+      );
+      assert_eq!(metadata.mode() & 0o777, 0o700);
+    }
+    assert_eq!(
+      sha256_file(&session_home.join("config.toml")).expect("live effective config digest"),
+      profile.config_sha256
+    );
     let mut scanned_environments = 0_usize;
     for entry in fs::read_dir("/proc").expect("read procfs") {
       let entry = entry.expect("procfs entry");
@@ -4437,6 +4640,7 @@ mod tests {
       attested.github_mcp_health_credential_revision,
       "fixture-credential-v1"
     );
+    assert_eq!(attested.config_sha256, profile.config_sha256);
     assert!(!attested.github_mcp_health_result_sha256.is_empty());
     let observations = fake_mcp.observations.lock().expect("fake MCP observations");
     assert!(
@@ -4512,7 +4716,15 @@ mod tests {
     let root = TempDir::new_in("/code/helixbox").expect("state lifecycle root");
     let exited = tempfile::tempdir_in(root.path()).expect("exited state");
     let exited_path = exited.path().to_path_buf();
-    let mut exited = Some(exited);
+    let exited_handle = File::open(exited.path()).expect("exited state handle");
+    let mut exited = Some(RuntimeStateHome {
+      directory: exited,
+      directory_handle: exited_handle
+        .try_clone()
+        .expect("clone exited state handle"),
+      config_file: exited_handle,
+      config_sha256: "a".repeat(64),
+    });
     assert_eq!(
       finalize_runtime_state_home(&mut exited, ProcessExit::Exited),
       None
@@ -4521,12 +4733,118 @@ mod tests {
 
     let unknown = tempfile::tempdir_in(root.path()).expect("unknown state");
     let unknown_path = unknown.path().to_path_buf();
-    let mut unknown = Some(unknown);
+    let unknown_handle = File::open(unknown.path()).expect("unknown state handle");
+    let mut unknown = Some(RuntimeStateHome {
+      directory: unknown,
+      directory_handle: unknown_handle
+        .try_clone()
+        .expect("clone unknown state handle"),
+      config_file: unknown_handle,
+      config_sha256: "a".repeat(64),
+    });
     assert_eq!(
       finalize_runtime_state_home(&mut unknown, ProcessExit::TimedOut),
       Some(unknown_path.clone())
     );
     assert!(unknown_path.exists());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn runtime_home_keeps_effective_config_root_owned_and_immutable() {
+    let temp = TempDir::new_in("/code/helixbox").expect("runtime home tempdir");
+    let program =
+      PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dynamic-tool-app-server.sh");
+    let mut profile = profile();
+    profile.codex_program = program.clone();
+    profile.codex_program_sha256 = sha256_file(&program).expect("program digest");
+    profile.codex_home = temp.path().join("codex-home");
+    profile.cwd = temp.path().join("workspace");
+    profile.config_sha256 = sha256_hex(profile.dedicated_config().as_bytes());
+    fs::create_dir(&profile.cwd).expect("workspace");
+    prepare_scheduled_codex_home(&profile).expect("CODEX_HOME");
+    let artifacts = Arc::new(test_artifacts(&program, &profile.codex_home, &profile.cwd));
+    let state_home =
+      create_runtime_state_home(&profile, &artifacts, (65_534, 65_534)).expect("runtime home");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555))
+      .expect("protect runtime home tempdir");
+    let root_owner = (Uid::effective().as_raw(), Gid::effective().as_raw());
+    assert!(opened_metadata_matches(
+      &state_home.directory_handle,
+      root_owner,
+      0o555,
+      true,
+      None
+    ));
+    assert!(opened_metadata_matches(
+      &state_home.config_file,
+      root_owner,
+      0o444,
+      false,
+      Some(1)
+    ));
+    assert_eq!(state_home.config_sha256, profile.config_sha256);
+    assert_eq!(
+      fs::read_to_string(state_home.path().join("config.toml")).expect("effective config"),
+      profile.dedicated_config()
+    );
+    let installation_id =
+      fs::read_to_string(state_home.path().join("installation_id")).expect("installation id");
+    assert_eq!(installation_id.len(), 36);
+    assert_eq!(installation_id.as_bytes()[14], b'4');
+    assert_eq!(installation_id.matches('-').count(), 4);
+    let installation_metadata =
+      fs::metadata(state_home.path().join("installation_id")).expect("installation metadata");
+    assert_eq!(
+      (installation_metadata.uid(), installation_metadata.gid()),
+      (65_534, 65_534)
+    );
+    assert_eq!(installation_metadata.mode() & 0o777, 0o600);
+    assert_eq!(installation_metadata.nlink(), 1);
+    let marker_metadata = fs::metadata(state_home.path().join(".personality_migration"))
+      .expect("personality migration marker");
+    assert_eq!((marker_metadata.uid(), marker_metadata.gid()), root_owner);
+    assert_eq!(marker_metadata.mode() & 0o777, 0o444);
+    assert_eq!(marker_metadata.nlink(), 1);
+    for directory in ["sqlite", "log", "tmp"] {
+      let metadata = fs::metadata(state_home.path().join(directory)).expect("runtime directory");
+      assert_eq!((metadata.uid(), metadata.gid()), (65_534, 65_534));
+      assert_eq!(metadata.mode() & 0o777, 0o700);
+    }
+
+    let writable = Command::new("/bin/sh")
+      .arg("-c")
+      .arg(": > sqlite/test.db; : > log/test.log")
+      .uid(65_534)
+      .gid(65_534)
+      .env_clear()
+      .current_dir(state_home.path())
+      .status()
+      .expect("runtime writable directories probe");
+    assert!(writable.success());
+    for attack in [
+      "printf x > config.toml",
+      "chmod 0600 config.toml",
+      "mv config.toml replaced.toml",
+      "ln installation_id replacement && mv -f replacement config.toml",
+      "rm config.toml",
+    ] {
+      let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(attack)
+        .uid(65_534)
+        .gid(65_534)
+        .env_clear()
+        .current_dir(state_home.path())
+        .stderr(Stdio::null())
+        .status()
+        .expect("runtime config attack probe");
+      assert!(!status.success(), "attack unexpectedly succeeded: {attack}");
+    }
+    assert_eq!(
+      sha256_file(&state_home.path().join("config.toml")).expect("post-attack config digest"),
+      profile.config_sha256
+    );
   }
 
   #[test]
@@ -5141,6 +5459,13 @@ mod tests {
     let pid_file = cwd.join("grandchild.pid");
     fs::create_dir(&base).expect("base");
     fs::create_dir(&cwd).expect("cwd");
+    chown(
+      &cwd,
+      Some(Uid::from_raw(65_534)),
+      Some(Gid::from_raw(65_534)),
+    )
+    .expect("own process-tree cwd");
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).expect("protect process-tree cwd");
     let program =
       PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/process-tree-app-server.sh");
     let mut profile = profile();
@@ -5153,14 +5478,9 @@ mod tests {
     let runtime = evidence(&profile);
     let started = Instant::now();
     let artifacts = Arc::new(test_artifacts(&program, &codex_home, &cwd));
-    let program_metadata = fs::metadata(&program).expect("program metadata");
-    let transport = StdioScheduledJsonlTransport::spawn(
-      &profile,
-      runtime,
-      &artifacts,
-      Some((program_metadata.uid(), program_metadata.gid())),
-    )
-    .expect("spawn");
+    let transport =
+      StdioScheduledJsonlTransport::spawn(&profile, runtime, &artifacts, Some((65_534, 65_534)))
+        .expect("spawn");
     let pid_deadline = Instant::now() + Duration::from_secs(2);
     while !pid_file.exists() && Instant::now() < pid_deadline {
       thread::sleep(Duration::from_millis(5));

@@ -555,6 +555,7 @@ mod tests {
 
   fn ready_until(expiry: u64) -> RemoteMessage {
     RemoteMessage::Ready(ReadyFrame {
+      signed_evidence_json: "{}".to_owned(),
       challenge: "d".repeat(64),
       ready_until_unix_millis: expiry,
       attested_profile_json: capability_profile_json(),
@@ -595,6 +596,7 @@ mod tests {
       .remote_recovery_attestation_json(&capability_profile_json(), &profile_digest(), 9)
       .expect("remote recovery attestation");
     RemoteMessage::Prepared(PreparedFrame {
+      signed_evidence_json: "{}".to_owned(),
       binding,
       preparation_nonce: "3".repeat(64),
       attested_profile_digest: hex_sha256(attested_profile_json.as_bytes()),
@@ -677,6 +679,7 @@ mod tests {
     let result = frame(
       3,
       RemoteMessage::Result(ResultFrame {
+        signed_evidence_json: "{}".to_owned(),
         binding: binding(),
         preparation_nonce: "3".repeat(64),
         kind: RemoteResultKind::Completed,
@@ -983,6 +986,7 @@ mod tests {
           frame(
             3,
             RemoteMessage::Result(ResultFrame {
+              signed_evidence_json: "{}".to_owned(),
               binding: binding(),
               preparation_nonce: "3".repeat(64),
               kind,
@@ -1124,6 +1128,7 @@ mod tests {
         frame(
           3,
           RemoteMessage::Result(ResultFrame {
+            signed_evidence_json: "{}".to_owned(),
             binding: binding(),
             preparation_nonce: "3".repeat(64),
             kind: RemoteResultKind::Completed,

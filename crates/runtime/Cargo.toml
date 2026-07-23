@@ -16,6 +16,7 @@ codeoff-config = { path = "../config" }
 codeoff-core = { path = "../core" }
 codeoff-state = { path = "../state" }
 nix.workspace = true
+ring.workspace = true
 rustls.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -918,6 +918,10 @@ pub struct ScheduledRunnerGatewayConfig {
   pub server_certificate_path: PathBuf,
   pub server_private_key_path: PathBuf,
   pub client_ca_bundle_path: PathBuf,
+  pub executor_evidence_public_key_path: PathBuf,
+  pub executor_evidence_key_id: String,
+  pub executor_evidence_key_revision: String,
+  pub executor_evidence_signer_identity: String,
   pub handshake_timeout_ms: u64,
   pub frame_timeout_ms: u64,
   pub readiness_ttl_ms: u64,
@@ -951,7 +955,32 @@ impl ScheduledRunnerGatewayConfig {
         "scheduled_codex.remote_runner.gateway.client_ca_bundle_path",
         &self.client_ca_bundle_path,
       ),
+      (
+        "scheduled_codex.remote_runner.gateway.executor_evidence_public_key_path",
+        &self.executor_evidence_public_key_path,
+      ),
     ])?;
+    for (field, value) in [
+      (
+        "scheduled_codex.remote_runner.gateway.executor_evidence_key_id",
+        self.executor_evidence_key_id.as_str(),
+      ),
+      (
+        "scheduled_codex.remote_runner.gateway.executor_evidence_key_revision",
+        self.executor_evidence_key_revision.as_str(),
+      ),
+      (
+        "scheduled_codex.remote_runner.gateway.executor_evidence_signer_identity",
+        self.executor_evidence_signer_identity.as_str(),
+      ),
+    ] {
+      if value.is_empty() || value != value.trim() || value.len() > 128 {
+        return Err(invalid_scheduled_codex(
+          field,
+          "must be bounded canonical text",
+        ));
+      }
+    }
     validate_milliseconds(
       "scheduled_codex.remote_runner.gateway.handshake_timeout_ms",
       self.handshake_timeout_ms,
@@ -1071,6 +1100,10 @@ impl ScheduledRunnerControlConfig {
 #[serde(deny_unknown_fields)]
 pub struct ScheduledRunnerExecutorConfig {
   pub local_socket_path: PathBuf,
+  pub evidence_private_key_path: PathBuf,
+  pub evidence_key_id: String,
+  pub evidence_key_revision: String,
+  pub evidence_signer_identity: String,
   pub expected_control_uid: u32,
   pub expected_control_gid: u32,
   pub codex_child_uid: u32,
@@ -1081,10 +1114,37 @@ pub struct ScheduledRunnerExecutorConfig {
 
 impl ScheduledRunnerExecutorConfig {
   fn validate(&self, deployment: &ScheduledCodexConfig) -> Result<(), ConfigError> {
-    validate_absolute_paths([(
-      "scheduled_codex.remote_runner.executor.local_socket_path",
-      &self.local_socket_path,
-    )])?;
+    validate_absolute_paths([
+      (
+        "scheduled_codex.remote_runner.executor.local_socket_path",
+        &self.local_socket_path,
+      ),
+      (
+        "scheduled_codex.remote_runner.executor.evidence_private_key_path",
+        &self.evidence_private_key_path,
+      ),
+    ])?;
+    for (field, value) in [
+      (
+        "scheduled_codex.remote_runner.executor.evidence_key_id",
+        self.evidence_key_id.as_str(),
+      ),
+      (
+        "scheduled_codex.remote_runner.executor.evidence_key_revision",
+        self.evidence_key_revision.as_str(),
+      ),
+      (
+        "scheduled_codex.remote_runner.executor.evidence_signer_identity",
+        self.evidence_signer_identity.as_str(),
+      ),
+    ] {
+      if value.is_empty() || value != value.trim() || value.len() > 128 {
+        return Err(invalid_scheduled_codex(
+          field,
+          "must be bounded canonical text",
+        ));
+      }
+    }
     if self.expected_control_uid == 0
       || self.expected_control_gid == 0
       || self.expected_control_uid == deployment.trusted_owner_uid

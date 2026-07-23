@@ -408,6 +408,7 @@ dependencies = [
  "codeoff-core",
  "codeoff-state",
  "nix",
+ "ring",
  "rustls",
  "serde_json",
  "sha2 0.10.9",

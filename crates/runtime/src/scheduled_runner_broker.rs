@@ -31,6 +31,9 @@ use crate::scheduled_remote_protocol::{
 use crate::scheduled_remote_session::{
   RemoteDisconnectOutcome, RemoteSessionRole, RemoteSessionState, RemoteTerminalDisposition,
 };
+use crate::scheduled_runner_evidence::{
+  RunnerEvidenceKind, SignedRunnerEvidence, verify_runner_evidence,
+};
 use crate::scheduled_runner_tls::{
   ScheduledRunnerAuthorizedPeer, ScheduledRunnerServerConnection, session_challenge, session_nonce,
 };
@@ -51,6 +54,11 @@ pub struct ScheduledRunnerBrokerConfig {
   pub runner_workload_identity: String,
   pub runner_client_spki_sha256: String,
   pub credential_revision: String,
+  pub executor_evidence_public_key: Vec<u8>,
+  pub executor_evidence_key_id: String,
+  pub executor_evidence_key_revision: String,
+  pub executor_evidence_signer_identity: String,
+  pub executor_identity: String,
   pub max_connections: usize,
   pub admission_ttl: Duration,
 }
@@ -63,6 +71,8 @@ impl ScheduledRunnerBrokerConfig {
       || !(1..=MAX_BROKER_CONNECTIONS).contains(&self.max_connections)
       || self.admission_ttl.is_zero()
       || self.admission_ttl > Duration::from_millis(MAX_ADMISSION_TTL_MILLIS)
+      || self.executor_evidence_public_key.len() != 32
+      || self.executor_evidence_key_id.is_empty()
     {
       return Err(ScheduledRunnerBrokerError::InvalidConfiguration);
     }
@@ -178,6 +188,7 @@ impl ScheduledRunnerBroker {
       ready_frame,
       ready,
       commands,
+      evidence_config: self.inner.config.clone(),
       connected: AtomicBool::new(true),
       slot: Mutex::new(None),
     });
@@ -245,6 +256,33 @@ impl ScheduledRunnerBroker {
       || attested.runner_workload_identity != config.runner_workload_identity
       || attested.runner_client_cert_public_key_fingerprint != config.runner_client_spki_sha256
       || attested.credential_revision != config.credential_revision
+    {
+      return Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch);
+    }
+    let evidence = SignedRunnerEvidence::parse_canonical_json(&ready.signed_evidence_json)
+      .map_err(|_| ScheduledRunnerBrokerError::ReadyIdentityMismatch)?;
+    if evidence.key_id != config.executor_evidence_key_id {
+      return Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch);
+    }
+    let claims = verify_runner_evidence(&evidence, &config.executor_evidence_public_key, now)
+      .map_err(|_| ScheduledRunnerBrokerError::ReadyIdentityMismatch)?;
+    if claims.kind != RunnerEvidenceKind::Ready
+      || claims.session_nonce != expected_session_nonce
+      || claims.challenge != expected_challenge
+      || claims.sequence != frame.sequence
+      || claims.expires_at_unix_millis != ready.ready_until_unix_millis
+      || claims.deployment_epoch != config.deployment_epoch
+      || claims.deployment_profile_digest != config.profile_digest
+      || claims.observed_profile_digest != ready.attested_profile_digest
+      || claims.signer_identity != config.executor_evidence_signer_identity
+      || claims.executor_identity != config.executor_identity
+      || claims.key_revision != config.executor_evidence_key_revision
+      || claims.credential_revision != config.credential_revision
+      || claims.payload_digest
+        != format!(
+          "{:x}",
+          Sha256::digest(ready.attested_profile_json.as_bytes())
+        )
     {
       return Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch);
     }
@@ -347,6 +385,45 @@ impl ScheduledRunnerBroker {
   }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_executor_evidence(
+  config: &ScheduledRunnerBrokerConfig,
+  ready_frame: &RemoteFrame,
+  expected_kind: RunnerEvidenceKind,
+  expected_sequence: u64,
+  expected_observed_profile_digest: &str,
+  expected_payload_digest: &str,
+  encoded: &str,
+  now: u64,
+) -> Result<(), ScheduledRunnerBrokerError> {
+  let RemoteMessage::Ready(ready) = &ready_frame.message else {
+    return Err(ScheduledRunnerBrokerError::ProtocolRejected);
+  };
+  let evidence = SignedRunnerEvidence::parse_canonical_json(encoded)
+    .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
+  if evidence.key_id != config.executor_evidence_key_id {
+    return Err(ScheduledRunnerBrokerError::ProtocolRejected);
+  }
+  let claims = verify_runner_evidence(&evidence, &config.executor_evidence_public_key, now)
+    .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
+  if claims.kind != expected_kind
+    || claims.session_nonce != ready_frame.session_nonce
+    || claims.challenge != ready.challenge
+    || claims.sequence != expected_sequence
+    || claims.deployment_epoch != config.deployment_epoch
+    || claims.deployment_profile_digest != config.profile_digest
+    || claims.observed_profile_digest != expected_observed_profile_digest
+    || claims.signer_identity != config.executor_evidence_signer_identity
+    || claims.key_revision != config.executor_evidence_key_revision
+    || claims.executor_identity != config.executor_identity
+    || claims.credential_revision != config.credential_revision
+    || claims.payload_digest != expected_payload_digest
+  {
+    return Err(ScheduledRunnerBrokerError::ProtocolRejected);
+  }
+  Ok(())
+}
+
 struct SessionRegistration {
   broker: ScheduledRunnerBroker,
   session: Arc<RegisteredRunnerSession>,
@@ -370,6 +447,7 @@ struct RegisteredRunnerSession {
   ready_frame: RemoteFrame,
   ready: ReadyFrame,
   commands: mpsc::Sender<BrokerCommand>,
+  evidence_config: ScheduledRunnerBrokerConfig,
   connected: AtomicBool,
   slot: Mutex<Option<ProtocolAdmission>>,
 }
@@ -551,6 +629,7 @@ async fn run_registered_connection(
               *prepare,
               cancellation,
               &mut state,
+              &session.evidence_config,
             ).await;
             let failed = result.is_err();
             let _ = response.send(result);
@@ -559,7 +638,7 @@ async fn run_registered_connection(
             }
           }
           BrokerCommand::Start { frame, cancellation, response } => {
-            let result = drive_start(&mut connection, *frame, cancellation, &mut state).await;
+            let result = drive_start(&mut connection, *frame, cancellation, &mut state, &session.evidence_config, &session.ready).await;
             let failed = result.is_err();
             let _ = response.send(result);
             return if failed {
@@ -601,6 +680,7 @@ async fn drive_prepare(
   prepare: RemoteFrame,
   cancellation: Arc<AtomicBool>,
   state: &mut Option<RemoteSessionState>,
+  evidence_config: &ScheduledRunnerBrokerConfig,
 ) -> Result<PreparedFrame, ScheduledRunnerBrokerError> {
   if state.is_some() {
     return Err(ScheduledRunnerBrokerError::SessionBusy);
@@ -662,6 +742,16 @@ async fn drive_prepare(
       .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
     match frame.message {
       RemoteMessage::Prepared(mut prepared) => {
+        validate_executor_evidence(
+          evidence_config,
+          ready,
+          RunnerEvidenceKind::Prepared,
+          2,
+          &prepared.attested_profile_digest,
+          &prepared.attested_profile_digest,
+          &prepared.signed_evidence_json,
+          unix_millis()?,
+        )?;
         let RemoteMessage::Ready(ready_identity) = &ready.message else {
           return Err(ScheduledRunnerBrokerError::ProtocolRejected);
         };
@@ -692,6 +782,8 @@ async fn drive_start(
   frame: RemoteFrame,
   cancellation: Arc<AtomicBool>,
   state: &mut Option<RemoteSessionState>,
+  evidence_config: &ScheduledRunnerBrokerConfig,
+  ready: &ReadyFrame,
 ) -> Result<RemoteExecutionTerminal, ScheduledRunnerBrokerError> {
   let session = state
     .as_mut()
@@ -735,7 +827,19 @@ async fn drive_start(
           .accept(RemoteSessionRole::Runner, frame.clone(), unix_millis()?)
           .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
         match frame.message {
-          RemoteMessage::Result(result) => return Ok(RemoteExecutionTerminal::Result(result)),
+          RemoteMessage::Result(result) => {
+            validate_executor_evidence(
+              evidence_config,
+              &RemoteFrame { version: REMOTE_PROTOCOL_VERSION, session_nonce: frame.session_nonce.clone(), sequence: 1, message: RemoteMessage::Ready(ready.clone()) },
+              RunnerEvidenceKind::Result,
+              3,
+              &ready.attested_profile_digest,
+              &format!("{:x}", Sha256::digest(result.result_json.as_bytes())),
+              &result.signed_evidence_json,
+              unix_millis()?,
+            )?;
+            return Ok(RemoteExecutionTerminal::Result(result));
+          },
           RemoteMessage::Heartbeat(heartbeat)
             if heartbeat.phase == RemoteHeartbeatPhase::Started => {}
           RemoteMessage::Error(ErrorFrame { .. }) => {
@@ -761,6 +865,10 @@ fn disconnect_terminal(outcome: RemoteDisconnectOutcome) -> RemoteExecutionTermi
   }
 }
 
+#[allow(
+  clippy::large_enum_variant,
+  reason = "one terminal result is consumed immediately"
+)]
 enum RemoteExecutionTerminal {
   Result(ResultFrame),
   FailedBeforeStart,
@@ -1070,6 +1178,21 @@ fn is_oci_digest(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::scheduled_runner_evidence::{
+    RunnerEvidenceClaims, RunnerEvidenceKind, sign_runner_evidence,
+  };
+  use ring::rand::SystemRandom;
+  use ring::signature::{Ed25519KeyPair, KeyPair};
+  use std::sync::OnceLock;
+
+  fn evidence_keys() -> &'static (Vec<u8>, Vec<u8>) {
+    static KEYS: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
+    KEYS.get_or_init(|| {
+      let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("key");
+      let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("pair");
+      (pkcs8.as_ref().to_vec(), pair.public_key().as_ref().to_vec())
+    })
+  }
 
   struct TestPermitIssuer;
 
@@ -1121,14 +1244,41 @@ mod tests {
     };
     profile.profile_sha256 = profile.computed_profile_sha256();
     let attested_profile_json = profile.canonical_json();
+    let attested_profile_digest = format!("{:x}", Sha256::digest(attested_profile_json.as_bytes()));
+    let now = unix_millis().expect("time");
+    let ready_until = now + 4_000;
+    let signed_evidence_json = sign_runner_evidence(
+      &RunnerEvidenceClaims {
+        kind: RunnerEvidenceKind::Ready,
+        algorithm_version: "ed25519-v1".to_owned(),
+        signer_identity: config.executor_evidence_signer_identity.clone(),
+        key_revision: config.executor_evidence_key_revision.clone(),
+        session_nonce: session_nonce.to_owned(),
+        challenge: challenge.to_owned(),
+        sequence: 1,
+        issued_at_unix_millis: now,
+        expires_at_unix_millis: ready_until,
+        deployment_epoch,
+        deployment_profile_digest: config.profile_digest.clone(),
+        observed_profile_digest: attested_profile_digest.clone(),
+        executor_identity: config.executor_identity.clone(),
+        credential_revision: config.credential_revision.clone(),
+        payload_digest: attested_profile_digest.clone(),
+      },
+      &config.executor_evidence_key_id,
+      &evidence_keys().0,
+    )
+    .expect("sign")
+    .canonical_json();
     RemoteFrame {
       version: REMOTE_PROTOCOL_VERSION,
       session_nonce: session_nonce.to_owned(),
       sequence: 1,
       message: RemoteMessage::Ready(ReadyFrame {
+        signed_evidence_json,
         challenge: challenge.to_owned(),
-        ready_until_unix_millis: unix_millis().expect("time") + 4_000,
-        attested_profile_digest: format!("{:x}", Sha256::digest(attested_profile_json.as_bytes())),
+        ready_until_unix_millis: ready_until,
+        attested_profile_digest,
         attested_profile_json,
         deployment_epoch,
         profile_digest: config.profile_digest,
@@ -1159,9 +1309,93 @@ mod tests {
       ready_frame: frame,
       ready,
       commands,
+      evidence_config: config,
       connected: AtomicBool::new(true),
       slot: Mutex::new(None),
     })
+  }
+
+  #[test]
+  fn prepared_and_result_evidence_reject_tamper_replay_and_wrong_kind() {
+    let config = config();
+    let nonce = "9".repeat(64);
+    let challenge = "8".repeat(64);
+    let ready = ready_frame(
+      &nonce,
+      &challenge,
+      config.deployment_epoch,
+      &config.runner_workload_identity,
+      &config.runner_client_spki_sha256,
+    );
+    let now = unix_millis().expect("time");
+    for (kind, sequence, payload) in [
+      (RunnerEvidenceKind::Prepared, 2, "6".repeat(64)),
+      (RunnerEvidenceKind::Result, 3, "7".repeat(64)),
+    ] {
+      let claims = RunnerEvidenceClaims {
+        kind,
+        algorithm_version: "ed25519-v1".to_owned(),
+        signer_identity: config.executor_evidence_signer_identity.clone(),
+        key_revision: config.executor_evidence_key_revision.clone(),
+        session_nonce: nonce.clone(),
+        challenge: challenge.clone(),
+        sequence,
+        issued_at_unix_millis: now,
+        expires_at_unix_millis: now + 4_000,
+        deployment_epoch: config.deployment_epoch,
+        deployment_profile_digest: config.profile_digest.clone(),
+        observed_profile_digest: "5".repeat(64),
+        executor_identity: config.executor_identity.clone(),
+        credential_revision: config.credential_revision.clone(),
+        payload_digest: payload.clone(),
+      };
+      let signed = sign_runner_evidence(
+        &claims,
+        &config.executor_evidence_key_id,
+        &evidence_keys().0,
+      )
+      .expect("signed evidence")
+      .canonical_json();
+      assert!(
+        validate_executor_evidence(
+          &config,
+          &ready,
+          kind,
+          sequence,
+          &"5".repeat(64),
+          &payload,
+          &signed,
+          now
+        )
+        .is_ok()
+      );
+      assert!(
+        validate_executor_evidence(
+          &config,
+          &ready,
+          kind,
+          sequence,
+          &"5".repeat(64),
+          &"0".repeat(64),
+          &signed,
+          now
+        )
+        .is_err()
+      );
+      assert!(
+        validate_executor_evidence(
+          &config,
+          &ready,
+          RunnerEvidenceKind::Ready,
+          sequence,
+          &"5".repeat(64),
+          &payload,
+          &signed,
+          now
+        )
+        .is_err()
+      );
+    }
   }
 
   #[test]
@@ -1341,6 +1575,7 @@ mod tests {
   fn remote_result_requires_the_exact_versioned_summary_shape() {
     let result = |result_json: &str| {
       remote_execution_result(ResultFrame {
+        signed_evidence_json: "{}".to_owned(),
         binding: RunBinding {
           run_id: "run-1".to_owned(),
           job_id: "job-1".to_owned(),
@@ -1386,6 +1621,11 @@ mod tests {
       runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
       runner_client_spki_sha256: "e".repeat(64),
       credential_revision: "credential-v1".to_owned(),
+      executor_evidence_public_key: evidence_keys().1.clone(),
+      executor_evidence_key_id: "executor-key-1".to_owned(),
+      executor_evidence_key_revision: "executor-evidence-2026-07".to_owned(),
+      executor_evidence_signer_identity: "spiffe://codeoff/executor/production".to_owned(),
+      executor_identity: "uid:0:gid:0".to_owned(),
       max_connections: 2,
       admission_ttl: Duration::from_secs(5),
     }

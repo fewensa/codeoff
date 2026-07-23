@@ -9,7 +9,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -432,6 +432,20 @@ fn load_roots(
   Ok(roots)
 }
 
+/// Loads a bounded root-owned 0400 file through the anchored no-symlink path walker.
+pub fn load_root_owned_bounded_file(
+  path: &Path,
+  max_bytes: u64,
+) -> Result<Vec<u8>, ScheduledRunnerTlsError> {
+  let mut file = open_owned_file(path, ROOT_FILE_OWNER, max_bytes)?;
+  let mut bytes = Vec::new();
+  file.read_to_end(&mut bytes)?;
+  if bytes.is_empty() || u64::try_from(bytes.len()).map_or(true, |len| len > max_bytes) {
+    return Err(ScheduledRunnerTlsError::FileRejected("size"));
+  }
+  Ok(bytes)
+}
+
 fn load_certificates(
   path: &Path,
   expected_owner: ExpectedFileOwner,
@@ -598,6 +612,7 @@ mod tests {
       session_nonce: "a".repeat(64),
       sequence: 1,
       message: RemoteMessage::Ready(ReadyFrame {
+        signed_evidence_json: "{}".to_owned(),
         challenge: "b".repeat(64),
         ready_until_unix_millis: NOW + 5_000,
         attested_profile_json: r#"{"schema_version":1}"#.to_owned(),

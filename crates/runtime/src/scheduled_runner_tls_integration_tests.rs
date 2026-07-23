@@ -278,6 +278,7 @@ fn ready(session_nonce: &str, challenge: String, fingerprint: &str, now: u64) ->
     session_nonce: session_nonce.to_owned(),
     sequence: 1,
     message: RemoteMessage::Ready(ReadyFrame {
+      signed_evidence_json: "{}".to_owned(),
       challenge,
       ready_until_unix_millis: now + 5_000,
       attested_profile_json: r#"{"schema_version":1}"#.to_owned(),

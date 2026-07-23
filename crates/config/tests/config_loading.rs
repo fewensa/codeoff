@@ -412,6 +412,10 @@ fn gateway_config() -> ScheduledRunnerGatewayConfig {
     server_certificate_path: "/run/codeoff/tls/server.crt".into(),
     server_private_key_path: "/run/codeoff/tls/server.key".into(),
     client_ca_bundle_path: "/run/codeoff/tls/client-ca.crt".into(),
+    executor_evidence_public_key_path: "/run/codeoff/evidence/executor.pub".into(),
+    executor_evidence_key_id: "executor-key-1".to_owned(),
+    executor_evidence_key_revision: "executor-evidence-2026-07".to_owned(),
+    executor_evidence_signer_identity: "spiffe://codeoff/executor/production".to_owned(),
     handshake_timeout_ms: 5_000,
     frame_timeout_ms: 30_000,
     readiness_ttl_ms: 30_000,
@@ -440,6 +444,10 @@ fn control_config() -> ScheduledRunnerControlConfig {
 fn executor_config() -> ScheduledRunnerExecutorConfig {
   ScheduledRunnerExecutorConfig {
     local_socket_path: "/run/codeoff/runner/executor.sock".into(),
+    evidence_private_key_path: "/run/codeoff/evidence/executor.pk8".into(),
+    evidence_key_id: "executor-key-1".to_owned(),
+    evidence_key_revision: "executor-evidence-2026-07".to_owned(),
+    evidence_signer_identity: "spiffe://codeoff/executor/production".to_owned(),
     expected_control_uid: 10_001,
     expected_control_gid: 10_001,
     codex_child_uid: 65_534,

@@ -47,6 +47,7 @@ pub struct ReadinessRequestFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyFrame {
+  pub signed_evidence_json: String,
   pub challenge: String,
   pub ready_until_unix_millis: u64,
   pub attested_profile_json: String,
@@ -93,6 +94,7 @@ pub struct PrepareFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedFrame {
+  pub signed_evidence_json: String,
   pub binding: RunBinding,
   pub preparation_nonce: String,
   pub attested_profile_json: String,
@@ -114,6 +116,7 @@ pub enum RemoteResultKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultFrame {
+  pub signed_evidence_json: String,
   pub binding: RunBinding,
   pub preparation_nonce: String,
   pub kind: RemoteResultKind,
@@ -374,6 +377,7 @@ impl ReadyFrame {
   fn validate_at(&self, now: u64) -> Result<(), RemoteProtocolError> {
     require_hex("ready.challenge", &self.challenge, 64)?;
     require_json_field("ready.attested_profile_json", &self.attested_profile_json)?;
+    require_json_field("ready.signed_evidence_json", &self.signed_evidence_json)?;
     require_hex(
       "ready.attested_profile_digest",
       &self.attested_profile_digest,
@@ -413,6 +417,7 @@ impl ReadyFrame {
       "runner_workload_identity": self.runner_workload_identity,
       "runner_client_cert_public_key_fingerprint": self.runner_client_cert_public_key_fingerprint,
       "credential_revision": self.credential_revision,
+      "signed_evidence_json": self.signed_evidence_json,
     })
   }
 
@@ -431,6 +436,7 @@ impl ReadyFrame {
         "runner_workload_identity",
         "runner_client_cert_public_key_fingerprint",
         "credential_revision",
+        "signed_evidence_json",
       ],
       "ready",
     )?;
@@ -449,6 +455,7 @@ impl ReadyFrame {
         "runner_client_cert_public_key_fingerprint",
       )?,
       credential_revision: required_string(object, "credential_revision")?,
+      signed_evidence_json: required_string(object, "signed_evidence_json")?,
     })
   }
 }
@@ -611,7 +618,8 @@ impl PreparedFrame {
       "prepared.attested_profile_digest",
       &self.attested_profile_digest,
       64,
-    )
+    )?;
+    require_json_field("prepared.signed_evidence_json", &self.signed_evidence_json)
   }
 
   fn to_value(&self) -> Value {
@@ -620,6 +628,7 @@ impl PreparedFrame {
       "preparation_nonce": self.preparation_nonce,
       "attested_profile_json": self.attested_profile_json,
       "attested_profile_digest": self.attested_profile_digest,
+      "signed_evidence_json": self.signed_evidence_json,
     })
   }
 
@@ -631,6 +640,7 @@ impl PreparedFrame {
         "preparation_nonce",
         "attested_profile_json",
         "attested_profile_digest",
+        "signed_evidence_json",
       ],
       "prepared",
     )?;
@@ -639,6 +649,7 @@ impl PreparedFrame {
       preparation_nonce: required_string(object, "preparation_nonce")?,
       attested_profile_json: required_string(object, "attested_profile_json")?,
       attested_profile_digest: required_string(object, "attested_profile_digest")?,
+      signed_evidence_json: required_string(object, "signed_evidence_json")?,
     })
   }
 }
@@ -669,7 +680,7 @@ impl ResultFrame {
     if self.result_json.len() > MAX_JSON_FIELD_BYTES {
       return Err(RemoteProtocolError::InvalidField("result.result_json"));
     }
-    Ok(())
+    require_json_field("result.signed_evidence_json", &self.signed_evidence_json)
   }
 
   fn to_value(&self) -> Value {
@@ -683,13 +694,20 @@ impl ResultFrame {
       "preparation_nonce": self.preparation_nonce,
       "kind": kind,
       "result_json": self.result_json,
+      "signed_evidence_json": self.signed_evidence_json,
     })
   }
 
   fn from_value(value: &Value) -> Result<Self, RemoteProtocolError> {
     let object = exact_object(
       value,
-      &["binding", "preparation_nonce", "kind", "result_json"],
+      &[
+        "binding",
+        "preparation_nonce",
+        "kind",
+        "result_json",
+        "signed_evidence_json",
+      ],
       "result",
     )?;
     let kind = match required_str(object, "kind")? {
@@ -703,6 +721,7 @@ impl ResultFrame {
       preparation_nonce: required_string(object, "preparation_nonce")?,
       kind,
       result_json: required_string(object, "result_json")?,
+      signed_evidence_json: required_string(object, "signed_evidence_json")?,
     })
   }
 }
@@ -946,6 +965,7 @@ mod tests {
       session_nonce: "c".repeat(64),
       sequence,
       message: RemoteMessage::Ready(ReadyFrame {
+        signed_evidence_json: "{}".to_owned(),
         challenge: "d".repeat(64),
         ready_until_unix_millis: NOW + 10_000,
         attested_profile_json: r#"{"schema_version":1}"#.to_owned(),
@@ -996,6 +1016,7 @@ mod tests {
       RemoteFrame {
         sequence: 4,
         message: RemoteMessage::Prepared(PreparedFrame {
+          signed_evidence_json: "{}".to_owned(),
           binding: binding(),
           preparation_nonce: "3".repeat(64),
           attested_profile_json: r#"{"profile":"bound"}"#.to_owned(),
@@ -1022,6 +1043,7 @@ mod tests {
       RemoteFrame {
         sequence: 7,
         message: RemoteMessage::Result(ResultFrame {
+          signed_evidence_json: "{}".to_owned(),
           binding: binding(),
           preparation_nonce: "3".repeat(64),
           kind: RemoteResultKind::OutcomeUnknown,

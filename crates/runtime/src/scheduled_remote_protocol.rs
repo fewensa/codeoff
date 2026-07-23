@@ -130,6 +130,8 @@ pub struct HeartbeatFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorFrame {
+  pub binding: Option<RunBinding>,
+  pub preparation_nonce: Option<String>,
   pub code: String,
   pub message: String,
   pub retryable: bool,
@@ -390,13 +392,7 @@ impl AdmissionFrame {
     require_hex("admission.challenge", &self.challenge, 64)?;
     require_hex("admission.admission_nonce", &self.admission_nonce, 64)?;
     require_hex("admission.profile_digest", &self.profile_digest, 64)?;
-    let valid_until = now.checked_add(MAX_ADMISSION_TTL_MILLIS);
-    if self.deployment_epoch == 0
-      || (now != 0
-        && (self.expires_at_unix_millis <= now
-          || valid_until.is_none()
-          || self.expires_at_unix_millis > valid_until.unwrap_or(0)))
-    {
+    if self.deployment_epoch == 0 || (now != 0 && self.expires_at_unix_millis <= now) {
       return Err(RemoteProtocolError::InvalidField("admission.validity"));
     }
     Ok(())
@@ -680,17 +676,41 @@ impl HeartbeatFrame {
 
 impl ErrorFrame {
   fn validate(&self) -> Result<(), RemoteProtocolError> {
+    if let Some(binding) = &self.binding {
+      binding.validate()?;
+    }
+    if let Some(nonce) = &self.preparation_nonce {
+      require_hex("error.preparation_nonce", nonce, 64)?;
+    }
     require_credential_revision("error.code", &self.code)?;
     require_bounded("error.message", &self.message, MAX_ERROR_BYTES)
   }
 
   fn to_value(&self) -> Value {
-    json!({"code": self.code, "message": self.message, "retryable": self.retryable})
+    json!({
+      "binding": self.binding.as_ref().map(RunBinding::to_value),
+      "preparation_nonce": self.preparation_nonce,
+      "code": self.code,
+      "message": self.message,
+      "retryable": self.retryable,
+    })
   }
 
   fn from_value(value: &Value) -> Result<Self, RemoteProtocolError> {
-    let object = exact_object(value, &["code", "message", "retryable"], "error")?;
+    let object = exact_object(
+      value,
+      &[
+        "binding",
+        "preparation_nonce",
+        "code",
+        "message",
+        "retryable",
+      ],
+      "error",
+    )?;
     Ok(Self {
+      binding: optional_object(object, "binding", RunBinding::from_value)?,
+      preparation_nonce: optional_string(object, "preparation_nonce")?,
       code: required_string(object, "code")?,
       message: required_string(object, "message")?,
       retryable: required(object, "retryable")?
@@ -746,6 +766,28 @@ fn required_u64(
   required(object, field)?
     .as_u64()
     .ok_or(RemoteProtocolError::InvalidField(field))
+}
+
+fn optional_string(
+  object: &Map<String, Value>,
+  field: &'static str,
+) -> Result<Option<String>, RemoteProtocolError> {
+  match required(object, field)? {
+    Value::Null => Ok(None),
+    Value::String(value) => Ok(Some(value.clone())),
+    _ => Err(RemoteProtocolError::InvalidField(field)),
+  }
+}
+
+fn optional_object<T>(
+  object: &Map<String, Value>,
+  field: &'static str,
+  parse: impl FnOnce(&Value) -> Result<T, RemoteProtocolError>,
+) -> Result<Option<T>, RemoteProtocolError> {
+  match required(object, field)? {
+    Value::Null => Ok(None),
+    value => parse(value).map(Some),
+  }
 }
 
 fn require_critical_id(field: &'static str, value: &str) -> Result<(), RemoteProtocolError> {
@@ -917,6 +959,8 @@ mod tests {
       RemoteFrame {
         sequence: 9,
         message: RemoteMessage::Error(ErrorFrame {
+          binding: Some(binding()),
+          preparation_nonce: Some("3".repeat(64)),
           code: "runner_unavailable".to_owned(),
           message: "runner slot unavailable".to_owned(),
           retryable: true,

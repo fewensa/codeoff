@@ -1599,6 +1599,52 @@ impl ScheduledPrepareAuthority {
     )
   }
 
+  /// Builds the canonical recovery attestation used by a remote runner and binds it to the
+  /// signed deployment profile selected by the gateway.
+  ///
+  /// # Errors
+  /// Returns an error when either profile is noncanonical or incomplete.
+  ///
+  /// # Panics
+  /// Panics only if this privately constructed authority no longer contains valid canonical JSON.
+  pub fn remote_recovery_attestation_json(
+    &self,
+    capability_profile_json: &str,
+    deployment_profile_digest: &str,
+    deployment_epoch: u64,
+  ) -> Result<String, StateValueError> {
+    let capability_profile = validate_recovery_capability_profile(capability_profile_json)?;
+    validate_lowercase_sha256(
+      "scheduled deployment profile digest",
+      deployment_profile_digest,
+    )?;
+    if deployment_epoch == 0 {
+      return Err(StateValueError::InvalidValue {
+        field: "scheduled deployment epoch",
+      });
+    }
+    let authority: Value = serde_json::from_str(&self.canonical_json)
+      .expect("validated authority remains valid canonical JSON");
+    Ok(
+      json!({
+        "authority": authority,
+        "authority_digest": self.digest,
+        "capability_profile": capability_profile,
+        "deployment_epoch": deployment_epoch,
+        "deployment_profile_digest": deployment_profile_digest,
+        "execution_surface": {
+          "approval_policy": "never",
+          "dynamic_tools": false,
+          "network_access": false,
+          "sandbox": "read-only",
+          "web_search": "disabled",
+        },
+        "schema_version": 3,
+      })
+      .to_string(),
+    )
+  }
+
   #[must_use]
   pub fn attestation_matches(
     &self,
@@ -1651,6 +1697,120 @@ impl ScheduledPrepareAuthority {
     profile
       .get("capability_profile")
       .is_some_and(|value| validate_recovery_capability_profile_value(value).is_ok())
+  }
+
+  #[must_use]
+  pub fn remote_recovery_attestation_matches(
+    &self,
+    canonical_json: &str,
+    digest: &str,
+    deployment_profile_digest: &str,
+    deployment_epoch: u64,
+  ) -> bool {
+    let Ok(profile) = serde_json::from_str::<Value>(canonical_json) else {
+      return false;
+    };
+    let expected_surface = json!({
+      "approval_policy": "never",
+      "dynamic_tools": false,
+      "network_access": false,
+      "sandbox": "read-only",
+      "web_search": "disabled",
+    });
+    profile.as_object().is_some_and(|object| object.len() == 7)
+      && serde_json::to_string(&profile).ok().as_deref() == Some(canonical_json)
+      && sha256_hex(canonical_json.as_bytes()) == digest
+      && profile.get("schema_version").and_then(Value::as_u64) == Some(3)
+      && profile.get("authority_digest").and_then(Value::as_str) == Some(self.digest())
+      && profile.get("authority")
+        == serde_json::from_str::<Value>(&self.canonical_json)
+          .ok()
+          .as_ref()
+      && profile
+        .get("deployment_profile_digest")
+        .and_then(Value::as_str)
+        == Some(deployment_profile_digest)
+      && profile.get("deployment_epoch").and_then(Value::as_u64) == Some(deployment_epoch)
+      && deployment_epoch > 0
+      && validate_lowercase_sha256(
+        "scheduled deployment profile digest",
+        deployment_profile_digest,
+      )
+      .is_ok()
+      && profile.get("execution_surface") == Some(&expected_surface)
+      && profile
+        .get("capability_profile")
+        .is_some_and(|value| validate_recovery_capability_profile_value(value).is_ok())
+  }
+
+  #[must_use]
+  pub fn matches_remote_binding(
+    &self,
+    run_id: &str,
+    job_id: &str,
+    attempt: u32,
+    fence: u64,
+    authority_digest: &str,
+  ) -> bool {
+    let Ok(authority) = serde_json::from_str::<Value>(&self.canonical_json) else {
+      return false;
+    };
+    authority_digest == self.digest()
+      && authority.pointer("/binding/run_id").and_then(Value::as_str) == Some(run_id)
+      && authority.pointer("/binding/job_id").and_then(Value::as_str) == Some(job_id)
+      && authority
+        .pointer("/binding/attempt")
+        .and_then(Value::as_u64)
+        == Some(u64::from(attempt))
+      && authority.pointer("/binding/fence").and_then(Value::as_u64) == Some(fence)
+  }
+
+  #[cfg(any(test, feature = "test-support"))]
+  #[must_use]
+  pub fn for_remote_session_test(run_id: &str, job_id: &str, attempt: u32, fence: u64) -> Self {
+    let canonical_json = json!({
+      "binding": {
+        "attempt": attempt,
+        "fence": fence,
+        "job_id": job_id,
+        "lease_owner": "remote-session-test",
+        "run_id": run_id,
+      },
+      "capability_identity_digest": "1".repeat(64),
+      "claim": {
+        "capability_schema_version": 1,
+        "coalesced_through": 100,
+        "definition_version": 1,
+        "job_generation": 1,
+        "schedule_generation": 1,
+        "schedule_id": "schedule-remote-session-test",
+        "scheduled_for": 100,
+      },
+      "digests": {
+        "baseline": "2".repeat(64),
+        "capability": "3".repeat(64),
+        "definition": "4".repeat(64),
+        "instruction": "5".repeat(64),
+        "targets": "6".repeat(64),
+        "task": "8".repeat(64),
+      },
+      "nonce": "7".repeat(64),
+      "operational_policy": SchedulerOperationalPolicy::default(),
+      "schema_version": 1,
+    })
+    .to_string();
+    let digest = framed_sha256(
+      "scheduled-prepare-authority-v1",
+      &[canonical_json.as_bytes()],
+    );
+    Self {
+      nonce: "7".repeat(64),
+      canonical_json,
+      digest,
+      instruction: "remote session test".to_owned(),
+      previous_success: None,
+      previous_success_was_truncated: false,
+    }
   }
 }
 

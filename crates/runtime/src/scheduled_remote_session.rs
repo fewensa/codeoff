@@ -1,10 +1,12 @@
 //! Role-aware lifecycle validation for one scheduled remote execution session.
 
+use codeoff_state::ScheduledPrepareAuthority;
 use sha2::{Digest, Sha256};
 
 use crate::scheduled_remote_protocol::{
   AdmissionFrame, MAX_ADMISSION_TTL_MILLIS, RemoteFrame, RemoteFrameSequencer,
-  RemoteHeartbeatPhase, RemoteMessage, RemoteProtocolError, RunBinding, SequenceAcceptance,
+  RemoteHeartbeatPhase, RemoteMessage, RemoteProtocolError, RemoteResultKind, RunBinding,
+  SequenceAcceptance,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,14 @@ pub enum RemoteSessionAcceptance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteDisconnectOutcome {
   PreflightNoExecution,
+  OutcomeUnknown,
+  AlreadyConclusive(RemoteTerminalDisposition),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTerminalDisposition {
+  Completed,
+  FailedBeforeStart,
   OutcomeUnknown,
 }
 
@@ -71,35 +81,48 @@ struct ReadyIdentity {
 #[derive(Debug, Clone)]
 struct AdmissionState {
   nonce: String,
-  expires_at_unix_millis: u64,
+  effective_expires_at_unix_millis: u64,
   consumed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalState {
+  disposition: RemoteTerminalDisposition,
+  conclusive_result: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct RemoteSessionState {
-  sequencer: RemoteFrameSequencer,
+  gateway_sequencer: RemoteFrameSequencer,
+  runner_sequencer: RemoteFrameSequencer,
+  expected_authority: ScheduledPrepareAuthority,
   phase: SessionPhase,
   ready: Option<ReadyIdentity>,
   admission: Option<AdmissionState>,
   binding: Option<RunBinding>,
   preparation_nonce: Option<String>,
   heartbeat_phase: Option<RemoteHeartbeatPhase>,
-  last_sender: Option<RemoteSessionRole>,
   started: bool,
+  terminal: Option<TerminalState>,
 }
 
 impl RemoteSessionState {
-  pub fn new(session_nonce: String) -> Result<Self, RemoteSessionError> {
+  pub fn new(
+    session_nonce: String,
+    expected_authority: ScheduledPrepareAuthority,
+  ) -> Result<Self, RemoteSessionError> {
     Ok(Self {
-      sequencer: RemoteFrameSequencer::new(session_nonce)?,
+      gateway_sequencer: RemoteFrameSequencer::new(session_nonce.clone())?,
+      runner_sequencer: RemoteFrameSequencer::new(session_nonce)?,
+      expected_authority,
       phase: SessionPhase::WaitingReady,
       ready: None,
       admission: None,
       binding: None,
       preparation_nonce: None,
       heartbeat_phase: None,
-      last_sender: None,
       started: false,
+      terminal: None,
     })
   }
 
@@ -109,12 +132,12 @@ impl RemoteSessionState {
     frame: RemoteFrame,
     now_unix_millis: u64,
   ) -> Result<RemoteSessionAcceptance, RemoteSessionError> {
-    let mut next_sequencer = self.sequencer.clone();
+    let mut next_sequencer = match sender {
+      RemoteSessionRole::Gateway => self.gateway_sequencer.clone(),
+      RemoteSessionRole::Runner => self.runner_sequencer.clone(),
+    };
     match next_sequencer.accept(frame.clone(), now_unix_millis)? {
       SequenceAcceptance::ExactDuplicate => {
-        if self.last_sender != Some(sender) {
-          return Err(RemoteSessionError::WrongSender);
-        }
         return Ok(RemoteSessionAcceptance::ExactDuplicate);
       }
       SequenceAcceptance::Accepted => {}
@@ -123,18 +146,27 @@ impl RemoteSessionState {
       return Err(RemoteSessionError::Terminal);
     }
     self.accept_message(sender, &frame.message, now_unix_millis)?;
-    self.sequencer = next_sequencer;
-    self.last_sender = Some(sender);
+    match sender {
+      RemoteSessionRole::Gateway => self.gateway_sequencer = next_sequencer,
+      RemoteSessionRole::Runner => self.runner_sequencer = next_sequencer,
+    }
     Ok(RemoteSessionAcceptance::Accepted)
   }
 
   #[must_use]
   pub fn disconnect(&self) -> RemoteDisconnectOutcome {
-    if self.started {
+    if let Some(terminal) = self.terminal.filter(|terminal| terminal.conclusive_result) {
+      RemoteDisconnectOutcome::AlreadyConclusive(terminal.disposition)
+    } else if self.started {
       RemoteDisconnectOutcome::OutcomeUnknown
     } else {
       RemoteDisconnectOutcome::PreflightNoExecution
     }
+  }
+
+  #[must_use]
+  pub fn terminal_disposition(&self) -> Option<RemoteTerminalDisposition> {
+    self.terminal.map(|terminal| terminal.disposition)
   }
 
   fn accept_message(
@@ -165,10 +197,10 @@ impl RemoteSessionState {
           RemoteSessionRole::Gateway,
           SessionPhase::WaitingAdmission,
         )?;
-        self.validate_admission(admission, now)?;
+        let effective_expiry = self.validate_admission(admission, now)?;
         self.admission = Some(AdmissionState {
           nonce: admission.admission_nonce.clone(),
-          expires_at_unix_millis: admission.expires_at_unix_millis,
+          effective_expires_at_unix_millis: effective_expiry,
           consumed: false,
         });
         self.phase = SessionPhase::WaitingPrepare;
@@ -206,10 +238,20 @@ impl RemoteSessionState {
           .as_ref()
           .expect("ready is present")
           .profile_digest;
-        if digest != prepared.attested_profile_digest
-          || prepared.attested_profile_digest != *profile_digest
-        {
+        if digest != prepared.attested_profile_digest {
           return Err(RemoteSessionError::AttestedProfileDigestMismatch);
+        }
+        if !self.expected_authority.remote_recovery_attestation_matches(
+          &prepared.attested_profile_json,
+          &prepared.attested_profile_digest,
+          profile_digest,
+          self
+            .ready
+            .as_ref()
+            .expect("ready is present")
+            .deployment_epoch,
+        ) {
+          return Err(RemoteSessionError::SessionIdentityMismatch);
         }
         self.preparation_nonce = Some(prepared.preparation_nonce.clone());
         self.phase = SessionPhase::WaitingStart;
@@ -227,13 +269,29 @@ impl RemoteSessionState {
         self.phase = SessionPhase::WaitingResult;
       }
       RemoteMessage::Result(result) => {
-        self.require(
-          sender,
-          RemoteSessionRole::Runner,
-          SessionPhase::WaitingResult,
-        )?;
+        if sender != RemoteSessionRole::Runner {
+          return Err(RemoteSessionError::WrongSender);
+        }
+        let expected_phase = match result.kind {
+          RemoteResultKind::FailedBeforeStart => SessionPhase::WaitingStart,
+          RemoteResultKind::Completed | RemoteResultKind::OutcomeUnknown => {
+            SessionPhase::WaitingResult
+          }
+        };
+        if self.phase != expected_phase {
+          return Err(RemoteSessionError::InvalidPhase);
+        }
         self.require_binding(&result.binding)?;
         self.require_preparation_nonce(&result.preparation_nonce)?;
+        let disposition = match result.kind {
+          RemoteResultKind::Completed => RemoteTerminalDisposition::Completed,
+          RemoteResultKind::FailedBeforeStart => RemoteTerminalDisposition::FailedBeforeStart,
+          RemoteResultKind::OutcomeUnknown => RemoteTerminalDisposition::OutcomeUnknown,
+        };
+        self.terminal = Some(TerminalState {
+          disposition,
+          conclusive_result: true,
+        });
         self.phase = SessionPhase::Terminal;
       }
       RemoteMessage::Heartbeat(heartbeat) => {
@@ -248,12 +306,29 @@ impl RemoteSessionState {
           return Err(RemoteSessionError::WrongSender);
         }
         self.require_binding(&cancel.binding)?;
+        self.terminal = Some(TerminalState {
+          disposition: if self.started {
+            RemoteTerminalDisposition::OutcomeUnknown
+          } else {
+            RemoteTerminalDisposition::FailedBeforeStart
+          },
+          conclusive_result: false,
+        });
         self.phase = SessionPhase::Terminal;
       }
-      RemoteMessage::Error(_) => {
+      RemoteMessage::Error(error) => {
         if sender != RemoteSessionRole::Runner {
           return Err(RemoteSessionError::WrongSender);
         }
+        self.validate_error_binding(error.binding.as_ref(), error.preparation_nonce.as_deref())?;
+        self.terminal = Some(TerminalState {
+          disposition: if self.started {
+            RemoteTerminalDisposition::OutcomeUnknown
+          } else {
+            RemoteTerminalDisposition::FailedBeforeStart
+          },
+          conclusive_result: false,
+        });
         self.phase = SessionPhase::Terminal;
       }
     }
@@ -279,7 +354,7 @@ impl RemoteSessionState {
     &self,
     admission: &AdmissionFrame,
     now: u64,
-  ) -> Result<(), RemoteSessionError> {
+  ) -> Result<u64, RemoteSessionError> {
     let ready = self.ready.as_ref().expect("ready is present");
     if admission.challenge != ready.challenge
       || admission.deployment_epoch != ready.deployment_epoch
@@ -287,19 +362,21 @@ impl RemoteSessionState {
     {
       return Err(RemoteSessionError::SessionIdentityMismatch);
     }
-    if ready.ready_until_unix_millis <= now {
-      return Err(RemoteSessionError::AdmissionExpired);
-    }
     let Some(max_expiry) = now.checked_add(MAX_ADMISSION_TTL_MILLIS) else {
       return Err(RemoteSessionError::AdmissionTtlInvalid);
     };
+    if ready.ready_until_unix_millis <= now {
+      return Err(RemoteSessionError::AdmissionExpired);
+    }
     if admission.expires_at_unix_millis <= now {
       return Err(RemoteSessionError::AdmissionExpired);
     }
-    if admission.expires_at_unix_millis > max_expiry {
-      return Err(RemoteSessionError::AdmissionTtlInvalid);
-    }
-    Ok(())
+    Ok(
+      ready
+        .ready_until_unix_millis
+        .min(admission.expires_at_unix_millis)
+        .min(max_expiry),
+    )
   }
 
   fn require_live_admission(
@@ -309,7 +386,7 @@ impl RemoteSessionState {
   ) -> Result<(), RemoteSessionError> {
     let admission = self.admission.as_ref().expect("admission is present");
     debug_assert!(!admission.nonce.is_empty());
-    if admission.expires_at_unix_millis <= now {
+    if admission.effective_expires_at_unix_millis <= now {
       return Err(RemoteSessionError::AdmissionExpired);
     }
     if admission.consumed != must_be_consumed {
@@ -326,6 +403,15 @@ impl RemoteSessionState {
     {
       return Err(RemoteSessionError::SessionIdentityMismatch);
     }
+    if !self.expected_authority.matches_remote_binding(
+      &binding.run_id,
+      &binding.job_id,
+      binding.attempt,
+      binding.fence_token,
+      &binding.authority_digest,
+    ) {
+      return Err(RemoteSessionError::RunBindingMismatch);
+    }
     Ok(())
   }
 
@@ -341,6 +427,23 @@ impl RemoteSessionState {
       return Err(RemoteSessionError::PreparationNonceMismatch);
     }
     Ok(())
+  }
+
+  fn validate_error_binding(
+    &self,
+    binding: Option<&RunBinding>,
+    preparation_nonce: Option<&str>,
+  ) -> Result<(), RemoteSessionError> {
+    match (&self.binding, binding) {
+      (None, None) => {}
+      (Some(expected), Some(actual)) if expected == actual => {}
+      _ => return Err(RemoteSessionError::RunBindingMismatch),
+    }
+    match (self.preparation_nonce.as_deref(), preparation_nonce) {
+      (None, None) => Ok(()),
+      (Some(expected), Some(actual)) if expected == actual => Ok(()),
+      _ => Err(RemoteSessionError::PreparationNonceMismatch),
+    }
   }
 
   fn accept_heartbeat(&mut self, phase: RemoteHeartbeatPhase) -> Result<(), RemoteSessionError> {
@@ -380,11 +483,19 @@ fn hex_sha256(bytes: &[u8]) -> String {
 mod tests {
   use super::*;
   use crate::scheduled_remote_protocol::{
-    AdmissionFrame, HeartbeatFrame, PrepareFrame, PreparedFrame, REMOTE_PROTOCOL_VERSION,
-    ReadyFrame, RemoteMessage, RemoteResultKind, ResultFrame, StartFrame,
+    AdmissionFrame, CancelFrame, ErrorFrame, HeartbeatFrame, PrepareFrame, PreparedFrame,
+    REMOTE_PROTOCOL_VERSION, ReadyFrame, RemoteMessage, RemoteResultKind, ResultFrame, StartFrame,
   };
 
   const NOW: u64 = 1_000_000;
+
+  fn authority() -> ScheduledPrepareAuthority {
+    ScheduledPrepareAuthority::for_remote_session_test("run-1", "job-1", 1, 7)
+  }
+
+  fn session() -> RemoteSessionState {
+    RemoteSessionState::new("c".repeat(64), authority()).expect("session")
+  }
 
   fn frame(sequence: u64, message: RemoteMessage) -> RemoteFrame {
     RemoteFrame {
@@ -401,25 +512,66 @@ mod tests {
       job_id: "job-1".to_owned(),
       attempt: 1,
       fence_token: 7,
-      authority_digest: "a".repeat(64),
+      authority_digest: authority().digest().to_owned(),
       profile_digest: profile_digest(),
       deployment_epoch: 9,
       credential_revision: "github-readonly-2026-07".to_owned(),
     }
   }
 
-  fn profile_json() -> String {
-    r#"{"profile":"bound"}"#.to_owned()
+  fn capability_profile_json() -> String {
+    let canonical = serde_json::json!({
+      "app_server_schema_sha256": "1".repeat(64),
+      "codex_program_sha256": "2".repeat(64),
+      "codex_version": "test-codex",
+      "config_revision": "test-config-v1",
+      "config_sha256": "3".repeat(64),
+      "credential_deny_policy_revision": "test-deny-v1",
+      "credential_isolation_revision": "test-isolation-v1",
+      "credential_reference": "test-read-only-credential",
+      "github_mcp_artifact_sha256": "4".repeat(64),
+      "github_mcp_endpoint_identity": "test-github-mcp",
+      "github_mcp_version": "test-mcp",
+      "github_tools": ["issue_read", "list_issues", "search_issues", "search_orgs"],
+      "negative_test_revision": "test-negative-v1",
+      "output_schema_revision": "test-output-v1",
+      "permission_policy_revision": "test-read-only-v1",
+    });
+    let profile_sha256 = hex_sha256(canonical.to_string().as_bytes());
+    serde_json::json!({
+      "app_server_schema_sha256": "1".repeat(64),
+      "attested_at_unix_seconds": 100,
+      "codex_program_sha256": "2".repeat(64),
+      "codex_version": "test-codex",
+      "config_revision": "test-config-v1",
+      "config_sha256": "3".repeat(64),
+      "credential_deny_policy_revision": "test-deny-v1",
+      "credential_isolation_revision": "test-isolation-v1",
+      "credential_reference": "test-read-only-credential",
+      "github_mcp_artifact_sha256": "4".repeat(64),
+      "github_mcp_endpoint_identity": "test-github-mcp",
+      "github_mcp_version": "test-mcp",
+      "github_tools": ["issue_read", "list_issues", "search_issues", "search_orgs"],
+      "negative_test_revision": "test-negative-v1",
+      "output_schema_revision": "test-output-v1",
+      "permission_policy_revision": "test-read-only-v1",
+      "profile_sha256": profile_sha256,
+    })
+    .to_string()
   }
 
   fn profile_digest() -> String {
-    hex_sha256(profile_json().as_bytes())
+    "b".repeat(64)
   }
 
   fn ready() -> RemoteMessage {
+    ready_until(NOW + 10_000)
+  }
+
+  fn ready_until(expiry: u64) -> RemoteMessage {
     RemoteMessage::Ready(ReadyFrame {
       challenge: "d".repeat(64),
-      ready_until_unix_millis: NOW + 10_000,
+      ready_until_unix_millis: expiry,
       deployment_epoch: 9,
       profile_digest: profile_digest(),
       gateway_image_digest: format!("sha256:{}", "e".repeat(64)),
@@ -450,11 +602,14 @@ mod tests {
   }
 
   fn prepared(binding: RunBinding) -> RemoteMessage {
+    let attested_profile_json = authority()
+      .remote_recovery_attestation_json(&capability_profile_json(), &profile_digest(), 9)
+      .expect("remote recovery attestation");
     RemoteMessage::Prepared(PreparedFrame {
       binding,
       preparation_nonce: "3".repeat(64),
-      attested_profile_json: profile_json(),
-      attested_profile_digest: profile_digest(),
+      attested_profile_digest: hex_sha256(attested_profile_json.as_bytes()),
+      attested_profile_json,
     })
   }
 
@@ -466,21 +621,51 @@ mod tests {
   }
 
   fn session_through_prepare(expiry: u64) -> RemoteSessionState {
-    let mut session = RemoteSessionState::new("c".repeat(64)).expect("session");
+    let mut session = session();
     session
       .accept(RemoteSessionRole::Runner, frame(1, ready()), NOW)
       .expect("ready");
     session
-      .accept(RemoteSessionRole::Gateway, frame(2, admission(expiry)), NOW)
+      .accept(RemoteSessionRole::Gateway, frame(1, admission(expiry)), NOW)
       .expect("admission");
     session
       .accept(
         RemoteSessionRole::Gateway,
-        frame(3, prepare(binding())),
+        frame(2, prepare(binding())),
         NOW,
       )
       .expect("prepare");
     session
+  }
+
+  fn session_through_prepared(expiry: u64) -> RemoteSessionState {
+    let mut session = session_through_prepare(expiry);
+    session
+      .accept(
+        RemoteSessionRole::Runner,
+        frame(2, prepared(binding())),
+        NOW,
+      )
+      .expect("prepared");
+    session
+  }
+
+  fn session_through_start(expiry: u64) -> RemoteSessionState {
+    let mut session = session_through_prepared(expiry);
+    session
+      .accept(RemoteSessionRole::Gateway, frame(3, start(binding())), NOW)
+      .expect("start");
+    session
+  }
+
+  fn error(binding: Option<RunBinding>, preparation_nonce: Option<String>) -> RemoteMessage {
+    RemoteMessage::Error(ErrorFrame {
+      binding,
+      preparation_nonce,
+      code: "runner_unavailable".to_owned(),
+      message: "runner slot unavailable".to_owned(),
+      retryable: true,
+    })
   }
 
   #[test]
@@ -489,19 +674,19 @@ mod tests {
     session
       .accept(
         RemoteSessionRole::Runner,
-        frame(4, prepared(binding())),
+        frame(2, prepared(binding())),
         NOW,
       )
       .expect("prepared");
     session
-      .accept(RemoteSessionRole::Gateway, frame(5, start(binding())), NOW)
+      .accept(RemoteSessionRole::Gateway, frame(3, start(binding())), NOW)
       .expect("start");
     assert_eq!(
       session.disconnect(),
       RemoteDisconnectOutcome::OutcomeUnknown
     );
     let result = frame(
-      6,
+      3,
       RemoteMessage::Result(ResultFrame {
         binding: binding(),
         preparation_nonce: "3".repeat(64),
@@ -513,18 +698,22 @@ mod tests {
       .accept(RemoteSessionRole::Runner, result.clone(), NOW)
       .expect("result");
     assert_eq!(
+      session.disconnect(),
+      RemoteDisconnectOutcome::AlreadyConclusive(RemoteTerminalDisposition::Completed)
+    );
+    assert_eq!(
       session.accept(RemoteSessionRole::Runner, result, NOW),
       Ok(RemoteSessionAcceptance::ExactDuplicate)
     );
     assert_eq!(
-      session.accept(RemoteSessionRole::Runner, frame(7, ready()), NOW),
+      session.accept(RemoteSessionRole::Runner, frame(4, ready()), NOW),
       Err(RemoteSessionError::Terminal)
     );
   }
 
   #[test]
   fn wrong_role_and_out_of_order_messages_do_not_advance_the_session() {
-    let mut session = RemoteSessionState::new("c".repeat(64)).expect("session");
+    let mut session = session();
     assert_eq!(
       session.accept(RemoteSessionRole::Gateway, frame(1, ready()), NOW),
       Err(RemoteSessionError::WrongSender)
@@ -535,7 +724,7 @@ mod tests {
     assert_eq!(
       session.accept(
         RemoteSessionRole::Gateway,
-        frame(2, prepare(binding())),
+        frame(1, prepare(binding())),
         NOW
       ),
       Err(RemoteSessionError::InvalidPhase)
@@ -544,36 +733,34 @@ mod tests {
 
   #[test]
   fn admission_has_checked_hard_ttl_and_expires_at_prepare_and_start() {
-    let mut overflow = RemoteSessionState::new("c".repeat(64)).expect("session");
+    let mut overflow = session();
     overflow
       .accept(RemoteSessionRole::Runner, frame(1, ready()), NOW)
       .expect("ready");
     assert!(matches!(
       overflow.accept(
         RemoteSessionRole::Gateway,
-        frame(2, admission(u64::MAX)),
+        frame(1, admission(u64::MAX)),
         u64::MAX - 1
       ),
-      Err(RemoteSessionError::Protocol(
-        RemoteProtocolError::InvalidField("admission.validity")
-      ))
+      Err(RemoteSessionError::AdmissionTtlInvalid)
     ));
 
-    let mut at_prepare = RemoteSessionState::new("c".repeat(64)).expect("session");
+    let mut at_prepare = session();
     at_prepare
       .accept(RemoteSessionRole::Runner, frame(1, ready()), NOW)
       .expect("ready");
     at_prepare
       .accept(
         RemoteSessionRole::Gateway,
-        frame(2, admission(NOW + 1)),
+        frame(1, admission(NOW + 1)),
         NOW,
       )
       .expect("admission");
     assert_eq!(
       at_prepare.accept(
         RemoteSessionRole::Gateway,
-        frame(3, prepare(binding())),
+        frame(2, prepare(binding())),
         NOW + 1
       ),
       Err(RemoteSessionError::AdmissionExpired)
@@ -583,14 +770,14 @@ mod tests {
     at_start
       .accept(
         RemoteSessionRole::Runner,
-        frame(4, prepared(binding())),
+        frame(2, prepared(binding())),
         NOW,
       )
       .expect("prepared");
     assert_eq!(
       at_start.accept(
         RemoteSessionRole::Gateway,
-        frame(5, start(binding())),
+        frame(3, start(binding())),
         NOW + 1
       ),
       Err(RemoteSessionError::AdmissionExpired)
@@ -603,7 +790,7 @@ mod tests {
     assert_eq!(
       session.accept(
         RemoteSessionRole::Gateway,
-        frame(4, prepare(binding())),
+        frame(3, prepare(binding())),
         NOW
       ),
       Err(RemoteSessionError::AdmissionConsumed)
@@ -611,14 +798,14 @@ mod tests {
     let mut changed = binding();
     changed.fence_token += 1;
     assert_eq!(
-      session.accept(RemoteSessionRole::Runner, frame(4, prepared(changed)), NOW),
+      session.accept(RemoteSessionRole::Runner, frame(2, prepared(changed)), NOW),
       Err(RemoteSessionError::RunBindingMismatch)
     );
   }
 
   #[test]
   fn exact_duplicate_is_idempotent_but_conflict_and_sender_change_are_rejected() {
-    let mut session = RemoteSessionState::new("c".repeat(64)).expect("session");
+    let mut session = session();
     let ready_frame = frame(1, ready());
     session
       .accept(RemoteSessionRole::Runner, ready_frame.clone(), NOW)
@@ -642,14 +829,14 @@ mod tests {
     };
     payload.attested_profile_json = r#"{"profile":"different"}"#.to_owned();
     assert_eq!(
-      session.accept(RemoteSessionRole::Runner, frame(4, bad), NOW),
+      session.accept(RemoteSessionRole::Runner, frame(2, bad), NOW),
       Err(RemoteSessionError::AttestedProfileDigestMismatch)
     );
     session
       .accept(
         RemoteSessionRole::Runner,
         frame(
-          4,
+          2,
           RemoteMessage::Heartbeat(HeartbeatFrame {
             binding: binding(),
             phase: RemoteHeartbeatPhase::Preparing,
@@ -662,7 +849,7 @@ mod tests {
       session.accept(
         RemoteSessionRole::Runner,
         frame(
-          5,
+          3,
           RemoteMessage::Heartbeat(HeartbeatFrame {
             binding: binding(),
             phase: RemoteHeartbeatPhase::Started,
@@ -680,6 +867,340 @@ mod tests {
     assert_eq!(
       session.disconnect(),
       RemoteDisconnectOutcome::PreflightNoExecution
+    );
+  }
+
+  #[test]
+  fn prepared_uses_a_distinct_recovery_digest_bound_to_profile_and_run_authority() {
+    let mut session = session_through_prepare(NOW + 5_000);
+    let valid = prepared(binding());
+    let RemoteMessage::Prepared(valid_payload) = &valid else {
+      unreachable!()
+    };
+    assert_ne!(valid_payload.attested_profile_digest, profile_digest());
+    session
+      .accept(RemoteSessionRole::Runner, frame(2, valid), NOW)
+      .expect("distinct attestation and deployment digests");
+
+    let mut old_false_fixture = session_through_prepare(NOW + 5_000);
+    let mut false_prepared = prepared(binding());
+    let RemoteMessage::Prepared(payload) = &mut false_prepared else {
+      unreachable!()
+    };
+    payload.attested_profile_digest = profile_digest();
+    assert_eq!(
+      old_false_fixture.accept(RemoteSessionRole::Runner, frame(2, false_prepared), NOW),
+      Err(RemoteSessionError::AttestedProfileDigestMismatch)
+    );
+
+    for mutation in [
+      "deployment_profile",
+      "authority",
+      "attestation_epoch",
+      "outer_epoch",
+    ] {
+      let mut rejected = session_through_prepare(NOW + 5_000);
+      let mut message = prepared(binding());
+      let RemoteMessage::Prepared(payload) = &mut message else {
+        unreachable!()
+      };
+      match mutation {
+        "deployment_profile" => {
+          let mut value: serde_json::Value =
+            serde_json::from_str(&payload.attested_profile_json).expect("attestation JSON");
+          value["deployment_profile_digest"] = serde_json::Value::String("c".repeat(64));
+          payload.attested_profile_json = value.to_string();
+          payload.attested_profile_digest = hex_sha256(payload.attested_profile_json.as_bytes());
+        }
+        "authority" => {
+          let mut value: serde_json::Value =
+            serde_json::from_str(&payload.attested_profile_json).expect("attestation JSON");
+          value["authority"]["binding"]["run_id"] =
+            serde_json::Value::String("run-other".to_owned());
+          payload.attested_profile_json = value.to_string();
+          payload.attested_profile_digest = hex_sha256(payload.attested_profile_json.as_bytes());
+        }
+        "attestation_epoch" => {
+          let mut value: serde_json::Value =
+            serde_json::from_str(&payload.attested_profile_json).expect("attestation JSON");
+          value["deployment_epoch"] = serde_json::Value::from(10);
+          payload.attested_profile_json = value.to_string();
+          payload.attested_profile_digest = hex_sha256(payload.attested_profile_json.as_bytes());
+        }
+        "outer_epoch" => payload.binding.deployment_epoch += 1,
+        _ => unreachable!(),
+      }
+      assert!(
+        rejected
+          .accept(RemoteSessionRole::Runner, frame(2, message), NOW)
+          .is_err()
+      );
+    }
+  }
+
+  #[test]
+  fn effective_admission_expiry_is_the_shortest_ready_requested_or_hard_cap() {
+    for (ready_expiry, admission_expiry, effective_expiry) in [
+      (NOW + 5, NOW + 20, NOW + 5),
+      (NOW + 20, NOW + 5, NOW + 5),
+      (
+        NOW + MAX_ADMISSION_TTL_MILLIS,
+        u64::MAX,
+        NOW + MAX_ADMISSION_TTL_MILLIS,
+      ),
+    ] {
+      let mut at_boundary = session();
+      at_boundary
+        .accept(
+          RemoteSessionRole::Runner,
+          frame(1, ready_until(ready_expiry)),
+          NOW,
+        )
+        .expect("ready");
+      at_boundary
+        .accept(
+          RemoteSessionRole::Gateway,
+          frame(1, admission(admission_expiry)),
+          NOW,
+        )
+        .expect("admission");
+      assert_eq!(
+        at_boundary.accept(
+          RemoteSessionRole::Gateway,
+          frame(2, prepare(binding())),
+          effective_expiry
+        ),
+        Err(RemoteSessionError::AdmissionExpired)
+      );
+
+      let mut before_boundary = session();
+      before_boundary
+        .accept(
+          RemoteSessionRole::Runner,
+          frame(1, ready_until(ready_expiry)),
+          NOW,
+        )
+        .expect("ready");
+      before_boundary
+        .accept(
+          RemoteSessionRole::Gateway,
+          frame(1, admission(admission_expiry)),
+          NOW,
+        )
+        .expect("admission");
+      before_boundary
+        .accept(
+          RemoteSessionRole::Gateway,
+          frame(2, prepare(binding())),
+          effective_expiry - 1,
+        )
+        .expect("valid immediately before effective expiry");
+    }
+
+    let mut exact_now = session();
+    exact_now
+      .accept(RemoteSessionRole::Runner, frame(1, ready()), NOW)
+      .expect("ready");
+    assert!(
+      exact_now
+        .accept(RemoteSessionRole::Gateway, frame(1, admission(NOW)), NOW)
+        .is_err()
+    );
+  }
+
+  #[test]
+  fn every_result_kind_is_terminal_and_disconnect_is_already_conclusive() {
+    for (kind, expected, started) in [
+      (
+        RemoteResultKind::FailedBeforeStart,
+        RemoteTerminalDisposition::FailedBeforeStart,
+        false,
+      ),
+      (
+        RemoteResultKind::Completed,
+        RemoteTerminalDisposition::Completed,
+        true,
+      ),
+      (
+        RemoteResultKind::OutcomeUnknown,
+        RemoteTerminalDisposition::OutcomeUnknown,
+        true,
+      ),
+    ] {
+      let mut session = if started {
+        session_through_start(NOW + 5_000)
+      } else {
+        session_through_prepared(NOW + 5_000)
+      };
+      session
+        .accept(
+          RemoteSessionRole::Runner,
+          frame(
+            3,
+            RemoteMessage::Result(ResultFrame {
+              binding: binding(),
+              preparation_nonce: "3".repeat(64),
+              kind,
+              result_json: "{}".to_owned(),
+            }),
+          ),
+          NOW,
+        )
+        .expect("typed result");
+      assert_eq!(session.terminal_disposition(), Some(expected));
+      assert_eq!(
+        session.disconnect(),
+        RemoteDisconnectOutcome::AlreadyConclusive(expected)
+      );
+    }
+  }
+
+  #[test]
+  fn error_and_cancel_are_exactly_bound_and_typed_before_and_after_start() {
+    let mut early_error = session();
+    early_error
+      .accept(RemoteSessionRole::Runner, frame(1, error(None, None)), NOW)
+      .expect("preflight error");
+    assert_eq!(
+      early_error.terminal_disposition(),
+      Some(RemoteTerminalDisposition::FailedBeforeStart)
+    );
+    assert_eq!(
+      early_error.disconnect(),
+      RemoteDisconnectOutcome::PreflightNoExecution
+    );
+
+    let mut prestart_cancel = session_through_prepared(NOW + 5_000);
+    prestart_cancel
+      .accept(
+        RemoteSessionRole::Gateway,
+        frame(
+          3,
+          RemoteMessage::Cancel(CancelFrame {
+            binding: binding(),
+            reason: "operator_cancelled".to_owned(),
+          }),
+        ),
+        NOW,
+      )
+      .expect("pre-start cancel");
+    assert_eq!(
+      prestart_cancel.terminal_disposition(),
+      Some(RemoteTerminalDisposition::FailedBeforeStart)
+    );
+
+    let mut poststart_error = session_through_start(NOW + 5_000);
+    assert_eq!(
+      poststart_error.accept(RemoteSessionRole::Runner, frame(3, error(None, None)), NOW),
+      Err(RemoteSessionError::RunBindingMismatch)
+    );
+    poststart_error
+      .accept(
+        RemoteSessionRole::Runner,
+        frame(3, error(Some(binding()), Some("3".repeat(64)))),
+        NOW,
+      )
+      .expect("bound post-start error");
+    assert_eq!(
+      poststart_error.terminal_disposition(),
+      Some(RemoteTerminalDisposition::OutcomeUnknown)
+    );
+    assert_eq!(
+      poststart_error.disconnect(),
+      RemoteDisconnectOutcome::OutcomeUnknown
+    );
+
+    let mut poststart_cancel = session_through_start(NOW + 5_000);
+    poststart_cancel
+      .accept(
+        RemoteSessionRole::Gateway,
+        frame(
+          4,
+          RemoteMessage::Cancel(CancelFrame {
+            binding: binding(),
+            reason: "lease_lost".to_owned(),
+          }),
+        ),
+        NOW,
+      )
+      .expect("bound post-start cancel");
+    assert_eq!(
+      poststart_cancel.terminal_disposition(),
+      Some(RemoteTerminalDisposition::OutcomeUnknown)
+    );
+    assert_eq!(
+      poststart_cancel.disconnect(),
+      RemoteDisconnectOutcome::OutcomeUnknown
+    );
+  }
+
+  #[test]
+  fn role_sequences_are_independent_and_terminal_interleavings_fail_closed() {
+    let mut session = session_through_prepare(NOW + 5_000);
+    session
+      .accept(
+        RemoteSessionRole::Runner,
+        frame(
+          2,
+          RemoteMessage::Heartbeat(HeartbeatFrame {
+            binding: binding(),
+            phase: RemoteHeartbeatPhase::Preparing,
+          }),
+        ),
+        NOW,
+      )
+      .expect("runner sequence two after gateway sequence two");
+    session
+      .accept(
+        RemoteSessionRole::Gateway,
+        frame(
+          3,
+          RemoteMessage::Cancel(CancelFrame {
+            binding: binding(),
+            reason: "lease_lost".to_owned(),
+          }),
+        ),
+        NOW,
+      )
+      .expect("gateway cancel interleaves after runner heartbeat");
+    assert_eq!(
+      session.accept(
+        RemoteSessionRole::Runner,
+        frame(3, error(Some(binding()), None)),
+        NOW
+      ),
+      Err(RemoteSessionError::Terminal)
+    );
+
+    let mut result_first = session_through_start(NOW + 5_000);
+    result_first
+      .accept(
+        RemoteSessionRole::Runner,
+        frame(
+          3,
+          RemoteMessage::Result(ResultFrame {
+            binding: binding(),
+            preparation_nonce: "3".repeat(64),
+            kind: RemoteResultKind::Completed,
+            result_json: "{}".to_owned(),
+          }),
+        ),
+        NOW,
+      )
+      .expect("result wins");
+    assert_eq!(
+      result_first.accept(
+        RemoteSessionRole::Gateway,
+        frame(
+          4,
+          RemoteMessage::Cancel(CancelFrame {
+            binding: binding(),
+            reason: "late_cancel".to_owned(),
+          }),
+        ),
+        NOW
+      ),
+      Err(RemoteSessionError::Terminal)
     );
   }
 }

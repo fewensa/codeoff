@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use codeoff_core::SchedulerOperationalPolicy;
@@ -1451,6 +1451,7 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
+      && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2062,6 +2063,87 @@ async fn test_idempotent_typed_lifecycle_mutation_and_in_progress_result() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn scheduler_cadence_migration_upgrades_pre_and_exact_policy_checkpoints() {
+  let temp = tempdir().expect("create tempdir");
+  let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+  for (label, include_policy_migration) in [("pre-policy", false), ("exact-policy", true)] {
+    let checkpoint = temp.path().join(format!("{label}-migrations"));
+    std::fs::create_dir(&checkpoint).expect("create checkpoint migrations");
+    for entry in std::fs::read_dir(&source).expect("read migrations") {
+      let entry = entry.expect("migration entry");
+      let file_name = entry.file_name();
+      if file_name == "20260722140000_scheduler_cadence_proof.sql"
+        || (!include_policy_migration
+          && file_name == "20260722130000_scheduler_operational_policy.sql")
+      {
+        continue;
+      }
+      std::fs::copy(entry.path(), checkpoint.join(file_name)).expect("copy checkpoint migration");
+    }
+    let state_dir = temp.path().join(format!("{label}-state"));
+    std::fs::create_dir(&state_dir).expect("create state dir");
+    let options = SqliteConnectOptions::from_str(&database_url(&state_dir))
+      .expect("database options")
+      .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+      .max_connections(1)
+      .connect_with(options)
+      .await
+      .expect("connect checkpoint database");
+    Migrator::new(checkpoint)
+      .await
+      .expect("load checkpoint migrator")
+      .run(&pool)
+      .await
+      .expect("run checkpoint migrations");
+    let policy_checksum = if include_policy_migration {
+      Some(
+        sqlx::query_scalar::<_, Vec<u8>>(
+          "select checksum from _sqlx_migrations where version = 20260722130000",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read policy migration checksum"),
+      )
+    } else {
+      None
+    };
+    drop(pool);
+
+    let store = StateStore::initialize(&state_dir, None)
+      .await
+      .expect("upgrade checkpoint");
+    let pool = SqlitePool::connect(&database_url(&state_dir))
+      .await
+      .expect("reconnect upgraded database");
+    let applied: i64 = sqlx::query_scalar(
+      "select count(*) from _sqlx_migrations where version in (20260722130000, 20260722140000) and success = true",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read upgraded migrations");
+    assert_eq!(applied, 2);
+    if let Some(policy_checksum) = policy_checksum {
+      let upgraded_checksum: Vec<u8> =
+        sqlx::query_scalar("select checksum from _sqlx_migrations where version = 20260722130000")
+          .fetch_one(&pool)
+          .await
+          .expect("read upgraded policy checksum");
+      assert_eq!(upgraded_checksum, policy_checksum);
+    }
+    let cadence_columns: i64 = sqlx::query_scalar(
+      "select count(*) from pragma_table_info('schedules') where name in ('cadence_proof_version', 'cadence_proof_json')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read cadence columns");
+    assert_eq!(cadence_columns, 2);
+    drop(store);
+  }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() {
   let temp = tempdir().expect("create tempdir");
   let old_migrations = temp.path().join("old-migrations");
@@ -2085,6 +2167,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
           | "20260722080000_scheduler_retention.sql"
           | "20260722090000_scheduler_delivery_retention_completion.sql"
           | "20260722100000_scheduler_delivery_retention_null_safety.sql"
+          | "20260722140000_scheduler_cadence_proof.sql"
       )
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
@@ -2696,6 +2779,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
+      && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2785,6 +2869,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
+      && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2872,6 +2957,7 @@ async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_pay
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
+      && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy issue-06 migration");
@@ -3056,6 +3142,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
+      && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -3320,6 +3407,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
+      && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -3399,6 +3487,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
+      && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -3491,6 +3580,7 @@ async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_ident
       && entry.file_name() != "20260722090000_scheduler_delivery_retention_completion.sql"
       && entry.file_name() != "20260722100000_scheduler_delivery_retention_null_safety.sql"
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
+      && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -11363,6 +11453,7 @@ async fn prepare_pending_delivery_authority(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn delivery_claim_refreshes_time_after_write_lock_and_claims_once_before_deadline() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
@@ -11381,11 +11472,11 @@ async fn delivery_claim_refreshes_time_after_write_lock_and_claims_once_before_d
     .begin_with("BEGIN IMMEDIATE")
     .await
     .expect("acquire write lock");
-  let clock = Arc::new(AtomicI64::new(115));
+  let clock_reads = Arc::new(AtomicUsize::new(0));
   let started = Arc::new(Barrier::new(2));
   let task_store = store.clone();
   let task_authority = authority.clone();
-  let task_clock = Arc::clone(&clock);
+  let task_clock_reads = Arc::clone(&clock_reads);
   let task_started = Arc::clone(&started);
   let claim_task = tokio::spawn(async move {
     task_started.wait().await;
@@ -11394,12 +11485,17 @@ async fn delivery_claim_refreshes_time_after_write_lock_and_claims_once_before_d
         &task_authority,
         "deadline-worker",
         115,
-        &|| task_clock.load(Ordering::SeqCst),
+        &|| {
+          if task_clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            115
+          } else {
+            deadline
+          }
+        },
       )
       .await
   });
   started.wait().await;
-  clock.store(deadline, Ordering::SeqCst);
   drop(blocker);
   assert!(
     claim_task
@@ -11420,13 +11516,72 @@ async fn delivery_claim_refreshes_time_after_write_lock_and_claims_once_before_d
   .expect("deadline authority");
   assert_eq!(terminal, ("failed_terminal".to_owned(), 0, 0, 0));
 
-  let live = prepare_pending_delivery_authority(&store, "before-deadline", 210).await;
+  let commit_crossing = prepare_pending_delivery_authority(&store, "commit-deadline", 210).await;
+  let commit_deadline = commit_crossing
+    .scheduler_policy()
+    .delivery_deadline_at(commit_crossing.payload_created_at())
+    .expect("commit deadline");
+  let commit_clock_reads = AtomicUsize::new(0);
+  assert!(
+    store
+      .claim_scheduled_delivery_from_snapshot_with_clock(
+        &commit_crossing,
+        "commit-deadline-worker",
+        215,
+        &|| match commit_clock_reads.fetch_add(1, Ordering::SeqCst) {
+          0 => 215,
+          1 => commit_deadline - 1,
+          _ => commit_deadline,
+        },
+      )
+      .await
+      .expect("commit deadline claim")
+      .is_none()
+  );
+  let commit_terminal: (String, i64, i64, i64) = sqlx::query_as(
+    "select state, attempt, fence, (select count(*) from scheduled_delivery_attempts where delivery_id = ?1) from scheduled_run_deliveries where delivery_id = ?1",
+  )
+  .bind(commit_crossing.delivery_id())
+  .fetch_one(&pool)
+  .await
+  .expect("commit deadline authority");
+  assert_eq!(commit_terminal, ("failed_terminal".to_owned(), 0, 0, 0));
+
+  let lease_crossing = prepare_pending_delivery_authority(&store, "commit-lease", 310).await;
+  let lease_seconds = i64::from(lease_crossing.scheduler_policy().delivery_lease_seconds);
+  let lease_clock_reads = AtomicUsize::new(0);
+  assert!(
+    store
+      .claim_scheduled_delivery_from_snapshot_with_clock(
+        &lease_crossing,
+        "commit-lease-worker",
+        315,
+        &|| match lease_clock_reads.fetch_add(1, Ordering::SeqCst) {
+          0 => 315,
+          1 => 316,
+          _ => 316 + lease_seconds,
+        },
+      )
+      .await
+      .expect("commit lease claim")
+      .is_none()
+  );
+  let lease_rollback: (String, i64, i64, i64) = sqlx::query_as(
+    "select state, attempt, fence, (select count(*) from scheduled_delivery_attempts where delivery_id = ?1) from scheduled_run_deliveries where delivery_id = ?1",
+  )
+  .bind(lease_crossing.delivery_id())
+  .fetch_one(&pool)
+  .await
+  .expect("commit lease authority");
+  assert_eq!(lease_rollback, ("pending".to_owned(), 0, 0, 0));
+
+  let live = prepare_pending_delivery_authority(&store, "before-deadline", 410).await;
   let live_deadline = live
     .scheduler_policy()
     .delivery_deadline_at(live.payload_created_at())
     .expect("live deadline");
   let claimed = store
-    .claim_scheduled_delivery_from_snapshot_with_clock(&live, "live-worker", 215, &|| {
+    .claim_scheduled_delivery_from_snapshot_with_clock(&live, "live-worker", 415, &|| {
       live_deadline - 1
     })
     .await
@@ -11436,7 +11591,7 @@ async fn delivery_claim_refreshes_time_after_write_lock_and_claims_once_before_d
   assert_eq!(claimed.binding.fence(), 1);
   assert!(
     store
-      .claim_scheduled_delivery_from_snapshot_with_clock(&live, "duplicate-worker", 215, &|| {
+      .claim_scheduled_delivery_from_snapshot_with_clock(&live, "duplicate-worker", 415, &|| {
         live_deadline - 1
       },)
       .await

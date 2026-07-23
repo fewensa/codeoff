@@ -488,10 +488,10 @@ impl ScheduledCodexConfig {
 
   fn validate_github_mcp_access(&self) -> Result<(), ConfigError> {
     let invalid = |field, reason| ConfigError::InvalidScheduler { field, reason };
-    if self.github_mcp_access_auth_mode != "bearer-token-env-v1" {
+    if self.github_mcp_access_auth_mode != "supervisor-dynamic-tools-v1" {
       return Err(invalid(
         "scheduled_codex.github_mcp_access_auth_mode",
-        "must be bearer-token-env-v1",
+        "must be supervisor-dynamic-tools-v1",
       ));
     }
     CredentialRevision::parse(&self.github_mcp_access_token_revision).map_err(|_| {

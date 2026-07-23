@@ -99,7 +99,7 @@ impl ScheduledRunnerBrokerConfig {
     .map_err(|_| ScheduledRunnerBrokerError::InvalidConfiguration)?;
     CredentialRevision::parse(&self.credential_revision)
       .map_err(|_| ScheduledRunnerBrokerError::InvalidConfiguration)?;
-    if self.github_mcp_access_auth_mode != "bearer-token-env-v1"
+    if self.github_mcp_access_auth_mode != "supervisor-dynamic-tools-v1"
       || CredentialRevision::parse(&self.github_mcp_access_token_revision).is_err()
     {
       return Err(ScheduledRunnerBrokerError::InvalidConfiguration);
@@ -1462,12 +1462,13 @@ mod tests {
       github_mcp_configured_endpoint_identity: config
         .github_mcp_configured_endpoint_identity
         .clone(),
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       github_mcp_health_checked_at_unix_seconds: 1,
       github_mcp_health_credential_revision: config.credential_revision.clone(),
       github_mcp_health_result_sha256: "8".repeat(64),
       github_mcp_health_tool: "get_me".to_owned(),
+      github_tool_schema_sha256: "9".repeat(64),
       github_tools: [
         "get_me",
         "issue_read",
@@ -1557,12 +1558,13 @@ mod tests {
       github_mcp_configured_endpoint_identity: config
         .github_mcp_configured_endpoint_identity
         .clone(),
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       github_mcp_health_checked_at_unix_seconds: 1,
       github_mcp_health_credential_revision: config.credential_revision.clone(),
       github_mcp_health_result_sha256: "8".repeat(64),
       github_mcp_health_tool: "get_me".to_owned(),
+      github_tool_schema_sha256: "9".repeat(64),
       github_tools: [
         "get_me",
         "issue_read",
@@ -2848,7 +2850,7 @@ mod tests {
       credential_revision: "credential-v1".to_owned(),
       github_mcp_configured_artifact_sha256: "3".repeat(64),
       github_mcp_configured_endpoint_identity: "test-endpoint".to_owned(),
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       executor_evidence_public_key: evidence_keys().1.clone(),
       executor_evidence_key_id: "executor-key-1".to_owned(),

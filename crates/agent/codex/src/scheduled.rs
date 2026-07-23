@@ -52,6 +52,7 @@ use crate::scheduled_artifacts::{
 };
 #[cfg(all(unix, test))]
 use crate::scheduled_artifacts::{test_artifacts, verify_scheduled_artifacts_for_test};
+use crate::scheduled_mcp::{ScheduledGithubMcpClient, ScheduledMcpAttestation};
 use crate::{JsonlTransport, send_notification, send_request};
 
 pub const CODEX_CLI_VERSION: &str = "0.144.6";
@@ -68,7 +69,7 @@ const GITHUB_MCP_SERVER_INFO_NAME: &str = "github-mcp-server";
 const GITHUB_MCP_HEALTH_TOOL: &str = "get_me";
 pub const GITHUB_MCP_ACCESS_TOKEN_ENV: &str = "CODEOFF_SCHEDULED_GITHUB_MCP_BEARER_TOKEN";
 const CODEX_SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
-const GITHUB_MCP_ACCESS_AUTH_MODE: &str = "bearer-token-env-v1";
+const GITHUB_MCP_ACCESS_AUTH_MODE: &str = "supervisor-dynamic-tools-v1";
 const OUTPUT_SCHEMA_REVISION: &str = "scheduled-result-v1";
 const OUTPUT_SCHEMA_VERSION: u64 = 1;
 const CREDENTIAL_DENY_POLICY_REVISION: &str = "scheduled-credential-isolation-v1";
@@ -112,7 +113,7 @@ const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
   allow(dead_code, reason = "reserved for the issue 09 deployment verifier")
 )]
 const CHILD_LOCALE: &str = "C.UTF-8";
-const EXPECTED_GITHUB_TOOLS: [&str; 5] = [
+pub(crate) const EXPECTED_GITHUB_TOOLS: [&str; 5] = [
   "get_me",
   "issue_read",
   "list_issues",
@@ -150,17 +151,8 @@ impl RequestedCapabilityProfile {
 
   #[must_use]
   pub fn dedicated_config(&self) -> String {
-    let tools = EXPECTED_GITHUB_TOOLS
-      .iter()
-      .map(|tool| format!("\"{tool}\""))
-      .collect::<Vec<_>>()
-      .join(", ");
     format!(
-      "web_search = \"disabled\"\n\n[shell_environment_policy]\ninherit = \"none\"\nignore_default_excludes = false\nexclude = [{token_env:?}]\ninclude_only = [\"PATH\", \"LANG\", \"LC_ALL\"]\nset = {{ PATH = {child_path:?}, LANG = {child_locale:?}, LC_ALL = {child_locale:?} }}\n\n[mcp_servers.{GITHUB_MCP_NAME}]\nurl = {url:?}\nenabled = true\nrequired = true\nbearer_token_env_var = {token_env:?}\nenabled_tools = [{tools}]\n",
-      url = self.github_mcp_url,
-      token_env = GITHUB_MCP_ACCESS_TOKEN_ENV,
-      child_path = CHILD_PATH,
-      child_locale = CHILD_LOCALE,
+      "web_search = \"disabled\"\n\n[features]\nshell_tool = false\nunified_exec = false\n\n[shell_environment_policy]\ninherit = \"none\"\nignore_default_excludes = false\ninclude_only = [\"PATH\", \"LANG\", \"LC_ALL\"]\nset = {{ PATH = {CHILD_PATH:?}, LANG = {CHILD_LOCALE:?}, LC_ALL = {CHILD_LOCALE:?} }}\n",
     )
   }
 
@@ -646,7 +638,6 @@ impl StdioScheduledJsonlTransport {
     runtime_evidence: ScheduledRuntimeEvidence,
     artifacts: &Arc<VerifiedScheduledArtifacts>,
     child_identity: Option<(u32, u32)>,
-    github_mcp_access_token: &str,
   ) -> Result<Self, String> {
     profile.validate().map_err(|failure| failure.message)?;
     if profile.codex_program_sha256 != runtime_evidence.codex_program_sha256 {
@@ -670,7 +661,6 @@ impl StdioScheduledJsonlTransport {
       .arg("-c")
       .arg(format!("log_dir={log_dir}"))
       .env("CODEX_HOME", state_home.path())
-      .env(GITHUB_MCP_ACCESS_TOKEN_ENV, github_mcp_access_token)
       .env(CODEX_SQLITE_HOME_ENV, state_home.path().join("sqlite"))
       .stdin(Stdio::piped())
       .stdout(Stdio::piped())
@@ -998,12 +988,26 @@ pub trait ScheduledCodexExecution: Send + Sync {
 
 pub struct ScheduledCodexExecutor<F> {
   transport_factory: F,
+  github_mcp: Option<Arc<ScheduledGithubMcpClient>>,
 }
 
 impl<F> ScheduledCodexExecutor<F> {
   /// Creates an executor that still requires a durably consumed isolation permit on every prepare.
   pub fn new(transport_factory: F) -> Self {
-    Self { transport_factory }
+    Self {
+      transport_factory,
+      github_mcp: None,
+    }
+  }
+
+  fn with_supervisor_github_mcp(
+    transport_factory: F,
+    github_mcp: Arc<ScheduledGithubMcpClient>,
+  ) -> Self {
+    Self {
+      transport_factory,
+      github_mcp: Some(github_mcp),
+    }
   }
 }
 
@@ -1050,7 +1054,13 @@ where
         "scheduled_run_deadline_overflow",
       )));
     };
-    prepare_protocol(transport, request, attested_profile, deadline)
+    prepare_protocol(
+      transport,
+      request,
+      attested_profile,
+      deadline,
+      self.github_mcp.clone(),
+    )
   }
 }
 
@@ -1213,15 +1223,21 @@ fn build_production_scheduled_codex_executor_with_identity(
     let executor_artifacts = Arc::clone(&artifacts);
     let executor_evidence = runtime_evidence.clone();
     let github_mcp_access_token = load_github_mcp_access_token()?;
-    let executor = ScheduledCodexExecutor::new(move |requested: RequestedCapabilityProfile| {
-      StdioScheduledJsonlTransport::spawn(
-        &requested,
-        executor_evidence.clone(),
-        &executor_artifacts,
-        child_identity,
-        &github_mcp_access_token,
-      )
-    });
+    let github_mcp = Arc::new(
+      ScheduledGithubMcpClient::new(&profile.github_mcp_url, github_mcp_access_token)
+        .map_err(preflight)?,
+    );
+    let executor = ScheduledCodexExecutor::with_supervisor_github_mcp(
+      move |requested: RequestedCapabilityProfile| {
+        StdioScheduledJsonlTransport::spawn(
+          &requested,
+          executor_evidence.clone(),
+          &executor_artifacts,
+          child_identity,
+        )
+      },
+      github_mcp,
+    );
     Ok(BuiltScheduledCodexExecutor {
       profile,
       authority,
@@ -1541,6 +1557,7 @@ fn attest_runtime(
     github_mcp_health_credential_revision: String::new(),
     github_mcp_health_result_sha256: String::new(),
     github_mcp_health_tool: GITHUB_MCP_HEALTH_TOOL.to_owned(),
+    github_tool_schema_sha256: String::new(),
     github_tools: RequestedCapabilityProfile::github_tool_inventory(),
     credential_reference: requested.credential_reference.clone(),
     permission_policy_revision: requested.permission_policy_revision.clone(),
@@ -1566,6 +1583,7 @@ struct PreparedCodexExecution<T> {
   transport: T,
   request: ScheduledCodexRequest,
   attested_profile: AttestedCapabilityProfile,
+  github_mcp: Option<Arc<ScheduledGithubMcpClient>>,
   thread_id: String,
   deadline: Instant,
 }
@@ -1584,6 +1602,7 @@ impl<T: ScheduledJsonlTransport + Send> PreparedScheduledCodexExecution
       &self.thread_id,
       self.attested_profile.clone(),
       self.deadline,
+      self.github_mcp.as_deref(),
     );
     match bounded_shutdown(&mut self.transport, &self.request) {
       Ok(()) => result,
@@ -1611,10 +1630,24 @@ fn prepare_protocol<T: ScheduledJsonlTransport + Send + 'static>(
   request: ScheduledCodexRequest,
   mut attested_profile: AttestedCapabilityProfile,
   deadline: Instant,
+  github_mcp: Option<Arc<ScheduledGithubMcpClient>>,
 ) -> Result<Box<dyn PreparedScheduledCodexExecution>, ScheduledExecutionResult> {
-  let initialize = json!({
+  let supervisor_attestation = match attest_supervisor_github_mcp(github_mcp.as_deref()) {
+    Ok(attestation) => attestation,
+    Err(failure) => {
+      return reject_preparation(
+        transport,
+        &request,
+        ScheduledExecutionResult::PreflightRejected(failure),
+      );
+    }
+  };
+  let mut initialize = json!({
     "clientInfo": {"name": "codeoff-scheduler", "version": env!("CARGO_PKG_VERSION")},
   });
+  if supervisor_attestation.is_some() {
+    initialize["capabilities"] = json!({"experimentalApi": true});
+  }
   if let Err(failure) = scheduled_request(
     &mut transport,
     1,
@@ -1628,35 +1661,7 @@ fn prepare_protocol<T: ScheduledJsonlTransport + Send + 'static>(
   if let Err(error) = send_notification(&mut transport, "initialized") {
     return reject_preparation(transport, &request, transport_failure(error));
   }
-  let thread_params = json!({
-    "approvalPolicy": "never",
-    "cwd": request.profile.cwd,
-    "ephemeral": true,
-    "sandbox": "read-only",
-    "config": {
-      "web_search": "disabled",
-      "shell_environment_policy": {
-        "inherit": "none",
-        "ignore_default_excludes": false,
-        "exclude": [GITHUB_MCP_ACCESS_TOKEN_ENV],
-        "include_only": ["PATH", "LANG", "LC_ALL"],
-        "set": {
-          "PATH": CHILD_PATH,
-          "LANG": CHILD_LOCALE,
-          "LC_ALL": CHILD_LOCALE,
-        },
-      },
-      "mcp_servers": {
-        GITHUB_MCP_NAME: {
-          "url": request.profile.github_mcp_url,
-          "enabled": true,
-          "required": true,
-          "bearer_token_env_var": GITHUB_MCP_ACCESS_TOKEN_ENV,
-          "enabled_tools": EXPECTED_GITHUB_TOOLS,
-        }
-      }
-    }
-  });
+  let thread_params = scheduled_thread_params(&request, supervisor_attestation.as_ref());
   let thread = match scheduled_request(
     &mut transport,
     2,
@@ -1675,43 +1680,117 @@ fn prepare_protocol<T: ScheduledJsonlTransport + Send + 'static>(
       protocol_failure(capability("thread_start_missing_thread_id")),
     );
   };
-  let inventory = match scheduled_request(
-    &mut transport,
-    3,
-    "mcpServerStatus/list",
-    &json!({"threadId": thread_id, "detail": "full", "limit": 100}),
-    deadline,
-    &request.cancellation,
-  ) {
-    Ok(inventory) => inventory,
-    Err(failure) => return reject_preparation(transport, &request, protocol_failure(failure)),
-  };
-  if let Err(failure) = attest_mcp_inventory(&inventory) {
-    return reject_preparation(
-      transport,
-      &request,
-      ScheduledExecutionResult::PreflightRejected(failure),
-    );
-  }
-  let (health_digest, checked_at) =
+  let (health_digest, checked_at) = if let Some(attestation) = supervisor_attestation {
+    attested_profile
+      .github_tool_schema_sha256
+      .clone_from(&attestation.tool_schema_sha256);
+    match attest_mcp_health(&attestation.health) {
+      Ok(digest) => (digest, now_unix_seconds()),
+      Err(failure) => {
+        return reject_preparation(
+          transport,
+          &request,
+          ScheduledExecutionResult::PreflightRejected(failure),
+        );
+      }
+    }
+  } else {
+    let inventory = match scheduled_request(
+      &mut transport,
+      3,
+      "mcpServerStatus/list",
+      &json!({"threadId": thread_id, "detail": "full", "limit": 100}),
+      deadline,
+      &request.cancellation,
+    ) {
+      Ok(inventory) => inventory,
+      Err(failure) => return reject_preparation(transport, &request, protocol_failure(failure)),
+    };
+    match attest_mcp_inventory(&inventory) {
+      Ok(schema_digest) => attested_profile.github_tool_schema_sha256 = schema_digest,
+      Err(failure) => {
+        return reject_preparation(
+          transport,
+          &request,
+          ScheduledExecutionResult::PreflightRejected(failure),
+        );
+      }
+    }
     match attest_github_mcp_health(&mut transport, &request, &thread_id, deadline) {
       Ok(attestation) => attestation,
       Err(failure) => return reject_preparation(transport, &request, *failure),
-    };
-  attested_profile.github_mcp_health_checked_at_unix_seconds = checked_at;
-  attested_profile
-    .github_mcp_health_credential_revision
-    .clone_from(&request.profile.credential_revision);
-  attested_profile.github_mcp_health_result_sha256 = health_digest;
-  attested_profile.attested_at_unix_seconds = checked_at;
-  attested_profile.profile_sha256 = attested_profile.computed_profile_sha256();
+    }
+  };
+  finalize_mcp_attestation(&mut attested_profile, &request, health_digest, checked_at);
   Ok(Box::new(PreparedCodexExecution {
     transport,
     request,
     attested_profile,
+    github_mcp,
     thread_id,
     deadline,
   }))
+}
+
+fn attest_supervisor_github_mcp(
+  github_mcp: Option<&ScheduledGithubMcpClient>,
+) -> Result<Option<ScheduledMcpAttestation>, ScheduledFailure> {
+  github_mcp
+    .map(|client| {
+      client
+        .attest(
+          GITHUB_MCP_SERVER_INFO_NAME,
+          GITHUB_MCP_SERVER_VERSION,
+          &RequestedCapabilityProfile::github_tool_inventory(),
+        )
+        .map_err(capability)
+    })
+    .transpose()
+}
+
+fn finalize_mcp_attestation(
+  attested: &mut AttestedCapabilityProfile,
+  request: &ScheduledCodexRequest,
+  health_digest: String,
+  checked_at: u64,
+) {
+  attested.github_mcp_health_checked_at_unix_seconds = checked_at;
+  attested
+    .github_mcp_health_credential_revision
+    .clone_from(&request.profile.credential_revision);
+  attested.github_mcp_health_result_sha256 = health_digest;
+  attested.attested_at_unix_seconds = checked_at;
+  attested.profile_sha256 = attested.computed_profile_sha256();
+}
+
+fn scheduled_thread_params(
+  request: &ScheduledCodexRequest,
+  supervisor_attestation: Option<&ScheduledMcpAttestation>,
+) -> Value {
+  let mut params = json!({
+    "approvalPolicy": "never",
+    "cwd": request.profile.cwd,
+    "ephemeral": true,
+    "sandbox": "read-only",
+    "config": {
+      "web_search": "disabled",
+      "features": {"shell_tool": false, "unified_exec": false},
+      "shell_environment_policy": {
+        "inherit": "none",
+        "ignore_default_excludes": false,
+        "include_only": ["PATH", "LANG", "LC_ALL"],
+        "set": {
+          "PATH": CHILD_PATH,
+          "LANG": CHILD_LOCALE,
+          "LC_ALL": CHILD_LOCALE,
+        },
+      }
+    }
+  });
+  if let Some(attestation) = &supervisor_attestation {
+    params["dynamicTools"] = Value::Array(attestation.tool_specs.clone());
+  }
+  params
 }
 
 fn attest_github_mcp_health<T: ScheduledJsonlTransport>(
@@ -1745,6 +1824,7 @@ fn execute_prepared_protocol<T: ScheduledJsonlTransport>(
   thread_id: &str,
   attested_profile: AttestedCapabilityProfile,
   deadline: Instant,
+  github_mcp: Option<&ScheduledGithubMcpClient>,
 ) -> ScheduledExecutionResult {
   if request.cancellation.load(Ordering::Acquire) {
     return ScheduledExecutionResult::Interrupted {
@@ -1786,6 +1866,7 @@ fn execute_prepared_protocol<T: ScheduledJsonlTransport>(
     &turn_id,
     attested_profile,
     deadline,
+    github_mcp,
   )
 }
 
@@ -1863,7 +1944,7 @@ fn reject_preparation<T: ScheduledJsonlTransport>(
   }
 }
 
-fn attest_mcp_inventory(inventory: &Value) -> Result<(), ScheduledFailure> {
+fn attest_mcp_inventory(inventory: &Value) -> Result<String, ScheduledFailure> {
   if !inventory["nextCursor"].is_null() {
     return Err(capability("mcp_inventory_exceeded_single_exact_page"));
   }
@@ -1906,7 +1987,22 @@ fn attest_mcp_inventory(inventory: &Value) -> Result<(), ScheduledFailure> {
       return Err(capability("github_mcp_tool_not_attested_read_only"));
     }
   }
-  Ok(())
+  let schemas: Vec<_> = tools
+    .iter()
+    .map(|(name, tool)| {
+      json!({
+        "name": name,
+        "description": tool["description"].as_str().unwrap_or("GitHub read-only tool"),
+        "inputSchema": tool["inputSchema"].clone(),
+      })
+    })
+    .collect();
+  let encoded = serde_json::to_vec(&schemas)
+    .map_err(|_| capability("github_mcp_tool_schema_not_serializable"))?;
+  if encoded.len() > MAX_JSONL_MESSAGE_BYTES || json_depth(&Value::Array(schemas)) > 16 {
+    return Err(capability("github_mcp_tool_schema_exceeds_limit"));
+  }
+  Ok(sha256_hex(&encoded))
 }
 
 fn attest_mcp_health(health: &Value) -> Result<String, ScheduledFailure> {
@@ -1967,9 +2063,11 @@ fn wait_for_scheduled_turn<T: ScheduledJsonlTransport>(
   turn_id: &str,
   attested_profile: AttestedCapabilityProfile,
   deadline: Instant,
+  github_mcp: Option<&ScheduledGithubMcpClient>,
 ) -> ScheduledExecutionResult {
   let mut phased_final = None;
   let mut final_item_ids = BTreeSet::new();
+  let mut tool_call_ids = BTreeSet::new();
   let mut final_delta_bytes = 0_usize;
   loop {
     if request.cancellation.load(Ordering::Acquire) {
@@ -1993,17 +2091,21 @@ fn wait_for_scheduled_turn<T: ScheduledJsonlTransport>(
         }
         match message["method"].as_str() {
           Some("item/tool/call") => {
-            let _ = transport.write_json(json!({
-              "jsonrpc": "2.0",
-              "id": message["id"].clone(),
-              "result": {
-                "success": false,
-                "contentItems": [{"type": "inputText", "text": "scheduled_dynamic_tools_disabled"}],
-              }
-            }));
-            return ScheduledExecutionResult::PreflightRejected(capability(
-              "scheduled_dynamic_tool_call_observed",
-            ));
+            let Some(client) = github_mcp else {
+              return ScheduledExecutionResult::PreflightRejected(capability(
+                "scheduled_dynamic_tool_call_without_supervisor",
+              ));
+            };
+            if let Err(failure) = handle_scheduled_dynamic_tool_call(
+              transport,
+              &message,
+              thread_id,
+              turn_id,
+              client,
+              &mut tool_call_ids,
+            ) {
+              return ScheduledExecutionResult::Failed(failure);
+            }
           }
           Some("item/completed")
             if params["threadId"].as_str() == Some(thread_id)
@@ -2069,6 +2171,59 @@ fn wait_for_scheduled_turn<T: ScheduledJsonlTransport>(
       Err(error) => return transport_failure(error),
     }
   }
+}
+
+fn handle_scheduled_dynamic_tool_call<T: ScheduledJsonlTransport>(
+  transport: &mut T,
+  message: &Value,
+  thread_id: &str,
+  turn_id: &str,
+  github_mcp: &ScheduledGithubMcpClient,
+  seen_call_ids: &mut BTreeSet<String>,
+) -> Result<(), ScheduledFailure> {
+  let params = &message["params"];
+  if !message["id"].is_string() && !message["id"].is_number() {
+    return Err(capability("scheduled_dynamic_tool_call_id_invalid"));
+  }
+  let call_id = serde_json::to_string(&message["id"])
+    .map_err(|_| capability("scheduled_dynamic_tool_call_id_invalid"))?;
+  if call_id.len() > 128
+    || !seen_call_ids.insert(call_id)
+    || params["threadId"].as_str() != Some(thread_id)
+    || params["turnId"].as_str() != Some(turn_id)
+  {
+    return Err(capability("scheduled_dynamic_tool_call_binding_invalid"));
+  }
+  let tool = params["tool"]
+    .as_str()
+    .or_else(|| params["name"].as_str())
+    .filter(|tool| EXPECTED_GITHUB_TOOLS.contains(tool))
+    .ok_or_else(|| capability("scheduled_dynamic_tool_denied"))?;
+  let arguments = params
+    .get("arguments")
+    .filter(|arguments| arguments.is_object())
+    .cloned()
+    .ok_or_else(|| capability("scheduled_dynamic_tool_arguments_invalid"))?;
+  let result = github_mcp
+    .call(tool, &arguments)
+    .map_err(|_| capability("scheduled_dynamic_tool_call_failed"))?;
+  let text = serde_json::to_string(&result)
+    .map_err(|_| capability("scheduled_dynamic_tool_result_invalid"))?;
+  transport
+    .write_json(json!({
+      "jsonrpc": "2.0",
+      "id": message["id"].clone(),
+      "result": {
+        "success": true,
+        "contentItems": [{"type": "inputText", "text": text}],
+      }
+    }))
+    .map_err(|_| {
+      ScheduledFailure::new(
+        ScheduledFailureKind::Transport,
+        "scheduled_dynamic_tool_response_failed",
+      )
+    })
 }
 
 fn observe_final_stream_event(
@@ -3004,11 +3159,14 @@ mod tests {
         })).collect::<Vec<_>>()
       }),
       "tools/call" => {
-        assert_eq!(
-          body["params"]["name"].as_str(),
-          Some(GITHUB_MCP_HEALTH_TOOL)
-        );
-        health()
+        if body["params"]["name"].as_str() == Some(GITHUB_MCP_HEALTH_TOOL) {
+          health()
+        } else {
+          json!({
+            "content": [{"type": "text", "text": "read-only fixture result"}],
+            "isError": false,
+          })
+        }
       }
       "resources/list" => json!({"resources": []}),
       "resources/templates/list" => json!({"resourceTemplates": []}),
@@ -3456,7 +3614,6 @@ mod tests {
       json!({
         "inherit": "none",
         "ignore_default_excludes": false,
-        "exclude": [GITHUB_MCP_ACCESS_TOKEN_ENV],
         "include_only": ["PATH", "LANG", "LC_ALL"],
         "set": {
           "PATH": CHILD_PATH,
@@ -3465,6 +3622,11 @@ mod tests {
         },
       })
     );
+    assert_eq!(
+      thread_start["params"]["config"]["features"],
+      json!({"shell_tool": false, "unified_exec": false})
+    );
+    assert!(thread_start["params"]["dynamicTools"].is_null());
     assert_eq!(
       methods,
       [
@@ -3486,6 +3648,186 @@ mod tests {
       json!({"type": "readOnly", "networkAccess": false})
     );
     assert_eq!(turn["params"]["outputSchema"], fixed_output_schema());
+  }
+
+  #[test]
+  #[allow(
+    clippy::too_many_lines,
+    reason = "the security regression keeps the accepted call and binding denial matrix together"
+  )]
+  fn dynamic_tool_calls_are_exactly_bound_and_one_shot() {
+    let bearer = "fixture-bearer-token-with-no-external-authority-0000000000000000";
+    let fake_mcp = FakeAuthenticatedMcpServer::start(bearer);
+    let github_mcp =
+      ScheduledGithubMcpClient::new(&fake_mcp.url(), bearer.to_owned()).expect("MCP client");
+    github_mcp
+      .attest(
+        GITHUB_MCP_SERVER_INFO_NAME,
+        GITHUB_MCP_SERVER_VERSION,
+        &RequestedCapabilityProfile::github_tool_inventory(),
+      )
+      .expect("MCP attestation");
+    let profile = profile();
+    let actions = Arc::new(Mutex::new(Actions::default()));
+    let mut transport = MockTransport {
+      evidence: evidence(&profile),
+      reads: VecDeque::new(),
+      actions: Arc::clone(&actions),
+    };
+    let mut seen = BTreeSet::new();
+    let call = json!({
+      "jsonrpc": "2.0",
+      "id": "call-1",
+      "method": "item/tool/call",
+      "params": {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "tool": "issue_read",
+        "arguments": {"owner": "helixbox", "repo": "codeoff", "issue_number": 1},
+      },
+    });
+    handle_scheduled_dynamic_tool_call(
+      &mut transport,
+      &call,
+      "thread-1",
+      "turn-1",
+      &github_mcp,
+      &mut seen,
+    )
+    .expect("bound dynamic tool call");
+    assert_eq!(
+      actions.lock().expect("actions").writes[0]["result"]["success"],
+      true
+    );
+
+    let duplicate = handle_scheduled_dynamic_tool_call(
+      &mut transport,
+      &call,
+      "thread-1",
+      "turn-1",
+      &github_mcp,
+      &mut seen,
+    )
+    .expect_err("duplicate or late call must fail");
+    assert_eq!(
+      duplicate.message,
+      "scheduled_dynamic_tool_call_binding_invalid"
+    );
+
+    for (message, expected) in [
+      (
+        json!({
+          "id": "call-2",
+          "params": {
+            "threadId": "wrong-thread",
+            "turnId": "turn-1",
+            "tool": "issue_read",
+            "arguments": {},
+          },
+        }),
+        "scheduled_dynamic_tool_call_binding_invalid",
+      ),
+      (
+        json!({
+          "id": "call-3",
+          "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tool": "create_issue",
+            "arguments": {},
+          },
+        }),
+        "scheduled_dynamic_tool_denied",
+      ),
+      (
+        json!({
+          "id": {"invalid": true},
+          "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tool": "issue_read",
+            "arguments": {},
+          },
+        }),
+        "scheduled_dynamic_tool_call_id_invalid",
+      ),
+    ] {
+      let failure = handle_scheduled_dynamic_tool_call(
+        &mut transport,
+        &message,
+        "thread-1",
+        "turn-1",
+        &github_mcp,
+        &mut seen,
+      )
+      .expect_err("unbound dynamic tool call must fail");
+      assert_eq!(failure.message, expected);
+    }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn process_transport_relays_dynamic_tool_call_through_supervisor() {
+    let bearer = "fixture-bearer-token-with-no-external-authority-0000000000000000";
+    let fake_mcp = FakeAuthenticatedMcpServer::start(bearer);
+    let temp = TempDir::new_in("/code/helixbox").expect("process transport tempdir");
+    let program =
+      PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dynamic-tool-app-server.sh");
+    let mut profile = profile();
+    profile.codex_program = program.clone();
+    profile.codex_program_sha256 = sha256_file(&program).expect("fake App Server digest");
+    profile.codex_home = temp.path().join("codex-home");
+    profile.cwd = temp.path().join("workspace");
+    profile.github_mcp_url = fake_mcp.url();
+    profile.config_sha256 = sha256_hex(profile.dedicated_config().as_bytes());
+    fs::create_dir(&profile.cwd).expect("process transport workspace");
+    fs::set_permissions(&profile.cwd, fs::Permissions::from_mode(0o555))
+      .expect("protect process transport workspace");
+    prepare_scheduled_codex_home(&profile).expect("process transport CODEX_HOME");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555))
+      .expect("protect process transport tempdir");
+
+    let artifacts = Arc::new(test_artifacts(&program, &profile.codex_home, &profile.cwd));
+    let runtime = evidence(&profile);
+    let transport_artifacts = Arc::clone(&artifacts);
+    let github_mcp = Arc::new(
+      ScheduledGithubMcpClient::new(&fake_mcp.url(), bearer.to_owned()).expect("MCP client"),
+    );
+    let executor = ScheduledCodexExecutor::with_supervisor_github_mcp(
+      move |requested| {
+        StdioScheduledJsonlTransport::spawn(
+          &requested,
+          runtime.clone(),
+          &transport_artifacts,
+          Some((65_534, 65_534)),
+        )
+      },
+      github_mcp,
+    );
+    let scheduled_request = request(profile);
+    let result = execute_test(&executor, scheduled_request);
+    let ScheduledExecutionResult::Completed {
+      output,
+      thread_id,
+      turn_id,
+      ..
+    } = result
+    else {
+      panic!("unexpected process transport result: {result:?}");
+    };
+    assert_eq!(output.summary, "process dynamic tool completed");
+    assert_eq!(thread_id, "thread-1");
+    assert_eq!(turn_id, "turn-1");
+    let observations = fake_mcp.observations.lock().expect("MCP observations");
+    assert_eq!(
+      observations
+        .methods
+        .iter()
+        .filter(|method| method.as_str() == "tools/call")
+        .count(),
+      2,
+      "attestation get_me and relayed issue_read must be the only upstream calls"
+    );
   }
 
   #[test]
@@ -3519,6 +3861,7 @@ mod tests {
     profile.github_mcp_health_checked_at_unix_seconds = profile.attested_at_unix_seconds;
     profile.github_mcp_health_credential_revision = profile.credential_revision.clone();
     profile.github_mcp_health_result_sha256 = "8".repeat(64);
+    profile.github_tool_schema_sha256 = "9".repeat(64);
     profile.profile_sha256 = profile.computed_profile_sha256();
     profile.validate().expect("canonical profile");
     let authority =
@@ -3997,17 +4340,88 @@ mod tests {
       runner_image_digest: profile.runner_image_digest.clone(),
     };
     let transport_artifacts = Arc::clone(&artifacts);
-    let executor = ScheduledCodexExecutor::new(move |requested| {
-      StdioScheduledJsonlTransport::spawn(
-        &requested,
-        runtime_evidence.clone(),
-        &transport_artifacts,
-        Some((65_534, 65_534)),
-        bearer,
-      )
-    });
+    let github_mcp = Arc::new(
+      ScheduledGithubMcpClient::new(&fake_mcp.url(), bearer.to_owned())
+        .expect("supervisor MCP client"),
+    );
+    let executor = ScheduledCodexExecutor::with_supervisor_github_mcp(
+      move |requested| {
+        StdioScheduledJsonlTransport::spawn(
+          &requested,
+          runtime_evidence.clone(),
+          &transport_artifacts,
+          Some((65_534, 65_534)),
+        )
+      },
+      github_mcp,
+    );
+    let now = now_unix_seconds();
+    let authority = ScheduledDeploymentAuthority {
+      schema_version: 1,
+      deployment_epoch: 1,
+      attestation_id: "ab".repeat(32),
+      attestation_digest: "cd".repeat(32),
+      trust_key_id: "ef".repeat(32),
+      profile_digest: isolation_profile_binding_digest(&profile).expect("profile binding"),
+      github_mcp_access_auth_mode: profile.github_mcp_access_auth_mode.clone(),
+      github_mcp_access_token_revision: profile.github_mcp_access_token_revision.clone(),
+      isolation_revision: "deployment-isolation-v1".to_owned(),
+      issued_at_unix_seconds: now.saturating_sub(1),
+      expires_at_unix_seconds: now.saturating_add(300),
+    };
+    let built = BuiltScheduledCodexExecutor {
+      profile: profile.clone(),
+      authority: authority.clone(),
+      executor: Arc::new(executor),
+    };
+    let readiness = built
+      .probe_readiness(Duration::from_secs(30))
+      .expect("production BuiltScheduledCodexExecutor readiness");
+    assert!(!readiness.github_tool_schema_sha256.is_empty());
+    assert_eq!(
+      fs::read_dir(&state_root)
+        .expect("read readiness-cleaned state root")
+        .count(),
+      0,
+      "readiness process state must not survive the session"
+    );
+
     let scheduled_request = request(profile.clone());
-    let prepared = prepare_test(&executor, scheduled_request).expect("real App Server preparation");
+    let permit = ScheduledIsolationPermit {
+      identity: scheduled_request.identity.clone(),
+      deployment_epoch: authority.deployment_epoch,
+      attestation_id: authority.attestation_id.clone(),
+      profile_digest: authority.profile_digest.clone(),
+      nonce: "12".repeat(32),
+      permit_id: "34".repeat(32),
+      isolation_revision: authority.isolation_revision.clone(),
+      expires_at_unix_seconds: now.saturating_add(30),
+    };
+    let prepared = built
+      .executor
+      .prepare(scheduled_request, permit)
+      .expect("real production App Server preparation");
+    let mut scanned_environments = 0_usize;
+    for entry in fs::read_dir("/proc").expect("read procfs") {
+      let entry = entry.expect("procfs entry");
+      if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+        continue;
+      }
+      let Ok(environment) = fs::read(entry.path().join("environ")) else {
+        continue;
+      };
+      scanned_environments += 1;
+      assert!(
+        !environment
+          .windows(bearer.len())
+          .any(|window| window == bearer.as_bytes()),
+        "supervisor bearer must not be readable from any process environment"
+      );
+    }
+    assert!(
+      scanned_environments > 0,
+      "procfs scan must observe processes"
+    );
     let attested = prepared
       .shutdown_without_execute()
       .expect("bounded real App Server shutdown");
@@ -4043,11 +4457,14 @@ mod tests {
         .iter()
         .any(|method| method == "tools/list")
     );
-    assert!(
+    assert_eq!(
       observations
         .methods
         .iter()
-        .any(|method| method == "tools/call")
+        .filter(|method| method.as_str() == "tools/call")
+        .count(),
+      2,
+      "readiness and production PREPARE must each authenticate with get_me"
     );
     assert!(!attested.canonical_json().contains(bearer));
 
@@ -4399,28 +4816,30 @@ mod tests {
   }
 
   #[test]
-  fn config_contains_only_pinned_read_only_github_mcp() {
+  fn config_disables_local_tools_and_contains_no_mcp_credentials() {
     let profile = profile();
     let config = profile.dedicated_config();
     assert!(config.contains("web_search = \"disabled\""));
+    assert!(config.contains("[features]"));
+    assert!(config.contains("shell_tool = false"));
+    assert!(config.contains("unified_exec = false"));
     assert!(config.contains("[shell_environment_policy]"));
     assert!(config.contains("inherit = \"none\""));
     assert!(config.contains("ignore_default_excludes = false"));
-    assert!(config.contains(&format!("exclude = [\"{GITHUB_MCP_ACCESS_TOKEN_ENV}\"]")));
     assert!(config.contains("include_only = [\"PATH\", \"LANG\", \"LC_ALL\"]"));
     assert!(config.contains(&format!(
       "set = {{ PATH = {CHILD_PATH:?}, LANG = {CHILD_LOCALE:?}, LC_ALL = {CHILD_LOCALE:?} }}"
     )));
-    assert!(config.contains("[mcp_servers.github]"));
-    assert!(config.contains("required = true"));
-    assert!(config.contains(&format!(
-      "bearer_token_env_var = \"{GITHUB_MCP_ACCESS_TOKEN_ENV}\""
-    )));
+    assert!(!config.contains("mcp_servers"));
+    assert!(!config.contains(&profile.github_mcp_url));
+    assert!(!config.contains(GITHUB_MCP_ACCESS_TOKEN_ENV));
     assert!(!config.contains("github-readonly-service-account"));
     assert!(!config.contains("slack"));
-    for tool in EXPECTED_GITHUB_TOOLS {
-      assert!(config.contains(tool));
-    }
+    assert!(
+      EXPECTED_GITHUB_TOOLS
+        .iter()
+        .all(|tool| !config.contains(tool))
+    );
   }
 
   #[test]
@@ -4740,7 +5159,6 @@ mod tests {
       runtime,
       &artifacts,
       Some((program_metadata.uid(), program_metadata.gid())),
-      &"t".repeat(MIN_MCP_ACCESS_TOKEN_BYTES),
     )
     .expect("spawn");
     let pid_deadline = Instant::now() + Duration::from_secs(2);

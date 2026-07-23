@@ -290,7 +290,7 @@ fn ready(session_nonce: &str, challenge: String, fingerprint: &str, now: u64) ->
       runner_workload_identity: WORKLOAD_IDENTITY.to_owned(),
       runner_client_cert_public_key_fingerprint: fingerprint.to_owned(),
       credential_revision: "github-readonly-2026-07".to_owned(),
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
     }),
   }

@@ -28,6 +28,7 @@ pub struct AttestedCapabilityProfile {
   pub github_mcp_health_credential_revision: String,
   pub github_mcp_health_result_sha256: String,
   pub github_mcp_health_tool: String,
+  pub github_tool_schema_sha256: String,
   pub github_tools: BTreeSet<String>,
   pub credential_reference: String,
   pub permission_policy_revision: String,
@@ -88,6 +89,7 @@ impl AttestedCapabilityProfile {
       "github_mcp_health_result_sha256": self.github_mcp_health_result_sha256,
       "github_mcp_health_tool": self.github_mcp_health_tool,
       "github_mcp_version": self.github_mcp_version,
+      "github_tool_schema_sha256": self.github_tool_schema_sha256,
       "github_tools": tools,
       "negative_test_revision": self.negative_test_revision,
       "output_schema_revision": self.output_schema_revision,
@@ -123,6 +125,7 @@ impl AttestedCapabilityProfile {
       "github_mcp_health_result_sha256": self.github_mcp_health_result_sha256,
       "github_mcp_health_tool": self.github_mcp_health_tool,
       "github_mcp_version": self.github_mcp_version,
+      "github_tool_schema_sha256": self.github_tool_schema_sha256,
       "github_tools": tools,
       "negative_test_revision": self.negative_test_revision,
       "output_schema_revision": self.output_schema_revision,
@@ -141,7 +144,7 @@ impl AttestedCapabilityProfile {
   pub fn validate(&self) -> Result<(), AttestedCapabilityProfileError> {
     if self.attested_at_unix_seconds == 0
       || self.github_mcp_health_checked_at_unix_seconds != self.attested_at_unix_seconds
-      || self.github_mcp_access_auth_mode != "bearer-token-env-v1"
+      || self.github_mcp_access_auth_mode != "supervisor-dynamic-tools-v1"
       || self.github_mcp_health_tool != "get_me"
       || self.github_mcp_health_credential_revision != self.credential_revision
       || CredentialRevision::parse(&self.github_mcp_access_token_revision).is_err()
@@ -161,6 +164,7 @@ impl AttestedCapabilityProfile {
       &self.config_sha256,
       &self.github_mcp_configured_artifact_sha256,
       &self.github_mcp_health_result_sha256,
+      &self.github_tool_schema_sha256,
       &self.profile_sha256,
       &self.runner_client_cert_public_key_fingerprint,
     ] {
@@ -191,7 +195,7 @@ impl AttestedCapabilityProfile {
     }
     let object = parsed
       .as_object()
-      .filter(|object| object.len() == 28)
+      .filter(|object| object.len() == 29)
       .ok_or(AttestedCapabilityProfileError::InvalidShape)?;
     let string = |field: &str| {
       object
@@ -239,6 +243,7 @@ impl AttestedCapabilityProfile {
       github_mcp_health_result_sha256: string("github_mcp_health_result_sha256")?,
       github_mcp_health_tool: string("github_mcp_health_tool")?,
       github_mcp_version: string("github_mcp_version")?,
+      github_tool_schema_sha256: string("github_tool_schema_sha256")?,
       github_tools: tools,
       negative_test_revision: string("negative_test_revision")?,
       output_schema_revision: string("output_schema_revision")?,
@@ -302,12 +307,13 @@ mod tests {
       github_mcp_version: "1.6.0".to_owned(),
       github_mcp_configured_artifact_sha256: "3".repeat(64),
       github_mcp_configured_endpoint_identity: "configured-sidecar".to_owned(),
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       github_mcp_health_checked_at_unix_seconds: 1,
       github_mcp_health_credential_revision: "credential-v1".to_owned(),
       github_mcp_health_result_sha256: "4".repeat(64),
       github_mcp_health_tool: "get_me".to_owned(),
+      github_tool_schema_sha256: "9".repeat(64),
       github_tools: EXPECTED_GITHUB_TOOLS.map(str::to_owned).into(),
       credential_reference: "configured-credential".to_owned(),
       permission_policy_revision: "policy-v1".to_owned(),

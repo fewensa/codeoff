@@ -723,7 +723,7 @@ mod tests {
       runner_workload_identity: "spiffe://codeoff/runner".to_owned(),
       runner_client_cert_public_key_fingerprint: "7".repeat(64),
       credential_revision: "credential-v1".to_owned(),
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
     };
     let ready_digest = ready_evidence_payload_digest(&ready);
@@ -779,7 +779,7 @@ mod tests {
       preparation_nonce: "3".repeat(64),
       attested_profile_json: "{\"profile\":1}".to_owned(),
       attested_profile_digest: "4".repeat(64),
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
     };
     let prepared_digest = prepared_evidence_payload_digest(&prepared);

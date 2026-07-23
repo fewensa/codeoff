@@ -3,6 +3,7 @@
 mod scheduled;
 #[cfg(unix)]
 mod scheduled_artifacts;
+mod scheduled_mcp;
 
 pub use codeoff_core::AttestedCapabilityProfile;
 pub use scheduled::{

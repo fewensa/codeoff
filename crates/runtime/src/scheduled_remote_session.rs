@@ -528,12 +528,13 @@ mod tests {
       github_mcp_version: "test-mcp".to_owned(),
       github_mcp_configured_artifact_sha256: "4".repeat(64),
       github_mcp_configured_endpoint_identity: "test-github-mcp".to_owned(),
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       github_mcp_health_checked_at_unix_seconds: 100,
       github_mcp_health_credential_revision: "credential-v1".to_owned(),
       github_mcp_health_result_sha256: "8".repeat(64),
       github_mcp_health_tool: "get_me".to_owned(),
+      github_tool_schema_sha256: "9".repeat(64),
       github_tools: [
         "get_me",
         "issue_read",
@@ -586,7 +587,7 @@ mod tests {
       runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
       runner_client_cert_public_key_fingerprint: "1".repeat(64),
       credential_revision: "github-readonly-2026-07".to_owned(),
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
     })
   }
@@ -622,7 +623,7 @@ mod tests {
       preparation_nonce: "3".repeat(64),
       attested_profile_digest: hex_sha256(attested_profile_json.as_bytes()),
       attested_profile_json,
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
     })
   }

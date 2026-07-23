@@ -1164,7 +1164,7 @@ mod tests {
       github_mcp_url: "http://127.0.0.1:8090/mcp".to_owned(),
       github_mcp_configured_artifact_sha256: "2".repeat(64),
       github_mcp_configured_endpoint_identity: "github-mcp-scheduled-v1".to_owned(),
-      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       credential_reference: "kubernetes:codeoff/github-mcp".to_owned(),
       permission_policy_revision: "scheduled-read-only-v1".to_owned(),
@@ -1369,7 +1369,7 @@ mod tests {
         preparation_nonce: executor_preparation_nonce.clone(),
         attested_profile_json: "{}".to_owned(),
         attested_profile_digest: "1".repeat(64),
-        github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+        github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
         github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       };
       let payload_digest = prepared_evidence_payload_digest(&prepared);

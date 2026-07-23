@@ -255,7 +255,7 @@ github_mcp_url = "http://127.0.0.1:8090/mcp"
 github_mcp_artifact_path = "/opt/codeoff/bin/github-mcp-server"
 github_mcp_artifact_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 github_mcp_endpoint_identity = "github-mcp-scheduled-v1"
-github_mcp_access_auth_mode = "bearer-token-env-v1"
+github_mcp_access_auth_mode = "supervisor-dynamic-tools-v1"
 github_mcp_access_token_revision = "mcp-channel-v1"
 credential_reference = "kubernetes:codeoff/github-mcp"
 permission_policy_revision = "scheduled-read-only-v1"
@@ -382,7 +382,7 @@ fn valid_scheduled_codex_config() -> ScheduledCodexConfig {
     github_mcp_artifact_path: "/opt/codeoff/bin/github-mcp-server".into(),
     github_mcp_artifact_sha256: "b".repeat(64),
     github_mcp_endpoint_identity: "github-mcp-scheduled-v1".to_owned(),
-    github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+    github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
     github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
     credential_reference: "kubernetes:codeoff/github-mcp".to_owned(),
     permission_policy_revision: "scheduled-read-only-v1".to_owned(),

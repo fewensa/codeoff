@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use codeoff_agent_contract::{InvocationPrincipalRef, InvocationSource, SessionMode, ToolPolicy};
-use codeoff_core::{AttestedCapabilityProfile, CredentialRevision};
+use codeoff_core::{AttestedCapabilityProfile, CredentialRevision, EvidenceKeyId};
 use codeoff_state::{ScheduledExecutorAdmission, ScheduledPrepareAuthority};
 use rustls::crypto::CryptoProvider;
 use serde_json::Value;
@@ -73,7 +73,7 @@ impl ScheduledRunnerBrokerConfig {
       || self.admission_ttl.is_zero()
       || self.admission_ttl > Duration::from_millis(MAX_ADMISSION_TTL_MILLIS)
       || self.executor_evidence_public_key.len() != 32
-      || self.executor_evidence_key_id.is_empty()
+      || EvidenceKeyId::parse(&self.executor_evidence_key_id).is_err()
     {
       return Err(ScheduledRunnerBrokerError::InvalidConfiguration);
     }
@@ -1268,11 +1268,45 @@ fn is_oci_digest(value: &str) -> bool {
 mod tests {
   use super::*;
   use crate::scheduled_runner_evidence::{
-    RunnerEvidenceClaims, RunnerEvidenceKind, sign_runner_evidence,
+    RunnerEvidenceClaims, RunnerEvidenceKind, SignedRunnerEvidence, sign_runner_evidence,
   };
   use ring::rand::SystemRandom;
   use ring::signature::{Ed25519KeyPair, KeyPair};
+  use std::fs;
+  use std::os::unix::fs::PermissionsExt;
+  use std::os::unix::process::CommandExt;
+  use std::path::PathBuf;
+  use std::process::{Command, Stdio};
   use std::sync::OnceLock;
+
+  use crate::scheduled_remote_protocol::ReadinessRequestFrame;
+  use crate::scheduled_runner_control::{
+    ScheduledRunnerControlConfig, ScheduledRunnerControlConnection, relay_runner_frames,
+  };
+  use crate::scheduled_runner_evidence::RunnerEvidenceSigner;
+  use crate::scheduled_runner_executor::{
+    ProtectedScheduledExecutorListener, ScheduledRunnerExecutorConfig,
+  };
+  use crate::scheduled_runner_tls::integration_tests::CertificateFixture;
+  use crate::scheduled_runner_tls::{
+    ScheduledRunnerIoPolicy, ScheduledRunnerTlsClient, ScheduledRunnerTlsPaths,
+    ScheduledRunnerTlsServer, session_challenge, session_nonce,
+  };
+  use codeoff_agent_contract::{AgentTask, InvocationPrincipal};
+  use codeoff_state::RunLeaseBinding;
+  use nix::unistd::{Gid, Uid, chown, getegid, geteuid};
+  use tokio::net::TcpListener;
+
+  const PRODUCTION_RELAY_HELPER_ENV: &str = "CODEOFF_PRODUCTION_RELAY_HELPER";
+  const PRODUCTION_RELAY_ADDRESS_ENV: &str = "CODEOFF_PRODUCTION_RELAY_ADDRESS";
+  const PRODUCTION_RELAY_CA_ENV: &str = "CODEOFF_PRODUCTION_RELAY_CA";
+  const PRODUCTION_RELAY_CERT_ENV: &str = "CODEOFF_PRODUCTION_RELAY_CERT";
+  const PRODUCTION_RELAY_KEY_ENV: &str = "CODEOFF_PRODUCTION_RELAY_KEY";
+  const PRODUCTION_RELAY_SOCKET_ENV: &str = "CODEOFF_PRODUCTION_RELAY_SOCKET";
+  const PRODUCTION_RELAY_EVIDENCE_KEY_ENV: &str = "CODEOFF_PRODUCTION_RELAY_EVIDENCE_KEY";
+  const TEST_SERVER_NAME: &str = "gateway.codeoff.test";
+  const TEST_CONTROL_UID: u32 = 65_533;
+  const TEST_CONTROL_GID: u32 = 65_533;
 
   fn evidence_keys() -> &'static (Vec<u8>, Vec<u8>) {
     static KEYS: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
@@ -1281,6 +1315,84 @@ mod tests {
       let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("pair");
       (pkcs8.as_ref().to_vec(), pair.public_key().as_ref().to_vec())
     })
+  }
+
+  #[test]
+  fn production_relay_subprocess_helper() {
+    if std::env::var_os(PRODUCTION_RELAY_HELPER_ENV).is_none() {
+      return;
+    }
+    let value = |name: &str| std::env::var(name).expect("production relay helper environment");
+    let evidence_key = PathBuf::from(value(PRODUCTION_RELAY_EVIDENCE_KEY_ENV));
+    assert!(
+      RunnerEvidenceSigner::load(&evidence_key, "executor-key-1").is_err(),
+      "non-root control must not read executor evidence key"
+    );
+    let address = value(PRODUCTION_RELAY_ADDRESS_ENV)
+      .parse()
+      .expect("gateway address");
+    let paths = ScheduledRunnerTlsPaths {
+      certificate_chain: value(PRODUCTION_RELAY_CERT_ENV).into(),
+      private_key: value(PRODUCTION_RELAY_KEY_ENV).into(),
+      trust_bundle: value(PRODUCTION_RELAY_CA_ENV).into(),
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("relay runtime");
+    runtime.block_on(async move {
+      let timeout = Duration::from_secs(5);
+      let policy = ScheduledRunnerIoPolicy {
+        handshake_timeout: timeout,
+        read_timeout: timeout,
+        write_timeout: timeout,
+      };
+      let client = ScheduledRunnerTlsClient::load_for_owner(
+        &paths,
+        TEST_SERVER_NAME,
+        policy,
+        geteuid().as_raw(),
+        getegid().as_raw(),
+      )
+      .expect("control TLS client");
+      let mut remote = client.connect(address).await.expect("control TLS connect");
+      let nonce = session_nonce(&remote.channel_binding);
+      let challenge = session_challenge(&remote.channel_binding);
+      let mut local = ScheduledRunnerControlConnection::connect(&ScheduledRunnerControlConfig {
+        socket_path: value(PRODUCTION_RELAY_SOCKET_ENV).into(),
+        executor_uid: 0,
+        executor_gid: 0,
+        connect_timeout: timeout,
+        read_timeout: timeout,
+        write_timeout: timeout,
+      })
+      .await
+      .expect("control local connect")
+      .framed;
+      let ready_until_unix_millis = unix_millis().expect("time") + 4_000;
+      local
+        .write_frame(&RemoteFrame {
+          version: REMOTE_PROTOCOL_VERSION,
+          session_nonce: nonce.clone(),
+          sequence: 1,
+          message: RemoteMessage::ReadinessRequest(ReadinessRequestFrame {
+            challenge: challenge.clone(),
+            ready_until_unix_millis,
+          }),
+        })
+        .await
+        .expect("readiness request");
+      let ready = local
+        .read_frame(unix_millis().expect("time"))
+        .await
+        .expect("ready read")
+        .expect("ready frame");
+      remote
+        .framed
+        .write_frame(&ready)
+        .await
+        .expect("relay ready");
+      relay_runner_frames(&mut remote.framed, &mut local, &nonce)
+        .await
+        .expect("production relay");
+    });
   }
 
   struct TestPermitIssuer;
@@ -1391,6 +1503,83 @@ mod tests {
       session_nonce: session_nonce.to_owned(),
       sequence: 1,
       message: RemoteMessage::Ready(ready),
+    }
+  }
+
+  fn capability_profile(config: &ScheduledRunnerBrokerConfig) -> AttestedCapabilityProfile {
+    let mut profile = AttestedCapabilityProfile {
+      codex_version: "test-codex".to_owned(),
+      app_server_schema_sha256: "1".repeat(64),
+      codex_program_sha256: "2".repeat(64),
+      github_mcp_version: "test-mcp".to_owned(),
+      github_mcp_artifact_sha256: "3".repeat(64),
+      github_mcp_endpoint_identity: "test-endpoint".to_owned(),
+      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
+      github_mcp_health_checked_at_unix_seconds: 1,
+      github_mcp_health_credential_revision: config.credential_revision.clone(),
+      github_mcp_health_result_sha256: "8".repeat(64),
+      github_mcp_health_tool: "get_me".to_owned(),
+      github_tools: [
+        "get_me",
+        "issue_read",
+        "list_issues",
+        "search_issues",
+        "search_orgs",
+      ]
+      .into_iter()
+      .map(str::to_owned)
+      .collect(),
+      credential_reference: "test-credential".to_owned(),
+      permission_policy_revision: "test-policy".to_owned(),
+      config_revision: "test-config".to_owned(),
+      config_sha256: "4".repeat(64),
+      gateway_image_digest: config.gateway_image_digest.clone(),
+      runner_image_digest: config.runner_image_digest.clone(),
+      runner_workload_identity: config.runner_workload_identity.clone(),
+      runner_client_cert_public_key_fingerprint: config.runner_client_spki_sha256.clone(),
+      credential_revision: config.credential_revision.clone(),
+      credential_isolation_revision: "test-isolation".to_owned(),
+      credential_deny_policy_revision: "test-deny".to_owned(),
+      negative_test_revision: "test-negative".to_owned(),
+      output_schema_revision: "test-output".to_owned(),
+      attested_at_unix_seconds: 1,
+      profile_sha256: String::new(),
+    };
+    profile.profile_sha256 = profile.computed_profile_sha256();
+    profile
+  }
+
+  #[allow(
+    clippy::too_many_arguments,
+    reason = "test evidence binds every production claim"
+  )]
+  fn production_claims(
+    config: &ScheduledRunnerBrokerConfig,
+    kind: RunnerEvidenceKind,
+    session_nonce: &str,
+    challenge: &str,
+    sequence: u64,
+    expires_at_unix_millis: u64,
+    observed_profile_digest: &str,
+    payload_digest: String,
+  ) -> RunnerEvidenceClaims {
+    RunnerEvidenceClaims {
+      kind,
+      algorithm_version: "ed25519-v1".to_owned(),
+      signer_identity: config.executor_evidence_signer_identity.clone(),
+      key_revision: config.executor_evidence_key_revision.clone(),
+      session_nonce: session_nonce.to_owned(),
+      challenge: challenge.to_owned(),
+      sequence,
+      issued_at_unix_millis: unix_millis().expect("time"),
+      expires_at_unix_millis,
+      deployment_epoch: config.deployment_epoch,
+      deployment_profile_digest: config.profile_digest.clone(),
+      observed_profile_digest: observed_profile_digest.to_owned(),
+      executor_identity: config.executor_identity.clone(),
+      credential_revision: config.credential_revision.clone(),
+      payload_digest,
     }
   }
 
@@ -1743,6 +1932,10 @@ mod tests {
     );
     accept_authenticated_prepared(&mut session, &config, &ready, &prepared_frame, now)
       .expect("valid prepared remains acceptable");
+    assert!(
+      accept_authenticated_prepared(&mut session, &config, &ready, &prepared_frame, now).is_err(),
+      "exact same-kind prepared replay must fail closed"
+    );
     session
       .accept(
         RemoteSessionRole::Gateway,
@@ -1796,25 +1989,41 @@ mod tests {
       sequence: 3,
       message: RemoteMessage::Result(result),
     };
-    let mut translated = result_frame.clone();
-    let RemoteMessage::Result(translated_payload) = &mut translated.message else {
-      unreachable!()
-    };
-    translated_payload.kind = RemoteResultKind::OutcomeUnknown;
-    assert!(
-      accept_authenticated_result(
-        &mut session,
-        &config,
-        match &ready.message {
-          RemoteMessage::Ready(ready) => ready,
-          _ => unreachable!(),
-        },
-        &profile_digest,
-        &translated,
-        now,
-      )
-      .is_err()
-    );
+    for mutation in 0..11 {
+      let mut translated = result_frame.clone();
+      let RemoteMessage::Result(translated_payload) = &mut translated.message else {
+        unreachable!()
+      };
+      match mutation {
+        0 => translated_payload.binding.run_id.push('x'),
+        1 => translated_payload.binding.job_id.push('x'),
+        2 => translated_payload.binding.attempt += 1,
+        3 => translated_payload.binding.fence_token += 1,
+        4 => translated_payload.binding.authority_digest = "0".repeat(64),
+        5 => translated_payload.binding.profile_digest = "0".repeat(64),
+        6 => translated_payload.binding.deployment_epoch += 1,
+        7 => translated_payload.binding.credential_revision = "credential-v2".to_owned(),
+        8 => translated_payload.preparation_nonce = "5".repeat(64),
+        9 => translated_payload.kind = RemoteResultKind::OutcomeUnknown,
+        10 => translated_payload.result_json.push(' '),
+        _ => unreachable!(),
+      }
+      assert!(
+        accept_authenticated_result(
+          &mut session,
+          &config,
+          match &ready.message {
+            RemoteMessage::Ready(ready) => ready,
+            _ => unreachable!(),
+          },
+          &profile_digest,
+          &translated,
+          now,
+        )
+        .is_err(),
+        "result mutation {mutation} advanced authenticated state"
+      );
+    }
     accept_authenticated_result(
       &mut session,
       &config,
@@ -1827,6 +2036,49 @@ mod tests {
       now,
     )
     .expect("valid result remains acceptable");
+    assert!(
+      accept_authenticated_result(
+        &mut session,
+        &config,
+        match &ready.message {
+          RemoteMessage::Ready(ready) => ready,
+          _ => unreachable!(),
+        },
+        &profile_digest,
+        &result_frame,
+        now,
+      )
+      .is_err(),
+      "exact same-kind result replay must fail closed"
+    );
+
+    let reconnect_nonce = "a".repeat(64);
+    let reconnect_ready = ready_frame(
+      &reconnect_nonce,
+      &"b".repeat(64),
+      config.deployment_epoch,
+      &config.runner_workload_identity,
+      &config.runner_client_spki_sha256,
+    );
+    let RemoteMessage::Result(result) = &result_frame.message else {
+      unreachable!()
+    };
+    assert!(
+      validate_executor_evidence(
+        &config,
+        &reconnect_ready,
+        ExpectedRunnerEvidence {
+          kind: RunnerEvidenceKind::Result,
+          sequence: result_frame.sequence,
+          observed_profile_digest: &profile_digest,
+          payload_digest: &result_evidence_payload_digest(result),
+        },
+        &result.signed_evidence_json,
+        now,
+      )
+      .is_err(),
+      "evidence from an old connection must not replay after reconnect"
+    );
   }
 
   #[test]
@@ -1983,6 +2235,425 @@ mod tests {
       )),
       RemoteExecutionTerminal::FailedBeforeStart
     ));
+  }
+
+  #[tokio::test]
+  #[allow(
+    clippy::too_many_lines,
+    reason = "one root-only integration keeps TLS, setuid relay, broker state, and evidence visible"
+  )]
+  async fn production_setuid_relay_drives_signed_broker_session_to_result() {
+    if geteuid().as_raw() != 0 {
+      return;
+    }
+    let fixture = CertificateFixture::new("broker-production-relay");
+    fs::set_permissions(
+      fixture
+        .client_paths()
+        .certificate_chain
+        .parent()
+        .expect("fixture root"),
+      fs::Permissions::from_mode(0o755),
+    )
+    .expect("fixture root permissions");
+    let timeout = Duration::from_secs(5);
+    let policy = ScheduledRunnerIoPolicy {
+      handshake_timeout: timeout,
+      read_timeout: timeout,
+      write_timeout: timeout,
+    };
+    let mut broker_config = config();
+    broker_config.runner_client_spki_sha256 = fixture.client_spki_sha256.clone();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("evidence key");
+    let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("evidence pair");
+    broker_config.executor_evidence_public_key = pair.public_key().as_ref().to_vec();
+    let evidence_key_path = fixture
+      .client_paths()
+      .certificate_chain
+      .parent()
+      .expect("fixture root")
+      .join("executor.pk8");
+    fs::write(&evidence_key_path, pkcs8.as_ref()).expect("evidence private key");
+    fs::set_permissions(&evidence_key_path, fs::Permissions::from_mode(0o400))
+      .expect("evidence private key mode");
+    let signer =
+      RunnerEvidenceSigner::load(&evidence_key_path, &broker_config.executor_evidence_key_id)
+        .expect("root evidence signer");
+    let broker = ScheduledRunnerBroker::new(broker_config.clone()).expect("broker");
+    let server = ScheduledRunnerTlsServer::load(
+      &fixture.server_paths(),
+      broker.expected_authorized_peer(),
+      policy,
+    )
+    .expect("TLS server");
+    let tcp = TcpListener::bind("127.0.0.1:0")
+      .await
+      .expect("gateway bind");
+    let address = tcp.local_addr().expect("gateway address");
+    let socket_path = evidence_key_path
+      .parent()
+      .expect("fixture root")
+      .join("executor.sock");
+    let helper_executable = evidence_key_path
+      .parent()
+      .expect("fixture root")
+      .join("production-relay-helper");
+    fs::copy(
+      std::env::current_exe().expect("test executable"),
+      &helper_executable,
+    )
+    .expect("copy relay helper");
+    fs::set_permissions(&helper_executable, fs::Permissions::from_mode(0o755))
+      .expect("relay helper permissions");
+    let executor_listener =
+      ProtectedScheduledExecutorListener::bind(ScheduledRunnerExecutorConfig {
+        socket_path: socket_path.clone(),
+        control_uid: TEST_CONTROL_UID,
+        control_gid: TEST_CONTROL_GID,
+        accept_timeout: timeout,
+        read_timeout: timeout,
+        write_timeout: timeout,
+      })
+      .expect("protected executor listener");
+
+    let client_paths = fixture.client_paths();
+    for path in [
+      &client_paths.certificate_chain,
+      &client_paths.private_key,
+      &client_paths.trust_bundle,
+    ] {
+      chown(
+        path,
+        Some(Uid::from_raw(TEST_CONTROL_UID)),
+        Some(Gid::from_raw(TEST_CONTROL_GID)),
+      )
+      .expect("control TLS file owner");
+    }
+    let child = Command::new(&helper_executable)
+      .arg("--exact")
+      .arg("scheduled_runner_broker::tests::production_relay_subprocess_helper")
+      .arg("--nocapture")
+      .env_clear()
+      .env(PRODUCTION_RELAY_HELPER_ENV, "1")
+      .env(PRODUCTION_RELAY_ADDRESS_ENV, address.to_string())
+      .env(PRODUCTION_RELAY_CA_ENV, &client_paths.trust_bundle)
+      .env(PRODUCTION_RELAY_CERT_ENV, &client_paths.certificate_chain)
+      .env(PRODUCTION_RELAY_KEY_ENV, &client_paths.private_key)
+      .env(PRODUCTION_RELAY_SOCKET_ENV, &socket_path)
+      .env(PRODUCTION_RELAY_EVIDENCE_KEY_ENV, &evidence_key_path)
+      .uid(TEST_CONTROL_UID)
+      .gid(TEST_CONTROL_GID)
+      .stdin(Stdio::null())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .spawn()
+      .expect("spawn setuid control relay");
+
+    let broker_for_connection = broker.clone();
+    let connection_task = tokio::spawn(async move {
+      let (stream, _) = tcp.accept().await.expect("gateway accept");
+      let connection = server.accept(stream).await.expect("TLS accept");
+      broker_for_connection.run_connection(connection).await
+    });
+    let mut local = executor_listener
+      .accept()
+      .await
+      .expect("root executor accepted setuid control")
+      .framed;
+    let readiness_request = local
+      .read_frame(unix_millis().expect("time"))
+      .await
+      .expect("readiness request read")
+      .expect("readiness request");
+    let RemoteMessage::ReadinessRequest(readiness) = &readiness_request.message else {
+      panic!("readiness request expected")
+    };
+    let profile = capability_profile(&broker_config);
+    let profile_json = profile.canonical_json();
+    let profile_digest = format!("{:x}", Sha256::digest(profile_json.as_bytes()));
+    let mut ready = ReadyFrame {
+      signed_evidence_json: String::new(),
+      challenge: readiness.challenge.clone(),
+      ready_until_unix_millis: readiness.ready_until_unix_millis,
+      attested_profile_digest: profile_digest.clone(),
+      attested_profile_json: profile_json.clone(),
+      deployment_epoch: broker_config.deployment_epoch,
+      profile_digest: broker_config.profile_digest.clone(),
+      gateway_image_digest: broker_config.gateway_image_digest.clone(),
+      runner_image_digest: broker_config.runner_image_digest.clone(),
+      runner_workload_identity: broker_config.runner_workload_identity.clone(),
+      runner_client_cert_public_key_fingerprint: broker_config.runner_client_spki_sha256.clone(),
+      credential_revision: broker_config.credential_revision.clone(),
+    };
+    ready.signed_evidence_json = signer
+      .sign(&production_claims(
+        &broker_config,
+        RunnerEvidenceKind::Ready,
+        &readiness_request.session_nonce,
+        &readiness.challenge,
+        1,
+        readiness.ready_until_unix_millis,
+        &profile_digest,
+        ready_evidence_payload_digest(&ready),
+      ))
+      .expect("sign ready")
+      .canonical_json();
+    local
+      .write_frame(&RemoteFrame {
+        version: REMOTE_PROTOCOL_VERSION,
+        session_nonce: readiness_request.session_nonce.clone(),
+        sequence: 1,
+        message: RemoteMessage::Ready(ready.clone()),
+      })
+      .await
+      .expect("ready");
+
+    let session = tokio::time::timeout(timeout, async {
+      loop {
+        if let Some(session) = broker.session() {
+          break session;
+        }
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("broker registration");
+    broker
+      .state_admission(true)
+      .expect("reserve broker session");
+    let authority = ScheduledPrepareAuthority::for_remote_session_test("run-1", "job-1", 1, 7);
+    let input = PrepareInput {
+      task: AgentTask {
+        task_id: "scheduled:run-1:1:7".to_owned(),
+        instruction: "check".to_owned(),
+        source: InvocationSource::ScheduledRun {
+          job_id: "job-1".to_owned(),
+          run_id: "run-1".to_owned(),
+          scheduled_for: "2026-07-23T00:00:00Z".to_owned(),
+        },
+        principal: InvocationPrincipal::service("codeoff-scheduler"),
+        session: SessionMode::Fresh,
+        channel: None,
+        previous_success: None,
+        tool_policy: ToolPolicy::None,
+        feedback_target: None,
+      },
+      binding: RunLeaseBinding::for_remote_session_test("run-1", "job-1", 1, 7),
+      authority,
+      definition_json: "{\"schema_version\":1}".to_owned(),
+      capability_json: "{\"schema_version\":1}".to_owned(),
+      capability_digest: "3".repeat(64),
+      targets_json: "[]".to_owned(),
+      cancellation: Arc::new(AtomicBool::new(false)),
+    };
+
+    let executor_config = broker_config.clone();
+    let executor_signer =
+      RunnerEvidenceSigner::load(&evidence_key_path, &broker_config.executor_evidence_key_id)
+        .expect("root executor evidence signer");
+    let executor_profile_json = profile_json.clone();
+    let executor_profile_digest = profile_digest.clone();
+    let executor_ready = ready.clone();
+    let executor_authority_digest = input.authority.digest().to_owned();
+    let executor = tokio::spawn(async move {
+      for expected in ["admission", "prepare"] {
+        let frame = local
+          .read_frame(unix_millis().expect("time"))
+          .await
+          .expect("gateway frame read")
+          .expect("gateway frame");
+        assert_eq!(
+          match frame.message {
+            RemoteMessage::Admission(_) => "admission",
+            RemoteMessage::Prepare(_) => "prepare",
+            _ => "unexpected",
+          },
+          expected
+        );
+      }
+      let binding = RunBinding {
+        run_id: "run-1".to_owned(),
+        job_id: "job-1".to_owned(),
+        attempt: 1,
+        fence_token: 7,
+        authority_digest: executor_authority_digest,
+        profile_digest: executor_config.profile_digest.clone(),
+        deployment_epoch: executor_config.deployment_epoch,
+        credential_revision: executor_config.credential_revision.clone(),
+      };
+      let mut prepared = PreparedFrame {
+        signed_evidence_json: String::new(),
+        binding: binding.clone(),
+        preparation_nonce: "6".repeat(64),
+        attested_profile_digest: executor_profile_digest.clone(),
+        attested_profile_json: executor_profile_json,
+      };
+      prepared.signed_evidence_json = executor_signer
+        .sign(&production_claims(
+          &executor_config,
+          RunnerEvidenceKind::Prepared,
+          &readiness_request.session_nonce,
+          &executor_ready.challenge,
+          2,
+          executor_ready.ready_until_unix_millis,
+          &executor_profile_digest,
+          prepared_evidence_payload_digest(&prepared),
+        ))
+        .expect("sign prepared")
+        .canonical_json();
+      local
+        .write_frame(&RemoteFrame {
+          version: REMOTE_PROTOCOL_VERSION,
+          session_nonce: readiness_request.session_nonce.clone(),
+          sequence: 2,
+          message: RemoteMessage::Prepared(prepared),
+        })
+        .await
+        .expect("prepared");
+      let start = local
+        .read_frame(unix_millis().expect("time"))
+        .await
+        .expect("start read")
+        .expect("start frame");
+      assert_eq!(start.sequence, 4, "local relay sequence includes readiness");
+      let RemoteMessage::Start(start) = start.message else {
+        panic!("start expected")
+      };
+      let mut result = ResultFrame {
+        signed_evidence_json: String::new(),
+        binding,
+        preparation_nonce: start.preparation_nonce,
+        kind: RemoteResultKind::Completed,
+        result_json: "{\"schema_version\":1,\"summary\":\"done\"}".to_owned(),
+      };
+      result.signed_evidence_json = executor_signer
+        .sign(&production_claims(
+          &executor_config,
+          RunnerEvidenceKind::Result,
+          &readiness_request.session_nonce,
+          &executor_ready.challenge,
+          3,
+          executor_ready.ready_until_unix_millis,
+          &executor_profile_digest,
+          result_evidence_payload_digest(&result),
+        ))
+        .expect("sign result")
+        .canonical_json();
+      local
+        .write_frame(&RemoteFrame {
+          version: REMOTE_PROTOCOL_VERSION,
+          session_nonce: readiness_request.session_nonce,
+          sequence: 3,
+          message: RemoteMessage::Result(result),
+        })
+        .await
+        .expect("result");
+    });
+
+    let verified = session
+      .prepare(&input, "{\"schema_version\":1}".to_owned())
+      .await
+      .expect("stateful authenticated prepare");
+    let terminal = session
+      .start(
+        verified.frame.binding,
+        verified.frame.preparation_nonce,
+        verified.executor_observed_profile_digest,
+        Arc::new(AtomicBool::new(false)),
+      )
+      .await
+      .expect("stateful authenticated result");
+    assert!(matches!(
+      terminal,
+      RemoteExecutionTerminal::Result(ResultFrame {
+        kind: RemoteResultKind::Completed,
+        ..
+      })
+    ));
+    executor.await.expect("executor task");
+    assert!(connection_task.await.expect("connection task").is_ok());
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output())
+      .await
+      .expect("join control child")
+      .expect("control child output");
+    assert!(
+      output.status.success(),
+      "control relay failed: stdout={} stderr={}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+      broker.session().is_none(),
+      "terminal session must unregister"
+    );
+  }
+
+  #[tokio::test]
+  async fn invalid_signed_ready_through_real_tls_run_connection_never_registers() {
+    if geteuid().as_raw() != 0 {
+      return;
+    }
+    let fixture = CertificateFixture::new("broker-invalid-ready");
+    let timeout = Duration::from_secs(5);
+    let policy = ScheduledRunnerIoPolicy {
+      handshake_timeout: timeout,
+      read_timeout: timeout,
+      write_timeout: timeout,
+    };
+    let mut broker_config = config();
+    broker_config.runner_client_spki_sha256 = fixture.client_spki_sha256.clone();
+    let broker = ScheduledRunnerBroker::new(broker_config.clone()).expect("broker");
+    let server = ScheduledRunnerTlsServer::load(
+      &fixture.server_paths(),
+      broker.expected_authorized_peer(),
+      policy,
+    )
+    .expect("TLS server");
+    let client = ScheduledRunnerTlsClient::load(&fixture.client_paths(), TEST_SERVER_NAME, policy)
+      .expect("TLS client");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let broker_for_connection = broker.clone();
+    let accepted = tokio::spawn(async move {
+      let (stream, _) = listener.accept().await.expect("accept");
+      let connection = server.accept(stream).await.expect("TLS accept");
+      broker_for_connection.run_connection(connection).await
+    });
+    let mut connection = client.connect(address).await.expect("TLS connect");
+    let nonce = session_nonce(&connection.channel_binding);
+    let challenge = session_challenge(&connection.channel_binding);
+    let mut frame = ready_frame(
+      &nonce,
+      &challenge,
+      broker_config.deployment_epoch,
+      &broker_config.runner_workload_identity,
+      &broker_config.runner_client_spki_sha256,
+    );
+    let RemoteMessage::Ready(ready) = &mut frame.message else {
+      unreachable!()
+    };
+    let mut evidence = SignedRunnerEvidence::parse_canonical_json(&ready.signed_evidence_json)
+      .expect("signed ready evidence");
+    let replacement = if evidence.signature_hex.starts_with('0') {
+      "1"
+    } else {
+      "0"
+    };
+    evidence.signature_hex.replace_range(0..1, replacement);
+    ready.signed_evidence_json = evidence.canonical_json();
+    connection
+      .framed
+      .write_frame(&frame)
+      .await
+      .expect("invalid ready frame");
+    assert!(matches!(
+      accepted.await.expect("connection task"),
+      Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch)
+    ));
+    assert!(
+      broker.session().is_none(),
+      "invalid READY passed run_connection registry boundary"
+    );
   }
 
   #[tokio::test]

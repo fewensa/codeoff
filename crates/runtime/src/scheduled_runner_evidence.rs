@@ -3,6 +3,7 @@
 use std::fmt;
 use std::fmt::Write;
 
+use codeoff_core::EvidenceKeyId;
 use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -19,7 +20,6 @@ const EVIDENCE_DOMAIN: &[u8] = b"codeoff-scheduled-runner-evidence-v1";
 const MAX_EVIDENCE_BYTES: usize = 64 * 1024;
 const MAX_EVIDENCE_KEY_BYTES: u64 = 4 * 1024;
 const ED25519_SIGNATURE_HEX_BYTES: usize = 128;
-const MAX_KEY_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerEvidenceKind {
@@ -122,7 +122,7 @@ impl RunnerEvidenceSigner {
       .map_err(|_| RunnerEvidenceError::InvalidKey)?;
     let key_pair =
       Ed25519KeyPair::from_pkcs8(&bytes).map_err(|_| RunnerEvidenceError::InvalidKey)?;
-    if !valid_key_id(key_id) {
+    if EvidenceKeyId::parse(key_id).is_err() {
       return Err(RunnerEvidenceError::InvalidKey);
     }
     Ok(Self {
@@ -148,7 +148,7 @@ impl RunnerEvidenceVerifier {
   pub fn load(path: &Path, key_id: &str) -> Result<Self, RunnerEvidenceError> {
     let public_key =
       load_root_owned_bounded_file(path, 32).map_err(|_| RunnerEvidenceError::InvalidKey)?;
-    if public_key.len() != 32 || !valid_key_id(key_id) {
+    if public_key.len() != 32 || EvidenceKeyId::parse(key_id).is_err() {
       return Err(RunnerEvidenceError::InvalidKey);
     }
     Ok(Self {
@@ -221,7 +221,7 @@ fn sign_with_key_pair(
   key_id: &str,
   key_pair: &Ed25519KeyPair,
 ) -> Result<SignedRunnerEvidence, RunnerEvidenceError> {
-  if !valid_key_id(key_id) {
+  if EvidenceKeyId::parse(key_id).is_err() {
     return Err(RunnerEvidenceError::InvalidKey);
   }
   validate_claims(claims, claims.issued_at_unix_millis)?;
@@ -491,15 +491,8 @@ fn binding_value(binding: &RunBinding) -> Value {
   })
 }
 
-fn valid_key_id(value: &str) -> bool {
-  (1..=MAX_KEY_ID_BYTES).contains(&value.len())
-    && value
-      .bytes()
-      .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
 fn validate_outer_fields(evidence: &SignedRunnerEvidence) -> Result<(), RunnerEvidenceError> {
-  if !valid_key_id(&evidence.key_id) {
+  if EvidenceKeyId::parse(&evidence.key_id).is_err() {
     return Err(RunnerEvidenceError::InvalidKey);
   }
   if evidence.signature_hex.len() != ED25519_SIGNATURE_HEX_BYTES
@@ -654,7 +647,7 @@ mod tests {
     }
     for key_id in [
       String::new(),
-      "a".repeat(MAX_KEY_ID_BYTES + 1),
+      "a".repeat(codeoff_core::MAX_EVIDENCE_KEY_ID_BYTES + 1),
       "KEY-1".to_owned(),
     ] {
       let mut candidate = signed.clone();

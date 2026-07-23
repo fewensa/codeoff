@@ -1313,6 +1313,18 @@ impl ConsumeScheduledExecutionPermit {
 }
 
 impl RunLeaseBinding {
+  #[cfg(any(test, feature = "test-support"))]
+  #[must_use]
+  pub fn for_remote_session_test(run_id: &str, job_id: &str, attempt: i64, fence: i64) -> Self {
+    Self {
+      run_id: run_id.to_owned(),
+      job_id: job_id.to_owned(),
+      attempt,
+      fence,
+      lease_owner: "remote-session-test".to_owned(),
+    }
+  }
+
   #[must_use]
   pub fn run_id(&self) -> &str {
     &self.run_id

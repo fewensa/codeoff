@@ -4,6 +4,7 @@ use std::fmt;
 
 pub const MAX_CRITICAL_ID_BYTES: usize = 128;
 pub const MAX_CREDENTIAL_REVISION_BYTES: usize = 128;
+pub const MAX_EVIDENCE_KEY_ID_BYTES: usize = 128;
 pub const MAX_RUNNER_WORKLOAD_IDENTITY_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +62,34 @@ impl CredentialRevision {
     if !is_bounded_ascii_token(value, MAX_CREDENTIAL_REVISION_BYTES, true, false) {
       return Err(ScheduledIdentityError {
         reason: "credential_revision_invalid",
+      });
+    }
+    Ok(Self(value.to_owned()))
+  }
+
+  #[must_use]
+  pub fn as_str(&self) -> &str {
+    &self.0
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EvidenceKeyId(String);
+
+impl EvidenceKeyId {
+  /// Parses the exact canonical key identifier shared by config and evidence verification.
+  ///
+  /// # Errors
+  /// Returns an error unless the identifier is 1..=128 lowercase ASCII alphanumeric/hyphen bytes.
+  pub fn parse(value: &str) -> Result<Self, ScheduledIdentityError> {
+    if value.is_empty()
+      || value.len() > MAX_EVIDENCE_KEY_ID_BYTES
+      || !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+      return Err(ScheduledIdentityError {
+        reason: "evidence_key_id_invalid",
       });
     }
     Ok(Self(value.to_owned()))
@@ -233,5 +262,25 @@ mod tests {
     assert!(CriticalId::parse(" run-1").is_err());
     assert!(CriticalId::parse("run-").is_err());
     assert!(CriticalId::parse(&"a".repeat(MAX_CRITICAL_ID_BYTES + 1)).is_err());
+  }
+
+  #[test]
+  fn evidence_key_id_has_one_exact_bounded_canonical_contract() {
+    let max = "a".repeat(MAX_EVIDENCE_KEY_ID_BYTES);
+    for valid in ["a", "executor-key-1", max.as_str()] {
+      assert!(EvidenceKeyId::parse(valid).is_ok(), "valid={valid}");
+    }
+    let oversized = "a".repeat(MAX_EVIDENCE_KEY_ID_BYTES + 1);
+    for invalid in [
+      "",
+      "KEY-1",
+      "key_1",
+      "key/1",
+      " key-1",
+      "key-1 ",
+      oversized.as_str(),
+    ] {
+      assert!(EvidenceKeyId::parse(invalid).is_err(), "invalid={invalid}");
+    }
   }
 }

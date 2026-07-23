@@ -594,7 +594,7 @@ fn domain_bound_sha256(domain: &[u8], value: &[u8]) -> String {
 
 #[cfg(all(test, unix))]
 #[path = "scheduled_runner_tls_integration_tests.rs"]
-mod integration_tests;
+pub(crate) mod integration_tests;
 
 #[cfg(test)]
 mod tests {

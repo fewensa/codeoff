@@ -27,14 +27,14 @@ use tokio_rustls::TlsConnector;
 const SERVER_NAME: &str = "gateway.codeoff.test";
 const WORKLOAD_IDENTITY: &str = "spiffe://codeoff/runner/production";
 
-struct CertificateFixture {
+pub(crate) struct CertificateFixture {
   temp: TempDir,
   ca_certificate: PathBuf,
   server_certificate: PathBuf,
   server_key: PathBuf,
   client_certificate: PathBuf,
   client_key: PathBuf,
-  client_spki_sha256: String,
+  pub(crate) client_spki_sha256: String,
 }
 
 impl CertificateFixture {
@@ -42,7 +42,7 @@ impl CertificateFixture {
     clippy::too_many_lines,
     reason = "keeps one ephemeral OpenSSL CA/server/client fixture lifecycle auditable"
   )]
-  fn new(label: &str) -> Self {
+  pub(crate) fn new(label: &str) -> Self {
     let temp = tempfile::Builder::new()
       .prefix("codeoff-runner-tls-")
       .tempdir()
@@ -210,7 +210,7 @@ impl CertificateFixture {
     }
   }
 
-  fn server_paths(&self) -> ScheduledRunnerTlsPaths {
+  pub(crate) fn server_paths(&self) -> ScheduledRunnerTlsPaths {
     ScheduledRunnerTlsPaths {
       certificate_chain: self.server_certificate.clone(),
       private_key: self.server_key.clone(),
@@ -218,7 +218,7 @@ impl CertificateFixture {
     }
   }
 
-  fn client_paths(&self) -> ScheduledRunnerTlsPaths {
+  pub(crate) fn client_paths(&self) -> ScheduledRunnerTlsPaths {
     ScheduledRunnerTlsPaths {
       certificate_chain: self.client_certificate.clone(),
       private_key: self.client_key.clone(),

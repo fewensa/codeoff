@@ -6,7 +6,7 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use codeoff_core::{
-  CredentialRevision, RunnerWorkloadIdentity, SCHEDULER_OPERATIONAL_POLICY_VERSION,
+  CredentialRevision, EvidenceKeyId, RunnerWorkloadIdentity, SCHEDULER_OPERATIONAL_POLICY_VERSION,
   SchedulerOperationalPolicy,
 };
 use serde::Deserialize;
@@ -994,10 +994,6 @@ impl ScheduledRunnerGatewayConfig {
     ])?;
     for (field, value) in [
       (
-        "scheduled_codex.remote_runner.gateway.executor_evidence_key_id",
-        self.executor_evidence_key_id.as_str(),
-      ),
-      (
         "scheduled_codex.remote_runner.gateway.executor_evidence_key_revision",
         self.executor_evidence_key_revision.as_str(),
       ),
@@ -1013,6 +1009,12 @@ impl ScheduledRunnerGatewayConfig {
         ));
       }
     }
+    EvidenceKeyId::parse(&self.executor_evidence_key_id).map_err(|_| {
+      invalid_scheduled_codex(
+        "scheduled_codex.remote_runner.gateway.executor_evidence_key_id",
+        "must use 1..=128 lowercase ASCII alphanumeric/hyphen bytes",
+      )
+    })?;
     validate_milliseconds(
       "scheduled_codex.remote_runner.gateway.handshake_timeout_ms",
       self.handshake_timeout_ms,
@@ -1158,10 +1160,6 @@ impl ScheduledRunnerExecutorConfig {
     ])?;
     for (field, value) in [
       (
-        "scheduled_codex.remote_runner.executor.evidence_key_id",
-        self.evidence_key_id.as_str(),
-      ),
-      (
         "scheduled_codex.remote_runner.executor.evidence_key_revision",
         self.evidence_key_revision.as_str(),
       ),
@@ -1177,6 +1175,12 @@ impl ScheduledRunnerExecutorConfig {
         ));
       }
     }
+    EvidenceKeyId::parse(&self.evidence_key_id).map_err(|_| {
+      invalid_scheduled_codex(
+        "scheduled_codex.remote_runner.executor.evidence_key_id",
+        "must use 1..=128 lowercase ASCII alphanumeric/hyphen bytes",
+      )
+    })?;
     if self.expected_control_uid == 0
       || self.expected_control_gid == 0
       || self.expected_control_uid == deployment.trusted_owner_uid

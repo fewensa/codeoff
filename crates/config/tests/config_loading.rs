@@ -526,6 +526,65 @@ fn test_remote_runner_roles_reject_unsafe_addresses_paths_identities_and_bounds(
 }
 
 #[test]
+fn test_remote_runner_evidence_key_ids_use_the_core_canonical_contract() {
+  let valid_at_limit = "a".repeat(codeoff_core::MAX_EVIDENCE_KEY_ID_BYTES);
+  for key_id in ["a", "executor-key-1", valid_at_limit.as_str()] {
+    let mut scheduled = valid_scheduled_codex_config();
+    scheduled.execution_backend = ScheduledExecutionBackend::RemoteRunner;
+    let mut gateway = gateway_config();
+    gateway.executor_evidence_key_id = key_id.to_owned();
+    scheduled.remote_runner.gateway = Some(gateway);
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Gateway)
+      .expect("canonical gateway evidence key ID");
+
+    scheduled.remote_runner.gateway = None;
+    let mut executor = executor_config();
+    executor.evidence_key_id = key_id.to_owned();
+    scheduled.remote_runner.executor = Some(executor);
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Executor)
+      .expect("canonical executor evidence key ID");
+  }
+
+  let oversized = "a".repeat(codeoff_core::MAX_EVIDENCE_KEY_ID_BYTES + 1);
+  for key_id in [
+    "",
+    "KEY-1",
+    "key_1",
+    "key/1",
+    " key-1",
+    "key-1 ",
+    oversized.as_str(),
+  ] {
+    let mut scheduled = valid_scheduled_codex_config();
+    scheduled.execution_backend = ScheduledExecutionBackend::RemoteRunner;
+    let mut gateway = gateway_config();
+    gateway.executor_evidence_key_id = key_id.to_owned();
+    scheduled.remote_runner.gateway = Some(gateway);
+    assert!(matches!(
+      scheduled.validate_remote_runner_role(ScheduledRunnerRole::Gateway),
+      Err(ConfigError::InvalidScheduler {
+        field: "scheduled_codex.remote_runner.gateway.executor_evidence_key_id",
+        ..
+      })
+    ));
+
+    scheduled.remote_runner.gateway = None;
+    let mut executor = executor_config();
+    executor.evidence_key_id = key_id.to_owned();
+    scheduled.remote_runner.executor = Some(executor);
+    assert!(matches!(
+      scheduled.validate_remote_runner_role(ScheduledRunnerRole::Executor),
+      Err(ConfigError::InvalidScheduler {
+        field: "scheduled_codex.remote_runner.executor.evidence_key_id",
+        ..
+      })
+    ));
+  }
+}
+
+#[test]
 fn test_remote_runner_tables_deny_unknown_fields_and_backend_aliases() {
   let dir = tempdir().expect("create tempdir");
   for body in [

@@ -21,6 +21,7 @@ use codeoff_runtime::scheduled_runner_broker::{
 };
 use codeoff_runtime::scheduled_runner_control::{
   ScheduledRunnerControlConfig as LocalControlConfig, ScheduledRunnerControlConnection,
+  relay_runner_frames,
 };
 use codeoff_runtime::scheduled_runner_evidence::{
   RunnerEvidenceClaims, RunnerEvidenceKind, RunnerEvidenceSigner, prepared_evidence_payload_digest,
@@ -338,60 +339,8 @@ async fn run_control_session(config: CodeoffConfig) -> Result<(), Box<dyn Error>
     return Err(io::Error::other("scheduled runner executor readiness binding mismatch").into());
   }
   remote.framed.write_frame(&ready_frame).await?;
-  relay_runner_frames(&mut remote.framed, &mut local, &runner_session_nonce).await
-}
-
-async fn relay_runner_frames<R, L>(
-  remote: &mut codeoff_runtime::scheduled_runner_tls::ScheduledRunnerFramed<R>,
-  local: &mut codeoff_runtime::scheduled_runner_tls::ScheduledRunnerFramed<L>,
-  expected_session_nonce: &str,
-) -> Result<(), Box<dyn Error>>
-where
-  R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-  L: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-  let mut gateway_sequence = 0_u64;
-  let mut runner_sequence = 1_u64;
-  loop {
-    tokio::select! {
-      incoming = remote.read_frame(unix_millis()?) => {
-        let Some(frame) = incoming? else {
-          return Err(io::Error::other("scheduled runner gateway disconnected").into());
-        };
-        gateway_sequence = gateway_sequence.saturating_add(1);
-        if frame.session_nonce != expected_session_nonce
-          || frame.sequence != gateway_sequence
-          || !matches!(frame.message, RemoteMessage::Admission(_) | RemoteMessage::Prepare(_) | RemoteMessage::Start(_) | RemoteMessage::Cancel(_))
-        {
-          return Err(io::Error::other("scheduled runner gateway frame rejected").into());
-        }
-        let terminal = matches!(frame.message, RemoteMessage::Cancel(_));
-        let mut local_frame = frame;
-        local_frame.sequence = local_frame.sequence.saturating_add(1);
-        local.write_frame(&local_frame).await?;
-        if terminal {
-          return Ok(());
-        }
-      }
-      incoming = local.read_frame(unix_millis()?) => {
-        let Some(frame) = incoming? else {
-          return Err(io::Error::other("scheduled runner executor disconnected").into());
-        };
-        runner_sequence = runner_sequence.saturating_add(1);
-        if frame.session_nonce != expected_session_nonce
-          || frame.sequence != runner_sequence
-          || !matches!(frame.message, RemoteMessage::Prepared(_) | RemoteMessage::Heartbeat(_) | RemoteMessage::Result(_) | RemoteMessage::Error(_))
-        {
-          return Err(io::Error::other("scheduled runner executor frame rejected").into());
-        }
-        let terminal = matches!(frame.message, RemoteMessage::Result(_) | RemoteMessage::Error(_));
-        remote.write_frame(&frame).await?;
-        if terminal {
-          return Ok(());
-        }
-      }
-    }
-  }
+  relay_runner_frames(&mut remote.framed, &mut local, &runner_session_nonce).await?;
+  Ok(())
 }
 
 pub(crate) fn run_executor(config: CodeoffConfig) -> Result<(), Box<dyn Error>> {
@@ -766,7 +715,7 @@ fn validate_start(
   preparation_nonce: &str,
   session_nonce: &str,
 ) -> Result<(), Box<dyn Error>> {
-  if frame.sequence != 3
+  if frame.sequence != 4
     || frame.session_nonce != session_nonce
     || &start.binding != binding
     || start.preparation_nonce != preparation_nonce
@@ -1356,6 +1305,7 @@ mod tests {
         .await
         .expect("start read")
         .expect("start frame");
+      assert_eq!(start.sequence, 4);
       assert!(matches!(start.message, RemoteMessage::Start(_)));
       let mut result = ResultFrame {
         signed_evidence_json: String::new(),

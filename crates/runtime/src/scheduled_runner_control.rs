@@ -3,12 +3,13 @@
 use std::fmt;
 use std::os::fd::AsFd;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use tokio::net::UnixStream;
 
-use crate::scheduled_runner_tls::ScheduledRunnerFramed;
+use crate::scheduled_remote_protocol::RemoteMessage;
+use crate::scheduled_runner_tls::{ScheduledRunnerFramed, ScheduledRunnerTlsError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledRunnerControlConfig {
@@ -101,6 +102,96 @@ impl ScheduledRunnerControlConnection {
       framed: ScheduledRunnerFramed::new(stream, config.read_timeout, config.write_timeout),
     })
   }
+}
+
+#[derive(Debug)]
+pub enum ScheduledRunnerRelayError {
+  Clock,
+  GatewayDisconnected,
+  ExecutorDisconnected,
+  GatewayFrameRejected,
+  ExecutorFrameRejected,
+  Transport(ScheduledRunnerTlsError),
+}
+
+impl fmt::Display for ScheduledRunnerRelayError {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(formatter, "{self:?}")
+  }
+}
+
+impl std::error::Error for ScheduledRunnerRelayError {}
+
+impl From<ScheduledRunnerTlsError> for ScheduledRunnerRelayError {
+  fn from(error: ScheduledRunnerTlsError) -> Self {
+    Self::Transport(error)
+  }
+}
+
+/// Relays the exact scheduled-runner protocol between the remote gateway and local executor.
+///
+/// # Errors
+/// Returns an error on transport failure, disconnect, session/sequence mismatch, or a frame whose
+/// direction is not permitted by the protocol.
+pub async fn relay_runner_frames<R, L>(
+  remote: &mut ScheduledRunnerFramed<R>,
+  local: &mut ScheduledRunnerFramed<L>,
+  expected_session_nonce: &str,
+) -> Result<(), ScheduledRunnerRelayError>
+where
+  R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+  L: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+  let mut gateway_sequence = 0_u64;
+  let mut runner_sequence = 1_u64;
+  loop {
+    tokio::select! {
+      incoming = remote.read_frame(unix_millis()?) => {
+        let Some(frame) = incoming? else {
+          return Err(ScheduledRunnerRelayError::GatewayDisconnected);
+        };
+        gateway_sequence = gateway_sequence.saturating_add(1);
+        if frame.session_nonce != expected_session_nonce
+          || frame.sequence != gateway_sequence
+          || !matches!(frame.message, RemoteMessage::Admission(_) | RemoteMessage::Prepare(_) | RemoteMessage::Start(_) | RemoteMessage::Cancel(_))
+        {
+          return Err(ScheduledRunnerRelayError::GatewayFrameRejected);
+        }
+        let terminal = matches!(frame.message, RemoteMessage::Cancel(_));
+        let mut local_frame = frame;
+        local_frame.sequence = local_frame.sequence.saturating_add(1);
+        local.write_frame(&local_frame).await?;
+        if terminal {
+          return Ok(());
+        }
+      }
+      incoming = local.read_frame(unix_millis()?) => {
+        let Some(frame) = incoming? else {
+          return Err(ScheduledRunnerRelayError::ExecutorDisconnected);
+        };
+        runner_sequence = runner_sequence.saturating_add(1);
+        if frame.session_nonce != expected_session_nonce
+          || frame.sequence != runner_sequence
+          || !matches!(frame.message, RemoteMessage::Prepared(_) | RemoteMessage::Heartbeat(_) | RemoteMessage::Result(_) | RemoteMessage::Error(_))
+        {
+          return Err(ScheduledRunnerRelayError::ExecutorFrameRejected);
+        }
+        let terminal = matches!(frame.message, RemoteMessage::Result(_) | RemoteMessage::Error(_));
+        remote.write_frame(&frame).await?;
+        if terminal {
+          return Ok(());
+        }
+      }
+    }
+  }
+}
+
+fn unix_millis() -> Result<u64, ScheduledRunnerRelayError> {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .ok()
+    .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+    .ok_or(ScheduledRunnerRelayError::Clock)
 }
 
 pub(crate) fn require_cloexec(fd: &impl AsFd) -> Result<(), ScheduledRunnerControlError> {

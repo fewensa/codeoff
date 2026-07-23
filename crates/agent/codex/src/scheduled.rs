@@ -122,8 +122,8 @@ pub struct RequestedCapabilityProfile {
   pub codex_home: PathBuf,
   pub cwd: PathBuf,
   pub github_mcp_url: String,
-  pub github_mcp_artifact_sha256: String,
-  pub github_mcp_endpoint_identity: String,
+  pub github_mcp_configured_artifact_sha256: String,
+  pub github_mcp_configured_endpoint_identity: String,
   pub github_mcp_access_auth_mode: String,
   pub github_mcp_access_token_revision: String,
   pub credential_reference: String,
@@ -178,7 +178,7 @@ impl RequestedCapabilityProfile {
     require_sha256("codex_program_sha256", &self.codex_program_sha256)?;
     require_non_empty(
       "github_mcp_endpoint_identity",
-      &self.github_mcp_endpoint_identity,
+      &self.github_mcp_configured_endpoint_identity,
     )?;
     if self.github_mcp_access_auth_mode != GITHUB_MCP_ACCESS_AUTH_MODE {
       return Err(preflight("github_mcp_access_auth_mode_invalid"));
@@ -193,9 +193,9 @@ impl RequestedCapabilityProfile {
     require_non_empty("config_revision", &self.config_revision)?;
     require_sha256(
       "github_mcp_artifact_sha256",
-      &self.github_mcp_artifact_sha256,
+      &self.github_mcp_configured_artifact_sha256,
     )?;
-    if !cfg!(test) && !is_pinned_github_mcp_artifact(&self.github_mcp_artifact_sha256) {
+    if !cfg!(test) && !is_pinned_github_mcp_artifact(&self.github_mcp_configured_artifact_sha256) {
       return Err(preflight("github_mcp_artifact_digest_not_pinned_v1_6_0"));
     }
     let actual_config_hash = sha256_hex(self.dedicated_config().as_bytes());
@@ -1193,8 +1193,8 @@ fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfil
     codex_home: config.codex_home.clone(),
     cwd: config.cwd.clone(),
     github_mcp_url: config.github_mcp_url.clone(),
-    github_mcp_artifact_sha256: config.github_mcp_artifact_sha256.clone(),
-    github_mcp_endpoint_identity: config.github_mcp_endpoint_identity.clone(),
+    github_mcp_configured_artifact_sha256: config.github_mcp_artifact_sha256.clone(),
+    github_mcp_configured_endpoint_identity: config.github_mcp_endpoint_identity.clone(),
     github_mcp_access_auth_mode: config.github_mcp_access_auth_mode.clone(),
     github_mcp_access_token_revision: config.github_mcp_access_token_revision.clone(),
     credential_reference: config.credential_reference.clone(),
@@ -1423,8 +1423,10 @@ fn attest_runtime(
     app_server_schema_sha256: evidence.app_server_schema_sha256.clone(),
     codex_program_sha256: evidence.codex_program_sha256.clone(),
     github_mcp_version: GITHUB_MCP_SERVER_VERSION.to_owned(),
-    github_mcp_artifact_sha256: requested.github_mcp_artifact_sha256.clone(),
-    github_mcp_endpoint_identity: requested.github_mcp_endpoint_identity.clone(),
+    github_mcp_configured_artifact_sha256: requested.github_mcp_configured_artifact_sha256.clone(),
+    github_mcp_configured_endpoint_identity: requested
+      .github_mcp_configured_endpoint_identity
+      .clone(),
     github_mcp_access_auth_mode: requested.github_mcp_access_auth_mode.clone(),
     github_mcp_access_token_revision: requested.github_mcp_access_token_revision.clone(),
     github_mcp_health_checked_at_unix_seconds: 0,
@@ -2495,10 +2497,10 @@ fn isolation_profile_binding_digest(
       "sandbox": "read-only",
       "web_search": "disabled",
     },
-    "github_mcp_artifact_sha256": profile.github_mcp_artifact_sha256,
+    "github_mcp_configured_artifact_sha256": profile.github_mcp_configured_artifact_sha256,
     "github_mcp_access_auth_mode": profile.github_mcp_access_auth_mode,
     "github_mcp_access_token_revision": profile.github_mcp_access_token_revision,
-    "github_mcp_endpoint_identity": profile.github_mcp_endpoint_identity,
+    "github_mcp_configured_endpoint_identity": profile.github_mcp_configured_endpoint_identity,
     "github_mcp_url": profile.github_mcp_url,
     "github_mcp_version": GITHUB_MCP_SERVER_VERSION,
     "github_tools": EXPECTED_GITHUB_TOOLS,
@@ -2802,8 +2804,8 @@ mod tests {
       codex_home: PathBuf::from("/var/lib/codeoff-scheduled/codex-home"),
       cwd: PathBuf::from("/var/lib/codeoff-scheduled/workspace"),
       github_mcp_url: "http://127.0.0.1:18081/mcp".to_owned(),
-      github_mcp_artifact_sha256: GITHUB_MCP_ARTIFACT_SHA256_X86_64.to_owned(),
-      github_mcp_endpoint_identity: "github-readonly-sidecar".to_owned(),
+      github_mcp_configured_artifact_sha256: GITHUB_MCP_ARTIFACT_SHA256_X86_64.to_owned(),
+      github_mcp_configured_endpoint_identity: "github-readonly-sidecar".to_owned(),
       github_mcp_access_auth_mode: GITHUB_MCP_ACCESS_AUTH_MODE.to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       credential_reference: "github-readonly-service-account".to_owned(),
@@ -2830,8 +2832,8 @@ mod tests {
       cwd: profile.cwd.clone(),
       github_mcp_url: profile.github_mcp_url.clone(),
       github_mcp_artifact_path: "/opt/codeoff/bin/github-mcp-server".into(),
-      github_mcp_artifact_sha256: profile.github_mcp_artifact_sha256.clone(),
-      github_mcp_endpoint_identity: profile.github_mcp_endpoint_identity.clone(),
+      github_mcp_artifact_sha256: profile.github_mcp_configured_artifact_sha256.clone(),
+      github_mcp_endpoint_identity: profile.github_mcp_configured_endpoint_identity.clone(),
       github_mcp_access_auth_mode: profile.github_mcp_access_auth_mode.clone(),
       github_mcp_access_token_revision: profile.github_mcp_access_token_revision.clone(),
       credential_reference: profile.credential_reference.clone(),
@@ -3205,23 +3207,23 @@ mod tests {
   }
 
   #[test]
-  fn production_profile_round_trips_remote_v3_recovery_contract() {
+  fn configured_profile_round_trips_remote_recovery_contract() {
     let requested = profile();
     let scheduled_request = request(requested.clone());
     let permit = issue_test_isolation_permit(&scheduled_request);
-    let mut observed = attest_runtime(&requested, &evidence(&requested), permit)
-      .expect("production attested profile");
-    observed.github_mcp_health_checked_at_unix_seconds = observed.attested_at_unix_seconds;
-    observed.github_mcp_health_credential_revision = observed.credential_revision.clone();
-    observed.github_mcp_health_result_sha256 = "8".repeat(64);
-    observed.profile_sha256 = observed.computed_profile_sha256();
-    observed.validate().expect("canonical profile");
+    let mut profile = attest_runtime(&requested, &evidence(&requested), permit)
+      .expect("configured attested profile");
+    profile.github_mcp_health_checked_at_unix_seconds = profile.attested_at_unix_seconds;
+    profile.github_mcp_health_credential_revision = profile.credential_revision.clone();
+    profile.github_mcp_health_result_sha256 = "8".repeat(64);
+    profile.profile_sha256 = profile.computed_profile_sha256();
+    profile.validate().expect("canonical profile");
     let authority =
       codeoff_state::ScheduledPrepareAuthority::for_remote_session_test("run-1", "job-1", 1, 1);
     let deployment_digest = "9".repeat(64);
     let recovery = authority
-      .remote_recovery_attestation_json(&observed.canonical_json(), &deployment_digest, 1)
-      .expect("remote v3 recovery");
+      .remote_recovery_attestation_json(&profile.canonical_json(), &deployment_digest, 1)
+      .expect("remote recovery");
     assert!(authority.remote_recovery_attestation_matches(
       &recovery,
       &sha256_hex(recovery.as_bytes()),
@@ -3376,7 +3378,7 @@ mod tests {
     );
 
     let mut other_profile = profile.clone();
-    other_profile.github_mcp_endpoint_identity = "different-endpoint".to_owned();
+    other_profile.github_mcp_configured_endpoint_identity = "different-endpoint".to_owned();
     let path = write_signed_attestation(&temp, &key, &isolation_payload(&other_profile));
     let failure = load_signed_isolation_authority(&profile, &path, &trust_bundle)
       .expect_err("mismatched profile must fail");

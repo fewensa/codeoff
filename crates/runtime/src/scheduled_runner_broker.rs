@@ -55,6 +55,8 @@ pub struct ScheduledRunnerBrokerConfig {
   pub runner_workload_identity: String,
   pub runner_client_spki_sha256: String,
   pub credential_revision: String,
+  pub github_mcp_configured_artifact_sha256: String,
+  pub github_mcp_configured_endpoint_identity: String,
   pub github_mcp_access_auth_mode: String,
   pub github_mcp_access_token_revision: String,
   pub executor_evidence_public_key: Vec<u8>,
@@ -83,6 +85,10 @@ impl ScheduledRunnerBrokerConfig {
       || !is_lowercase_sha256(&self.profile_digest)
       || !is_oci_digest(&self.gateway_image_digest)
       || !is_oci_digest(&self.runner_image_digest)
+      || !is_lowercase_sha256(&self.github_mcp_configured_artifact_sha256)
+      || self.github_mcp_configured_endpoint_identity.is_empty()
+      || self.github_mcp_configured_endpoint_identity
+        != self.github_mcp_configured_endpoint_identity.trim()
     {
       return Err(ScheduledRunnerBrokerError::InvalidConfiguration);
     }
@@ -266,6 +272,10 @@ impl ScheduledRunnerBroker {
       || attested.runner_workload_identity != config.runner_workload_identity
       || attested.runner_client_cert_public_key_fingerprint != config.runner_client_spki_sha256
       || attested.credential_revision != config.credential_revision
+      || attested.github_mcp_configured_artifact_sha256
+        != config.github_mcp_configured_artifact_sha256
+      || attested.github_mcp_configured_endpoint_identity
+        != config.github_mcp_configured_endpoint_identity
       || attested.github_mcp_access_auth_mode != config.github_mcp_access_auth_mode
       || attested.github_mcp_access_token_revision != config.github_mcp_access_token_revision
     {
@@ -454,6 +464,10 @@ fn accept_authenticated_prepared(
     .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
   if attested.github_mcp_access_auth_mode != config.github_mcp_access_auth_mode
     || attested.github_mcp_access_token_revision != config.github_mcp_access_token_revision
+    || attested.github_mcp_configured_artifact_sha256
+      != config.github_mcp_configured_artifact_sha256
+    || attested.github_mcp_configured_endpoint_identity
+      != config.github_mcp_configured_endpoint_identity
   {
     return Err(ScheduledRunnerBrokerError::ProtocolRejected);
   }
@@ -1444,8 +1458,10 @@ mod tests {
       app_server_schema_sha256: "1".repeat(64),
       codex_program_sha256: "2".repeat(64),
       github_mcp_version: "test-mcp".to_owned(),
-      github_mcp_artifact_sha256: "3".repeat(64),
-      github_mcp_endpoint_identity: "test-endpoint".to_owned(),
+      github_mcp_configured_artifact_sha256: config.github_mcp_configured_artifact_sha256.clone(),
+      github_mcp_configured_endpoint_identity: config
+        .github_mcp_configured_endpoint_identity
+        .clone(),
       github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       github_mcp_health_checked_at_unix_seconds: 1,
@@ -1537,8 +1553,10 @@ mod tests {
       app_server_schema_sha256: "1".repeat(64),
       codex_program_sha256: "2".repeat(64),
       github_mcp_version: "test-mcp".to_owned(),
-      github_mcp_artifact_sha256: "3".repeat(64),
-      github_mcp_endpoint_identity: "test-endpoint".to_owned(),
+      github_mcp_configured_artifact_sha256: config.github_mcp_configured_artifact_sha256.clone(),
+      github_mcp_configured_endpoint_identity: config
+        .github_mcp_configured_endpoint_identity
+        .clone(),
       github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       github_mcp_health_checked_at_unix_seconds: 1,
@@ -1951,7 +1969,7 @@ mod tests {
       sequence: 2,
       message: RemoteMessage::Prepared(prepared),
     };
-    for mutation in 0..3 {
+    for mutation in 0..5 {
       let mut translated = prepared_frame.clone();
       let RemoteMessage::Prepared(translated_payload) = &mut translated.message else {
         unreachable!()
@@ -1960,6 +1978,20 @@ mod tests {
         0 => translated_payload.preparation_nonce = "5".repeat(64),
         1 => translated_payload.github_mcp_access_auth_mode = "legacy-bearer".to_owned(),
         2 => translated_payload.github_mcp_access_token_revision = "mcp-channel-v0".to_owned(),
+        3 | 4 => {
+          let mut profile = capability_profile(&config);
+          if mutation == 3 {
+            profile.github_mcp_configured_artifact_sha256 = "9".repeat(64);
+          } else {
+            profile.github_mcp_configured_endpoint_identity = "different-sidecar".to_owned();
+          }
+          profile.profile_sha256 = profile.computed_profile_sha256();
+          translated_payload.attested_profile_json = profile.canonical_json();
+          translated_payload.attested_profile_digest = format!(
+            "{:x}",
+            Sha256::digest(translated_payload.attested_profile_json.as_bytes())
+          );
+        }
         _ => unreachable!(),
       }
       assert!(
@@ -2246,6 +2278,27 @@ mod tests {
       ),
       Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch)
     ));
+    for claim in ["artifact", "endpoint"] {
+      let mut configured = config.clone();
+      match claim {
+        "artifact" => configured.github_mcp_configured_artifact_sha256 = "9".repeat(64),
+        "endpoint" => {
+          configured.github_mcp_configured_endpoint_identity = "different-sidecar".to_owned();
+        }
+        _ => unreachable!(),
+      }
+      let configured = ScheduledRunnerBroker::new(configured).expect("configured claim broker");
+      assert!(matches!(
+        configured.validate_ready(
+          &configured.expected_authorized_peer(),
+          &valid,
+          valid_ready,
+          &nonce,
+          &challenge,
+        ),
+        Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch)
+      ));
+    }
     assert!(broker.session().is_none());
   }
 
@@ -2793,6 +2846,8 @@ mod tests {
       runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
       runner_client_spki_sha256: "e".repeat(64),
       credential_revision: "credential-v1".to_owned(),
+      github_mcp_configured_artifact_sha256: "3".repeat(64),
+      github_mcp_configured_endpoint_identity: "test-endpoint".to_owned(),
       github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       executor_evidence_public_key: evidence_keys().1.clone(),

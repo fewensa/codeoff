@@ -20,8 +20,8 @@ pub struct AttestedCapabilityProfile {
   pub app_server_schema_sha256: String,
   pub codex_program_sha256: String,
   pub github_mcp_version: String,
-  pub github_mcp_artifact_sha256: String,
-  pub github_mcp_endpoint_identity: String,
+  pub github_mcp_configured_artifact_sha256: String,
+  pub github_mcp_configured_endpoint_identity: String,
   pub github_mcp_access_auth_mode: String,
   pub github_mcp_access_token_revision: String,
   pub github_mcp_health_checked_at_unix_seconds: u64,
@@ -79,10 +79,10 @@ impl AttestedCapabilityProfile {
       "credential_reference": self.credential_reference,
       "credential_revision": self.credential_revision,
       "gateway_image_digest": self.gateway_image_digest,
-      "github_mcp_artifact_sha256": self.github_mcp_artifact_sha256,
+      "github_mcp_configured_artifact_sha256": self.github_mcp_configured_artifact_sha256,
       "github_mcp_access_auth_mode": self.github_mcp_access_auth_mode,
       "github_mcp_access_token_revision": self.github_mcp_access_token_revision,
-      "github_mcp_endpoint_identity": self.github_mcp_endpoint_identity,
+      "github_mcp_configured_endpoint_identity": self.github_mcp_configured_endpoint_identity,
       "github_mcp_health_checked_at_unix_seconds": self.github_mcp_health_checked_at_unix_seconds,
       "github_mcp_health_credential_revision": self.github_mcp_health_credential_revision,
       "github_mcp_health_result_sha256": self.github_mcp_health_result_sha256,
@@ -114,10 +114,10 @@ impl AttestedCapabilityProfile {
       "credential_reference": self.credential_reference,
       "credential_revision": self.credential_revision,
       "gateway_image_digest": self.gateway_image_digest,
-      "github_mcp_artifact_sha256": self.github_mcp_artifact_sha256,
+      "github_mcp_configured_artifact_sha256": self.github_mcp_configured_artifact_sha256,
       "github_mcp_access_auth_mode": self.github_mcp_access_auth_mode,
       "github_mcp_access_token_revision": self.github_mcp_access_token_revision,
-      "github_mcp_endpoint_identity": self.github_mcp_endpoint_identity,
+      "github_mcp_configured_endpoint_identity": self.github_mcp_configured_endpoint_identity,
       "github_mcp_health_checked_at_unix_seconds": self.github_mcp_health_checked_at_unix_seconds,
       "github_mcp_health_credential_revision": self.github_mcp_health_credential_revision,
       "github_mcp_health_result_sha256": self.github_mcp_health_result_sha256,
@@ -134,7 +134,7 @@ impl AttestedCapabilityProfile {
     sha256_hex(canonical.to_string().as_bytes())
   }
 
-  /// Validates the complete observed capability profile and its self-digest.
+  /// Validates runtime evidence, configured deployment claims, and their self-digest.
   ///
   /// # Errors
   /// Returns an error when a required field, digest, image identity, or tool inventory is invalid.
@@ -159,7 +159,7 @@ impl AttestedCapabilityProfile {
       &self.app_server_schema_sha256,
       &self.codex_program_sha256,
       &self.config_sha256,
-      &self.github_mcp_artifact_sha256,
+      &self.github_mcp_configured_artifact_sha256,
       &self.github_mcp_health_result_sha256,
       &self.profile_sha256,
       &self.runner_client_cert_public_key_fingerprint,
@@ -227,10 +227,10 @@ impl AttestedCapabilityProfile {
       credential_reference: string("credential_reference")?,
       credential_revision: string("credential_revision")?,
       gateway_image_digest: string("gateway_image_digest")?,
-      github_mcp_artifact_sha256: string("github_mcp_artifact_sha256")?,
+      github_mcp_configured_artifact_sha256: string("github_mcp_configured_artifact_sha256")?,
       github_mcp_access_auth_mode: string("github_mcp_access_auth_mode")?,
       github_mcp_access_token_revision: string("github_mcp_access_token_revision")?,
-      github_mcp_endpoint_identity: string("github_mcp_endpoint_identity")?,
+      github_mcp_configured_endpoint_identity: string("github_mcp_configured_endpoint_identity")?,
       github_mcp_health_checked_at_unix_seconds: object
         .get("github_mcp_health_checked_at_unix_seconds")
         .and_then(Value::as_u64)
@@ -258,7 +258,7 @@ impl AttestedCapabilityProfile {
     [
       &self.codex_version,
       &self.github_mcp_version,
-      &self.github_mcp_endpoint_identity,
+      &self.github_mcp_configured_endpoint_identity,
       &self.github_mcp_access_auth_mode,
       &self.github_mcp_access_token_revision,
       &self.github_mcp_health_credential_revision,
@@ -288,4 +288,102 @@ fn is_lowercase_hex(value: &str, length: usize) -> bool {
 
 fn sha256_hex(bytes: &[u8]) -> String {
   format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn profile() -> AttestedCapabilityProfile {
+    let mut profile = AttestedCapabilityProfile {
+      codex_version: "0.144.6".to_owned(),
+      app_server_schema_sha256: "1".repeat(64),
+      codex_program_sha256: "2".repeat(64),
+      github_mcp_version: "1.6.0".to_owned(),
+      github_mcp_configured_artifact_sha256: "3".repeat(64),
+      github_mcp_configured_endpoint_identity: "configured-sidecar".to_owned(),
+      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
+      github_mcp_health_checked_at_unix_seconds: 1,
+      github_mcp_health_credential_revision: "credential-v1".to_owned(),
+      github_mcp_health_result_sha256: "4".repeat(64),
+      github_mcp_health_tool: "get_me".to_owned(),
+      github_tools: EXPECTED_GITHUB_TOOLS.map(str::to_owned).into(),
+      credential_reference: "configured-credential".to_owned(),
+      permission_policy_revision: "policy-v1".to_owned(),
+      config_revision: "config-v1".to_owned(),
+      config_sha256: "5".repeat(64),
+      gateway_image_digest: format!("sha256:{}", "6".repeat(64)),
+      runner_image_digest: format!("sha256:{}", "7".repeat(64)),
+      runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
+      runner_client_cert_public_key_fingerprint: "8".repeat(64),
+      credential_revision: "credential-v1".to_owned(),
+      credential_isolation_revision: "isolation-v1".to_owned(),
+      credential_deny_policy_revision: "deny-v1".to_owned(),
+      negative_test_revision: "negative-v1".to_owned(),
+      output_schema_revision: "output-v1".to_owned(),
+      attested_at_unix_seconds: 1,
+      profile_sha256: String::new(),
+    };
+    profile.profile_sha256 = profile.computed_profile_sha256();
+    profile
+  }
+
+  #[test]
+  fn canonical_profile_rejects_legacy_mixed_unknown_and_duplicate_provenance_keys() {
+    let canonical = profile().canonical_json();
+    assert!(AttestedCapabilityProfile::parse_canonical_json(&canonical).is_ok());
+
+    let mut legacy: Value = serde_json::from_str(&canonical).expect("profile JSON");
+    let object = legacy.as_object_mut().expect("profile object");
+    let artifact = object
+      .remove("github_mcp_configured_artifact_sha256")
+      .expect("configured artifact");
+    let endpoint = object
+      .remove("github_mcp_configured_endpoint_identity")
+      .expect("configured endpoint");
+    object.insert("github_mcp_artifact_sha256".to_owned(), artifact);
+    object.insert("github_mcp_endpoint_identity".to_owned(), endpoint);
+    assert!(AttestedCapabilityProfile::parse_canonical_json(&legacy.to_string()).is_err());
+
+    let mut mixed: Value = serde_json::from_str(&canonical).expect("profile JSON");
+    mixed
+      .as_object_mut()
+      .expect("profile object")
+      .insert("github_mcp_endpoint_identity".to_owned(), json!("legacy"));
+    assert!(matches!(
+      AttestedCapabilityProfile::parse_canonical_json(&mixed.to_string()),
+      Err(AttestedCapabilityProfileError::InvalidShape)
+    ));
+
+    let unknown = format!(
+      "{},\"unknown_provenance\":true}}",
+      canonical.trim_end_matches('}')
+    );
+    assert!(matches!(
+      AttestedCapabilityProfile::parse_canonical_json(&unknown),
+      Err(AttestedCapabilityProfileError::InvalidShape)
+    ));
+    let duplicate = format!(
+      "{},\"github_mcp_configured_endpoint_identity\":\"duplicate\"}}",
+      canonical.trim_end_matches('}')
+    );
+    assert!(matches!(
+      AttestedCapabilityProfile::parse_canonical_json(&duplicate),
+      Err(AttestedCapabilityProfileError::NonCanonicalJson)
+    ));
+  }
+
+  #[test]
+  fn configured_deployment_claims_are_signed_but_not_live_workload_proof() {
+    let original = profile();
+    let mut changed = original.clone();
+    changed.github_mcp_configured_endpoint_identity = "different-configured-sidecar".to_owned();
+    assert_ne!(
+      changed.computed_profile_sha256(),
+      original.computed_profile_sha256()
+    );
+    assert!(!original.canonical_json().contains("observed_endpoint"));
+    assert!(!original.canonical_json().contains("live_provenance"));
+  }
 }

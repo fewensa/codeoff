@@ -238,7 +238,7 @@ fn verify_scheduled_artifacts_with_policy(
   )?;
   verify_digest(
     &github_mcp_artifact,
-    &profile.github_mcp_artifact_sha256,
+    &profile.github_mcp_configured_artifact_sha256,
     "github_mcp_artifact_digest_mismatch_at_startup",
   )?;
   let attestation = open_verified(

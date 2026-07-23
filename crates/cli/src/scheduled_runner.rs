@@ -152,6 +152,10 @@ pub(crate) async fn build_gateway(
     runner_workload_identity: profile.runner_workload_identity.clone(),
     runner_client_spki_sha256: profile.runner_client_cert_public_key_fingerprint.clone(),
     credential_revision: profile.credential_revision.clone(),
+    github_mcp_configured_artifact_sha256: profile.github_mcp_configured_artifact_sha256.clone(),
+    github_mcp_configured_endpoint_identity: profile
+      .github_mcp_configured_endpoint_identity
+      .clone(),
     github_mcp_access_auth_mode: authority.github_mcp_access_auth_mode.clone(),
     github_mcp_access_token_revision: authority.github_mcp_access_token_revision.clone(),
     executor_evidence_public_key: load_root_owned_bounded_file(
@@ -1108,8 +1112,8 @@ mod tests {
       codex_home: "/var/lib/codeoff/scheduled-codex".into(),
       cwd: "/work/codeoff-scheduled".into(),
       github_mcp_url: "http://127.0.0.1:8090/mcp".to_owned(),
-      github_mcp_artifact_sha256: "2".repeat(64),
-      github_mcp_endpoint_identity: "github-mcp-scheduled-v1".to_owned(),
+      github_mcp_configured_artifact_sha256: "2".repeat(64),
+      github_mcp_configured_endpoint_identity: "github-mcp-scheduled-v1".to_owned(),
       github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       credential_reference: "kubernetes:codeoff/github-mcp".to_owned(),
@@ -1132,8 +1136,8 @@ mod tests {
       cwd: profile.cwd,
       github_mcp_url: profile.github_mcp_url,
       github_mcp_artifact_path: "/opt/codeoff/bin/untrusted-github-mcp".into(),
-      github_mcp_artifact_sha256: profile.github_mcp_artifact_sha256,
-      github_mcp_endpoint_identity: profile.github_mcp_endpoint_identity,
+      github_mcp_artifact_sha256: profile.github_mcp_configured_artifact_sha256,
+      github_mcp_endpoint_identity: profile.github_mcp_configured_endpoint_identity,
       github_mcp_access_auth_mode: profile.github_mcp_access_auth_mode,
       github_mcp_access_token_revision: profile.github_mcp_access_token_revision,
       credential_reference: profile.credential_reference,

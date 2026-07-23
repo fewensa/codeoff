@@ -6,14 +6,14 @@
 
 use std::fmt;
 
+use codeoff_core::{CredentialRevision, CriticalId, RunnerWorkloadIdentity};
 use serde_json::{Map, Value, json};
 
 pub const REMOTE_PROTOCOL_VERSION: u64 = 1;
 pub const MAX_REMOTE_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_READY_TTL_MILLIS: u64 = 30_000;
+pub const MAX_ADMISSION_TTL_MILLIS: u64 = 30_000;
 
-const MAX_ID_BYTES: usize = 256;
-const MAX_REVISION_BYTES: usize = 128;
 const MAX_JSON_FIELD_BYTES: usize = 32 * 1024;
 const MAX_ERROR_BYTES: usize = 2 * 1024;
 
@@ -320,16 +320,14 @@ impl ReadyFrame {
     require_hex("ready.profile_digest", &self.profile_digest, 64)?;
     require_image_digest("ready.gateway_image_digest", &self.gateway_image_digest)?;
     require_image_digest("ready.runner_image_digest", &self.runner_image_digest)?;
-    require_id(
-      "ready.runner_workload_identity",
-      &self.runner_workload_identity,
-    )?;
+    RunnerWorkloadIdentity::parse(&self.runner_workload_identity)
+      .map_err(|_| RemoteProtocolError::InvalidField("ready.runner_workload_identity"))?;
     require_hex(
       "ready.runner_client_cert_public_key_fingerprint",
       &self.runner_client_cert_public_key_fingerprint,
       64,
     )?;
-    require_revision("ready.credential_revision", &self.credential_revision)?;
+    require_credential_revision("ready.credential_revision", &self.credential_revision)?;
     if self.deployment_epoch == 0
       || (now != 0
         && (self.ready_until_unix_millis <= now
@@ -392,7 +390,13 @@ impl AdmissionFrame {
     require_hex("admission.challenge", &self.challenge, 64)?;
     require_hex("admission.admission_nonce", &self.admission_nonce, 64)?;
     require_hex("admission.profile_digest", &self.profile_digest, 64)?;
-    if self.deployment_epoch == 0 || (now != 0 && self.expires_at_unix_millis <= now) {
+    let valid_until = now.checked_add(MAX_ADMISSION_TTL_MILLIS);
+    if self.deployment_epoch == 0
+      || (now != 0
+        && (self.expires_at_unix_millis <= now
+          || valid_until.is_none()
+          || self.expires_at_unix_millis > valid_until.unwrap_or(0)))
+    {
       return Err(RemoteProtocolError::InvalidField("admission.validity"));
     }
     Ok(())
@@ -432,11 +436,11 @@ impl AdmissionFrame {
 
 impl RunBinding {
   fn validate(&self) -> Result<(), RemoteProtocolError> {
-    require_id("binding.run_id", &self.run_id)?;
-    require_id("binding.job_id", &self.job_id)?;
+    require_critical_id("binding.run_id", &self.run_id)?;
+    require_critical_id("binding.job_id", &self.job_id)?;
     require_hex("binding.authority_digest", &self.authority_digest, 64)?;
     require_hex("binding.profile_digest", &self.profile_digest, 64)?;
-    require_revision("binding.credential_revision", &self.credential_revision)?;
+    require_credential_revision("binding.credential_revision", &self.credential_revision)?;
     if self.attempt == 0 || self.fence_token == 0 || self.deployment_epoch == 0 {
       return Err(RemoteProtocolError::InvalidField("binding.authority"));
     }
@@ -676,7 +680,7 @@ impl HeartbeatFrame {
 
 impl ErrorFrame {
   fn validate(&self) -> Result<(), RemoteProtocolError> {
-    require_revision("error.code", &self.code)?;
+    require_credential_revision("error.code", &self.code)?;
     require_bounded("error.message", &self.message, MAX_ERROR_BYTES)
   }
 
@@ -744,12 +748,19 @@ fn required_u64(
     .ok_or(RemoteProtocolError::InvalidField(field))
 }
 
-fn require_id(field: &'static str, value: &str) -> Result<(), RemoteProtocolError> {
-  require_bounded(field, value, MAX_ID_BYTES)
+fn require_critical_id(field: &'static str, value: &str) -> Result<(), RemoteProtocolError> {
+  CriticalId::parse(value)
+    .map(|_| ())
+    .map_err(|_| RemoteProtocolError::InvalidField(field))
 }
 
-fn require_revision(field: &'static str, value: &str) -> Result<(), RemoteProtocolError> {
-  require_bounded(field, value, MAX_REVISION_BYTES)
+fn require_credential_revision(
+  field: &'static str,
+  value: &str,
+) -> Result<(), RemoteProtocolError> {
+  CredentialRevision::parse(value)
+    .map(|_| ())
+    .map_err(|_| RemoteProtocolError::InvalidField(field))
 }
 
 fn require_json_field(field: &'static str, value: &str) -> Result<(), RemoteProtocolError> {

@@ -19,6 +19,7 @@ pub mod schedule_tools;
 pub mod scheduled_delivery;
 pub mod scheduled_execution;
 pub mod scheduled_remote_protocol;
+pub mod scheduled_remote_session;
 pub mod scheduler_observability;
 
 use std::collections::HashSet;

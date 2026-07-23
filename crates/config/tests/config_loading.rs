@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use codeoff_config::{
   CodeoffConfig, ConfigError, ConfigLoadOptions, DataRetentionConfig, DatabaseConfig,
-  ScheduledCodexConfig, SchedulerRuntimeConfig, SlackDirectMessageFeedbackMode,
+  ScheduledCodexConfig, ScheduledExecutionBackend, ScheduledRemoteRunnerConfig,
+  ScheduledRunnerControlConfig, ScheduledRunnerExecutorConfig, ScheduledRunnerGatewayConfig,
+  ScheduledRunnerRole, SchedulerRuntimeConfig, SlackDirectMessageFeedbackMode,
   SlackResponseFeedbackMode,
 };
 use tempfile::tempdir;
@@ -368,6 +370,8 @@ fn test_scheduler_policy_rejects_strict_heartbeat_and_incoherent_deadlines() {
 
 fn valid_scheduled_codex_config() -> ScheduledCodexConfig {
   ScheduledCodexConfig {
+    execution_backend: ScheduledExecutionBackend::Local,
+    remote_runner: ScheduledRemoteRunnerConfig::default(),
     codex_program: "/opt/codeoff/bin/codex".into(),
     codex_program_sha256: "a".repeat(64),
     codex_home: "/var/lib/codeoff/scheduled-codex".into(),
@@ -400,6 +404,143 @@ fn scheduler_with_valid_scheduled_codex() -> CodeoffConfig {
   config.scheduler.run_claims_enabled = true;
   config.agent.scheduled_codex = valid_scheduled_codex_config();
   config
+}
+
+fn gateway_config() -> ScheduledRunnerGatewayConfig {
+  ScheduledRunnerGatewayConfig {
+    bind: "0.0.0.0:7443".to_owned(),
+    server_certificate_path: "/run/codeoff/tls/server.crt".into(),
+    server_private_key_path: "/run/codeoff/tls/server.key".into(),
+    client_ca_bundle_path: "/run/codeoff/tls/client-ca.crt".into(),
+    handshake_timeout_ms: 5_000,
+    frame_timeout_ms: 30_000,
+    readiness_ttl_ms: 60_000,
+    max_connections: 2,
+  }
+}
+
+fn control_config() -> ScheduledRunnerControlConfig {
+  ScheduledRunnerControlConfig {
+    gateway_address: "codeoff-gateway.codeoff.svc:7443".to_owned(),
+    gateway_server_name: "codeoff-gateway.codeoff.svc".to_owned(),
+    client_certificate_path: "/run/codeoff/tls/client.crt".into(),
+    client_private_key_path: "/run/codeoff/tls/client.key".into(),
+    server_ca_bundle_path: "/run/codeoff/tls/server-ca.crt".into(),
+    local_socket_path: "/run/codeoff/runner/executor.sock".into(),
+    expected_executor_uid: 65_534,
+    expected_executor_gid: 65_534,
+    connect_timeout_ms: 5_000,
+    frame_timeout_ms: 30_000,
+  }
+}
+
+fn executor_config() -> ScheduledRunnerExecutorConfig {
+  ScheduledRunnerExecutorConfig {
+    local_socket_path: "/run/codeoff/runner/executor.sock".into(),
+    expected_control_uid: 0,
+    expected_control_gid: 0,
+    codex_child_uid: 65_532,
+    codex_child_gid: 65_532,
+    accept_timeout_ms: 5_000,
+    frame_timeout_ms: 30_000,
+  }
+}
+
+#[test]
+fn test_remote_runner_roles_require_exactly_one_strict_role_table() {
+  let mut scheduled = valid_scheduled_codex_config();
+  scheduled.execution_backend = ScheduledExecutionBackend::RemoteRunner;
+  scheduled.remote_runner.gateway = Some(gateway_config());
+  scheduled
+    .validate_remote_runner_role(ScheduledRunnerRole::Gateway)
+    .expect("gateway role");
+
+  scheduled.remote_runner.control = Some(control_config());
+  assert!(matches!(
+    scheduled.validate_remote_runner_role(ScheduledRunnerRole::Gateway),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.remote_runner",
+      ..
+    })
+  ));
+
+  scheduled.remote_runner.gateway = None;
+  scheduled
+    .validate_remote_runner_role(ScheduledRunnerRole::Control)
+    .expect("control role");
+
+  scheduled.remote_runner.control = None;
+  scheduled.remote_runner.executor = Some(executor_config());
+  scheduled
+    .validate_remote_runner_role(ScheduledRunnerRole::Executor)
+    .expect("executor role");
+}
+
+#[test]
+fn test_remote_runner_roles_reject_unsafe_addresses_paths_identities_and_bounds() {
+  let mut scheduled = valid_scheduled_codex_config();
+  scheduled.execution_backend = ScheduledExecutionBackend::RemoteRunner;
+  let mut gateway = gateway_config();
+  gateway.bind = "0.0.0.0:0".to_owned();
+  scheduled.remote_runner.gateway = Some(gateway);
+  assert!(
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Gateway)
+      .is_err()
+  );
+
+  scheduled.remote_runner.gateway = None;
+  let mut control = control_config();
+  control.gateway_server_name = "Codeoff.Example".to_owned();
+  scheduled.remote_runner.control = Some(control);
+  assert!(
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Control)
+      .is_err()
+  );
+
+  scheduled.remote_runner.control = None;
+  let mut executor = executor_config();
+  executor.local_socket_path = "relative.sock".into();
+  scheduled.remote_runner.executor = Some(executor);
+  assert!(
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Executor)
+      .is_err()
+  );
+}
+
+#[test]
+fn test_remote_runner_tables_deny_unknown_fields_and_backend_aliases() {
+  let dir = tempdir().expect("create tempdir");
+  for body in [
+    r#"
+[agent.scheduled_codex]
+execution_backend = "remote"
+"#,
+    r#"
+[agent.scheduled_codex]
+execution_backend = "remote-runner"
+
+[agent.scheduled_codex.remote_runner.gateway]
+bind = "0.0.0.0:7443"
+server_certificate_path = "/run/server.crt"
+server_private_key_path = "/run/server.key"
+client_ca_bundle_path = "/run/client-ca.crt"
+handshake_timeout_ms = 5000
+frame_timeout_ms = 30000
+readiness_ttl_ms = 60000
+max_connections = 2
+connection_limit = 2
+"#,
+  ] {
+    let config_path = dir.path().join("codeoff.toml");
+    fs::write(&config_path, body).expect("write config");
+    assert!(matches!(
+      CodeoffConfig::load(ConfigLoadOptions::new().config_path(config_path)),
+      Err(ConfigError::Parse { .. })
+    ));
+  }
 }
 
 #[test]

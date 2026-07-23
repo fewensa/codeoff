@@ -2389,6 +2389,8 @@ mod tests {
 
   fn remote_config(profile: &RequestedCapabilityProfile) -> ScheduledCodexConfig {
     ScheduledCodexConfig {
+      execution_backend: codeoff_config::ScheduledExecutionBackend::default(),
+      remote_runner: codeoff_config::ScheduledRemoteRunnerConfig::default(),
       codex_program: profile.codex_program.clone(),
       codex_program_sha256: profile.codex_program_sha256.clone(),
       codex_home: profile.codex_home.clone(),
@@ -2919,6 +2921,8 @@ mod tests {
     fs::set_permissions(&trust_bundle_path, fs::Permissions::from_mode(0o444))
       .expect("protect trust bundle");
     let mut config = ScheduledCodexConfig {
+      execution_backend: codeoff_config::ScheduledExecutionBackend::default(),
+      remote_runner: codeoff_config::ScheduledRemoteRunnerConfig::default(),
       codex_program: codex_program.clone(),
       codex_program_sha256: sha256_file(&codex_program).expect("program digest"),
       codex_home: codex_home.clone(),

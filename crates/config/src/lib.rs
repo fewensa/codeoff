@@ -6,7 +6,9 @@ mod error;
 pub use codeoff_core::{CredentialRevision, RunnerWorkloadIdentity};
 pub use config::{
   AgentConfig, CodeoffConfig, ConfigLoadOptions, DataRetentionConfig, DatabaseConfig,
-  ScheduledCodexConfig, SchedulerRuntimeConfig, ServerConfig, SlackConfig,
+  ScheduledCodexConfig, ScheduledExecutionBackend, ScheduledRemoteRunnerConfig,
+  ScheduledRunnerControlConfig, ScheduledRunnerExecutorConfig, ScheduledRunnerGatewayConfig,
+  ScheduledRunnerRole, SchedulerRuntimeConfig, ServerConfig, SlackConfig,
   SlackDirectMessageFeedbackMode, SlackResponseFeedbackConfig, SlackResponseFeedbackMode,
   SlackUserTokenConfig, StateConfig,
 };

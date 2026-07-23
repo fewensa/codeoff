@@ -257,9 +257,13 @@ credential_reference = "kubernetes:codeoff/github-mcp"
 permission_policy_revision = "scheduled-read-only-v1"
 config_revision = "scheduled-codex-v1"
 config_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-runtime_image_digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+gateway_image_digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+runner_image_digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+runner_workload_identity = "spiffe://codeoff/runner/production"
+runner_client_cert_public_key_fingerprint = "1111111111111111111111111111111111111111111111111111111111111111"
+credential_revision = "github-readonly-2026-07"
 isolation_attestation_path = "/var/run/codeoff/isolation-attestation.json"
-isolation_verifier_public_key = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+isolation_trust_bundle_path = "/opt/codeoff/attestation/isolation-trust-bundle.json"
 trusted_owner_uid = 0
 trusted_owner_gid = 0
 runtime_uid = 65534
@@ -376,10 +380,13 @@ fn valid_scheduled_codex_config() -> ScheduledCodexConfig {
     permission_policy_revision: "scheduled-read-only-v1".to_owned(),
     config_revision: "scheduled-codex-v1".to_owned(),
     config_sha256: "c".repeat(64),
-    runtime_image_digest: format!("sha256:{}", "e".repeat(64)),
+    gateway_image_digest: format!("sha256:{}", "e".repeat(64)),
+    runner_image_digest: format!("sha256:{}", "f".repeat(64)),
+    runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
+    runner_client_cert_public_key_fingerprint: "1".repeat(64),
+    credential_revision: "github-readonly-2026-07".to_owned(),
     isolation_attestation_path: "/var/run/codeoff/isolation-attestation.json".into(),
-    isolation_verifier_public_key: "d".repeat(64),
-    isolation_verifier_public_key_path: PathBuf::new(),
+    isolation_trust_bundle_path: "/opt/codeoff/attestation/isolation-trust-bundle.json".into(),
     trusted_owner_uid: 0,
     trusted_owner_gid: 0,
     runtime_uid: 65_534,
@@ -408,28 +415,11 @@ fn test_scheduled_codex_rejects_unsafe_paths_digests_keys_and_urls() {
   ));
 
   let mut config = scheduler_with_valid_scheduled_codex();
-  config
-    .agent
-    .scheduled_codex
-    .isolation_verifier_public_key
-    .clear();
-  config
-    .agent
-    .scheduled_codex
-    .isolation_verifier_public_key_path =
-    "/opt/codeoff/attestation/isolation-verifier-public-key".into();
-  config.validate().expect("public key path");
-
-  let mut config = scheduler_with_valid_scheduled_codex();
-  config
-    .agent
-    .scheduled_codex
-    .isolation_verifier_public_key_path =
-    "/opt/codeoff/attestation/isolation-verifier-public-key".into();
+  config.agent.scheduled_codex.isolation_trust_bundle_path = "relative/trust-bundle.json".into();
   assert!(matches!(
     config.validate(),
     Err(ConfigError::InvalidScheduler {
-      field: "scheduled_codex.isolation_verifier_public_key",
+      field: "scheduled_codex.isolation_trust_bundle_path",
       ..
     })
   ));
@@ -455,21 +445,11 @@ fn test_scheduled_codex_rejects_unsafe_paths_digests_keys_and_urls() {
   ));
 
   let mut config = scheduler_with_valid_scheduled_codex();
-  config.agent.scheduled_codex.runtime_image_digest = "sha-f375909".to_owned();
+  config.agent.scheduled_codex.runner_image_digest = "sha-f375909".to_owned();
   assert!(matches!(
     config.validate(),
     Err(ConfigError::InvalidScheduler {
-      field: "scheduled_codex.runtime_image_digest",
-      ..
-    })
-  ));
-
-  let mut config = scheduler_with_valid_scheduled_codex();
-  config.agent.scheduled_codex.isolation_verifier_public_key = "short".to_owned();
-  assert!(matches!(
-    config.validate(),
-    Err(ConfigError::InvalidScheduler {
-      field: "scheduled_codex.isolation_verifier_public_key",
+      field: "scheduled_codex.runner_image_digest",
       ..
     })
   ));

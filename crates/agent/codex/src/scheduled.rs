@@ -83,6 +83,7 @@ const ISOLATION_ATTESTATION_SCHEMA_VERSION: u64 = 2;
 const ISOLATION_ATTESTATION_MAX_ISSUED_AGE_SECONDS: u64 = 300;
 const ISOLATION_ATTESTATION_MAX_VALIDITY_SECONDS: u64 = 600;
 const ISOLATION_ATTESTATION_FUTURE_SKEW_SECONDS: u64 = 30;
+const MAX_ISOLATION_TRUST_KEYS: usize = 16;
 #[cfg(test)]
 const TEST_PERMIT_TTL: Duration = Duration::from_secs(30);
 #[cfg_attr(
@@ -111,7 +112,11 @@ pub struct RequestedCapabilityProfile {
   pub permission_policy_revision: String,
   pub config_revision: String,
   pub config_sha256: String,
-  pub runtime_image_digest: String,
+  pub gateway_image_digest: String,
+  pub runner_image_digest: String,
+  pub runner_workload_identity: String,
+  pub runner_client_cert_public_key_fingerprint: String,
+  pub credential_revision: String,
 }
 
 impl RequestedCapabilityProfile {
@@ -171,12 +176,17 @@ impl RequestedCapabilityProfile {
     if self.config_sha256 != actual_config_hash {
       return Err(preflight("scheduled_config_digest_mismatch"));
     }
-    if self.runtime_image_digest.len() != 71
-      || !self.runtime_image_digest.starts_with("sha256:")
-      || !is_lowercase_hex(&self.runtime_image_digest[7..], 64)
-    {
-      return Err(preflight("scheduled_runtime_image_digest_invalid"));
+    for digest in [&self.gateway_image_digest, &self.runner_image_digest] {
+      if !is_oci_sha256_digest(digest) {
+        return Err(preflight("scheduled_deployment_image_digest_invalid"));
+      }
     }
+    require_non_empty("runner_workload_identity", &self.runner_workload_identity)?;
+    require_sha256(
+      "runner_client_cert_public_key_fingerprint",
+      &self.runner_client_cert_public_key_fingerprint,
+    )?;
+    require_non_empty("credential_revision", &self.credential_revision)?;
     Ok(())
   }
 }
@@ -194,7 +204,7 @@ pub struct ScheduledRuntimeEvidence {
   pub app_server_schema_sha256: String,
   pub codex_program_sha256: String,
   pub config_sha256: String,
-  pub runtime_image_digest: String,
+  pub runner_image_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +233,7 @@ pub struct ScheduledDeploymentAuthority {
   pub deployment_epoch: i64,
   pub attestation_id: String,
   pub attestation_digest: String,
+  pub trust_key_id: String,
   pub profile_digest: String,
   pub isolation_revision: String,
   pub issued_at_unix_seconds: u64,
@@ -299,7 +310,11 @@ pub struct AttestedCapabilityProfile {
   pub permission_policy_revision: String,
   pub config_revision: String,
   pub config_sha256: String,
-  pub runtime_image_digest: String,
+  pub gateway_image_digest: String,
+  pub runner_image_digest: String,
+  pub runner_workload_identity: String,
+  pub runner_client_cert_public_key_fingerprint: String,
+  pub credential_revision: String,
   pub credential_isolation_revision: String,
   pub credential_deny_policy_revision: String,
   pub negative_test_revision: String,
@@ -329,7 +344,11 @@ impl AttestedCapabilityProfile {
       "negative_test_revision": self.negative_test_revision,
       "output_schema_revision": self.output_schema_revision,
       "permission_policy_revision": self.permission_policy_revision,
-      "runtime_image_digest": self.runtime_image_digest,
+      "gateway_image_digest": self.gateway_image_digest,
+      "runner_image_digest": self.runner_image_digest,
+      "runner_workload_identity": self.runner_workload_identity,
+      "runner_client_cert_public_key_fingerprint": self.runner_client_cert_public_key_fingerprint,
+      "credential_revision": self.credential_revision,
       "profile_sha256": self.profile_sha256,
     })
     .to_string()
@@ -824,7 +843,7 @@ pub fn build_production_scheduled_codex_executor(
   let authority = load_signed_isolation_authority_contents(
     &profile,
     &artifacts.attestation_contents,
-    &artifacts.verifier_public_key_contents,
+    &artifacts.trust_bundle_contents,
   )?;
   #[cfg(unix)]
   let executor = ScheduledCodexExecutor::new(move |profile| {
@@ -849,9 +868,9 @@ pub fn load_current_scheduled_deployment_authority(
   config: &ScheduledCodexConfig,
   profile: &RequestedCapabilityProfile,
 ) -> Result<ScheduledDeploymentAuthority, ScheduledFailure> {
-  let (contents, verifier_public_key) = read_verified_scheduled_authority_material(config)
+  let (contents, trust_bundle) = read_verified_scheduled_authority_material(config)
     .map_err(|error| preflight(format!("scheduled_attestation_reload_failed:{error}")))?;
-  load_signed_isolation_authority_contents(profile, &contents, &verifier_public_key)
+  load_signed_isolation_authority_contents(profile, &contents, &trust_bundle)
 }
 
 fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfile {
@@ -867,7 +886,13 @@ fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfil
     permission_policy_revision: config.permission_policy_revision.clone(),
     config_revision: config.config_revision.clone(),
     config_sha256: config.config_sha256.clone(),
-    runtime_image_digest: config.runtime_image_digest.clone(),
+    gateway_image_digest: config.gateway_image_digest.clone(),
+    runner_image_digest: config.runner_image_digest.clone(),
+    runner_workload_identity: config.runner_workload_identity.clone(),
+    runner_client_cert_public_key_fingerprint: config
+      .runner_client_cert_public_key_fingerprint
+      .clone(),
+    credential_revision: config.credential_revision.clone(),
   }
 }
 
@@ -885,7 +910,7 @@ fn spawn_production_transport(
     app_server_schema_sha256: CODEX_APP_SERVER_SCHEMA_SHA256.to_owned(),
     codex_program_sha256: profile.codex_program_sha256.clone(),
     config_sha256: profile.config_sha256.clone(),
-    runtime_image_digest: profile.runtime_image_digest.clone(),
+    runner_image_digest: profile.runner_image_digest.clone(),
   };
   StdioScheduledJsonlTransport::spawn(&profile, runtime_evidence, &artifacts)
 }
@@ -1089,8 +1114,8 @@ fn attest_runtime(
   if evidence.config_sha256 != requested.config_sha256 {
     return Err(capability("scheduled_config_runtime_digest_mismatch"));
   }
-  if evidence.runtime_image_digest != requested.runtime_image_digest {
-    return Err(capability("scheduled_runtime_image_digest_mismatch"));
+  if evidence.runner_image_digest != requested.runner_image_digest {
+    return Err(capability("scheduled_runner_image_digest_mismatch"));
   }
   Ok(AttestedCapabilityProfile {
     codex_version: evidence.codex_version.clone(),
@@ -1104,7 +1129,13 @@ fn attest_runtime(
     permission_policy_revision: requested.permission_policy_revision.clone(),
     config_revision: requested.config_revision.clone(),
     config_sha256: requested.config_sha256.clone(),
-    runtime_image_digest: requested.runtime_image_digest.clone(),
+    gateway_image_digest: requested.gateway_image_digest.clone(),
+    runner_image_digest: requested.runner_image_digest.clone(),
+    runner_workload_identity: requested.runner_workload_identity.clone(),
+    runner_client_cert_public_key_fingerprint: requested
+      .runner_client_cert_public_key_fingerprint
+      .clone(),
+    credential_revision: requested.credential_revision.clone(),
     credential_isolation_revision: isolation_permit.isolation_revision,
     credential_deny_policy_revision: CREDENTIAL_DENY_POLICY_REVISION.to_owned(),
     negative_test_revision: NEGATIVE_TEST_REVISION.to_owned(),
@@ -1780,7 +1811,11 @@ fn profile_sha256(profile: &AttestedCapabilityProfile) -> String {
     "negative_test_revision": profile.negative_test_revision,
     "output_schema_revision": profile.output_schema_revision,
     "permission_policy_revision": profile.permission_policy_revision,
-    "runtime_image_digest": profile.runtime_image_digest,
+    "gateway_image_digest": profile.gateway_image_digest,
+    "runner_image_digest": profile.runner_image_digest,
+    "runner_workload_identity": profile.runner_workload_identity,
+    "runner_client_cert_public_key_fingerprint": profile.runner_client_cert_public_key_fingerprint,
+    "credential_revision": profile.credential_revision,
   });
   sha256_hex(canonical.to_string().as_bytes())
 }
@@ -1789,11 +1824,11 @@ fn profile_sha256(profile: &AttestedCapabilityProfile) -> String {
 fn load_signed_isolation_authority(
   profile: &RequestedCapabilityProfile,
   path: &Path,
-  public_key_hex: &str,
+  trust_bundle: &str,
 ) -> Result<ScheduledDeploymentAuthority, ScheduledFailure> {
   let contents = fs::read_to_string(path)
     .map_err(|error| preflight(format!("read_scheduled_isolation_attestation:{error}")))?;
-  load_signed_isolation_authority_contents(profile, &contents, public_key_hex)
+  load_signed_isolation_authority_contents(profile, &contents, trust_bundle)
 }
 
 #[allow(
@@ -1803,7 +1838,7 @@ fn load_signed_isolation_authority(
 fn load_signed_isolation_authority_contents(
   profile: &RequestedCapabilityProfile,
   contents: &str,
-  public_key_hex: &str,
+  trust_bundle: &str,
 ) -> Result<ScheduledDeploymentAuthority, ScheduledFailure> {
   let document: Value = serde_json::from_str(contents)
     .map_err(|_| preflight("scheduled_isolation_attestation_invalid_json"))?;
@@ -1815,7 +1850,7 @@ fn load_signed_isolation_authority_contents(
   }
   let document = document
     .as_object()
-    .filter(|object| object.len() == 3)
+    .filter(|object| has_exact_fields(object, &["payload", "signature", "signature_algorithm"]))
     .ok_or_else(|| preflight("scheduled_isolation_attestation_fields_mismatch"))?;
   if document.get("signature_algorithm").and_then(Value::as_str) != Some("ed25519") {
     return Err(preflight(
@@ -1825,7 +1860,21 @@ fn load_signed_isolation_authority_contents(
   let payload = document
     .get("payload")
     .and_then(Value::as_object)
-    .filter(|object| object.len() == 8)
+    .filter(|object| {
+      has_exact_fields(
+        object,
+        &[
+          "attestation_id",
+          "credential_isolation_revision",
+          "deployment_epoch",
+          "expires_at_unix_seconds",
+          "issued_at_unix_seconds",
+          "negative_test_revision",
+          "profile_binding_digest",
+          "schema_version",
+        ],
+      )
+    })
     .ok_or_else(|| preflight("scheduled_isolation_attestation_payload_fields_mismatch"))?;
   let canonical_payload = Value::Object(payload.clone()).to_string();
   let signature = decode_lowercase_hex(
@@ -1836,20 +1885,35 @@ fn load_signed_isolation_authority_contents(
     64,
     "scheduled_isolation_attestation_signature_invalid",
   )?;
-  let public_key = decode_lowercase_hex(
-    public_key_hex,
-    32,
-    "scheduled_isolation_verifier_public_key_invalid",
-  )?;
-  UnparsedPublicKey::new(&ED25519, public_key)
-    .verify(canonical_payload.as_bytes(), &signature)
-    .map_err(|_| preflight("scheduled_isolation_attestation_signature_invalid"))?;
   let schema_version = payload
     .get("schema_version")
     .and_then(Value::as_u64)
     .filter(|version| *version == ISOLATION_ATTESTATION_SCHEMA_VERSION)
     .ok_or_else(|| preflight("scheduled_isolation_attestation_version_mismatch"))?;
   let _ = schema_version;
+  let deployment_epoch = payload
+    .get("deployment_epoch")
+    .and_then(Value::as_u64)
+    .and_then(|value| i64::try_from(value).ok())
+    .filter(|value| *value > 0)
+    .ok_or_else(|| preflight("scheduled_isolation_deployment_epoch_invalid"))?;
+  let trust_keys = isolation_trust_keys_for_epoch(trust_bundle, deployment_epoch)?;
+  let verified_key_ids = trust_keys
+    .iter()
+    .filter(|(_, public_key)| {
+      UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(canonical_payload.as_bytes(), &signature)
+        .is_ok()
+    })
+    .map(|(key_id, _)| key_id.clone())
+    .collect::<Vec<_>>();
+  let [trust_key_id] = verified_key_ids.as_slice() else {
+    return Err(preflight(if verified_key_ids.is_empty() {
+      "scheduled_isolation_attestation_signature_invalid"
+    } else {
+      "scheduled_isolation_attestation_signature_ambiguous"
+    }));
+  };
   let attestation_id = payload
     .get("attestation_id")
     .and_then(Value::as_str)
@@ -1876,12 +1940,6 @@ fn load_signed_isolation_authority_contents(
   {
     return Err(preflight("scheduled_isolation_attestation_not_current"));
   }
-  let deployment_epoch = payload
-    .get("deployment_epoch")
-    .and_then(Value::as_u64)
-    .and_then(|value| i64::try_from(value).ok())
-    .filter(|value| *value > 0)
-    .ok_or_else(|| preflight("scheduled_isolation_deployment_epoch_invalid"))?;
   let profile_binding_digest = payload
     .get("profile_binding_digest")
     .and_then(Value::as_str)
@@ -1908,11 +1966,114 @@ fn load_signed_isolation_authority_contents(
     deployment_epoch,
     attestation_id: attestation_id.to_owned(),
     attestation_digest: sha256_hex(contents.as_bytes()),
+    trust_key_id: trust_key_id.clone(),
     profile_digest: profile_binding_digest.to_owned(),
     isolation_revision: isolation_revision.to_owned(),
     issued_at_unix_seconds: issued_at,
     expires_at_unix_seconds: expires_at,
   })
+}
+
+fn has_exact_fields(object: &serde_json::Map<String, Value>, expected: &[&str]) -> bool {
+  object.len() == expected.len() && expected.iter().all(|field| object.contains_key(*field))
+}
+
+fn isolation_trust_keys_for_epoch(
+  contents: &str,
+  deployment_epoch: i64,
+) -> Result<Vec<(String, Vec<u8>)>, ScheduledFailure> {
+  let bundle: Value = serde_json::from_str(contents)
+    .map_err(|_| preflight("scheduled_isolation_trust_bundle_invalid_json"))?;
+  if bundle.to_string().as_bytes() != contents.as_bytes() {
+    return Err(preflight(
+      "scheduled_isolation_trust_bundle_must_be_canonical_json",
+    ));
+  }
+  let bundle = bundle
+    .as_object()
+    .filter(|object| has_exact_fields(object, &["keys", "schema_version"]))
+    .ok_or_else(|| preflight("scheduled_isolation_trust_bundle_fields_mismatch"))?;
+  if bundle.get("schema_version").and_then(Value::as_u64) != Some(1) {
+    return Err(preflight(
+      "scheduled_isolation_trust_bundle_version_mismatch",
+    ));
+  }
+  let keys = bundle
+    .get("keys")
+    .and_then(Value::as_array)
+    .filter(|keys| !keys.is_empty() && keys.len() <= MAX_ISOLATION_TRUST_KEYS)
+    .ok_or_else(|| preflight("scheduled_isolation_trust_bundle_keys_invalid"))?;
+  let mut key_ids = BTreeSet::new();
+  let mut public_keys = BTreeSet::new();
+  let mut valid = Vec::new();
+  for key in keys {
+    let key = key
+      .as_object()
+      .filter(|object| {
+        has_exact_fields(
+          object,
+          &[
+            "key_id",
+            "not_after_deployment_epoch",
+            "not_before_deployment_epoch",
+            "public_key",
+          ],
+        )
+      })
+      .ok_or_else(|| preflight("scheduled_isolation_trust_bundle_key_fields_mismatch"))?;
+    let key_id = key
+      .get("key_id")
+      .and_then(Value::as_str)
+      .filter(|value| is_lowercase_hex(value, 64))
+      .ok_or_else(|| preflight("scheduled_isolation_trust_bundle_key_id_invalid"))?;
+    let public_key_hex = key
+      .get("public_key")
+      .and_then(Value::as_str)
+      .ok_or_else(|| preflight("scheduled_isolation_trust_bundle_public_key_invalid"))?;
+    let public_key = decode_lowercase_hex(
+      public_key_hex,
+      32,
+      "scheduled_isolation_trust_bundle_public_key_invalid",
+    )?;
+    if key_id != sha256_hex(&public_key) {
+      return Err(preflight(
+        "scheduled_isolation_trust_bundle_key_id_mismatch",
+      ));
+    }
+    if !key_ids.insert(key_id.to_owned()) || !public_keys.insert(public_key_hex.to_owned()) {
+      return Err(preflight("scheduled_isolation_trust_bundle_duplicate_key"));
+    }
+    let not_before = key
+      .get("not_before_deployment_epoch")
+      .and_then(Value::as_u64)
+      .and_then(|value| i64::try_from(value).ok())
+      .filter(|value| *value > 0)
+      .ok_or_else(|| preflight("scheduled_isolation_trust_bundle_not_before_invalid"))?;
+    let not_after = match key.get("not_after_deployment_epoch") {
+      Some(Value::Null) => None,
+      Some(value) => Some(
+        value
+          .as_u64()
+          .and_then(|value| i64::try_from(value).ok())
+          .filter(|value| *value >= not_before)
+          .ok_or_else(|| preflight("scheduled_isolation_trust_bundle_not_after_invalid"))?,
+      ),
+      None => {
+        return Err(preflight(
+          "scheduled_isolation_trust_bundle_not_after_invalid",
+        ));
+      }
+    };
+    if deployment_epoch >= not_before && not_after.is_none_or(|epoch| deployment_epoch <= epoch) {
+      valid.push((key_id.to_owned(), public_key));
+    }
+  }
+  if valid.is_empty() {
+    return Err(preflight(
+      "scheduled_isolation_trust_bundle_no_key_for_epoch",
+    ));
+  }
+  Ok(valid)
 }
 
 fn isolation_profile_binding_digest(
@@ -1938,6 +2099,7 @@ fn isolation_profile_binding_digest(
     "config_revision": profile.config_revision,
     "config_sha256": profile.config_sha256,
     "credential_reference": profile.credential_reference,
+    "credential_revision": profile.credential_revision,
     "cwd": path("scheduled_cwd", &profile.cwd)?,
     "execution_surface": {
       "approval_policy": "never",
@@ -1951,8 +2113,12 @@ fn isolation_profile_binding_digest(
     "github_mcp_url": profile.github_mcp_url,
     "github_mcp_version": GITHUB_MCP_SERVER_VERSION,
     "github_tools": EXPECTED_GITHUB_TOOLS,
+    "gateway_image_digest": profile.gateway_image_digest,
     "negative_test_revision": NEGATIVE_TEST_REVISION,
     "permission_policy_revision": profile.permission_policy_revision,
+    "runner_client_cert_public_key_fingerprint": profile.runner_client_cert_public_key_fingerprint,
+    "runner_image_digest": profile.runner_image_digest,
+    "runner_workload_identity": profile.runner_workload_identity,
   });
   Ok(sha256_hex(binding.to_string().as_bytes()))
 }
@@ -1988,6 +2154,12 @@ fn is_lowercase_hex(value: &str, expected_len: usize) -> bool {
     && value
       .bytes()
       .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_oci_sha256_digest(value: &str) -> bool {
+  value
+    .strip_prefix("sha256:")
+    .is_some_and(|digest| is_lowercase_hex(digest, 64))
 }
 
 fn is_loopback_http_url(url: &str) -> bool {
@@ -2247,7 +2419,11 @@ mod tests {
       permission_policy_revision: "github-issues-read-v1".to_owned(),
       config_revision: "scheduled-codex-v1".to_owned(),
       config_sha256: String::new(),
-      runtime_image_digest: format!("sha256:{}", "e".repeat(64)),
+      gateway_image_digest: format!("sha256:{}", "e".repeat(64)),
+      runner_image_digest: format!("sha256:{}", "f".repeat(64)),
+      runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
+      runner_client_cert_public_key_fingerprint: "1".repeat(64),
+      credential_revision: "github-readonly-2026-07".to_owned(),
     };
     profile.config_sha256 = sha256_hex(profile.dedicated_config().as_bytes());
     profile
@@ -2259,7 +2435,7 @@ mod tests {
       app_server_schema_sha256: CODEX_APP_SERVER_SCHEMA_SHA256.to_owned(),
       codex_program_sha256: profile.codex_program_sha256.clone(),
       config_sha256: profile.config_sha256.clone(),
-      runtime_image_digest: profile.runtime_image_digest.clone(),
+      runner_image_digest: profile.runner_image_digest.clone(),
     }
   }
 
@@ -2316,6 +2492,22 @@ mod tests {
       write!(output, "{byte:02x}").expect("write hex");
       output
     })
+  }
+
+  fn isolation_trust_bundle(keys: &[(&Ed25519KeyPair, i64, Option<i64>)]) -> String {
+    let keys = keys
+      .iter()
+      .map(|(key, not_before, not_after)| {
+        let public_key = lowercase_hex(key.public_key().as_ref());
+        json!({
+          "key_id": sha256_hex(key.public_key().as_ref()),
+          "not_after_deployment_epoch": not_after,
+          "not_before_deployment_epoch": not_before,
+          "public_key": public_key,
+        })
+      })
+      .collect::<Vec<_>>();
+    json!({"keys": keys, "schema_version": 1}).to_string()
   }
 
   fn isolation_payload(profile: &RequestedCapabilityProfile) -> Value {
@@ -2584,18 +2776,18 @@ mod tests {
   fn signed_isolation_attestation_accepts_only_current_exact_profile() {
     let profile = profile();
     let key = signing_key();
-    let public_key = lowercase_hex(key.public_key().as_ref());
+    let trust_bundle = isolation_trust_bundle(&[(&key, 1, None)]);
     let temp = TempDir::new().expect("tempdir");
 
     let path = write_signed_attestation(&temp, &key, &isolation_payload(&profile));
-    let authority = load_signed_isolation_authority(&profile, &path, &public_key)
+    let authority = load_signed_isolation_authority(&profile, &path, &trust_bundle)
       .expect("valid signed attestation");
     assert_eq!(authority.deployment_epoch, 1);
 
     let mut other_profile = profile.clone();
     other_profile.github_mcp_endpoint_identity = "different-endpoint".to_owned();
     let path = write_signed_attestation(&temp, &key, &isolation_payload(&other_profile));
-    let failure = load_signed_isolation_authority(&profile, &path, &public_key)
+    let failure = load_signed_isolation_authority(&profile, &path, &trust_bundle)
       .expect_err("mismatched profile must fail");
     assert_eq!(
       failure.message,
@@ -2607,14 +2799,14 @@ mod tests {
     expired["issued_at_unix_seconds"] = json!(now.saturating_sub(10));
     expired["expires_at_unix_seconds"] = json!(now.saturating_sub(1));
     let path = write_signed_attestation(&temp, &key, &expired);
-    assert!(load_signed_isolation_authority(&profile, &path, &public_key).is_err());
+    assert!(load_signed_isolation_authority(&profile, &path, &trust_bundle).is_err());
   }
 
   #[test]
   fn signed_isolation_attestation_rejects_stale_future_and_overlong_windows() {
     let profile = profile();
     let key = signing_key();
-    let public_key = lowercase_hex(key.public_key().as_ref());
+    let trust_bundle = isolation_trust_bundle(&[(&key, 1, None)]);
     let temp = TempDir::new().expect("tempdir");
     let now = now_unix_seconds();
     let cases = [
@@ -2636,8 +2828,67 @@ mod tests {
       payload["issued_at_unix_seconds"] = json!(issued_at);
       payload["expires_at_unix_seconds"] = json!(expires_at);
       let path = write_signed_attestation(&temp, &key, &payload);
-      assert!(load_signed_isolation_authority(&profile, &path, &public_key).is_err());
+      assert!(load_signed_isolation_authority(&profile, &path, &trust_bundle).is_err());
     }
+  }
+
+  #[test]
+  fn isolation_trust_bundle_enforces_rotation_epochs_and_overlap() {
+    let profile = profile();
+    let old_key = signing_key();
+    let new_key = signing_key();
+    let trust_bundle = isolation_trust_bundle(&[(&old_key, 1, Some(2)), (&new_key, 2, None)]);
+    let temp = TempDir::new().expect("tempdir");
+    let cases = [
+      (1, &old_key, true),
+      (1, &new_key, false),
+      (2, &old_key, true),
+      (2, &new_key, true),
+      (3, &old_key, false),
+      (3, &new_key, true),
+    ];
+    for (epoch, key, accepted) in cases {
+      let mut payload = isolation_payload(&profile);
+      payload["deployment_epoch"] = json!(epoch);
+      let path = write_signed_attestation(&temp, key, &payload);
+      let result = load_signed_isolation_authority(&profile, &path, &trust_bundle);
+      assert_eq!(
+        result.is_ok(),
+        accepted,
+        "epoch={epoch} accepted={accepted}"
+      );
+      if let Ok(authority) = result {
+        assert_eq!(
+          authority.trust_key_id,
+          sha256_hex(key.public_key().as_ref())
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn isolation_trust_bundle_rejects_unknown_duplicate_and_mismatched_keys() {
+    let profile = profile();
+    let key = signing_key();
+    let temp = TempDir::new().expect("tempdir");
+    let path = write_signed_attestation(&temp, &key, &isolation_payload(&profile));
+    let valid = isolation_trust_bundle(&[(&key, 1, None)]);
+
+    let mut unknown: Value = serde_json::from_str(&valid).expect("parse bundle");
+    unknown["unexpected"] = json!(true);
+    assert!(load_signed_isolation_authority(&profile, &path, &unknown.to_string()).is_err());
+
+    let mut duplicate: Value = serde_json::from_str(&valid).expect("parse bundle");
+    let duplicate_key = duplicate["keys"][0].clone();
+    duplicate["keys"]
+      .as_array_mut()
+      .expect("keys")
+      .push(duplicate_key);
+    assert!(load_signed_isolation_authority(&profile, &path, &duplicate.to_string()).is_err());
+
+    let mut mismatched: Value = serde_json::from_str(&valid).expect("parse bundle");
+    mismatched["keys"][0]["key_id"] = json!("0".repeat(64));
+    assert!(load_signed_isolation_authority(&profile, &path, &mismatched.to_string()).is_err());
   }
 
   #[cfg(unix)]
@@ -2659,14 +2910,14 @@ mod tests {
     fs::set_permissions(&cwd, fs::Permissions::from_mode(0o555)).expect("protect workspace");
     let attestation_path = temp.path().join("isolation-attestation.json");
     let key = signing_key();
-    let verifier_public_key_path = temp.path().join("isolation-verifier-public-key");
+    let trust_bundle_path = temp.path().join("isolation-trust-bundle.json");
     fs::write(
-      &verifier_public_key_path,
-      lowercase_hex(key.public_key().as_ref()),
+      &trust_bundle_path,
+      isolation_trust_bundle(&[(&key, 1, None)]),
     )
-    .expect("write verifier public key");
-    fs::set_permissions(&verifier_public_key_path, fs::Permissions::from_mode(0o444))
-      .expect("protect verifier public key");
+    .expect("write trust bundle");
+    fs::set_permissions(&trust_bundle_path, fs::Permissions::from_mode(0o444))
+      .expect("protect trust bundle");
     let mut config = ScheduledCodexConfig {
       codex_program: codex_program.clone(),
       codex_program_sha256: sha256_file(&codex_program).expect("program digest"),
@@ -2680,10 +2931,13 @@ mod tests {
       permission_policy_revision: "github-issues-read-v1".to_owned(),
       config_revision: "scheduled-codex-v1".to_owned(),
       config_sha256: String::new(),
-      runtime_image_digest: format!("sha256:{}", "e".repeat(64)),
+      gateway_image_digest: format!("sha256:{}", "e".repeat(64)),
+      runner_image_digest: format!("sha256:{}", "f".repeat(64)),
+      runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
+      runner_client_cert_public_key_fingerprint: "1".repeat(64),
+      credential_revision: "github-readonly-2026-07".to_owned(),
       isolation_attestation_path: attestation_path.clone(),
-      isolation_verifier_public_key: String::new(),
-      isolation_verifier_public_key_path: verifier_public_key_path,
+      isolation_trust_bundle_path: trust_bundle_path,
       trusted_owner_uid: fs::metadata(&codex_program)
         .expect("program metadata")
         .uid(),
@@ -2709,17 +2963,39 @@ mod tests {
     let authority = load_signed_isolation_authority_contents(
       &requested,
       &artifacts.attestation_contents,
-      &artifacts.verifier_public_key_contents,
+      &artifacts.trust_bundle_contents,
     )
     .expect("signed authority");
     assert_eq!(authority.deployment_epoch, 1);
+
+    for mutation in ["gateway_image", "runner_image", "credential_revision"] {
+      let mut replayed = requested.clone();
+      match mutation {
+        "gateway_image" => replayed.gateway_image_digest = format!("sha256:{}", "a".repeat(64)),
+        "runner_image" => replayed.runner_image_digest = format!("sha256:{}", "b".repeat(64)),
+        "credential_revision" => {
+          replayed.credential_revision = "github-readonly-rotated".to_owned();
+        }
+        _ => unreachable!(),
+      }
+      let failure = load_signed_isolation_authority_contents(
+        &replayed,
+        &artifacts.attestation_contents,
+        &artifacts.trust_bundle_contents,
+      )
+      .expect_err("attestation replay against changed deployment identity must fail");
+      assert_eq!(
+        failure.message,
+        "scheduled_isolation_profile_binding_mismatch"
+      );
+    }
   }
 
   #[test]
   fn signed_isolation_attestation_rejects_bad_signature_and_legacy_or_unknown_shapes() {
     let profile = profile();
     let key = signing_key();
-    let public_key = lowercase_hex(key.public_key().as_ref());
+    let trust_bundle = isolation_trust_bundle(&[(&key, 1, None)]);
     let temp = TempDir::new().expect("tempdir");
 
     let path = write_signed_attestation(&temp, &key, &isolation_payload(&profile));
@@ -2728,17 +3004,17 @@ mod tests {
         .expect("parse attestation");
     bad_signature["signature"] = json!("00".repeat(64));
     fs::write(&path, bad_signature.to_string()).expect("write bad signature");
-    assert!(load_signed_isolation_authority(&profile, &path, &public_key).is_err());
+    assert!(load_signed_isolation_authority(&profile, &path, &trust_bundle).is_err());
 
     let mut legacy = isolation_payload(&profile);
     legacy["schema_version"] = json!(0);
     let path = write_signed_attestation(&temp, &key, &legacy);
-    assert!(load_signed_isolation_authority(&profile, &path, &public_key).is_err());
+    assert!(load_signed_isolation_authority(&profile, &path, &trust_bundle).is_err());
 
     let mut unknown = isolation_payload(&profile);
     unknown["unexpected"] = json!(true);
     let path = write_signed_attestation(&temp, &key, &unknown);
-    assert!(load_signed_isolation_authority(&profile, &path, &public_key).is_err());
+    assert!(load_signed_isolation_authority(&profile, &path, &trust_bundle).is_err());
   }
 
   #[test]
@@ -3039,7 +3315,7 @@ mod tests {
         "version" => runtime.codex_version = "0.145.0".to_owned(),
         "schema" => runtime.app_server_schema_sha256 = "b".repeat(64),
         "executable" => runtime.codex_program_sha256 = "c".repeat(64),
-        "image" => runtime.runtime_image_digest = format!("sha256:{}", "d".repeat(64)),
+        "image" => runtime.runner_image_digest = format!("sha256:{}", "d".repeat(64)),
         _ => unreachable!(),
       }
       let actions = Arc::new(Mutex::new(Actions::default()));

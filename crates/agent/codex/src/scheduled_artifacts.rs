@@ -14,7 +14,7 @@ use crate::scheduled::RequestedCapabilityProfile;
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_ATTESTATION_BYTES: u64 = 64 * 1024;
-const MAX_VERIFIER_PUBLIC_KEY_BYTES: u64 = 64;
+const MAX_TRUST_BUNDLE_BYTES: u64 = 64 * 1024;
 
 pub(super) struct VerifiedScheduledArtifacts {
   pub program: File,
@@ -38,10 +38,10 @@ pub(super) struct VerifiedScheduledArtifacts {
   pub attestation_contents: String,
   #[allow(
     dead_code,
-    reason = "retains the verified public key inode for the executor lifetime"
+    reason = "retains the verified trust bundle inode for the executor lifetime"
   )]
-  verifier_public_key: Option<File>,
-  pub verifier_public_key_contents: String,
+  trust_bundle: File,
+  pub trust_bundle_contents: String,
 }
 
 #[derive(Clone, Copy)]
@@ -81,43 +81,17 @@ pub(super) fn read_verified_scheduled_authority_material(
     MAX_ATTESTATION_BYTES,
     "scheduled_isolation_attestation",
   )?;
-  let verifier_public_key = read_verifier_public_key(config, policy)?;
-  Ok((attestation_contents, verifier_public_key.contents))
-}
-
-struct VerifiedPublicKey {
-  file: Option<File>,
-  contents: String,
-}
-
-fn read_verifier_public_key(
-  config: &ScheduledCodexConfig,
-  policy: ArtifactTrustPolicy,
-) -> Result<VerifiedPublicKey, String> {
-  if config
-    .isolation_verifier_public_key_path
-    .as_os_str()
-    .is_empty()
-  {
-    return Ok(VerifiedPublicKey {
-      file: None,
-      contents: config.isolation_verifier_public_key.clone(),
-    });
-  }
-  let file = open_verified(
-    &config.isolation_verifier_public_key_path,
+  let trust_bundle = open_verified(
+    &config.isolation_trust_bundle_path,
     ArtifactKind::ReadOnlyFile,
     policy,
   )?;
-  let contents = read_utf8(
-    &file,
-    MAX_VERIFIER_PUBLIC_KEY_BYTES,
-    "scheduled_isolation_verifier_public_key",
+  let trust_bundle_contents = read_utf8(
+    &trust_bundle,
+    MAX_TRUST_BUNDLE_BYTES,
+    "scheduled_isolation_trust_bundle",
   )?;
-  Ok(VerifiedPublicKey {
-    file: Some(file),
-    contents,
-  })
+  Ok((attestation_contents, trust_bundle_contents))
 }
 
 fn observed_trust_policy(config: &ScheduledCodexConfig) -> Result<ArtifactTrustPolicy, String> {
@@ -213,7 +187,16 @@ fn verify_scheduled_artifacts_with_policy(
     MAX_ATTESTATION_BYTES,
     "scheduled_isolation_attestation",
   )?;
-  let verifier_public_key = read_verifier_public_key(config, policy)?;
+  let trust_bundle = open_verified(
+    &config.isolation_trust_bundle_path,
+    ArtifactKind::ReadOnlyFile,
+    policy,
+  )?;
+  let trust_bundle_contents = read_utf8(
+    &trust_bundle,
+    MAX_TRUST_BUNDLE_BYTES,
+    "scheduled_isolation_trust_bundle",
+  )?;
   Ok(VerifiedScheduledArtifacts {
     program,
     codex_home,
@@ -222,8 +205,8 @@ fn verify_scheduled_artifacts_with_policy(
     github_mcp_artifact,
     attestation,
     attestation_contents,
-    verifier_public_key: verifier_public_key.file,
-    verifier_public_key_contents: verifier_public_key.contents,
+    trust_bundle,
+    trust_bundle_contents,
   })
 }
 
@@ -245,6 +228,7 @@ pub(super) fn test_artifacts(
   let program = File::open(program).expect("test program");
   let codex_home = File::open(codex_home).expect("test CODEX_HOME");
   let cwd = File::open(cwd).expect("test cwd");
+  let trust_bundle = program.try_clone().expect("test trust bundle placeholder");
   VerifiedScheduledArtifacts {
     config: codex_home.try_clone().expect("test config placeholder"),
     github_mcp_artifact: program.try_clone().expect("test MCP placeholder"),
@@ -253,8 +237,8 @@ pub(super) fn test_artifacts(
     codex_home,
     cwd,
     attestation_contents: String::new(),
-    verifier_public_key: None,
-    verifier_public_key_contents: String::new(),
+    trust_bundle,
+    trust_bundle_contents: String::new(),
   }
 }
 

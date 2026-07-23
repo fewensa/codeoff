@@ -2,7 +2,7 @@ use std::fmt::{self, Write as _};
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
-use codeoff_core::SchedulerOperationalPolicy;
+use codeoff_core::{AttestedCapabilityProfile, SchedulerOperationalPolicy};
 use croner::parser::CronParser;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1815,107 +1815,25 @@ impl ScheduledPrepareAuthority {
 }
 
 fn validate_recovery_capability_profile(canonical_json: &str) -> Result<Value, StateValueError> {
-  validate_canonical_json("scheduled recovery capability profile", canonical_json)?;
-  let value = serde_json::from_str(canonical_json).map_err(|_| StateValueError::InvalidJson {
-    field: "scheduled recovery capability profile",
+  AttestedCapabilityProfile::parse_canonical_json(canonical_json).map_err(|_| {
+    StateValueError::InvalidJson {
+      field: "scheduled recovery capability profile",
+    }
   })?;
-  validate_recovery_capability_profile_value(&value)?;
-  Ok(value)
+  serde_json::from_str(canonical_json).map_err(|_| StateValueError::InvalidJson {
+    field: "scheduled recovery capability profile",
+  })
 }
 
 fn validate_recovery_capability_profile_value(value: &Value) -> Result<(), StateValueError> {
-  const EXPECTED_GITHUB_TOOLS: [&str; 4] =
-    ["issue_read", "list_issues", "search_issues", "search_orgs"];
-  const REQUIRED_TEXT: [&str; 15] = [
-    "app_server_schema_sha256",
-    "codex_program_sha256",
-    "codex_version",
-    "config_revision",
-    "config_sha256",
-    "credential_deny_policy_revision",
-    "credential_isolation_revision",
-    "credential_reference",
-    "github_mcp_artifact_sha256",
-    "github_mcp_endpoint_identity",
-    "github_mcp_version",
-    "negative_test_revision",
-    "output_schema_revision",
-    "permission_policy_revision",
-    "profile_sha256",
-  ];
-  let object = value.as_object().ok_or(StateValueError::InvalidJson {
+  let canonical = serde_json::to_string(value).map_err(|_| StateValueError::InvalidJson {
     field: "scheduled recovery capability profile",
   })?;
-  if object.len() != REQUIRED_TEXT.len() + 2
-    || REQUIRED_TEXT.iter().any(|field| {
-      object
-        .get(*field)
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
+  AttestedCapabilityProfile::parse_canonical_json(&canonical)
+    .map(|_| ())
+    .map_err(|_| StateValueError::InvalidJson {
+      field: "scheduled recovery capability profile",
     })
-    || object
-      .get("attested_at_unix_seconds")
-      .and_then(Value::as_u64)
-      .is_none()
-  {
-    return Err(StateValueError::InvalidJson {
-      field: "scheduled recovery capability profile",
-    });
-  }
-  let Some(tools) = object.get("github_tools").and_then(Value::as_array) else {
-    return Err(StateValueError::InvalidJson {
-      field: "scheduled recovery capability profile",
-    });
-  };
-  if tools.len() != EXPECTED_GITHUB_TOOLS.len()
-    || tools
-      .iter()
-      .zip(EXPECTED_GITHUB_TOOLS)
-      .any(|(actual, expected)| actual.as_str() != Some(expected))
-  {
-    return Err(StateValueError::InvalidJson {
-      field: "scheduled recovery capability profile",
-    });
-  }
-  for field in [
-    "app_server_schema_sha256",
-    "codex_program_sha256",
-    "config_sha256",
-    "github_mcp_artifact_sha256",
-    "profile_sha256",
-  ] {
-    validate_lowercase_sha256(
-      "scheduled recovery capability profile digest",
-      object[field]
-        .as_str()
-        .expect("required string checked above"),
-    )?;
-  }
-  let canonical_profile = json!({
-    "app_server_schema_sha256": object["app_server_schema_sha256"],
-    "codex_program_sha256": object["codex_program_sha256"],
-    "codex_version": object["codex_version"],
-    "config_revision": object["config_revision"],
-    "config_sha256": object["config_sha256"],
-    "credential_deny_policy_revision": object["credential_deny_policy_revision"],
-    "credential_isolation_revision": object["credential_isolation_revision"],
-    "credential_reference": object["credential_reference"],
-    "github_mcp_artifact_sha256": object["github_mcp_artifact_sha256"],
-    "github_mcp_endpoint_identity": object["github_mcp_endpoint_identity"],
-    "github_mcp_version": object["github_mcp_version"],
-    "github_tools": object["github_tools"],
-    "negative_test_revision": object["negative_test_revision"],
-    "output_schema_revision": object["output_schema_revision"],
-    "permission_policy_revision": object["permission_policy_revision"],
-  });
-  if object["profile_sha256"].as_str()
-    != Some(&sha256_hex(canonical_profile.to_string().as_bytes()))
-  {
-    return Err(StateValueError::InvalidSha256 {
-      field: "scheduled recovery capability profile digest",
-    });
-  }
-  Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

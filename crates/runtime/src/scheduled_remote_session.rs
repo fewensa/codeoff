@@ -475,6 +475,8 @@ mod tests {
     AdmissionFrame, CancelFrame, ErrorFrame, HeartbeatFrame, PrepareFrame, PreparedFrame,
     REMOTE_PROTOCOL_VERSION, ReadyFrame, RemoteMessage, RemoteResultKind, ResultFrame, StartFrame,
   };
+  use codeoff_core::AttestedCapabilityProfile;
+  use std::collections::BTreeSet;
 
   const NOW: u64 = 1_000_000;
 
@@ -509,44 +511,35 @@ mod tests {
   }
 
   fn capability_profile_json() -> String {
-    let canonical = serde_json::json!({
-      "app_server_schema_sha256": "1".repeat(64),
-      "codex_program_sha256": "2".repeat(64),
-      "codex_version": "test-codex",
-      "config_revision": "test-config-v1",
-      "config_sha256": "3".repeat(64),
-      "credential_deny_policy_revision": "test-deny-v1",
-      "credential_isolation_revision": "test-isolation-v1",
-      "credential_reference": "test-read-only-credential",
-      "github_mcp_artifact_sha256": "4".repeat(64),
-      "github_mcp_endpoint_identity": "test-github-mcp",
-      "github_mcp_version": "test-mcp",
-      "github_tools": ["issue_read", "list_issues", "search_issues", "search_orgs"],
-      "negative_test_revision": "test-negative-v1",
-      "output_schema_revision": "test-output-v1",
-      "permission_policy_revision": "test-read-only-v1",
-    });
-    let profile_sha256 = hex_sha256(canonical.to_string().as_bytes());
-    serde_json::json!({
-      "app_server_schema_sha256": "1".repeat(64),
-      "attested_at_unix_seconds": 100,
-      "codex_program_sha256": "2".repeat(64),
-      "codex_version": "test-codex",
-      "config_revision": "test-config-v1",
-      "config_sha256": "3".repeat(64),
-      "credential_deny_policy_revision": "test-deny-v1",
-      "credential_isolation_revision": "test-isolation-v1",
-      "credential_reference": "test-read-only-credential",
-      "github_mcp_artifact_sha256": "4".repeat(64),
-      "github_mcp_endpoint_identity": "test-github-mcp",
-      "github_mcp_version": "test-mcp",
-      "github_tools": ["issue_read", "list_issues", "search_issues", "search_orgs"],
-      "negative_test_revision": "test-negative-v1",
-      "output_schema_revision": "test-output-v1",
-      "permission_policy_revision": "test-read-only-v1",
-      "profile_sha256": profile_sha256,
-    })
-    .to_string()
+    let mut profile = AttestedCapabilityProfile {
+      codex_version: "test-codex".to_owned(),
+      app_server_schema_sha256: "1".repeat(64),
+      codex_program_sha256: "2".repeat(64),
+      github_mcp_version: "test-mcp".to_owned(),
+      github_mcp_artifact_sha256: "4".repeat(64),
+      github_mcp_endpoint_identity: "test-github-mcp".to_owned(),
+      github_tools: ["issue_read", "list_issues", "search_issues", "search_orgs"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>(),
+      credential_reference: "test-read-only-credential".to_owned(),
+      permission_policy_revision: "test-read-only-v1".to_owned(),
+      config_revision: "test-config-v1".to_owned(),
+      config_sha256: "3".repeat(64),
+      gateway_image_digest: format!("sha256:{}", "5".repeat(64)),
+      runner_image_digest: format!("sha256:{}", "6".repeat(64)),
+      runner_workload_identity: "spiffe://codeoff/runner/test".to_owned(),
+      runner_client_cert_public_key_fingerprint: "7".repeat(64),
+      credential_revision: "credential-v1".to_owned(),
+      credential_isolation_revision: "test-isolation-v1".to_owned(),
+      credential_deny_policy_revision: "test-deny-v1".to_owned(),
+      negative_test_revision: "test-negative-v1".to_owned(),
+      output_schema_revision: "test-output-v1".to_owned(),
+      attested_at_unix_seconds: 100,
+      profile_sha256: String::new(),
+    };
+    profile.profile_sha256 = profile.computed_profile_sha256();
+    profile.canonical_json()
   }
 
   fn profile_digest() -> String {

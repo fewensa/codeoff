@@ -24,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use codeoff_agent_contract::{AgentTask, InvocationSource, SessionMode, ToolPolicy};
 use codeoff_config::{CredentialRevision, RunnerWorkloadIdentity, ScheduledCodexConfig};
+use codeoff_core::AttestedCapabilityProfile;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -458,64 +459,6 @@ impl ScheduledIsolationPermit {
 pub struct ScheduledFinalOutput {
   pub schema_version: u64,
   pub summary: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttestedCapabilityProfile {
-  pub codex_version: String,
-  pub app_server_schema_sha256: String,
-  pub codex_program_sha256: String,
-  pub github_mcp_version: String,
-  pub github_mcp_artifact_sha256: String,
-  pub github_mcp_endpoint_identity: String,
-  pub github_tools: BTreeSet<String>,
-  pub credential_reference: String,
-  pub permission_policy_revision: String,
-  pub config_revision: String,
-  pub config_sha256: String,
-  pub gateway_image_digest: String,
-  pub runner_image_digest: String,
-  pub runner_workload_identity: String,
-  pub runner_client_cert_public_key_fingerprint: String,
-  pub credential_revision: String,
-  pub credential_isolation_revision: String,
-  pub credential_deny_policy_revision: String,
-  pub negative_test_revision: String,
-  pub output_schema_revision: String,
-  pub attested_at_unix_seconds: u64,
-  pub profile_sha256: String,
-}
-
-impl AttestedCapabilityProfile {
-  #[must_use]
-  pub fn canonical_json(&self) -> String {
-    let tools: Vec<_> = self.github_tools.iter().collect();
-    json!({
-      "app_server_schema_sha256": self.app_server_schema_sha256,
-      "attested_at_unix_seconds": self.attested_at_unix_seconds,
-      "codex_program_sha256": self.codex_program_sha256,
-      "codex_version": self.codex_version,
-      "config_revision": self.config_revision,
-      "config_sha256": self.config_sha256,
-      "credential_deny_policy_revision": self.credential_deny_policy_revision,
-      "credential_isolation_revision": self.credential_isolation_revision,
-      "credential_reference": self.credential_reference,
-      "github_mcp_artifact_sha256": self.github_mcp_artifact_sha256,
-      "github_mcp_endpoint_identity": self.github_mcp_endpoint_identity,
-      "github_mcp_version": self.github_mcp_version,
-      "github_tools": tools,
-      "negative_test_revision": self.negative_test_revision,
-      "output_schema_revision": self.output_schema_revision,
-      "permission_policy_revision": self.permission_policy_revision,
-      "gateway_image_digest": self.gateway_image_digest,
-      "runner_image_digest": self.runner_image_digest,
-      "runner_workload_identity": self.runner_workload_identity,
-      "runner_client_cert_public_key_fingerprint": self.runner_client_cert_public_key_fingerprint,
-      "credential_revision": self.credential_revision,
-      "profile_sha256": self.profile_sha256,
-    })
-    .to_string()
-  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1470,7 +1413,7 @@ fn prepare_protocol<T: ScheduledJsonlTransport + Send + 'static>(
       ScheduledExecutionResult::PreflightRejected(failure),
     );
   }
-  attested_profile.profile_sha256 = profile_sha256(&attested_profile);
+  attested_profile.profile_sha256 = attested_profile.computed_profile_sha256();
   Ok(Box::new(PreparedCodexExecution {
     transport,
     request,
@@ -2007,33 +1950,6 @@ fn parse_usage(turn: &Value) -> ScheduledUsage {
       .as_u64()
       .or_else(|| usage["output_tokens"].as_u64()),
   }
-}
-
-fn profile_sha256(profile: &AttestedCapabilityProfile) -> String {
-  let tools: Vec<_> = profile.github_tools.iter().collect();
-  let canonical = json!({
-    "app_server_schema_sha256": profile.app_server_schema_sha256,
-    "codex_program_sha256": profile.codex_program_sha256,
-    "codex_version": profile.codex_version,
-    "config_revision": profile.config_revision,
-    "config_sha256": profile.config_sha256,
-    "credential_deny_policy_revision": profile.credential_deny_policy_revision,
-    "credential_isolation_revision": profile.credential_isolation_revision,
-    "credential_reference": profile.credential_reference,
-    "github_mcp_artifact_sha256": profile.github_mcp_artifact_sha256,
-    "github_mcp_endpoint_identity": profile.github_mcp_endpoint_identity,
-    "github_mcp_version": profile.github_mcp_version,
-    "github_tools": tools,
-    "negative_test_revision": profile.negative_test_revision,
-    "output_schema_revision": profile.output_schema_revision,
-    "permission_policy_revision": profile.permission_policy_revision,
-    "gateway_image_digest": profile.gateway_image_digest,
-    "runner_image_digest": profile.runner_image_digest,
-    "runner_workload_identity": profile.runner_workload_identity,
-    "runner_client_cert_public_key_fingerprint": profile.runner_client_cert_public_key_fingerprint,
-    "credential_revision": profile.credential_revision,
-  });
-  sha256_hex(canonical.to_string().as_bytes())
 }
 
 #[cfg(test)]
@@ -2976,6 +2892,29 @@ mod tests {
         kind: ScheduledFailureKind::CredentialIsolationUnproven,
         ..
       })
+    ));
+  }
+
+  #[test]
+  fn production_profile_round_trips_remote_v3_recovery_contract() {
+    let requested = profile();
+    let scheduled_request = request(requested.clone());
+    let permit = issue_test_isolation_permit(&scheduled_request);
+    let mut observed = attest_runtime(&requested, &evidence(&requested), permit)
+      .expect("production attested profile");
+    observed.profile_sha256 = observed.computed_profile_sha256();
+    observed.validate().expect("canonical profile");
+    let authority =
+      codeoff_state::ScheduledPrepareAuthority::for_remote_session_test("run-1", "job-1", 1, 1);
+    let deployment_digest = "9".repeat(64);
+    let recovery = authority
+      .remote_recovery_attestation_json(&observed.canonical_json(), &deployment_digest, 1)
+      .expect("remote v3 recovery");
+    assert!(authority.remote_recovery_attestation_matches(
+      &recovery,
+      &sha256_hex(recovery.as_bytes()),
+      &deployment_digest,
+      1,
     ));
   }
 

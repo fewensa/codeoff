@@ -50,9 +50,9 @@ pub const CODEX_APP_SERVER_SCHEMA_SHA256: &str =
   "2bc9867446f03c818018ee33c249f4d1da22c3e19a68d606b0e435faba04f1d1";
 pub const GITHUB_MCP_SERVER_VERSION: &str = "1.6.0";
 pub const GITHUB_MCP_ARTIFACT_SHA256_X86_64: &str =
-  "27443d173f209e60d4af9777e624bfea3de1af24897d46cc7324f01cf279a41d";
+  "955fff9cf50ae99ee021871a4782c36360252d82fd03c8307fd7394c44ba3886";
 pub const GITHUB_MCP_ARTIFACT_SHA256_ARM64: &str =
-  "25f8028304202674ec2e9977fec3ca0897cac33866dabb51aefd418bc0ce7ef2";
+  "5d47f9e36850769db8a46c97a7ad1e7a1bd51502c57765a81e697f5740455227";
 
 const GITHUB_MCP_NAME: &str = "github";
 const GITHUB_MCP_SERVER_INFO_NAME: &str = "github-mcp-server";
@@ -162,12 +162,7 @@ impl RequestedCapabilityProfile {
       "github_mcp_artifact_sha256",
       &self.github_mcp_artifact_sha256,
     )?;
-    if !cfg!(test)
-      && !matches!(
-        self.github_mcp_artifact_sha256.as_str(),
-        GITHUB_MCP_ARTIFACT_SHA256_X86_64 | GITHUB_MCP_ARTIFACT_SHA256_ARM64
-      )
-    {
+    if !cfg!(test) && !is_pinned_github_mcp_artifact(&self.github_mcp_artifact_sha256) {
       return Err(preflight("github_mcp_artifact_digest_not_pinned_v1_6_0"));
     }
     let actual_config_hash = sha256_hex(self.dedicated_config().as_bytes());
@@ -176,6 +171,13 @@ impl RequestedCapabilityProfile {
     }
     Ok(())
   }
+}
+
+fn is_pinned_github_mcp_artifact(digest: &str) -> bool {
+  matches!(
+    digest,
+    GITHUB_MCP_ARTIFACT_SHA256_X86_64 | GITHUB_MCP_ARTIFACT_SHA256_ARM64
+  )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2983,6 +2985,22 @@ mod tests {
     assert!(!config.contains("slack"));
     for tool in EXPECTED_GITHUB_TOOLS {
       assert!(config.contains(tool));
+    }
+  }
+
+  #[test]
+  fn github_mcp_runtime_pins_installed_binaries_not_release_archives() {
+    assert!(is_pinned_github_mcp_artifact(
+      GITHUB_MCP_ARTIFACT_SHA256_X86_64
+    ));
+    assert!(is_pinned_github_mcp_artifact(
+      GITHUB_MCP_ARTIFACT_SHA256_ARM64
+    ));
+    for archive_digest in [
+      "27443d173f209e60d4af9777e624bfea3de1af24897d46cc7324f01cf279a41d",
+      "25f8028304202674ec2e9977fec3ca0897cac33866dabb51aefd418bc0ce7ef2",
+    ] {
+      assert!(!is_pinned_github_mcp_artifact(archive_digest));
     }
   }
 

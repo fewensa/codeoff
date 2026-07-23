@@ -19,6 +19,7 @@ FROM node:22-${DEBIAN_VERSION}-slim AS runtime
 
 ARG CODEX_VERSION=0.144.6
 ARG CODEX_SCHEMA_SHA256=2bc9867446f03c818018ee33c249f4d1da22c3e19a68d606b0e435faba04f1d1
+ARG CODEX_PROGRAM_SHA256=134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477
 ARG GITHUB_MCP_VERSION=1.6.0
 ARG TARGETARCH
 
@@ -74,6 +75,7 @@ RUN apt-get update \
   && test "${CODEX_VERSION}" = "0.144.6" \
   && npm install -g "@openai/codex@${CODEX_VERSION}" \
   && test "$(codex --version)" = "codex-cli ${CODEX_VERSION}" \
+  && test "$(sha256sum /usr/local/lib/node_modules/@openai/codex/bin/codex.js | cut -d' ' -f1)" = "${CODEX_PROGRAM_SHA256}" \
   && codex_schema_dir="$(mktemp -d /tmp/codex-schema.XXXXXX)" \
   && codex app-server generate-json-schema --out "${codex_schema_dir}" \
   && actual_schema_sha256="$(python3 /usr/local/libexec/codeoff/codex-schema-hash.py "${codex_schema_dir}")" \
@@ -92,14 +94,15 @@ RUN apt-get update \
 RUN set -eux; \
   test "${GITHUB_MCP_VERSION}" = "1.6.0"; \
   case "${TARGETARCH:-amd64}" in \
-    amd64) github_mcp_arch=x86_64; github_mcp_sha256=27443d173f209e60d4af9777e624bfea3de1af24897d46cc7324f01cf279a41d ;; \
-    arm64) github_mcp_arch=arm64; github_mcp_sha256=25f8028304202674ec2e9977fec3ca0897cac33866dabb51aefd418bc0ce7ef2 ;; \
+    amd64) github_mcp_arch=x86_64; github_mcp_archive_sha256=27443d173f209e60d4af9777e624bfea3de1af24897d46cc7324f01cf279a41d; github_mcp_binary_sha256=955fff9cf50ae99ee021871a4782c36360252d82fd03c8307fd7394c44ba3886 ;; \
+    arm64) github_mcp_arch=arm64; github_mcp_archive_sha256=25f8028304202674ec2e9977fec3ca0897cac33866dabb51aefd418bc0ce7ef2; github_mcp_binary_sha256=5d47f9e36850769db8a46c97a7ad1e7a1bd51502c57765a81e697f5740455227 ;; \
     *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
   esac; \
   github_mcp_archive=/tmp/github-mcp-server.tar.gz; \
   curl -fsSLo "${github_mcp_archive}" "https://github.com/github/github-mcp-server/releases/download/v${GITHUB_MCP_VERSION}/github-mcp-server_Linux_${github_mcp_arch}.tar.gz"; \
-  printf '%s  %s\n' "${github_mcp_sha256}" "${github_mcp_archive}" | sha256sum -c -; \
+  printf '%s  %s\n' "${github_mcp_archive_sha256}" "${github_mcp_archive}" | sha256sum -c -; \
   tar -xzf "${github_mcp_archive}" -C /tmp github-mcp-server; \
+  test "$(sha256sum /tmp/github-mcp-server | cut -d' ' -f1)" = "${github_mcp_binary_sha256}"; \
   install -m 0755 /tmp/github-mcp-server /usr/local/bin/github-mcp-server; \
   test "$(github-mcp-server --version | sed -n '2s/^Version: //p')" = "${GITHUB_MCP_VERSION}"; \
   github_mcp_inventory="$( \
@@ -153,6 +156,10 @@ RUN set -eux; \
 
 RUN groupadd --system codeoff \
   && useradd --system --gid codeoff --home-dir /var/lib/codeoff --create-home codeoff \
+  && install -d -o root -g root -m 0555 \
+    /opt/codeoff/attestation \
+    /opt/codeoff/scheduled-codex \
+    /opt/codeoff/scheduled-workspace \
   && mkdir -p /etc/codeoff /var/lib/codeoff /var/lib/codex \
   && chown -R codeoff:codeoff /etc/codeoff /var/lib/codeoff /var/lib/codex
 

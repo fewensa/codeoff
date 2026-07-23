@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use codeoff_agent_contract::{InvocationPrincipalRef, InvocationSource, SessionMode, ToolPolicy};
 use codeoff_core::CredentialRevision;
 use codeoff_state::{ScheduledExecutorAdmission, ScheduledPrepareAuthority};
 use rustls::crypto::CryptoProvider;
@@ -403,6 +404,7 @@ impl RegisteredRunnerSession {
   ) -> Result<PreparedFrame, ScheduledRunnerBrokerError> {
     let reservation = self.reservation(unix_millis()?)?;
     let binding = remote_binding(input, &self.ready)?;
+    let task_json = remote_task_json(input, &binding)?;
     let admission = RemoteFrame {
       version: REMOTE_PROTOCOL_VERSION,
       session_nonce: self.session_nonce.clone(),
@@ -422,6 +424,7 @@ impl RegisteredRunnerSession {
       message: RemoteMessage::Prepare(PrepareFrame {
         binding,
         isolation_permit_envelope_json,
+        task_json,
         definition_json: input.definition_json.clone(),
         capability_json: input.capability_json.clone(),
         targets_json: input.targets_json.clone(),
@@ -886,6 +889,51 @@ fn remote_binding(
     deployment_epoch: ready.deployment_epoch,
     credential_revision: ready.credential_revision.clone(),
   })
+}
+
+fn remote_task_json(
+  input: &PrepareInput,
+  binding: &RunBinding,
+) -> Result<String, ScheduledRunnerBrokerError> {
+  let InvocationSource::ScheduledRun {
+    job_id,
+    run_id,
+    scheduled_for,
+  } = &input.task.source
+  else {
+    return Err(ScheduledRunnerBrokerError::ProtocolRejected);
+  };
+  if job_id != &binding.job_id
+    || run_id != &binding.run_id
+    || !matches!(input.task.session, SessionMode::Fresh)
+    || input.task.channel.is_some()
+    || input.task.feedback_target.is_some()
+    || !matches!(input.task.tool_policy, ToolPolicy::None)
+    || !matches!(
+      input.task.principal.as_ref(),
+      InvocationPrincipalRef::Service {
+        service: "codeoff-scheduler"
+      }
+    )
+  {
+    return Err(ScheduledRunnerBrokerError::ProtocolRejected);
+  }
+  let previous_success = input.task.previous_success.as_ref().map(|context| {
+    serde_json::json!({
+      "content": context.content,
+      "was_truncated": context.was_truncated,
+    })
+  });
+  Ok(
+    serde_json::json!({
+      "instruction": input.task.instruction,
+      "previous_success": previous_success,
+      "scheduled_for": scheduled_for,
+      "schema_version": 1,
+      "task_id": input.task.task_id,
+    })
+    .to_string(),
+  )
 }
 
 fn remote_execution_result(result: ResultFrame) -> ExecutionResult {

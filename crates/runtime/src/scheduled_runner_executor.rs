@@ -4,8 +4,13 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use codeoff_agent_contract::{
+  AgentTask, InvocationPrincipal, InvocationSource, PreviousSuccessContext, SessionMode, ToolPolicy,
+};
+use serde_json::{Map, Value};
 use tokio::net::{UnixStream, unix::UCred};
 
+use crate::scheduled_remote_protocol::RunBinding;
 use crate::scheduled_runner_control::{ScheduledRunnerControlError, require_cloexec};
 use crate::scheduled_runner_tls::ScheduledRunnerFramed;
 
@@ -38,8 +43,100 @@ pub enum ScheduledRunnerExecutorError {
   ConnectTimeout,
   ControlCredentialUnavailable,
   ControlCredentialMismatch,
+  InvalidTask,
   ControlChannel(ScheduledRunnerControlError),
   Io(std::io::Error),
+}
+
+pub fn decode_scheduled_remote_task(
+  encoded: &str,
+  binding: &RunBinding,
+) -> Result<AgentTask, ScheduledRunnerExecutorError> {
+  let value: Value =
+    serde_json::from_str(encoded).map_err(|_| ScheduledRunnerExecutorError::InvalidTask)?;
+  if serde_json::to_string(&value).ok().as_deref() != Some(encoded) {
+    return Err(ScheduledRunnerExecutorError::InvalidTask);
+  }
+  let object = exact_object(
+    &value,
+    &[
+      "instruction",
+      "previous_success",
+      "scheduled_for",
+      "schema_version",
+      "task_id",
+    ],
+  )?;
+  if object.get("schema_version").and_then(Value::as_u64) != Some(1) {
+    return Err(ScheduledRunnerExecutorError::InvalidTask);
+  }
+  let string = |field: &str| {
+    object
+      .get(field)
+      .and_then(Value::as_str)
+      .filter(|value| !value.is_empty() && *value == value.trim())
+      .map(str::to_owned)
+      .ok_or(ScheduledRunnerExecutorError::InvalidTask)
+  };
+  let task_id = string("task_id")?;
+  if task_id
+    != format!(
+      "scheduled:{}:{}:{}",
+      binding.run_id, binding.attempt, binding.fence_token
+    )
+  {
+    return Err(ScheduledRunnerExecutorError::InvalidTask);
+  }
+  let previous_success = match object.get("previous_success") {
+    Some(Value::Null) => None,
+    Some(value) => {
+      let previous = exact_object(value, &["content", "was_truncated"])?;
+      Some(PreviousSuccessContext {
+        content: previous
+          .get("content")
+          .and_then(Value::as_str)
+          .map(str::to_owned)
+          .ok_or(ScheduledRunnerExecutorError::InvalidTask)?,
+        was_truncated: previous
+          .get("was_truncated")
+          .and_then(Value::as_bool)
+          .ok_or(ScheduledRunnerExecutorError::InvalidTask)?,
+      })
+    }
+    None => return Err(ScheduledRunnerExecutorError::InvalidTask),
+  };
+  let task = AgentTask {
+    task_id,
+    instruction: string("instruction")?,
+    source: InvocationSource::ScheduledRun {
+      job_id: binding.job_id.clone(),
+      run_id: binding.run_id.clone(),
+      scheduled_for: string("scheduled_for")?,
+    },
+    principal: InvocationPrincipal::service("codeoff-scheduler"),
+    session: SessionMode::Fresh,
+    channel: None,
+    previous_success,
+    tool_policy: ToolPolicy::None,
+    feedback_target: None,
+  };
+  task
+    .validate()
+    .map_err(|_| ScheduledRunnerExecutorError::InvalidTask)?;
+  Ok(task)
+}
+
+fn exact_object<'a>(
+  value: &'a Value,
+  fields: &[&str],
+) -> Result<&'a Map<String, Value>, ScheduledRunnerExecutorError> {
+  let object = value
+    .as_object()
+    .ok_or(ScheduledRunnerExecutorError::InvalidTask)?;
+  if object.len() != fields.len() || fields.iter().any(|field| !object.contains_key(*field)) {
+    return Err(ScheduledRunnerExecutorError::InvalidTask);
+  }
+  Ok(object)
 }
 
 impl fmt::Display for ScheduledRunnerExecutorError {
@@ -133,6 +230,36 @@ mod tests {
       read_timeout: Duration::from_secs(2),
       write_timeout: Duration::from_secs(2),
     }
+  }
+
+  fn binding() -> RunBinding {
+    RunBinding {
+      run_id: "run-1".to_owned(),
+      job_id: "job-1".to_owned(),
+      attempt: 2,
+      fence_token: 3,
+      authority_digest: "a".repeat(64),
+      profile_digest: "b".repeat(64),
+      deployment_epoch: 4,
+      credential_revision: "credential-v1".to_owned(),
+    }
+  }
+
+  #[test]
+  fn scheduled_task_codec_is_canonical_and_exactly_binding_scoped() {
+    let encoded = r#"{"instruction":"check issues","previous_success":{"content":"prior","was_truncated":false},"scheduled_for":"2026-07-23T00:00:00Z","schema_version":1,"task_id":"scheduled:run-1:2:3"}"#;
+    let task = decode_scheduled_remote_task(encoded, &binding()).expect("scheduled task");
+    assert_eq!(task.instruction, "check issues");
+    assert_eq!(
+      task
+        .previous_success
+        .as_ref()
+        .map(|context| context.content.as_str()),
+      Some("prior")
+    );
+    assert!(decode_scheduled_remote_task(&format!(" {encoded}"), &binding()).is_err());
+    let wrong = encoded.replace("scheduled:run-1:2:3", "scheduled:run-1:2:4");
+    assert!(decode_scheduled_remote_task(&wrong, &binding()).is_err());
   }
 
   #[tokio::test]

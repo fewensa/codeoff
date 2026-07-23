@@ -596,6 +596,7 @@ mod tests {
     RemoteMessage::Prepare(PrepareFrame {
       binding,
       isolation_permit_envelope_json: r#"{"schema_version":1}"#.to_owned(),
+      task_json: r#"{"instruction":"check"}"#.to_owned(),
       definition_json: r#"{"prompt":"check"}"#.to_owned(),
       capability_json: r#"{"tools":["github"]}"#.to_owned(),
       targets_json: "[]".to_owned(),

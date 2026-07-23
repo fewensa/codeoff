@@ -6,6 +6,8 @@ mod scheduled_artifacts;
 mod scheduled_mcp;
 
 pub use codeoff_core::AttestedCapabilityProfile;
+#[cfg(unix)]
+pub use scheduled::enable_scheduled_executor_subreaper;
 pub use scheduled::{
   BuiltScheduledCodexExecutor, CODEX_APP_SERVER_SCHEMA_SHA256, CODEX_CLI_VERSION,
   GITHUB_MCP_ACCESS_TOKEN_ENV, GITHUB_MCP_ARTIFACT_SHA256_ARM64, GITHUB_MCP_ARTIFACT_SHA256_X86_64,

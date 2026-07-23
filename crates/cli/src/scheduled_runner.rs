@@ -9,7 +9,8 @@ use codeoff_agent_codex::ScheduledFailure;
 use codeoff_agent_codex::{
   GITHUB_MCP_ACCESS_TOKEN_ENV, RemoteIsolationPermitEnvelope, ScheduledCodexRequest,
   ScheduledExecutionIdentity, ScheduledExecutionResult, ScheduledFailureKind,
-  build_supervised_scheduled_codex_executor, load_trusted_owner_scheduled_deployment_authority,
+  build_supervised_scheduled_codex_executor, enable_scheduled_executor_subreaper,
+  load_trusted_owner_scheduled_deployment_authority,
 };
 use codeoff_config::{CodeoffConfig, ScheduledRunnerRole, SchedulerRuntimeConfig, SlackConfig};
 use codeoff_runtime::scheduled_execution::ScheduledExecutor;
@@ -363,6 +364,7 @@ pub(crate) fn run_executor(config: CodeoffConfig) -> Result<(), Box<dyn Error>> 
   {
     return Err(io::Error::other("scheduled runner executor process identity mismatch").into());
   }
+  enable_scheduled_executor_subreaper().map_err(io::Error::other)?;
   harden_scheduled_executor_process()?;
   let runtime = tokio::runtime::Runtime::new()?;
   runtime.block_on(run_executor_loop(config))

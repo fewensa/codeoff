@@ -1,6 +1,6 @@
 //! Fail-closed Codex execution boundary for scheduled tasks.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -46,11 +46,13 @@ use nix::sys::signal::{Signal, killpg};
 #[cfg(unix)]
 use nix::sys::stat::{Mode, SFlag, fchmod, fstat, mkdirat};
 #[cfg(unix)]
-use nix::unistd::Pid;
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 #[cfg(all(unix, test))]
 use nix::unistd::chown;
 #[cfg(unix)]
 use nix::unistd::{Gid, Uid, fchown};
+#[cfg(unix)]
+use nix::unistd::{Pid, getpid};
 
 #[cfg(unix)]
 use crate::scheduled_artifacts::{
@@ -71,6 +73,46 @@ pub const GITHUB_MCP_ARTIFACT_SHA256_X86_64: &str =
   "955fff9cf50ae99ee021871a4782c36360252d82fd03c8307fd7394c44ba3886";
 pub const GITHUB_MCP_ARTIFACT_SHA256_ARM64: &str =
   "5d47f9e36850769db8a46c97a7ad1e7a1bd51502c57765a81e697f5740455227";
+
+/// Enables process-wide descendant adoption for the dedicated root executor before it starts its
+/// async runtime. The executor role is sequential and must own no children at this boundary.
+///
+/// # Errors
+/// Returns an error when procfs cannot prove an empty child set or the kernel cannot enable and
+/// confirm subreaper mode.
+#[cfg(unix)]
+pub fn enable_scheduled_executor_subreaper() -> Result<(), String> {
+  if nix::sys::prctl::get_child_subreaper()
+    .map_err(|_| "scheduled_subreaper_query_failed".to_owned())?
+  {
+    return Err("scheduled_subreaper_already_enabled".to_owned());
+  }
+  if !discover_direct_children()?.is_empty() {
+    return Err("scheduled_subreaper_existing_children".to_owned());
+  }
+  nix::sys::prctl::set_child_subreaper(true)
+    .map_err(|_| "scheduled_subreaper_enable_failed".to_owned())?;
+  if !nix::sys::prctl::get_child_subreaper()
+    .map_err(|_| "scheduled_subreaper_query_failed".to_owned())?
+    || !discover_direct_children()?.is_empty()
+  {
+    return Err("scheduled_subreaper_activation_unproven".to_owned());
+  }
+  Ok(())
+}
+
+#[cfg(unix)]
+fn require_scheduled_descendant_guardian() -> Result<bool, String> {
+  let enabled = nix::sys::prctl::get_child_subreaper()
+    .map_err(|_| "scheduled_subreaper_query_failed".to_owned())?;
+  if !cfg!(test) && !enabled {
+    return Err("scheduled_subreaper_required".to_owned());
+  }
+  if enabled && !discover_direct_children()?.is_empty() {
+    return Err("scheduled_executor_has_unexpected_children_before_spawn".to_owned());
+  }
+  Ok(enabled)
+}
 
 const GITHUB_MCP_NAME: &str = "github";
 const GITHUB_MCP_SERVER_INFO_NAME: &str = "github-mcp-server";
@@ -609,6 +651,58 @@ enum ReaderEvent {
   Eof,
 }
 
+#[cfg(unix)]
+fn spawn_scheduled_jsonl_reader(
+  stdout: impl Read + Send + 'static,
+) -> Result<(Receiver<ReaderEvent>, JoinHandle<()>), String> {
+  let (sender, receiver) = mpsc::channel();
+  let reader = thread::Builder::new()
+    .name("scheduled-codex-jsonl".to_owned())
+    .spawn(move || {
+      use std::io::{BufRead, BufReader, Read as _};
+      let mut stdout = BufReader::new(stdout);
+      loop {
+        let mut line = Vec::new();
+        match (&mut stdout)
+          .take(u64::try_from(MAX_JSONL_MESSAGE_BYTES + 1).unwrap_or(u64::MAX))
+          .read_until(b'\n', &mut line)
+        {
+          Ok(0) => {
+            let _ = sender.send(ReaderEvent::Eof);
+            return;
+          }
+          Ok(_) if line.len() > MAX_JSONL_MESSAGE_BYTES => {
+            let _ = sender.send(ReaderEvent::Error(
+              "scheduled_codex_jsonl_message_too_large".to_owned(),
+            ));
+            return;
+          }
+          Ok(_) => match serde_json::from_slice(&line) {
+            Ok(message) => {
+              if sender.send(ReaderEvent::Message(message)).is_err() {
+                return;
+              }
+            }
+            Err(error) => {
+              let _ = sender.send(ReaderEvent::Error(format!(
+                "decode scheduled codex app server response: {error}"
+              )));
+              return;
+            }
+          },
+          Err(error) => {
+            let _ = sender.send(ReaderEvent::Error(format!(
+              "read scheduled codex app server response: {error}"
+            )));
+            return;
+          }
+        }
+      }
+    })
+    .map_err(|error| format!("start scheduled codex reader: {error}"))?;
+  Ok((receiver, reader))
+}
+
 /// Direct, process-group-owned stdio transport for scheduled Codex App Server runs.
 ///
 /// This crate-private transport independently re-hashes the executable and dedicated config before
@@ -620,12 +714,31 @@ enum ReaderEvent {
 )]
 pub(crate) struct StdioScheduledJsonlTransport {
   child: Child,
+  leader_reaped: bool,
   stdin: Option<ChildStdin>,
   reader: Option<JoinHandle<()>>,
   receiver: Receiver<ReaderEvent>,
   process_group: Pid,
   runtime_evidence: ScheduledRuntimeEvidence,
   state_home: Option<RuntimeStateHome>,
+  descendant_guardian: bool,
+  force_kill_descendants: bool,
+  guardian_discovery: GuardianDiscovery,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ChildIdentity {
+  pid: i32,
+  starttime: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardianDiscovery {
+  Procfs,
+  #[cfg(test)]
+  Fail,
 }
 
 #[cfg(unix)]
@@ -681,6 +794,7 @@ impl StdioScheduledJsonlTransport {
     if profile.config_sha256 != runtime_evidence.config_sha256 {
       return Err("scheduled_config_digest_mismatch_before_spawn".to_owned());
     }
+    let descendant_guardian = require_scheduled_descendant_guardian()?;
     let child_identity =
       child_identity.ok_or_else(|| "scheduled_codex_state_home_requires_supervisor".to_owned())?;
     let state_home = create_runtime_state_home(profile, artifacts, child_identity)?;
@@ -719,59 +833,19 @@ impl StdioScheduledJsonlTransport {
     let child_pid = i32::try_from(child.id())
       .map_err(|_| "scheduled codex app server pid overflow".to_owned())?;
     let process_group = Pid::from_raw(child_pid);
-    let (sender, receiver) = mpsc::channel();
-    let reader = thread::Builder::new()
-      .name("scheduled-codex-jsonl".to_owned())
-      .spawn(move || {
-        use std::io::{BufRead, BufReader, Read as _};
-        let mut stdout = BufReader::new(stdout);
-        loop {
-          let mut line = Vec::new();
-          match (&mut stdout)
-            .take(u64::try_from(MAX_JSONL_MESSAGE_BYTES + 1).unwrap_or(u64::MAX))
-            .read_until(b'\n', &mut line)
-          {
-            Ok(0) => {
-              let _ = sender.send(ReaderEvent::Eof);
-              return;
-            }
-            Ok(_) if line.len() > MAX_JSONL_MESSAGE_BYTES => {
-              let _ = sender.send(ReaderEvent::Error(
-                "scheduled_codex_jsonl_message_too_large".to_owned(),
-              ));
-              return;
-            }
-            Ok(_) => match serde_json::from_slice(&line) {
-              Ok(message) => {
-                if sender.send(ReaderEvent::Message(message)).is_err() {
-                  return;
-                }
-              }
-              Err(error) => {
-                let _ = sender.send(ReaderEvent::Error(format!(
-                  "decode scheduled codex app server response: {error}"
-                )));
-                return;
-              }
-            },
-            Err(error) => {
-              let _ = sender.send(ReaderEvent::Error(format!(
-                "read scheduled codex app server response: {error}"
-              )));
-              return;
-            }
-          }
-        }
-      })
-      .map_err(|error| format!("start scheduled codex reader: {error}"))?;
+    let (receiver, reader) = spawn_scheduled_jsonl_reader(stdout)?;
     Ok(Self {
       child,
+      leader_reaped: false,
       stdin: Some(stdin),
       reader: Some(reader),
       receiver,
       process_group,
       runtime_evidence,
       state_home: Some(state_home),
+      descendant_guardian,
+      force_kill_descendants: false,
+      guardian_discovery: GuardianDiscovery::Procfs,
     })
   }
 
@@ -802,14 +876,56 @@ impl StdioScheduledJsonlTransport {
     }
   }
 
-  fn wait_process_group_until(&mut self, deadline: Instant) -> Result<ProcessExit, String> {
-    loop {
-      self
+  fn reap_leader(&mut self) -> Result<(), String> {
+    if !self.leader_reaped
+      && self
         .child
         .try_wait()
-        .map_err(|error| format!("reap scheduled codex app server: {error}"))?;
-      self.join_finished_reader();
-      if self.process_group_is_gone()? {
+        .map_err(|error| format!("reap scheduled codex app server: {error}"))?
+        .is_some()
+    {
+      self.leader_reaped = true;
+    }
+    Ok(())
+  }
+
+  fn reap_adopted_descendants(&self) -> Result<(), String> {
+    if !self.leader_reaped {
+      return Ok(());
+    }
+    loop {
+      match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => return Ok(()),
+        Ok(_) => {}
+        Err(error) => return Err(format!("reap scheduled adopted descendant: {error}")),
+      }
+    }
+  }
+
+  fn process_tree_is_gone(&mut self) -> Result<bool, String> {
+    self.reap_leader()?;
+    self.join_finished_reader();
+    if !self.descendant_guardian {
+      return self.process_group_is_gone();
+    }
+    self.reap_adopted_descendants()?;
+    Ok(self.leader_reaped && self.discover_guarded_children()?.is_empty())
+  }
+
+  fn discover_guarded_children(&self) -> Result<BTreeSet<ChildIdentity>, String> {
+    match self.guardian_discovery {
+      GuardianDiscovery::Procfs => discover_direct_children(),
+      #[cfg(test)]
+      GuardianDiscovery::Fail => Err("scheduled_child_discovery_test_failure".to_owned()),
+    }
+  }
+
+  fn wait_process_group_until(&mut self, deadline: Instant) -> Result<ProcessExit, String> {
+    loop {
+      if self.descendant_guardian && self.force_kill_descendants {
+        freeze_and_kill_direct_children()?;
+      }
+      if self.process_tree_is_gone()? {
         finalize_runtime_state_home(&mut self.state_home, ProcessExit::Exited);
         return Ok(ProcessExit::Exited);
       }
@@ -879,7 +995,12 @@ impl ScheduledJsonlTransport for StdioScheduledJsonlTransport {
   }
 
   fn kill_process_group(&mut self) -> Result<(), String> {
-    self.signal_process_group(Signal::SIGKILL)
+    self.signal_process_group(Signal::SIGKILL)?;
+    if self.descendant_guardian {
+      self.force_kill_descendants = true;
+      freeze_and_kill_direct_children()?;
+    }
+    Ok(())
   }
 
   fn reap_until(&mut self, deadline: Instant) -> Result<ProcessExit, String> {
@@ -898,6 +1019,10 @@ impl Drop for StdioScheduledJsonlTransport {
       return;
     }
     let _ = self.signal_process_group(Signal::SIGKILL);
+    self.force_kill_descendants = self.descendant_guardian;
+    if self.descendant_guardian {
+      let _ = freeze_and_kill_direct_children();
+    }
     let confirmed_exit = Instant::now()
       .checked_add(Duration::from_millis(100))
       .and_then(|deadline| self.wait_process_group_until(deadline).ok())
@@ -906,6 +1031,162 @@ impl Drop for StdioScheduledJsonlTransport {
       finalize_runtime_state_home(&mut self.state_home, ProcessExit::TimedOut);
     }
   }
+}
+
+#[cfg(unix)]
+fn discover_direct_children() -> Result<BTreeSet<ChildIdentity>, String> {
+  discover_direct_children_in(Path::new("/proc/self/task"), Path::new("/proc"))
+}
+
+#[cfg(unix)]
+fn discover_direct_children_in(
+  task_root: &Path,
+  proc_root: &Path,
+) -> Result<BTreeSet<ChildIdentity>, String> {
+  for _ in 0..4 {
+    let mut pids = BTreeSet::new();
+    let mut retry = false;
+    let tasks = fs::read_dir(task_root)
+      .map_err(|error| format!("read scheduled executor task directory: {error}"))?;
+    for task in tasks {
+      let task = task.map_err(|error| format!("read scheduled executor task entry: {error}"))?;
+      let name = task.file_name();
+      if name.to_string_lossy().parse::<u32>().is_err() {
+        return Err("scheduled_executor_task_identity_invalid".to_owned());
+      }
+      let children = match fs::read_to_string(task.path().join("children")) {
+        Ok(children) => children,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+          retry = true;
+          break;
+        }
+        Err(error) => {
+          return Err(format!("read scheduled executor task children: {error}"));
+        }
+      };
+      for pid in children.split_whitespace() {
+        let pid = pid
+          .parse::<i32>()
+          .ok()
+          .filter(|pid| *pid > 0 && *pid != getpid().as_raw())
+          .ok_or_else(|| "scheduled_child_pid_invalid".to_owned())?;
+        pids.insert(pid);
+      }
+    }
+    if retry {
+      continue;
+    }
+    let mut children = BTreeSet::new();
+    for pid in pids {
+      match read_proc_starttime_in(proc_root, pid) {
+        Ok(Some(starttime)) => {
+          children.insert(ChildIdentity { pid, starttime });
+        }
+        Ok(None) => {
+          retry = true;
+          break;
+        }
+        Err(error) => return Err(error),
+      }
+    }
+    if !retry {
+      return Ok(children);
+    }
+  }
+  Err("scheduled_child_discovery_not_stable".to_owned())
+}
+
+#[cfg(unix)]
+fn read_proc_starttime(pid: i32) -> Result<Option<u64>, String> {
+  read_proc_starttime_in(Path::new("/proc"), pid)
+}
+
+#[cfg(unix)]
+fn read_proc_starttime_in(proc_root: &Path, pid: i32) -> Result<Option<u64>, String> {
+  let stat = match fs::read_to_string(proc_root.join(pid.to_string()).join("stat")) {
+    Ok(stat) => stat,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(format!("read scheduled child identity: {error}")),
+  };
+  parse_proc_starttime(pid, &stat).map(Some)
+}
+
+#[cfg(unix)]
+fn parse_proc_starttime(pid: i32, stat: &str) -> Result<u64, String> {
+  let (identity, fields) = stat
+    .rsplit_once(')')
+    .ok_or_else(|| "scheduled_child_stat_invalid".to_owned())?;
+  let observed_pid = identity
+    .split_once(" (")
+    .and_then(|(pid, _)| pid.parse::<i32>().ok())
+    .ok_or_else(|| "scheduled_child_stat_pid_invalid".to_owned())?;
+  if observed_pid != pid {
+    return Err("scheduled_child_stat_pid_mismatch".to_owned());
+  }
+  let starttime = fields
+    .split_whitespace()
+    .nth(19)
+    .and_then(|field| field.parse::<u64>().ok())
+    .ok_or_else(|| "scheduled_child_starttime_invalid".to_owned())?;
+  Ok(starttime)
+}
+
+#[cfg(unix)]
+fn verify_child_identity_in(proc_root: &Path, identity: ChildIdentity) -> Result<bool, String> {
+  match read_proc_starttime_in(proc_root, identity.pid)? {
+    None => Ok(false),
+    Some(starttime) if starttime == identity.starttime => Ok(true),
+    Some(_) => Err("scheduled_child_pid_reused".to_owned()),
+  }
+}
+
+#[cfg(unix)]
+fn signal_child_identity(identity: ChildIdentity, signal: Signal) -> Result<(), String> {
+  if !verify_child_identity_in(Path::new("/proc"), identity)? {
+    return Ok(());
+  }
+  match nix::sys::signal::kill(Pid::from_raw(identity.pid), signal) {
+    Ok(()) => match read_proc_starttime(identity.pid)? {
+      None => Ok(()),
+      Some(starttime) if starttime == identity.starttime => Ok(()),
+      Some(_) => Err("scheduled_child_pid_reused_after_signal".to_owned()),
+    },
+    Err(Errno::ESRCH) if read_proc_starttime(identity.pid)?.is_none() => Ok(()),
+    Err(Errno::ESRCH) => Err("scheduled_child_identity_survived_esrch".to_owned()),
+    Err(error) => Err(format!("signal scheduled child with {signal:?}: {error}")),
+  }
+}
+
+#[cfg(unix)]
+fn freeze_and_kill_direct_children() -> Result<(), String> {
+  let deadline = Instant::now()
+    .checked_add(Duration::from_millis(100))
+    .ok_or_else(|| "scheduled_child_freeze_deadline_overflow".to_owned())?;
+  let mut previous = BTreeMap::new();
+  for _ in 0..64 {
+    if Instant::now() >= deadline {
+      return Err("scheduled_child_freeze_deadline_exceeded".to_owned());
+    }
+    let children = discover_direct_children()?;
+    if children.is_empty() {
+      return Ok(());
+    }
+    for child in &children {
+      signal_child_identity(*child, Signal::SIGSTOP)?;
+    }
+    let current: BTreeMap<_, _> = discover_direct_children()?
+      .into_iter()
+      .map(|child| (child.pid, child.starttime))
+      .collect();
+    if current == previous {
+      for (pid, starttime) in current {
+        signal_child_identity(ChildIdentity { pid, starttime }, Signal::SIGKILL)?;
+      }
+      return Ok(());
+    }
+    previous = current;
+  }
+  Err("scheduled_child_freeze_fixed_point_exhausted".to_owned())
 }
 
 #[cfg(unix)]
@@ -2510,7 +2791,7 @@ fn bounded_shutdown<T: ScheduledJsonlTransport>(
   }
   Err(ScheduledFailure::new(
     ScheduledFailureKind::Transport,
-    "process_group_not_reaped_after_kill",
+    "process_tree_not_reaped_after_kill",
   ))
 }
 
@@ -4750,6 +5031,98 @@ mod tests {
   }
 
   #[cfg(unix)]
+  fn fake_proc_stat(pid: i32, starttime: u64) -> String {
+    let mut fields = vec!["S".to_owned()];
+    fields.extend(std::iter::repeat_n("0".to_owned(), 18));
+    fields.push(starttime.to_string());
+    format!("{pid} (name with ) parenthesis) {}", fields.join(" "))
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn proc_starttime_parser_binds_pid_and_rejects_malformed_identity() {
+    let pid = getpid().as_raw();
+    let stat = fs::read_to_string("/proc/self/stat").expect("current proc stat");
+    let parsed = parse_proc_starttime(pid, &stat).expect("current proc starttime");
+    assert!(parsed > 0);
+    assert_eq!(
+      read_proc_starttime(pid).expect("read current identity"),
+      Some(parsed)
+    );
+
+    assert_eq!(
+      parse_proc_starttime(pid + 1, &stat),
+      Err("scheduled_child_stat_pid_mismatch".to_owned())
+    );
+    assert_eq!(
+      parse_proc_starttime(pid, "malformed stat"),
+      Err("scheduled_child_stat_invalid".to_owned())
+    );
+    assert_eq!(
+      parse_proc_starttime(pid, &format!("{pid} (short) S")),
+      Err("scheduled_child_starttime_invalid".to_owned())
+    );
+    assert_eq!(parse_proc_starttime(42, &fake_proc_stat(42, 99)), Ok(99));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn proc_child_discovery_and_identity_checks_fail_closed() {
+    let root = TempDir::new().expect("proc fixture root");
+    let task_root = root.path().join("task");
+    let proc_root = root.path().join("proc");
+    fs::create_dir_all(task_root.join("100")).expect("task fixture");
+    fs::create_dir_all(proc_root.join("4242")).expect("proc fixture");
+    fs::write(task_root.join("100/children"), "4242\n").expect("children fixture");
+    fs::write(proc_root.join("4242/stat"), fake_proc_stat(4242, 99)).expect("stat fixture");
+    assert_eq!(
+      discover_direct_children_in(&task_root, &proc_root),
+      Ok(BTreeSet::from([ChildIdentity {
+        pid: 4242,
+        starttime: 99,
+      }]))
+    );
+    assert_eq!(
+      verify_child_identity_in(
+        &proc_root,
+        ChildIdentity {
+          pid: 4242,
+          starttime: 100,
+        }
+      ),
+      Err("scheduled_child_pid_reused".to_owned())
+    );
+    assert_eq!(
+      verify_child_identity_in(
+        &proc_root,
+        ChildIdentity {
+          pid: 4243,
+          starttime: 99,
+        }
+      ),
+      Ok(false)
+    );
+
+    let unreadable_root = root.path().join("unreadable-task");
+    fs::create_dir_all(unreadable_root.join("101/children"))
+      .expect("directory in place of children file");
+    assert!(
+      discover_direct_children_in(&unreadable_root, &proc_root)
+        .expect_err("children read failure must be fatal")
+        .starts_with("read scheduled executor task children:")
+    );
+
+    let malformed_root = root.path().join("malformed-task");
+    fs::create_dir_all(malformed_root.join("102")).expect("malformed task fixture");
+    fs::write(malformed_root.join("102/children"), "not-a-pid\n")
+      .expect("malformed children fixture");
+    assert_eq!(
+      discover_direct_children_in(&malformed_root, &proc_root),
+      Err("scheduled_child_pid_invalid".to_owned())
+    );
+  }
+
+  #[cfg(unix)]
   #[test]
   fn runtime_home_keeps_effective_config_root_owned_and_immutable() {
     let temp = TempDir::new_in("/code/helixbox").expect("runtime home tempdir");
@@ -5505,5 +5878,181 @@ mod tests {
     fs::remove_dir(&codex_home).expect("remove home");
     fs::remove_dir(&cwd).expect("remove cwd");
     fs::remove_dir(&base).expect("remove base");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn hostile_subreaper_process_helper() {
+    if std::env::var_os("CODEOFF_TEST_HOSTILE_SUBREAPER").is_none() {
+      return;
+    }
+    enable_scheduled_executor_subreaper().expect("enable isolated subreaper");
+    let temp = TempDir::new_in("/code/helixbox").expect("hostile process tempdir");
+    let cwd = temp.path().join("workspace");
+    let codex_home = temp.path().join("codex-home");
+    fs::create_dir(&cwd).expect("hostile cwd");
+    chown(
+      &cwd,
+      Some(Uid::from_raw(65_534)),
+      Some(Gid::from_raw(65_534)),
+    )
+    .expect("own hostile cwd");
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).expect("protect hostile cwd");
+    let program = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+      .join("tests/fixtures/hostile-process-tree-app-server.sh");
+    let mut profile = profile();
+    profile.codex_program = program.clone();
+    profile.codex_program_sha256 = sha256_file(&program).expect("hostile program digest");
+    profile.codex_home = codex_home;
+    profile.cwd = cwd.clone();
+    profile.config_sha256 = sha256_hex(profile.dedicated_config().as_bytes());
+    prepare_scheduled_codex_home(&profile).expect("hostile CODEX_HOME");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555))
+      .expect("protect hostile tempdir");
+    let artifacts = Arc::new(test_artifacts(&program, &profile.codex_home, &cwd));
+    let transport = StdioScheduledJsonlTransport::spawn(
+      &profile,
+      evidence(&profile),
+      &artifacts,
+      Some((65_534, 65_534)),
+    )
+    .expect("spawn hostile process tree");
+    let pid_files = [
+      "setsid.pid",
+      "double-fork.pid",
+      "fork-race-parent.pid",
+      "fork-race.pid",
+    ];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pid_files.iter().any(|name| !cwd.join(name).exists()) && Instant::now() < deadline {
+      thread::sleep(Duration::from_millis(5));
+    }
+    let pids = pid_files.map(|name| {
+      fs::read_to_string(cwd.join(name))
+        .expect("hostile pid file")
+        .trim()
+        .parse::<i32>()
+        .expect("hostile pid")
+    });
+    assert!(
+      pids
+        .iter()
+        .all(|pid| Path::new(&format!("/proc/{pid}")).exists())
+    );
+    drop(transport);
+    assert!(
+      discover_direct_children()
+        .expect("post-cleanup children")
+        .is_empty()
+    );
+    assert!(
+      pids
+        .iter()
+        .all(|pid| !Path::new(&format!("/proc/{pid}")).exists())
+    );
+    assert_eq!(
+      fs::read_dir(profile.codex_home.join("state"))
+        .expect("hostile cleaned state root")
+        .count(),
+      0,
+      "state must be deleted only after the hostile tree is empty"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn subreaper_reaps_setsid_double_fork_and_fork_race_in_isolated_process() {
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+      .arg("--exact")
+      .arg("scheduled::tests::hostile_subreaper_process_helper")
+      .arg("--nocapture")
+      .env("CODEOFF_TEST_HOSTILE_SUBREAPER", "1")
+      .output()
+      .expect("run isolated hostile subreaper test");
+    assert!(
+      output.status.success(),
+      "isolated hostile subreaper failed: stdout={} stderr={}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn guardian_uncertainty_quarantine_process_helper() {
+    if std::env::var_os("CODEOFF_TEST_GUARDIAN_UNCERTAINTY").is_none() {
+      return;
+    }
+    enable_scheduled_executor_subreaper().expect("enable isolated subreaper");
+    let temp = TempDir::new_in("/code/helixbox").expect("uncertainty tempdir");
+    let cwd = temp.path().join("workspace");
+    let codex_home = temp.path().join("codex-home");
+    fs::create_dir(&cwd).expect("uncertainty cwd");
+    chown(
+      &cwd,
+      Some(Uid::from_raw(65_534)),
+      Some(Gid::from_raw(65_534)),
+    )
+    .expect("own uncertainty cwd");
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).expect("protect uncertainty cwd");
+    let program = PathBuf::from("/bin/true");
+    let mut profile = profile();
+    profile.codex_program = program.clone();
+    profile.codex_program_sha256 = sha256_file(&program).expect("true digest");
+    profile.codex_home = codex_home;
+    profile.cwd = cwd.clone();
+    profile.config_sha256 = sha256_hex(profile.dedicated_config().as_bytes());
+    prepare_scheduled_codex_home(&profile).expect("uncertainty CODEX_HOME");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555))
+      .expect("protect uncertainty tempdir");
+    let artifacts = Arc::new(test_artifacts(&program, &profile.codex_home, &cwd));
+    let mut transport = StdioScheduledJsonlTransport::spawn(
+      &profile,
+      evidence(&profile),
+      &artifacts,
+      Some((65_534, 65_534)),
+    )
+    .expect("spawn uncertainty process");
+    let quarantined_state = transport
+      .state_home
+      .as_ref()
+      .expect("live uncertainty state")
+      .directory
+      .path()
+      .to_path_buf();
+    transport.guardian_discovery = GuardianDiscovery::Fail;
+    drop(transport);
+    assert!(quarantined_state.exists());
+    assert_eq!(
+      fs::read_dir(profile.codex_home.join("state"))
+        .expect("quarantined state root")
+        .count(),
+      1,
+      "cleanup uncertainty must retain exactly one quarantined session"
+    );
+    assert!(
+      discover_direct_children()
+        .expect("post-uncertainty child discovery")
+        .is_empty(),
+      "the test process must still reap its actual child"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn guardian_discovery_failure_quarantines_state_in_isolated_process() {
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+      .arg("--exact")
+      .arg("scheduled::tests::guardian_uncertainty_quarantine_process_helper")
+      .arg("--nocapture")
+      .env("CODEOFF_TEST_GUARDIAN_UNCERTAINTY", "1")
+      .output()
+      .expect("run isolated guardian uncertainty test");
+    assert!(
+      output.status.success(),
+      "isolated guardian uncertainty test failed: stdout={} stderr={}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
   }
 }

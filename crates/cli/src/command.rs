@@ -30,9 +30,9 @@ pub enum Command {
     #[command(subcommand)]
     command: ConfigCommand,
   },
-  /// Manages schedules as a trusted local operator configured only by deployment environment.
+  /// Inspects scheduler diagnostics and manages schedules under explicit local authority.
   #[command(
-    long_about = "Manage schedules through the local SQLite control plane. This is a trusted-local entrypoint, not a remote authentication boundary. CODEOFF_SCHEDULER_OPERATOR_ID and CODEOFF_SCHEDULER_OPERATOR_REALM must be configured by the process environment; owner or user overrides are not accepted."
+    long_about = "Inspect and manage scheduler state through the local SQLite control plane. Sanitized read-only diagnostics (status, runs, deliveries, and reconcile --dry-run) do not require operator identity. Owner-scoped schedule commands (create, get, list, update, pause, resume, and delete) require CODEOFF_SCHEDULER_OPERATOR_ID and CODEOFF_SCHEDULER_OPERATOR_REALM from the process environment. High-risk mutation commands (reconcile --apply, retry-run, retry-delivery, and resolve-delivery-unknown) require --authority-file plus a trusted deployment authority verifier; the current verifier fails closed. This is a trusted-local entrypoint, not a remote authentication boundary; owner or user overrides are not accepted."
   )]
   Scheduler {
     #[command(subcommand)]

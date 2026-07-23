@@ -33,7 +33,6 @@ use crate::scheduler_observability::{
 
 static PREPARE_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SCHEDULER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_LOG_ERROR_BYTES: usize = 512;
 
 #[derive(Clone)]
 pub struct GlobalTurnBudget {
@@ -289,8 +288,7 @@ async fn run_scheduled_worker(
       started_at.elapsed(),
       None,
     );
-    let delay = if let Err(error) = &tick {
-      eprintln!("scheduled worker tick failed: {}", bounded_log_error(error));
+    let delay = if tick.is_err() {
       orchestrator.policy.error_backoff
     } else {
       orchestrator.policy.tick_interval
@@ -475,18 +473,6 @@ fn admitted_mutation_join_error(error: tokio::task::JoinError) -> StateError {
   StateError::InvalidSchedulerState {
     reason: format!("scheduled admitted state mutation task failed: {error}"),
   }
-}
-
-fn bounded_log_error(error: &StateError) -> String {
-  let message = error.to_string();
-  if message.len() <= MAX_LOG_ERROR_BYTES {
-    return message;
-  }
-  let mut end = MAX_LOG_ERROR_BYTES;
-  while !message.is_char_boundary(end) {
-    end -= 1;
-  }
-  format!("{}…", &message[..end])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

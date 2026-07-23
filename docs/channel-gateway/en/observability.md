@@ -18,6 +18,10 @@ Other paths return `404`; non-`GET` methods return `405`; query strings are reje
 
 The following admin routes are not implemented and remain future work: runtime summaries, inbound/outbound queue inspection, event lookup, delivery lookup, and conversation mapping diagnostics. CLI scheduler diagnostics are trusted-local maintenance commands, not HTTP admin endpoints.
 
+With the common prefix `codeoff [--config PATH] [--state-dir PATH] scheduler`, the exact read-only CLI diagnostic surface is `status [--json]`, `runs list [--status STATE] [--limit N] [--json]`, `runs show RUN_ID [--json]`, `deliveries list [--status STATE] [--limit N] [--json]`, `deliveries show DELIVERY_ID [--json]`, and `reconcile --dry-run [--limit N] [--json]`. These commands need no operator identity, return sanitized projections, and do not mutate scheduler authority, but they still require trusted-local filesystem access to SQLite.
+
+Do not treat the diagnostic CLI as authorization for mutation commands. Owner-scoped `create|get|list|update|pause|resume|delete` commands require `CODEOFF_SCHEDULER_OPERATOR_ID` plus `CODEOFF_SCHEDULER_OPERATOR_REALM`. `reconcile --apply`, `retry-run`, `retry-delivery`, and `resolve-delivery-unknown` require expected authority coordinates and a non-empty, at-most-64-KiB `--authority-file`; retry and resolution also take canonical schema-version-1 reason/evidence JSON as documented in [Runtime](runtime.md#scheduler-cli-authority-boundary). The mutation verifier intentionally fails closed until the Issue 09 deployment injects trusted verifier authority, so no high-risk mutation is currently enabled by merely supplying files.
+
 ## Readiness Contract
 
 `/readyz` fails closed with `503` when SQLite cannot answer its bounded read probe within 250 ms. With the scheduler disabled it returns `200` and `scheduler_disabled` after SQLite passes.

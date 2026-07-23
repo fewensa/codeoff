@@ -58,6 +58,21 @@ fn test_cli_exposes_expected_subcommands() {
       .to_string()
       .contains("--as-user")
   );
+  let scheduler_help = scheduler.render_long_help().to_string();
+  for claim in [
+    "Sanitized read-only diagnostics",
+    "do not require operator identity",
+    "CODEOFF_SCHEDULER_OPERATOR_ID",
+    "CODEOFF_SCHEDULER_OPERATOR_REALM",
+    "reconcile --apply",
+    "--authority-file",
+    "current verifier fails closed",
+  ] {
+    assert!(
+      scheduler_help.contains(claim),
+      "missing scheduler help {claim}"
+    );
+  }
   let status_help = scheduler
     .find_subcommand("status")
     .expect("scheduler status")

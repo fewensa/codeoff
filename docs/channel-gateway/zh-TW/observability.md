@@ -18,6 +18,10 @@
 
 以下 admin routes 尚未實作，仍屬未來工作：runtime summary、inbound/outbound queue inspection、event lookup、delivery lookup 與 conversation mapping diagnostics。CLI scheduler diagnostics 是 trusted-local maintenance commands，不是 HTTP admin endpoints。
 
+在共用 prefix `codeoff [--config PATH] [--state-dir PATH] scheduler` 下，確切的 read-only CLI diagnostic surface 是 `status [--json]`、`runs list [--status STATE] [--limit N] [--json]`、`runs show RUN_ID [--json]`、`deliveries list [--status STATE] [--limit N] [--json]`、`deliveries show DELIVERY_ID [--json]`，以及 `reconcile --dry-run [--limit N] [--json]`。這些 commands 不需要 operator identity，回傳 sanitized projections，也不會 mutation scheduler authority，但仍需要 trusted-local SQLite filesystem access。
+
+不得將 diagnostic CLI 視為 mutation commands 的 authorization。Owner-scoped `create|get|list|update|pause|resume|delete` commands 需要 `CODEOFF_SCHEDULER_OPERATOR_ID` 與 `CODEOFF_SCHEDULER_OPERATOR_REALM`。`reconcile --apply`、`retry-run`、`retry-delivery` 與 `resolve-delivery-unknown` 需要 expected authority coordinates，以及 non-empty、上限 64 KiB 的 `--authority-file`；retry 與 resolution 另需 [Runtime](runtime.md#scheduler-cli-authority-boundary) 所述的 canonical schema-version-1 reason/evidence JSON。Mutation verifier 會刻意 fail closed，直到 Issue 09 deployment 注入 trusted verifier authority；因此只提供 files 並不會啟用任何 high-risk mutation。
+
 ## Readiness Contract
 
 若 SQLite 無法在 250 ms 內完成 bounded read probe，`/readyz` 會 fail closed 並回傳 `503`。Scheduler disabled 時，SQLite probe 通過後回傳 `200` 與 `scheduler_disabled`。

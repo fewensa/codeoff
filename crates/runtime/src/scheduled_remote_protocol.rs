@@ -75,6 +75,7 @@ pub struct RunBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareFrame {
   pub binding: RunBinding,
+  pub isolation_permit_envelope_json: String,
   pub definition_json: String,
   pub capability_json: String,
   pub targets_json: String,
@@ -492,6 +493,10 @@ impl RunBinding {
 impl PrepareFrame {
   fn validate(&self) -> Result<(), RemoteProtocolError> {
     self.binding.validate()?;
+    require_json_field(
+      "prepare.isolation_permit_envelope_json",
+      &self.isolation_permit_envelope_json,
+    )?;
     require_json_field("prepare.definition_json", &self.definition_json)?;
     require_json_field("prepare.capability_json", &self.capability_json)?;
     require_json_field("prepare.targets_json", &self.targets_json)
@@ -500,6 +505,7 @@ impl PrepareFrame {
   fn to_value(&self) -> Value {
     json!({
       "binding": self.binding.to_value(),
+      "isolation_permit_envelope_json": self.isolation_permit_envelope_json,
       "definition_json": self.definition_json,
       "capability_json": self.capability_json,
       "targets_json": self.targets_json,
@@ -511,6 +517,7 @@ impl PrepareFrame {
       value,
       &[
         "binding",
+        "isolation_permit_envelope_json",
         "definition_json",
         "capability_json",
         "targets_json",
@@ -519,6 +526,7 @@ impl PrepareFrame {
     )?;
     Ok(Self {
       binding: RunBinding::from_value(required(object, "binding")?)?,
+      isolation_permit_envelope_json: required_string(object, "isolation_permit_envelope_json")?,
       definition_json: required_string(object, "definition_json")?,
       capability_json: required_string(object, "capability_json")?,
       targets_json: required_string(object, "targets_json")?,
@@ -893,6 +901,7 @@ mod tests {
       sequence,
       message: RemoteMessage::Prepare(PrepareFrame {
         binding: binding(),
+        isolation_permit_envelope_json: r#"{"schema_version":1}"#.to_owned(),
         definition_json: r#"{"prompt":"check"}"#.to_owned(),
         capability_json: r#"{"tools":["github"]}"#.to_owned(),
         targets_json: "[]".to_owned(),

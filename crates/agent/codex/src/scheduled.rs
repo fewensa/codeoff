@@ -253,6 +253,127 @@ pub struct ScheduledIsolationPermit {
   expires_at_unix_seconds: u64,
 }
 
+pub struct RemoteIsolationPermitEnvelope {
+  canonical_json: String,
+}
+
+impl std::fmt::Debug for RemoteIsolationPermitEnvelope {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("RemoteIsolationPermitEnvelope")
+      .field("canonical_json", &"[REDACTED]")
+      .finish()
+  }
+}
+
+impl RemoteIsolationPermitEnvelope {
+  #[must_use]
+  pub fn as_json(&self) -> &str {
+    &self.canonical_json
+  }
+
+  /// Parses and imports one exact session-bound permit envelope.
+  ///
+  /// # Errors
+  /// Returns a fail-closed error for malformed, expired, replay-bound, or identity-mismatched
+  /// envelopes.
+  pub fn import(
+    encoded: &str,
+    authority: &ScheduledDeploymentAuthority,
+    expected_identity: &ScheduledExecutionIdentity,
+    expected_authority_digest: &str,
+    expected_credential_revision: &str,
+    expected_session_nonce: &str,
+  ) -> Result<ScheduledIsolationPermit, ScheduledFailure> {
+    let value: Value = serde_json::from_str(encoded)
+      .map_err(|_| preflight("scheduled_remote_permit_envelope_invalid"))?;
+    let object = value
+      .as_object()
+      .filter(|object| {
+        has_exact_fields(
+          object,
+          &[
+            "attempt",
+            "attestation_id",
+            "authority_digest",
+            "credential_revision",
+            "deployment_epoch",
+            "expires_at_unix_seconds",
+            "fence",
+            "job_id",
+            "nonce",
+            "permit_id",
+            "profile_digest",
+            "run_id",
+            "schema_version",
+            "session_nonce",
+          ],
+        )
+      })
+      .ok_or_else(|| preflight("scheduled_remote_permit_envelope_invalid"))?;
+    let string = |field: &str| {
+      object
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| preflight("scheduled_remote_permit_envelope_invalid"))
+    };
+    let positive_i64 = |field: &str| {
+      object
+        .get(field)
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| preflight("scheduled_remote_permit_envelope_invalid"))
+    };
+    let expires_at = object
+      .get("expires_at_unix_seconds")
+      .and_then(Value::as_u64)
+      .filter(|value| *value > now_unix_seconds())
+      .ok_or_else(|| preflight("scheduled_remote_permit_envelope_expired"))?;
+    let schema_version = object
+      .get("schema_version")
+      .and_then(Value::as_u64)
+      .filter(|value| *value == 1)
+      .ok_or_else(|| preflight("scheduled_remote_permit_envelope_invalid"))?;
+    debug_assert_eq!(schema_version, 1);
+    let nonce = string("nonce")?;
+    let permit_id = string("permit_id")?;
+    let profile_digest = string("profile_digest")?;
+    let session_nonce = string("session_nonce")?;
+    let authority_digest = string("authority_digest")?;
+    let credential_revision = string("credential_revision")?;
+    if !is_lowercase_hex(nonce, 64)
+      || !is_lowercase_hex(permit_id, 64)
+      || !is_lowercase_hex(profile_digest, 64)
+      || !is_lowercase_hex(session_nonce, 64)
+      || !is_lowercase_hex(authority_digest, 64)
+      || CredentialRevision::parse(credential_revision).is_err()
+      || string("attestation_id")? != authority.attestation_id
+      || profile_digest != authority.profile_digest
+      || authority_digest != expected_authority_digest
+      || credential_revision != expected_credential_revision
+      || session_nonce != expected_session_nonce
+      || positive_i64("deployment_epoch")? != authority.deployment_epoch
+      || string("run_id")? != expected_identity.run_id
+      || string("job_id")? != expected_identity.job_id
+      || positive_i64("attempt")? != expected_identity.attempt
+      || positive_i64("fence")? != expected_identity.fence
+      || expires_at != authority.expires_at_unix_seconds
+      || serde_json::to_string(&value).ok().as_deref() != Some(encoded)
+    {
+      return Err(preflight(
+        "scheduled_remote_permit_envelope_binding_mismatch",
+      ));
+    }
+    ScheduledIsolationPermit::from_consumed(
+      authority,
+      expected_identity.clone(),
+      profile_digest,
+      nonce.to_owned(),
+      permit_id.to_owned(),
+    )
+  }
+}
+
 impl ScheduledIsolationPermit {
   /// Reconstructs an opaque permit only after its exact binding was durably consumed.
   ///
@@ -289,6 +410,45 @@ impl ScheduledIsolationPermit {
       isolation_revision: authority.isolation_revision.clone(),
       expires_at_unix_seconds: authority.expires_at_unix_seconds,
     })
+  }
+
+  /// Consumes a durably bound permit into a canonical envelope for one authenticated runner
+  /// session.
+  ///
+  /// # Errors
+  /// Returns a fail-closed error when the supplied authority, credential revision, or session
+  /// binding is malformed or does not match the permit.
+  pub fn into_remote_envelope(
+    self,
+    authority_digest: &str,
+    credential_revision: &str,
+    session_nonce: &str,
+  ) -> Result<RemoteIsolationPermitEnvelope, ScheduledFailure> {
+    if !is_lowercase_hex(authority_digest, 64)
+      || !is_lowercase_hex(session_nonce, 64)
+      || CredentialRevision::parse(credential_revision).is_err()
+      || self.expires_at_unix_seconds <= now_unix_seconds()
+    {
+      return Err(preflight("scheduled_remote_permit_export_invalid"));
+    }
+    let canonical_json = json!({
+      "attempt": self.identity.attempt,
+      "attestation_id": self.attestation_id,
+      "authority_digest": authority_digest,
+      "credential_revision": credential_revision,
+      "deployment_epoch": self.deployment_epoch,
+      "expires_at_unix_seconds": self.expires_at_unix_seconds,
+      "fence": self.identity.fence,
+      "job_id": self.identity.job_id,
+      "nonce": self.nonce,
+      "permit_id": self.permit_id,
+      "profile_digest": self.profile_digest,
+      "run_id": self.identity.run_id,
+      "schema_version": 1,
+      "session_nonce": session_nonce,
+    })
+    .to_string();
+    Ok(RemoteIsolationPermitEnvelope { canonical_json })
   }
 }
 
@@ -2731,6 +2891,67 @@ mod tests {
       panic!("configured values are not observed remote attestation");
     };
     assert_eq!(failure.message, "scheduled_remote_backend_not_wired");
+  }
+
+  #[test]
+  fn remote_permit_envelope_is_canonical_redacted_and_exactly_session_bound() {
+    let scheduled_request = request(profile());
+    let permit = issue_test_isolation_permit(&scheduled_request);
+    let authority = ScheduledDeploymentAuthority {
+      schema_version: 1,
+      deployment_epoch: permit.deployment_epoch,
+      attestation_id: permit.attestation_id.clone(),
+      attestation_digest: "b".repeat(64),
+      trust_key_id: "c".repeat(64),
+      profile_digest: permit.profile_digest.clone(),
+      isolation_revision: permit.isolation_revision.clone(),
+      issued_at_unix_seconds: now_unix_seconds().saturating_sub(1),
+      expires_at_unix_seconds: permit.expires_at_unix_seconds,
+    };
+    let authority_digest = "d".repeat(64);
+    let session_nonce = "e".repeat(64);
+    let envelope = permit
+      .into_remote_envelope(
+        &authority_digest,
+        &scheduled_request.profile.credential_revision,
+        &session_nonce,
+      )
+      .expect("remote envelope");
+    assert!(!format!("{envelope:?}").contains(&authority_digest));
+    let imported = RemoteIsolationPermitEnvelope::import(
+      envelope.as_json(),
+      &authority,
+      &scheduled_request.identity,
+      &authority_digest,
+      &scheduled_request.profile.credential_revision,
+      &session_nonce,
+    )
+    .expect("exact session import");
+    assert_eq!(imported.identity, scheduled_request.identity);
+
+    assert!(
+      RemoteIsolationPermitEnvelope::import(
+        envelope.as_json(),
+        &authority,
+        &scheduled_request.identity,
+        &authority_digest,
+        &scheduled_request.profile.credential_revision,
+        &"f".repeat(64),
+      )
+      .is_err()
+    );
+    let noncanonical = envelope.as_json().replace('{', "{ ");
+    assert!(
+      RemoteIsolationPermitEnvelope::import(
+        &noncanonical,
+        &authority,
+        &scheduled_request.identity,
+        &authority_digest,
+        &scheduled_request.profile.credential_revision,
+        &session_nonce,
+      )
+      .is_err()
+    );
   }
 
   #[test]

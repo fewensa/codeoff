@@ -399,6 +399,7 @@ impl RegisteredRunnerSession {
   async fn prepare(
     &self,
     input: &PrepareInput,
+    isolation_permit_envelope_json: String,
   ) -> Result<PreparedFrame, ScheduledRunnerBrokerError> {
     let reservation = self.reservation(unix_millis()?)?;
     let binding = remote_binding(input, &self.ready)?;
@@ -420,6 +421,7 @@ impl RegisteredRunnerSession {
       sequence: 2,
       message: RemoteMessage::Prepare(PrepareFrame {
         binding,
+        isolation_permit_envelope_json,
         definition_json: input.definition_json.clone(),
         capability_json: input.capability_json.clone(),
         targets_json: input.targets_json.clone(),
@@ -726,12 +728,30 @@ enum RemoteExecutionTerminal {
 pub struct RemoteScheduledExecutionBackend {
   broker: ScheduledRunnerBroker,
   runtime: Handle,
+  permit_issuer: Arc<dyn RemoteIsolationPermitIssuer>,
+}
+
+#[async_trait]
+pub trait RemoteIsolationPermitIssuer: Send + Sync {
+  async fn issue(
+    &self,
+    input: &PrepareInput,
+    session_nonce: &str,
+  ) -> Result<String, PrepareFailure>;
 }
 
 impl RemoteScheduledExecutionBackend {
   #[must_use]
-  pub fn new(broker: ScheduledRunnerBroker, runtime: Handle) -> Self {
-    Self { broker, runtime }
+  pub fn new(
+    broker: ScheduledRunnerBroker,
+    runtime: Handle,
+    permit_issuer: Arc<dyn RemoteIsolationPermitIssuer>,
+  ) -> Self {
+    Self {
+      broker,
+      runtime,
+      permit_issuer,
+    }
   }
 }
 
@@ -782,8 +802,12 @@ impl ScheduledExecutionBackend for RemoteScheduledExecutionBackend {
       .broker
       .session()
       .ok_or_else(|| PrepareFailure::fatal("scheduled_remote_session_unavailable"))?;
+    let isolation_permit_envelope_json = self
+      .permit_issuer
+      .issue(input, &session.session_nonce)
+      .await?;
     let prepared = session
-      .prepare(input)
+      .prepare(input, isolation_permit_envelope_json)
       .await
       .map_err(remote_prepare_failure)?;
     Ok(BackendAuthorization::new(RemoteAuthorization {
@@ -941,6 +965,19 @@ fn is_oci_digest(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  struct TestPermitIssuer;
+
+  #[async_trait]
+  impl RemoteIsolationPermitIssuer for TestPermitIssuer {
+    async fn issue(
+      &self,
+      _input: &PrepareInput,
+      _session_nonce: &str,
+    ) -> Result<String, PrepareFailure> {
+      Ok(r#"{"schema_version":1}"#.to_owned())
+    }
+  }
 
   fn ready_frame(
     session_nonce: &str,
@@ -1150,7 +1187,8 @@ mod tests {
   #[tokio::test]
   async fn remote_backend_is_configured_but_fail_closed_without_a_ready_session() {
     let broker = ScheduledRunnerBroker::new(config()).expect("broker");
-    let backend = RemoteScheduledExecutionBackend::new(broker, Handle::current());
+    let backend =
+      RemoteScheduledExecutionBackend::new(broker, Handle::current(), Arc::new(TestPermitIssuer));
     assert!(backend.is_configured());
     assert_eq!(backend.readiness(), ExecutorReadiness::Unavailable);
     assert_eq!(

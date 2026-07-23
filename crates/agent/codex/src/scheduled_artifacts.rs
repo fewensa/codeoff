@@ -117,19 +117,7 @@ pub(super) fn read_verified_scheduled_authority_material(
 pub(super) fn read_trusted_owner_scheduled_authority_material(
   config: &ScheduledCodexConfig,
 ) -> Result<(String, String), String> {
-  if geteuid().as_raw() != config.trusted_owner_uid
-    || getegid().as_raw() != config.trusted_owner_gid
-    || config.trusted_owner_uid == config.runtime_uid
-    || config.trusted_owner_gid == config.runtime_gid
-  {
-    return Err("scheduled_trusted_owner_identity_mismatch".to_owned());
-  }
-  let policy = ArtifactTrustPolicy {
-    trusted_uid: config.trusted_owner_uid,
-    trusted_gid: config.trusted_owner_gid,
-    runtime_uid: config.runtime_uid,
-    runtime_gid: config.runtime_gid,
-  };
+  let policy = trusted_owner_policy(config)?;
   let attestation = open_verified(
     &config.isolation_attestation_path,
     ArtifactKind::ReadOnlyFile,
@@ -152,6 +140,22 @@ pub(super) fn read_trusted_owner_scheduled_authority_material(
       "scheduled_isolation_trust_bundle",
     )?,
   ))
+}
+
+fn trusted_owner_policy(config: &ScheduledCodexConfig) -> Result<ArtifactTrustPolicy, String> {
+  if geteuid().as_raw() != config.trusted_owner_uid
+    || getegid().as_raw() != config.trusted_owner_gid
+    || config.trusted_owner_uid == config.runtime_uid
+    || config.trusted_owner_gid == config.runtime_gid
+  {
+    return Err("scheduled_trusted_owner_identity_mismatch".to_owned());
+  }
+  Ok(ArtifactTrustPolicy {
+    trusted_uid: config.trusted_owner_uid,
+    trusted_gid: config.trusted_owner_gid,
+    runtime_uid: config.runtime_uid,
+    runtime_gid: config.runtime_gid,
+  })
 }
 
 fn observed_trust_policy(config: &ScheduledCodexConfig) -> Result<ArtifactTrustPolicy, String> {
@@ -275,6 +279,13 @@ pub(super) fn verify_scheduled_artifacts(
   profile: &RequestedCapabilityProfile,
 ) -> Result<VerifiedScheduledArtifacts, String> {
   verify_scheduled_artifacts_with_policy(config, profile, observed_trust_policy(config)?)
+}
+
+pub(super) fn verify_scheduled_artifacts_as_trusted_owner(
+  config: &ScheduledCodexConfig,
+  profile: &RequestedCapabilityProfile,
+) -> Result<VerifiedScheduledArtifacts, String> {
+  verify_scheduled_artifacts_with_policy(config, profile, trusted_owner_policy(config)?)
 }
 
 #[cfg(test)]

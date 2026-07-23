@@ -41,6 +41,7 @@ use nix::unistd::Pid;
 use crate::scheduled_artifacts::{
   VerifiedScheduledArtifacts, read_trusted_owner_scheduled_authority_material,
   read_verified_scheduled_authority_material, verify_scheduled_artifacts,
+  verify_scheduled_artifacts_as_trusted_owner,
 };
 #[cfg(all(unix, test))]
 use crate::scheduled_artifacts::{test_artifacts, verify_scheduled_artifacts_for_test};
@@ -669,6 +670,7 @@ impl StdioScheduledJsonlTransport {
     profile: &RequestedCapabilityProfile,
     runtime_evidence: ScheduledRuntimeEvidence,
     artifacts: &Arc<VerifiedScheduledArtifacts>,
+    child_identity: Option<(u32, u32)>,
   ) -> Result<Self, String> {
     profile.validate().map_err(|failure| failure.message)?;
     if profile.codex_program_sha256 != runtime_evidence.codex_program_sha256 {
@@ -681,6 +683,7 @@ impl StdioScheduledJsonlTransport {
       artifacts,
       &["codex", "app-server", "--listen", "stdio://"],
       true,
+      child_identity,
     )?;
     verified
       .command
@@ -992,15 +995,49 @@ pub struct BuiltScheduledCodexExecutor {
 pub fn build_production_scheduled_codex_executor(
   config: &ScheduledCodexConfig,
 ) -> Result<BuiltScheduledCodexExecutor, ScheduledFailure> {
+  build_production_scheduled_codex_executor_with_identity(config, None)
+}
+
+/// Builds a trusted supervisor-owned executor that launches Codex under the exact distinct
+/// nonroot runtime identity.
+///
+/// # Errors
+/// Returns a fail-closed error for identity, artifact, signed authority, or executable drift.
+pub fn build_supervised_scheduled_codex_executor(
+  config: &ScheduledCodexConfig,
+  runtime_user_id: u32,
+  runtime_group_id: u32,
+) -> Result<BuiltScheduledCodexExecutor, ScheduledFailure> {
+  if runtime_user_id == config.trusted_owner_uid
+    || runtime_group_id == config.trusted_owner_gid
+    || runtime_user_id != config.runtime_uid
+    || runtime_group_id != config.runtime_gid
+  {
+    return Err(preflight("scheduled_codex_child_identity_invalid"));
+  }
+  build_production_scheduled_codex_executor_with_identity(
+    config,
+    Some((runtime_user_id, runtime_group_id)),
+  )
+}
+
+fn build_production_scheduled_codex_executor_with_identity(
+  config: &ScheduledCodexConfig,
+  child_identity: Option<(u32, u32)>,
+) -> Result<BuiltScheduledCodexExecutor, ScheduledFailure> {
   let profile = requested_profile(config);
   profile.validate()?;
   #[cfg(unix)]
   {
+    let verified = child_identity.map_or_else(
+      || verify_scheduled_artifacts(config, &profile),
+      |_| verify_scheduled_artifacts_as_trusted_owner(config, &profile),
+    );
     let artifacts = Arc::new(
-      verify_scheduled_artifacts(config, &profile)
+      verified
         .map_err(|error| preflight(format!("scheduled_artifact_verification_failed:{error}")))?,
     );
-    verify_codex_version(&artifacts)?;
+    verify_codex_version(&artifacts, child_identity)?;
     let authority = load_signed_isolation_authority_contents(
       &profile,
       &artifacts.attestation_contents,
@@ -1020,6 +1057,7 @@ pub fn build_production_scheduled_codex_executor(
         &requested,
         executor_evidence.clone(),
         &executor_artifacts,
+        child_identity,
       )
     });
     Ok(BuiltScheduledCodexExecutor {
@@ -1091,8 +1129,9 @@ fn requested_profile(config: &ScheduledCodexConfig) -> RequestedCapabilityProfil
 #[cfg(unix)]
 fn verify_codex_version(
   artifacts: &Arc<VerifiedScheduledArtifacts>,
+  child_identity: Option<(u32, u32)>,
 ) -> Result<(), ScheduledFailure> {
-  let output = verified_command(artifacts, &["codex", "--version"], false)
+  let output = verified_command(artifacts, &["codex", "--version"], false, child_identity)
     .map_err(|error| preflight(format!("scheduled_codex_version_probe_failed:{error}")))?
     .command
     .output()
@@ -1118,6 +1157,7 @@ fn verified_command(
   artifacts: &Arc<VerifiedScheduledArtifacts>,
   arguments: &[&str],
   use_codex_home: bool,
+  child_identity: Option<(u32, u32)>,
 ) -> Result<VerifiedCommand, String> {
   let program = artifacts
     .program
@@ -1140,6 +1180,9 @@ fn verified_command(
       .map_err(|error| format!("inherit verified CODEX_HOME descriptor: {error}"))?;
   }
   let mut command = Command::new(format!("/proc/self/fd/{}", program.as_raw_fd()));
+  if let Some((uid, gid)) = child_identity {
+    command.uid(uid).gid(gid);
+  }
   command
     .args(&arguments[1..])
     .env_clear()
@@ -3242,7 +3285,7 @@ mod tests {
     let artifacts = Arc::new(
       verify_scheduled_artifacts_for_test(&config, &requested).expect("verified artifacts"),
     );
-    verify_codex_version(&artifacts).expect("version probe");
+    verify_codex_version(&artifacts, None).expect("version probe");
     let authority = load_signed_isolation_authority_contents(
       &requested,
       &artifacts.attestation_contents,
@@ -3761,7 +3804,7 @@ mod tests {
       .expect("protect replacement");
     fs::rename(&replacement, &program).expect("swap program path");
 
-    let output = verified_command(&artifacts, &["program"], false)
+    let output = verified_command(&artifacts, &["program"], false, None)
       .expect("verified command")
       .command
       .output()
@@ -3797,7 +3840,7 @@ mod tests {
     let started = Instant::now();
     let artifacts = Arc::new(test_artifacts(&program, &codex_home, &cwd));
     let transport =
-      StdioScheduledJsonlTransport::spawn(&profile, runtime, &artifacts).expect("spawn");
+      StdioScheduledJsonlTransport::spawn(&profile, runtime, &artifacts, None).expect("spawn");
     let pid_deadline = Instant::now() + Duration::from_secs(2);
     while !pid_file.exists() && Instant::now() < pid_deadline {
       thread::sleep(Duration::from_millis(5));

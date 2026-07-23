@@ -13,8 +13,8 @@ pub use scheduled::{
   ScheduledExecutionIdentity, ScheduledExecutionResult, ScheduledFailure, ScheduledFailureKind,
   ScheduledFinalOutput, ScheduledIsolationPermit, ScheduledJsonlTransport,
   ScheduledRuntimeEvidence, ScheduledUsage, TimedRead, build_production_scheduled_codex_executor,
-  load_current_scheduled_deployment_authority, load_trusted_owner_scheduled_deployment_authority,
-  prepare_scheduled_codex_home,
+  build_supervised_scheduled_codex_executor, load_current_scheduled_deployment_authority,
+  load_trusted_owner_scheduled_deployment_authority, prepare_scheduled_codex_home,
 };
 
 use std::collections::{HashMap, HashSet};

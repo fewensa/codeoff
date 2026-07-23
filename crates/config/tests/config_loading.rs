@@ -414,7 +414,7 @@ fn gateway_config() -> ScheduledRunnerGatewayConfig {
     client_ca_bundle_path: "/run/codeoff/tls/client-ca.crt".into(),
     handshake_timeout_ms: 5_000,
     frame_timeout_ms: 30_000,
-    readiness_ttl_ms: 60_000,
+    readiness_ttl_ms: 30_000,
     max_connections: 2,
   }
 }
@@ -427,18 +427,21 @@ fn control_config() -> ScheduledRunnerControlConfig {
     client_private_key_path: "/run/codeoff/tls/client.key".into(),
     server_ca_bundle_path: "/run/codeoff/tls/server-ca.crt".into(),
     local_socket_path: "/run/codeoff/runner/executor.sock".into(),
-    expected_executor_uid: 65_534,
-    expected_executor_gid: 65_534,
+    control_uid: 10_001,
+    control_gid: 10_001,
+    expected_executor_uid: 0,
+    expected_executor_gid: 0,
     connect_timeout_ms: 5_000,
     frame_timeout_ms: 30_000,
+    readiness_ttl_ms: 30_000,
   }
 }
 
 fn executor_config() -> ScheduledRunnerExecutorConfig {
   ScheduledRunnerExecutorConfig {
     local_socket_path: "/run/codeoff/runner/executor.sock".into(),
-    expected_control_uid: 0,
-    expected_control_gid: 0,
+    expected_control_uid: 10_001,
+    expected_control_gid: 10_001,
     codex_child_uid: 65_534,
     codex_child_gid: 65_534,
     accept_timeout_ms: 5_000,

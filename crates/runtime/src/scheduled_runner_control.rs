@@ -1,16 +1,12 @@
-//! Protected one-shot local channel between the credential-owning runner control process and the
-//! unprivileged scheduled executor.
+//! Credential-owning runner-control connection to the protected local executor channel.
 
 use std::fmt;
-use std::fs;
 use std::os::fd::AsFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-use nix::unistd::{Gid, chown};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 
 use crate::scheduled_runner_tls::ScheduledRunnerFramed;
 
@@ -19,25 +15,19 @@ pub struct ScheduledRunnerControlConfig {
   pub socket_path: PathBuf,
   pub executor_uid: u32,
   pub executor_gid: u32,
-  pub accept_timeout: Duration,
+  pub connect_timeout: Duration,
+  pub read_timeout: Duration,
+  pub write_timeout: Duration,
 }
 
 impl ScheduledRunnerControlConfig {
   pub fn validate(&self) -> Result<(), ScheduledRunnerControlError> {
-    if self.accept_timeout.is_zero() || !is_canonical_absolute_path(&self.socket_path) {
+    if self.connect_timeout.is_zero()
+      || self.read_timeout.is_zero()
+      || self.write_timeout.is_zero()
+      || !is_canonical_absolute_path(&self.socket_path)
+    {
       return Err(ScheduledRunnerControlError::InvalidConfiguration);
-    }
-    let parent = self
-      .socket_path
-      .parent()
-      .ok_or(ScheduledRunnerControlError::InvalidConfiguration)?;
-    let metadata = fs::metadata(parent).map_err(ScheduledRunnerControlError::Io)?;
-    if !metadata.is_dir() {
-      return Err(ScheduledRunnerControlError::InvalidConfiguration);
-    }
-    let sticky = metadata.permissions().mode() & 0o1000 != 0;
-    if metadata.permissions().mode() & 0o022 != 0 && !sticky {
-      return Err(ScheduledRunnerControlError::InsecureParentDirectory);
     }
     Ok(())
   }
@@ -46,12 +36,8 @@ impl ScheduledRunnerControlConfig {
 #[derive(Debug)]
 pub enum ScheduledRunnerControlError {
   InvalidConfiguration,
-  InsecureParentDirectory,
-  SocketPathExists,
-  SocketOwnershipMismatch,
-  SocketTypeMismatch,
   CloseOnExecMissing,
-  AcceptTimeout,
+  ConnectTimeout,
   PeerCredentialUnavailable,
   PeerCredentialMismatch,
   Io(std::io::Error),
@@ -78,119 +64,26 @@ pub struct ScheduledExecutorPeerCredentials {
   pub pid: Option<u32>,
 }
 
-pub struct ProtectedScheduledExecutorConnection {
-  stream: UnixStream,
+pub struct ScheduledRunnerControlConnection {
   pub peer: ScheduledExecutorPeerCredentials,
+  pub framed: ScheduledRunnerFramed<UnixStream>,
 }
 
-impl ProtectedScheduledExecutorConnection {
-  #[must_use]
-  pub fn into_inner(self) -> UnixStream {
-    self.stream
-  }
-
-  #[must_use]
-  pub fn into_framed(
-    self,
-    read_timeout: Duration,
-    write_timeout: Duration,
-  ) -> ScheduledRunnerFramed<UnixStream> {
-    ScheduledRunnerFramed::new(self.stream, read_timeout, write_timeout)
-  }
-}
-
-/// A listener that can accept at most one executor connection.
-pub struct ProtectedScheduledExecutorListener {
-  listener: UnixListener,
-  socket_path: OwnedSocketPath,
-  config: ScheduledRunnerControlConfig,
-}
-
-struct OwnedSocketPath {
-  path: PathBuf,
-  device: u64,
-  inode: u64,
-  unlink_armed: bool,
-}
-
-impl OwnedSocketPath {
-  fn capture(path: PathBuf) -> Result<Self, ScheduledRunnerControlError> {
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.file_type().is_socket() {
-      return Err(ScheduledRunnerControlError::SocketTypeMismatch);
-    }
-    Ok(Self {
-      path,
-      device: metadata.dev(),
-      inode: metadata.ino(),
-      unlink_armed: true,
-    })
-  }
-
-  fn unlink(&mut self) -> Result<(), ScheduledRunnerControlError> {
-    if !self.unlink_armed {
-      return Ok(());
-    }
-    let metadata = fs::symlink_metadata(&self.path)?;
-    if !metadata.file_type().is_socket() {
-      return Err(ScheduledRunnerControlError::SocketTypeMismatch);
-    }
-    if metadata.dev() != self.device || metadata.ino() != self.inode {
-      return Err(ScheduledRunnerControlError::SocketOwnershipMismatch);
-    }
-    fs::remove_file(&self.path)?;
-    self.unlink_armed = false;
-    Ok(())
-  }
-}
-
-impl Drop for OwnedSocketPath {
-  fn drop(&mut self) {
-    let _ = self.unlink();
-  }
-}
-
-impl ProtectedScheduledExecutorListener {
-  pub fn bind(config: ScheduledRunnerControlConfig) -> Result<Self, ScheduledRunnerControlError> {
+impl ScheduledRunnerControlConnection {
+  pub async fn connect(
+    config: &ScheduledRunnerControlConfig,
+  ) -> Result<Self, ScheduledRunnerControlError> {
     config.validate()?;
-    if fs::symlink_metadata(&config.socket_path).is_ok() {
-      return Err(ScheduledRunnerControlError::SocketPathExists);
-    }
-    let listener = UnixListener::bind(&config.socket_path)?;
-    let socket_path = OwnedSocketPath::capture(config.socket_path.clone())?;
-    require_cloexec(&listener)?;
-    let mut metadata = fs::symlink_metadata(&config.socket_path)?;
-    if !metadata.file_type().is_socket() {
-      return Err(ScheduledRunnerControlError::SocketTypeMismatch);
-    }
-    if metadata.gid() != config.executor_gid {
-      chown(
-        &config.socket_path,
-        None,
-        Some(Gid::from_raw(config.executor_gid)),
-      )
-      .map_err(|error| ScheduledRunnerControlError::Io(error.into()))?;
-    }
-    fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o620))?;
-    metadata = fs::symlink_metadata(&config.socket_path)?;
-    if metadata.dev() != socket_path.device || metadata.ino() != socket_path.inode {
-      return Err(ScheduledRunnerControlError::SocketOwnershipMismatch);
-    }
-    Ok(Self {
-      listener,
-      socket_path,
-      config,
-    })
-  }
-
-  pub async fn accept(
-    mut self,
-  ) -> Result<ProtectedScheduledExecutorConnection, ScheduledRunnerControlError> {
-    let accepted = tokio::time::timeout(self.config.accept_timeout, self.listener.accept())
-      .await
-      .map_err(|_| ScheduledRunnerControlError::AcceptTimeout)??;
-    self.socket_path.unlink()?;
-    let stream = accepted.0;
+    let deadline = tokio::time::Instant::now() + config.connect_timeout;
+    let stream = loop {
+      match UnixStream::connect(&config.socket_path).await {
+        Ok(stream) => break stream,
+        Err(_) if tokio::time::Instant::now() < deadline => {
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(_) => return Err(ScheduledRunnerControlError::ConnectTimeout),
+      }
+    };
     require_cloexec(&stream)?;
     let credentials = stream
       .peer_cred()
@@ -200,10 +93,13 @@ impl ProtectedScheduledExecutorListener {
       gid: credentials.gid(),
       pid: credentials.pid().and_then(|pid| u32::try_from(pid).ok()),
     };
-    if peer.uid != self.config.executor_uid || peer.gid != self.config.executor_gid {
+    if peer.uid != config.executor_uid || peer.gid != config.executor_gid {
       return Err(ScheduledRunnerControlError::PeerCredentialMismatch);
     }
-    Ok(ProtectedScheduledExecutorConnection { stream, peer })
+    Ok(Self {
+      peer,
+      framed: ScheduledRunnerFramed::new(stream, config.read_timeout, config.write_timeout),
+    })
   }
 }
 
@@ -228,6 +124,9 @@ fn is_canonical_absolute_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::fs;
+  use std::os::unix::fs::MetadataExt;
+  use tokio::net::UnixListener;
 
   fn config(path: PathBuf) -> ScheduledRunnerControlConfig {
     let metadata = fs::metadata(path.parent().expect("socket parent")).expect("parent metadata");
@@ -235,70 +134,55 @@ mod tests {
       socket_path: path,
       executor_uid: metadata.uid(),
       executor_gid: metadata.gid(),
-      accept_timeout: Duration::from_secs(2),
+      connect_timeout: Duration::from_secs(2),
+      read_timeout: Duration::from_secs(2),
+      write_timeout: Duration::from_secs(2),
     }
   }
 
   #[tokio::test]
-  async fn accepts_exact_peer_once_then_unlinks_the_listener() {
+  async fn connects_only_to_the_exact_executor_peer() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let path = temp.path().join("executor.sock");
-    let listener = ProtectedScheduledExecutorListener::bind(config(path.clone())).expect("bind");
-    let client = UnixStream::connect(&path);
-    let (accepted, client) = tokio::join!(listener.accept(), client);
-    let accepted = accepted.expect("authorized peer");
-    let _client = client.expect("client connect");
-    assert!(!path.exists());
-    assert_eq!(accepted.peer.uid, config(path).executor_uid);
+    let listener = UnixListener::bind(&path).expect("bind");
+    let accepted = listener.accept();
+    let expected = config(path);
+    let client = ScheduledRunnerControlConnection::connect(&expected);
+    let (accepted, client) = tokio::join!(accepted, client);
+    let _accepted = accepted.expect("accept");
+    assert_eq!(
+      client.expect("authorized peer").peer.uid,
+      expected.executor_uid
+    );
   }
 
   #[tokio::test]
-  async fn rejects_wrong_peer_credentials_after_unlinking() {
+  async fn rejects_wrong_executor_credentials() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let path = temp.path().join("executor.sock");
     let mut wrong = config(path.clone());
     wrong.executor_uid = wrong.executor_uid.saturating_add(1);
-    let listener = ProtectedScheduledExecutorListener::bind(wrong).expect("bind");
-    let client = UnixStream::connect(&path);
-    let (accepted, client) = tokio::join!(listener.accept(), client);
-    let _client = client.expect("client connect");
+    let listener = UnixListener::bind(&path).expect("bind");
+    let accepted = listener.accept();
+    let client = ScheduledRunnerControlConnection::connect(&wrong);
+    let (accepted, client) = tokio::join!(accepted, client);
+    let _accepted = accepted.expect("accept");
     assert!(matches!(
-      accepted,
+      client,
       Err(ScheduledRunnerControlError::PeerCredentialMismatch)
     ));
-    assert!(!path.exists());
   }
 
   #[tokio::test]
-  async fn accept_timeout_unlinks_the_owned_listener() {
+  async fn connect_timeout_is_bounded() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let path = temp.path().join("executor.sock");
     let mut candidate = config(path.clone());
-    candidate.accept_timeout = Duration::from_millis(5);
-    let listener = ProtectedScheduledExecutorListener::bind(candidate).expect("bind");
+    candidate.connect_timeout = Duration::from_millis(5);
     assert!(matches!(
-      listener.accept().await,
-      Err(ScheduledRunnerControlError::AcceptTimeout)
+      ScheduledRunnerControlConnection::connect(&candidate).await,
+      Err(ScheduledRunnerControlError::ConnectTimeout)
     ));
-    assert!(!path.exists());
-  }
-
-  #[tokio::test]
-  async fn refuses_to_replace_preexisting_path_and_drop_unlinks_only_its_socket() {
-    let temp = tempfile::tempdir().expect("temporary directory");
-    let path = temp.path().join("executor.sock");
-    fs::write(&path, b"owned elsewhere").expect("preexisting path");
-    assert!(matches!(
-      ProtectedScheduledExecutorListener::bind(config(path.clone())),
-      Err(ScheduledRunnerControlError::SocketPathExists)
-    ));
-    assert_eq!(fs::read(&path).expect("preserved path"), b"owned elsewhere");
-    fs::remove_file(&path).expect("remove test fixture");
-
-    let listener = ProtectedScheduledExecutorListener::bind(config(path.clone())).expect("bind");
-    assert!(path.exists());
-    drop(listener);
-    assert!(!path.exists());
   }
 
   #[test]
@@ -317,7 +201,7 @@ mod tests {
       Err(ScheduledRunnerControlError::InvalidConfiguration)
     ));
     candidate = config(temp.path().join("executor.sock"));
-    candidate.accept_timeout = Duration::ZERO;
+    candidate.connect_timeout = Duration::ZERO;
     assert!(matches!(
       candidate.validate(),
       Err(ScheduledRunnerControlError::InvalidConfiguration)

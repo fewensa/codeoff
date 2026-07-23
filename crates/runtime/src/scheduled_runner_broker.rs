@@ -206,6 +206,18 @@ impl ScheduledRunnerBroker {
       return Err(ScheduledRunnerBrokerError::SessionBindingMismatch);
     }
     let config = &self.inner.config;
+    let now = unix_millis()?;
+    let readiness_ttl_millis = u64::try_from(config.admission_ttl.as_millis())
+      .map_err(|_| ScheduledRunnerBrokerError::InvalidConfiguration)?;
+    let signed_not_after_millis = u64::try_from(config.signed_not_after_unix_seconds)
+      .unwrap_or(0)
+      .saturating_mul(1_000);
+    if ready.ready_until_unix_millis <= now
+      || ready.ready_until_unix_millis > now.saturating_add(readiness_ttl_millis)
+      || ready.ready_until_unix_millis > signed_not_after_millis
+    {
+      return Err(ScheduledRunnerBrokerError::SessionExpired);
+    }
     if ready.deployment_epoch < config.deployment_epoch {
       return Err(ScheduledRunnerBrokerError::StaleSession);
     }
@@ -1071,7 +1083,7 @@ mod tests {
       sequence: 1,
       message: RemoteMessage::Ready(ReadyFrame {
         challenge: challenge.to_owned(),
-        ready_until_unix_millis: unix_millis().expect("time") + 10_000,
+        ready_until_unix_millis: unix_millis().expect("time") + 4_000,
         deployment_epoch,
         profile_digest: config.profile_digest,
         gateway_image_digest: config.gateway_image_digest,

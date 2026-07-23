@@ -782,7 +782,7 @@ impl Default for DatabaseDriverSelection {
   }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SlackConfig {
   pub workspace_id: String,
@@ -838,7 +838,7 @@ pub enum SlackDirectMessageFeedbackMode {
   AssistantStatus,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SlackResponseFeedbackConfig {
   pub mode: SlackResponseFeedbackMode,
@@ -864,7 +864,7 @@ impl Default for SlackResponseFeedbackConfig {
   }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SlackUserTokenConfig {
   pub user_id: String,
@@ -964,10 +964,16 @@ impl ScheduledRunnerGatewayConfig {
       "scheduled_codex.remote_runner.gateway.readiness_ttl_ms",
       self.readiness_ttl_ms,
     )?;
-    if !(1..=64).contains(&self.max_connections) {
+    if self.readiness_ttl_ms > 30_000 {
+      return Err(invalid_scheduled_codex(
+        "scheduled_codex.remote_runner.gateway.readiness_ttl_ms",
+        "must be between 1 and 30000 milliseconds",
+      ));
+    }
+    if !(1..=16).contains(&self.max_connections) {
       return Err(invalid_scheduled_codex(
         "scheduled_codex.remote_runner.gateway.max_connections",
-        "must be between 1 and 64",
+        "must be between 1 and 16",
       ));
     }
     Ok(())
@@ -983,10 +989,13 @@ pub struct ScheduledRunnerControlConfig {
   pub client_private_key_path: PathBuf,
   pub server_ca_bundle_path: PathBuf,
   pub local_socket_path: PathBuf,
+  pub control_uid: u32,
+  pub control_gid: u32,
   pub expected_executor_uid: u32,
   pub expected_executor_gid: u32,
   pub connect_timeout_ms: u64,
   pub frame_timeout_ms: u64,
+  pub readiness_ttl_ms: u64,
 }
 
 impl ScheduledRunnerControlConfig {
@@ -1016,14 +1025,24 @@ impl ScheduledRunnerControlConfig {
         &self.local_socket_path,
       ),
     ])?;
-    if self.expected_executor_uid == 0
-      || self.expected_executor_gid == 0
-      || self.expected_executor_uid != deployment.runtime_uid
-      || self.expected_executor_gid != deployment.runtime_gid
+    if self.expected_executor_uid != deployment.trusted_owner_uid
+      || self.expected_executor_gid != deployment.trusted_owner_gid
     {
       return Err(invalid_scheduled_codex(
         "scheduled_codex.remote_runner.control.expected_executor_uid",
-        "must match the nonroot scheduled_codex runtime identity",
+        "must match the trusted executor supervisor identity",
+      ));
+    }
+    if self.control_uid == 0
+      || self.control_gid == 0
+      || self.control_uid == deployment.trusted_owner_uid
+      || self.control_gid == deployment.trusted_owner_gid
+      || self.control_uid == deployment.runtime_uid
+      || self.control_gid == deployment.runtime_gid
+    {
+      return Err(invalid_scheduled_codex(
+        "scheduled_codex.remote_runner.control.control_uid",
+        "must identify a dedicated nonroot runner-control process",
       ));
     }
     validate_milliseconds(
@@ -1033,7 +1052,18 @@ impl ScheduledRunnerControlConfig {
     validate_milliseconds(
       "scheduled_codex.remote_runner.control.frame_timeout_ms",
       self.frame_timeout_ms,
-    )
+    )?;
+    validate_milliseconds(
+      "scheduled_codex.remote_runner.control.readiness_ttl_ms",
+      self.readiness_ttl_ms,
+    )?;
+    if self.readiness_ttl_ms > 30_000 {
+      return Err(invalid_scheduled_codex(
+        "scheduled_codex.remote_runner.control.readiness_ttl_ms",
+        "must be between 1 and 30000 milliseconds",
+      ));
+    }
+    Ok(())
   }
 }
 
@@ -1055,12 +1085,16 @@ impl ScheduledRunnerExecutorConfig {
       "scheduled_codex.remote_runner.executor.local_socket_path",
       &self.local_socket_path,
     )])?;
-    if self.expected_control_uid != deployment.trusted_owner_uid
-      || self.expected_control_gid != deployment.trusted_owner_gid
+    if self.expected_control_uid == 0
+      || self.expected_control_gid == 0
+      || self.expected_control_uid == deployment.trusted_owner_uid
+      || self.expected_control_gid == deployment.trusted_owner_gid
+      || self.expected_control_uid == deployment.runtime_uid
+      || self.expected_control_gid == deployment.runtime_gid
     {
       return Err(invalid_scheduled_codex(
         "scheduled_codex.remote_runner.executor.expected_control_uid",
-        "must match the scheduled_codex trusted owner identity",
+        "must identify a dedicated nonroot runner-control process",
       ));
     }
     if self.codex_child_uid == 0
@@ -1116,7 +1150,7 @@ pub struct ScheduledCodexConfig {
   pub runtime_gid: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct CodexAppServerConfig {
   pub command: String,
@@ -1140,7 +1174,7 @@ impl Default for CodexAppServerConfig {
   }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct McpConfig {
   pub enabled: bool,

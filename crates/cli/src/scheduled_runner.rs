@@ -1,62 +1,251 @@
 use std::error::Error;
 use std::io;
-use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use codeoff_agent_codex::{
   RemoteIsolationPermitEnvelope, ScheduledCodexRequest, ScheduledExecutionIdentity,
-  ScheduledExecutionResult, ScheduledFailureKind, build_production_scheduled_codex_executor,
+  ScheduledExecutionResult, ScheduledFailureKind, build_supervised_scheduled_codex_executor,
   load_trusted_owner_scheduled_deployment_authority,
 };
-use codeoff_config::{CodeoffConfig, ScheduledRunnerRole};
+use codeoff_config::{CodeoffConfig, ScheduledRunnerRole, SchedulerRuntimeConfig, SlackConfig};
+use codeoff_runtime::scheduled_execution::ScheduledExecutor;
 use codeoff_runtime::scheduled_remote_protocol::{
   AdmissionFrame, ErrorFrame, MAX_READY_TTL_MILLIS, PreparedFrame, REMOTE_PROTOCOL_VERSION,
   ReadyFrame, RemoteFrame, RemoteMessage, RemoteResultKind, ResultFrame, RunBinding, StartFrame,
 };
+use codeoff_runtime::scheduled_runner_broker::{
+  RemoteScheduledExecutionBackend, ScheduledRunnerBroker, ScheduledRunnerBrokerConfig,
+};
 use codeoff_runtime::scheduled_runner_control::{
-  ProtectedScheduledExecutorListener, ScheduledRunnerControlConfig as LocalControlConfig,
+  ScheduledRunnerControlConfig as LocalControlConfig, ScheduledRunnerControlConnection,
 };
 use codeoff_runtime::scheduled_runner_executor::{
-  ScheduledRunnerExecutorConfig, ScheduledRunnerExecutorConnection, current_process_credentials,
-  decode_scheduled_remote_task,
+  ProtectedScheduledExecutorListener, ScheduledRunnerExecutorConfig, current_process_credentials,
+  decode_scheduled_remote_task, harden_scheduled_executor_process,
 };
 use codeoff_runtime::scheduled_runner_tls::{
   ScheduledRunnerIoPolicy, ScheduledRunnerTlsClient, ScheduledRunnerTlsError,
-  ScheduledRunnerTlsPaths, session_challenge, session_nonce,
+  ScheduledRunnerTlsPaths, ScheduledRunnerTlsServer, session_challenge, session_nonce,
 };
+use codeoff_state::{ScheduledExecutorEpochAuthority, StateStore};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::net::TcpListener;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 
-pub(crate) fn run_control(
-  config: CodeoffConfig,
-  config_path: Option<PathBuf>,
-) -> Result<(), Box<dyn Error>> {
+use crate::scheduled_codex::RemoteCodexPermitIssuer;
+
+pub(crate) struct ScheduledRunnerGateway {
+  listener: TcpListener,
+  tls: Arc<ScheduledRunnerTlsServer>,
+  broker: ScheduledRunnerBroker,
+  connections: Arc<Semaphore>,
+}
+
+impl ScheduledRunnerGateway {
+  pub(crate) async fn run_until(
+    self,
+    mut shutdown: watch::Receiver<bool>,
+  ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut tasks = JoinSet::new();
+    loop {
+      let permit = tokio::select! {
+        changed = shutdown.changed() => {
+          if changed.is_err() || *shutdown.borrow() {
+            break;
+          }
+          continue;
+        }
+        permit = Arc::clone(&self.connections).acquire_owned() => permit?,
+      };
+      let accepted = tokio::select! {
+        changed = shutdown.changed() => {
+          if changed.is_err() || *shutdown.borrow() {
+            break;
+          }
+          continue;
+        }
+        accepted = self.listener.accept() => accepted,
+      };
+      let (stream, _) = accepted?;
+      let tls = Arc::clone(&self.tls);
+      let broker = self.broker.clone();
+      tasks.spawn(async move {
+        let _permit = permit;
+        let result = async {
+          let connection = tls.accept(stream).await.map_err(|error| {
+            io::Error::other(format!("scheduled runner TLS rejected connection: {error}"))
+          })?;
+          broker.run_connection(connection).await.map_err(|error| {
+            io::Error::other(format!(
+              "scheduled runner broker rejected connection: {error}"
+            ))
+          })
+        }
+        .await;
+        if let Err(error) = result {
+          eprintln!("scheduled runner connection closed: {error}");
+        }
+      });
+      while tasks.try_join_next().is_some() {}
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    Ok(())
+  }
+}
+
+pub(crate) async fn build_gateway(
+  config: &CodeoffConfig,
+  state: StateStore,
+) -> Result<(ScheduledExecutor, ScheduledRunnerGateway), Box<dyn Error>> {
+  config
+    .agent
+    .scheduled_codex
+    .validate_remote_runner_role(ScheduledRunnerRole::Gateway)?;
+  validate_gateway_environment(|name| std::env::var_os(name).is_some())?;
+  let role = config
+    .agent
+    .scheduled_codex
+    .remote_runner
+    .gateway
+    .as_ref()
+    .ok_or_else(|| io::Error::other("scheduled runner gateway configuration missing"))?;
+  let (profile, authority) =
+    load_trusted_owner_scheduled_deployment_authority(&config.agent.scheduled_codex)
+      .map_err(|failure| io::Error::other(failure.message))?;
+  let now_seconds = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+  state
+    .register_scheduled_executor_epoch(
+      &ScheduledExecutorEpochAuthority {
+        schema_version: authority.schema_version,
+        deployment_epoch: authority.deployment_epoch,
+        attestation_id: authority.attestation_id.clone(),
+        attestation_digest: authority.attestation_digest.clone(),
+        profile_digest: authority.profile_digest.clone(),
+        issued_at: i64::try_from(authority.issued_at_unix_seconds)?,
+        expires_at: i64::try_from(authority.expires_at_unix_seconds)?,
+      },
+      now_seconds,
+    )
+    .await?;
+  let broker = ScheduledRunnerBroker::new(ScheduledRunnerBrokerConfig {
+    schema_version: authority.schema_version,
+    deployment_epoch: u64::try_from(authority.deployment_epoch)?,
+    attestation_id: authority.attestation_id.clone(),
+    profile_digest: authority.profile_digest.clone(),
+    signed_not_after_unix_seconds: i64::try_from(authority.expires_at_unix_seconds)?,
+    gateway_image_digest: profile.gateway_image_digest.clone(),
+    runner_image_digest: profile.runner_image_digest.clone(),
+    runner_workload_identity: profile.runner_workload_identity.clone(),
+    runner_client_spki_sha256: profile.runner_client_cert_public_key_fingerprint.clone(),
+    credential_revision: profile.credential_revision.clone(),
+    max_connections: role.max_connections,
+    admission_ttl: Duration::from_millis(role.readiness_ttl_ms),
+  })?;
+  let tls = Arc::new(ScheduledRunnerTlsServer::load(
+    &ScheduledRunnerTlsPaths {
+      certificate_chain: role.server_certificate_path.clone(),
+      private_key: role.server_private_key_path.clone(),
+      trust_bundle: role.client_ca_bundle_path.clone(),
+    },
+    broker.expected_authorized_peer(),
+    ScheduledRunnerIoPolicy {
+      handshake_timeout: Duration::from_millis(role.handshake_timeout_ms),
+      read_timeout: Duration::from_millis(role.frame_timeout_ms),
+      write_timeout: Duration::from_millis(role.frame_timeout_ms),
+    },
+  )?);
+  let listener = TcpListener::bind(&role.bind).await?;
+  let issuer = Arc::new(RemoteCodexPermitIssuer::new(
+    state,
+    authority,
+    profile.credential_revision,
+  ));
+  let backend =
+    RemoteScheduledExecutionBackend::new(broker.clone(), tokio::runtime::Handle::current(), issuer);
+  Ok((
+    ScheduledExecutor::new(Arc::new(backend)),
+    ScheduledRunnerGateway {
+      listener,
+      tls,
+      broker,
+      connections: Arc::new(Semaphore::new(role.max_connections)),
+    },
+  ))
+}
+
+pub(crate) fn run_control(config: CodeoffConfig) -> Result<(), Box<dyn Error>> {
   config
     .agent
     .scheduled_codex
     .validate_remote_runner_role(ScheduledRunnerRole::Control)?;
+  validate_dedicated_worker_surface(&config, ScheduledRunnerRole::Control)?;
   let observed = current_process_credentials();
-  if observed.uid != config.agent.scheduled_codex.trusted_owner_uid
-    || observed.gid != config.agent.scheduled_codex.trusted_owner_gid
-  {
+  let role = config
+    .agent
+    .scheduled_codex
+    .remote_runner
+    .control
+    .as_ref()
+    .ok_or_else(|| io::Error::other("scheduled runner control configuration missing"))?;
+  if observed.uid != role.control_uid || observed.gid != role.control_gid {
     return Err(io::Error::other("scheduled runner control process identity mismatch").into());
   }
   let runtime = tokio::runtime::Runtime::new()?;
-  runtime.block_on(run_control_async(config, config_path))
+  runtime.block_on(run_control_loop(config))
+}
+
+async fn run_control_loop(config: CodeoffConfig) -> Result<(), Box<dyn Error>> {
+  let mut attempt = 0_u32;
+  loop {
+    let session = run_control_session(config.clone());
+    tokio::pin!(session);
+    let failed = tokio::select! {
+      signal = tokio::signal::ctrl_c() => {
+        signal?;
+        return Ok(());
+      }
+      result = &mut session => {
+        if let Err(error) = result {
+          eprintln!("scheduled runner session ended: {error}");
+          true
+        } else {
+          false
+        }
+      }
+    };
+    attempt = if failed {
+      attempt.saturating_add(1).min(16)
+    } else {
+      0
+    };
+    let delay = reconnect_delay(attempt.saturating_sub(1));
+    tokio::select! {
+      signal = tokio::signal::ctrl_c() => {
+        signal?;
+        return Ok(());
+      }
+      () = tokio::time::sleep(delay) => {}
+    }
+  }
+}
+
+fn reconnect_delay(attempt: u32) -> Duration {
+  let exponent = attempt.min(6);
+  let base = 250_u64.saturating_mul(1_u64 << exponent).min(15_000);
+  let jitter = unix_millis().unwrap_or(0) % 251;
+  Duration::from_millis(base.saturating_add(jitter).min(15_250))
 }
 
 #[allow(
   clippy::too_many_lines,
-  reason = "the one-shot control keeps TLS, child, and relay ownership in one auditable scope"
+  reason = "the one-shot control keeps TLS and relay ownership in one auditable scope"
 )]
-async fn run_control_async(
-  config: CodeoffConfig,
-  config_path: Option<PathBuf>,
-) -> Result<(), Box<dyn Error>> {
+async fn run_control_session(config: CodeoffConfig) -> Result<(), Box<dyn Error>> {
   let role = config
     .agent
     .scheduled_codex
@@ -65,12 +254,6 @@ async fn run_control_async(
     .as_ref()
     .ok_or_else(|| io::Error::other("scheduled runner control configuration missing"))?;
   let frame_timeout = Duration::from_millis(role.frame_timeout_ms);
-  let listener = ProtectedScheduledExecutorListener::bind(LocalControlConfig {
-    socket_path: role.local_socket_path.clone(),
-    executor_uid: role.expected_executor_uid,
-    executor_gid: role.expected_executor_gid,
-    accept_timeout: Duration::from_millis(role.connect_timeout_ms),
-  })?;
   let (profile, authority) =
     load_trusted_owner_scheduled_deployment_authority(&config.agent.scheduled_codex)
       .map_err(|failure| io::Error::other(failure.message))?;
@@ -95,7 +278,7 @@ async fn run_control_async(
   let runner_session_nonce = session_nonce(&remote.channel_binding);
   let challenge = session_challenge(&remote.channel_binding);
   let now = unix_millis()?;
-  let configured_ttl = MAX_READY_TTL_MILLIS.min(
+  let configured_ttl = role.readiness_ttl_ms.min(MAX_READY_TTL_MILLIS).min(
     authority
       .expires_at_unix_seconds
       .saturating_mul(1_000)
@@ -124,57 +307,17 @@ async fn run_control_async(
       }),
     })
     .await?;
-  let mut child = spawn_executor(
-    config_path.as_ref(),
-    role.expected_executor_uid,
-    role.expected_executor_gid,
-  )?;
-  let accepted = match listener.accept().await {
-    Ok(connection) => connection,
-    Err(error) => {
-      stop_child(&mut child);
-      return Err(error.into());
-    }
-  };
-  let mut local = accepted.into_framed(frame_timeout, frame_timeout);
-  let relay = relay_runner_frames(&mut remote.framed, &mut local, &runner_session_nonce).await;
-  stop_child(&mut child);
-  relay
-}
-
-#[allow(
-  clippy::similar_names,
-  reason = "UID and GID are an exact paired process identity"
-)]
-fn spawn_executor(
-  config_path: Option<&PathBuf>,
-  executor_uid: u32,
-  executor_gid: u32,
-) -> Result<Child, Box<dyn Error>> {
-  let executable = std::env::current_exe()?;
-  let mut command = Command::new(executable);
-  command
-    .env_clear()
-    .env("LANG", "C.UTF-8")
-    .env("LC_ALL", "C.UTF-8")
-    .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-    .uid(executor_uid)
-    .gid(executor_gid)
-    .stdin(Stdio::null())
-    .stdout(Stdio::inherit())
-    .stderr(Stdio::inherit());
-  if let Some(path) = config_path {
-    command.arg("--config").arg(path);
-  }
-  command.args(["worker", "scheduled-runner-executor"]);
-  Ok(command.spawn()?)
-}
-
-fn stop_child(child: &mut Child) {
-  if child.try_wait().ok().flatten().is_none() {
-    let _ = child.kill();
-  }
-  let _ = child.wait();
+  let mut local = ScheduledRunnerControlConnection::connect(&LocalControlConfig {
+    socket_path: role.local_socket_path.clone(),
+    executor_uid: role.expected_executor_uid,
+    executor_gid: role.expected_executor_gid,
+    connect_timeout: Duration::from_millis(role.connect_timeout_ms),
+    read_timeout: frame_timeout,
+    write_timeout: frame_timeout,
+  })
+  .await?
+  .framed;
+  relay_runner_frames(&mut remote.framed, &mut local, &runner_session_nonce).await
 }
 
 async fn relay_runner_frames<R, L>(
@@ -233,14 +376,41 @@ pub(crate) fn run_executor(config: CodeoffConfig) -> Result<(), Box<dyn Error>> 
     .agent
     .scheduled_codex
     .validate_remote_runner_role(ScheduledRunnerRole::Executor)?;
+  validate_dedicated_worker_surface(&config, ScheduledRunnerRole::Executor)?;
   let observed = current_process_credentials();
-  if observed.uid != config.agent.scheduled_codex.runtime_uid
-    || observed.gid != config.agent.scheduled_codex.runtime_gid
+  if observed.uid != config.agent.scheduled_codex.trusted_owner_uid
+    || observed.gid != config.agent.scheduled_codex.trusted_owner_gid
   {
     return Err(io::Error::other("scheduled runner executor process identity mismatch").into());
   }
+  harden_scheduled_executor_process()?;
   let runtime = tokio::runtime::Runtime::new()?;
-  runtime.block_on(run_executor_async(config))
+  runtime.block_on(run_executor_loop(config))
+}
+
+async fn run_executor_loop(config: CodeoffConfig) -> Result<(), Box<dyn Error>> {
+  loop {
+    let session = run_executor_session(config.clone());
+    tokio::pin!(session);
+    tokio::select! {
+      signal = tokio::signal::ctrl_c() => {
+        signal?;
+        return Ok(());
+      }
+      result = &mut session => {
+        if let Err(error) = result {
+          eprintln!("scheduled executor session ended: {error}");
+        }
+      }
+    }
+    tokio::select! {
+      signal = tokio::signal::ctrl_c() => {
+        signal?;
+        return Ok(());
+      }
+      () = tokio::time::sleep(Duration::from_millis(250)) => {}
+    }
+  }
 }
 
 #[allow(
@@ -248,7 +418,7 @@ pub(crate) fn run_executor(config: CodeoffConfig) -> Result<(), Box<dyn Error>> 
   clippy::too_many_lines,
   reason = "the one-shot executor keeps the complete protocol phase order auditable"
 )]
-async fn run_executor_async(config: CodeoffConfig) -> Result<(), Box<dyn Error>> {
+async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error>> {
   let role = config
     .agent
     .scheduled_codex
@@ -257,18 +427,22 @@ async fn run_executor_async(config: CodeoffConfig) -> Result<(), Box<dyn Error>>
     .as_ref()
     .ok_or_else(|| io::Error::other("scheduled runner executor configuration missing"))?;
   let frame_timeout = Duration::from_millis(role.frame_timeout_ms);
-  let connection = ScheduledRunnerExecutorConnection::connect(&ScheduledRunnerExecutorConfig {
+  let listener = ProtectedScheduledExecutorListener::bind(ScheduledRunnerExecutorConfig {
     socket_path: role.local_socket_path.clone(),
     control_uid: role.expected_control_uid,
     control_gid: role.expected_control_gid,
-    connect_timeout: Duration::from_millis(role.accept_timeout_ms),
+    accept_timeout: Duration::from_millis(role.accept_timeout_ms),
     read_timeout: frame_timeout,
     write_timeout: frame_timeout,
-  })
-  .await?;
+  })?;
+  let connection = listener.accept().await?;
   let mut framed = connection.framed;
-  let built = build_production_scheduled_codex_executor(&config.agent.scheduled_codex)
-    .map_err(|failure| io::Error::other(failure.message))?;
+  let built = build_supervised_scheduled_codex_executor(
+    &config.agent.scheduled_codex,
+    role.codex_child_uid,
+    role.codex_child_gid,
+  )
+  .map_err(|failure| io::Error::other(failure.message))?;
   let now = unix_millis()?;
   let admission_frame = framed
     .read_frame(now)
@@ -588,6 +762,101 @@ fn preparation_nonce(envelope: &str, session_nonce: &str, capability_profile: &s
   )
 }
 
+const DEDICATED_RUNNER_SECRET_ENVIRONMENT: [&str; 4] = [
+  "CODEOFF_SCHEDULED_GITHUB_PAT",
+  "CODEOFF_SCHEDULED_RUNNER_CLIENT_PRIVATE_KEY",
+  "CODEOFF_SCHEDULED_RUNNER_ISSUER_PRIVATE_KEY",
+  "GITHUB_PAT",
+];
+
+fn validate_gateway_environment(present: impl Fn(&str) -> bool) -> Result<(), Box<dyn Error>> {
+  if let Some(name) = DEDICATED_RUNNER_SECRET_ENVIRONMENT
+    .iter()
+    .find(|name| present(name))
+  {
+    return Err(
+      io::Error::other(format!(
+        "scheduled runner gateway forbids dedicated secret environment {name}"
+      ))
+      .into(),
+    );
+  }
+  Ok(())
+}
+
+fn validate_dedicated_worker_surface(
+  config: &CodeoffConfig,
+  role: ScheduledRunnerRole,
+) -> Result<(), Box<dyn Error>> {
+  validate_dedicated_worker_surface_with(config, role, |name| std::env::var_os(name).is_some())
+}
+
+#[allow(
+  clippy::default_trait_access,
+  reason = "MCP and live Codex config types are intentionally not exported by codeoff-config"
+)]
+fn validate_dedicated_worker_surface_with(
+  config: &CodeoffConfig,
+  role: ScheduledRunnerRole,
+  present: impl Fn(&str) -> bool,
+) -> Result<(), Box<dyn Error>> {
+  if config.database_url().is_some()
+    || config.state_dir() != std::path::Path::new("./.codeoff")
+    || config.scheduler != SchedulerRuntimeConfig::default()
+  {
+    return Err(
+      io::Error::other(
+        "scheduled runner worker forbids database, state-directory, and scheduler surfaces",
+      )
+      .into(),
+    );
+  }
+  if config.slack != SlackConfig::default()
+    || config.mcp != Default::default()
+    || config.agent.codex_app_server != Default::default()
+  {
+    return Err(
+      io::Error::other(
+        "scheduled runner worker forbids Slack, live Codex, and MCP server configuration",
+      )
+      .into(),
+    );
+  }
+  let mut forbidden = vec![
+    "CODEOFF_DATABASE_URL",
+    "CODEOFF_STATE_DIR",
+    "DATABASE_URL",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "OPENAI_API_KEY",
+    config.slack.app_token_env.as_str(),
+    config.slack.bot_token_env.as_str(),
+    config.slack.signing_secret_env.as_str(),
+  ];
+  forbidden.extend(DEDICATED_RUNNER_SECRET_ENVIRONMENT);
+  forbidden.extend(
+    config
+      .slack
+      .user_tokens
+      .values()
+      .map(|token| token.token_env.as_str()),
+  );
+  if let Some(name) = forbidden.into_iter().find(|name| present(name)) {
+    let role_name = match role {
+      ScheduledRunnerRole::Gateway => "gateway",
+      ScheduledRunnerRole::Control => "control",
+      ScheduledRunnerRole::Executor => "executor",
+    };
+    return Err(
+      io::Error::other(format!(
+        "scheduled runner {role_name} forbids ambient secret environment {name}"
+      ))
+      .into(),
+    );
+  }
+  Ok(())
+}
+
 fn unix_millis() -> Result<u64, Box<dyn Error>> {
   Ok(u64::try_from(
     SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
@@ -596,4 +865,232 @@ fn unix_millis() -> Result<u64, Box<dyn Error>> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
   format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use codeoff_runtime::scheduled_remote_protocol::{PrepareFrame, PreparedFrame};
+  use codeoff_runtime::scheduled_runner_tls::ScheduledRunnerFramed;
+
+  #[test]
+  fn gateway_rejects_only_dedicated_runner_secret_environment() {
+    assert!(validate_gateway_environment(|name| name == "SLACK_BOT_TOKEN").is_ok());
+    assert!(
+      validate_gateway_environment(|name| name == "CODEOFF_SCHEDULED_RUNNER_CLIENT_PRIVATE_KEY")
+        .is_err()
+    );
+  }
+
+  #[test]
+  fn dedicated_workers_reject_state_live_and_secret_surfaces() {
+    let config = CodeoffConfig::default();
+    assert!(
+      validate_dedicated_worker_surface_with(&config, ScheduledRunnerRole::Control, |_| false)
+        .is_ok()
+    );
+    assert!(
+      validate_dedicated_worker_surface_with(&config, ScheduledRunnerRole::Executor, |name| {
+        name == "OPENAI_API_KEY"
+      })
+      .is_err()
+    );
+
+    let mut live = config.clone();
+    live.mcp.enabled = true;
+    assert!(
+      validate_dedicated_worker_surface_with(&live, ScheduledRunnerRole::Executor, |_| false)
+        .is_err()
+    );
+
+    let mut stateful = config;
+    stateful.database.url = Some("sqlite:///run/codeoff/state.db".to_owned());
+    assert!(
+      validate_dedicated_worker_surface_with(&stateful, ScheduledRunnerRole::Control, |_| false)
+        .is_err()
+    );
+  }
+
+  #[test]
+  fn reconnect_delay_is_bounded() {
+    assert!(reconnect_delay(0) >= Duration::from_millis(250));
+    assert!(reconnect_delay(32) <= Duration::from_millis(15_250));
+  }
+
+  #[tokio::test]
+  #[allow(
+    clippy::too_many_lines,
+    reason = "the protocol integration test keeps the complete bidirectional phase order visible"
+  )]
+  async fn relay_carries_complete_prepare_start_result_exchange() {
+    let nonce = "a".repeat(64);
+    let binding = RunBinding {
+      run_id: "run-1".to_owned(),
+      job_id: "job-1".to_owned(),
+      attempt: 1,
+      fence_token: 1,
+      authority_digest: "b".repeat(64),
+      profile_digest: "c".repeat(64),
+      deployment_epoch: 1,
+      credential_revision: "credential-v1".to_owned(),
+    };
+    let preparation_nonce = "d".repeat(64);
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (mut remote_relay, mut remote_gateway) =
+      local_framed_pair(temp.path().join("remote.sock")).await;
+    let (mut local_relay, mut local_executor) =
+      local_framed_pair(temp.path().join("local.sock")).await;
+    let executor_binding = binding.clone();
+    let executor_preparation_nonce = preparation_nonce.clone();
+
+    let relay = relay_runner_frames(&mut remote_relay, &mut local_relay, &nonce);
+    let gateway = async {
+      remote_gateway
+        .write_frame(&test_remote_frame(
+          &nonce,
+          1,
+          RemoteMessage::Admission(AdmissionFrame {
+            challenge: "e".repeat(64),
+            admission_nonce: "f".repeat(64),
+            expires_at_unix_millis: unix_millis().expect("time") + 5_000,
+            deployment_epoch: 1,
+            profile_digest: binding.profile_digest.clone(),
+          }),
+        ))
+        .await
+        .expect("admission");
+      remote_gateway
+        .write_frame(&test_remote_frame(
+          &nonce,
+          2,
+          RemoteMessage::Prepare(PrepareFrame {
+            binding: binding.clone(),
+            isolation_permit_envelope_json: r#"{"schema_version":1}"#.to_owned(),
+            task_json: r#"{"instruction":"check"}"#.to_owned(),
+            definition_json: r#"{"prompt":"check"}"#.to_owned(),
+            capability_json: r#"{"tools":[]}"#.to_owned(),
+            targets_json: r#"{"targets":[]}"#.to_owned(),
+          }),
+        ))
+        .await
+        .expect("prepare");
+      let prepared = remote_gateway
+        .read_frame(unix_millis().expect("time"))
+        .await
+        .expect("prepared read")
+        .expect("prepared frame");
+      assert!(matches!(prepared.message, RemoteMessage::Prepared(_)));
+      remote_gateway
+        .write_frame(&test_remote_frame(
+          &nonce,
+          3,
+          RemoteMessage::Start(StartFrame {
+            binding: binding.clone(),
+            preparation_nonce: preparation_nonce.clone(),
+          }),
+        ))
+        .await
+        .expect("start");
+      let result = remote_gateway
+        .read_frame(unix_millis().expect("time"))
+        .await
+        .expect("result read")
+        .expect("result frame");
+      assert!(matches!(result.message, RemoteMessage::Result(_)));
+    };
+    let executor = async {
+      for expected in ["admission", "prepare"] {
+        let frame = local_executor
+          .read_frame(unix_millis().expect("time"))
+          .await
+          .expect("gateway frame read")
+          .expect("gateway frame");
+        assert_eq!(
+          match frame.message {
+            RemoteMessage::Admission(_) => "admission",
+            RemoteMessage::Prepare(_) => "prepare",
+            _ => "unexpected",
+          },
+          expected
+        );
+      }
+      local_executor
+        .write_frame(&test_remote_frame(
+          &nonce,
+          2,
+          RemoteMessage::Prepared(PreparedFrame {
+            binding: executor_binding.clone(),
+            preparation_nonce: executor_preparation_nonce.clone(),
+            attested_profile_json: "{}".to_owned(),
+            attested_profile_digest: "1".repeat(64),
+          }),
+        ))
+        .await
+        .expect("prepared");
+      let start = local_executor
+        .read_frame(unix_millis().expect("time"))
+        .await
+        .expect("start read")
+        .expect("start frame");
+      assert!(matches!(start.message, RemoteMessage::Start(_)));
+      local_executor
+        .write_frame(&test_remote_frame(
+          &nonce,
+          3,
+          RemoteMessage::Result(ResultFrame {
+            binding: executor_binding,
+            preparation_nonce: executor_preparation_nonce,
+            kind: RemoteResultKind::Completed,
+            result_json: r#"{"schema_version":1,"summary":"ok"}"#.to_owned(),
+          }),
+        ))
+        .await
+        .expect("result");
+    };
+    let (relay, (), ()) = tokio::join!(relay, gateway, executor);
+    relay.expect("relay exchange");
+  }
+
+  fn test_remote_frame(nonce: &str, sequence: u64, message: RemoteMessage) -> RemoteFrame {
+    RemoteFrame {
+      version: REMOTE_PROTOCOL_VERSION,
+      session_nonce: nonce.to_owned(),
+      sequence,
+      message,
+    }
+  }
+
+  async fn local_framed_pair(
+    socket_path: std::path::PathBuf,
+  ) -> (
+    ScheduledRunnerFramed<tokio::net::UnixStream>,
+    ScheduledRunnerFramed<tokio::net::UnixStream>,
+  ) {
+    let credentials = current_process_credentials();
+    let timeout = Duration::from_secs(2);
+    let listener = ProtectedScheduledExecutorListener::bind(ScheduledRunnerExecutorConfig {
+      socket_path: socket_path.clone(),
+      control_uid: credentials.uid,
+      control_gid: credentials.gid,
+      accept_timeout: timeout,
+      read_timeout: timeout,
+      write_timeout: timeout,
+    })
+    .expect("local listener");
+    let accepted = listener.accept();
+    let control_config = LocalControlConfig {
+      socket_path,
+      executor_uid: credentials.uid,
+      executor_gid: credentials.gid,
+      connect_timeout: timeout,
+      read_timeout: timeout,
+      write_timeout: timeout,
+    };
+    let connected = ScheduledRunnerControlConnection::connect(&control_config);
+    let (accepted, connected) = tokio::join!(accepted, connected);
+    (
+      accepted.expect("accepted local peer").framed,
+      connected.expect("connected local peer").framed,
+    )
+  }
 }

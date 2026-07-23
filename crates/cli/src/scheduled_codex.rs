@@ -16,6 +16,7 @@ use codeoff_runtime::scheduled_execution::{
   PrepareInput, PreparedExecution, RefreshedExecutorAdmission, ScheduledExecutionBackend,
   ScheduledWorkerConfig,
 };
+use codeoff_runtime::scheduled_runner_broker::RemoteIsolationPermitIssuer;
 use codeoff_state::{
   ConsumeScheduledExecutionPermit, ScheduledExecutorAdmission, ScheduledExecutorEpochAuthority,
   StateError, StateStore,
@@ -178,6 +179,53 @@ pub(crate) struct CodexScheduledExecutionBackend {
   interrupt_grace: Duration,
   terminate_grace: Duration,
   kill_grace: Duration,
+}
+
+pub(crate) struct RemoteCodexPermitIssuer {
+  state: StateStore,
+  authority: ScheduledDeploymentAuthority,
+  credential_revision: String,
+}
+
+impl RemoteCodexPermitIssuer {
+  pub(crate) fn new(
+    state: StateStore,
+    authority: ScheduledDeploymentAuthority,
+    credential_revision: String,
+  ) -> Self {
+    Self {
+      state,
+      authority,
+      credential_revision,
+    }
+  }
+}
+
+#[async_trait]
+impl RemoteIsolationPermitIssuer for RemoteCodexPermitIssuer {
+  async fn issue(
+    &self,
+    input: &PrepareInput,
+    session_nonce: &str,
+  ) -> Result<String, PrepareFailure> {
+    let identity = scheduled_identity(input);
+    let permit = consume_authorization(
+      &self.state,
+      &self.authority,
+      &identity,
+      input.authority.digest(),
+      now_unix_seconds()?,
+    )
+    .await?;
+    permit
+      .into_remote_envelope(
+        input.authority.digest(),
+        &self.credential_revision,
+        session_nonce,
+      )
+      .map(|envelope| envelope.as_json().to_owned())
+      .map_err(scheduled_failure)
+  }
 }
 
 impl CodexScheduledExecutionBackend {

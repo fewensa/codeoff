@@ -30,7 +30,7 @@ use codeoff_channel_slack::{
   run_socket_worker,
 };
 use codeoff_config::{
-  CodeoffConfig, ConfigLoadOptions, SchedulerRuntimeConfig, SlackConfig,
+  CodeoffConfig, ConfigLoadOptions, ScheduledExecutionBackend, SchedulerRuntimeConfig, SlackConfig,
   SlackDirectMessageFeedbackMode, SlackResponseFeedbackMode,
 };
 use codeoff_mcp::McpTcpServer;
@@ -70,6 +70,7 @@ use crate::observability::{
 };
 use crate::scheduled_codex::CodexScheduledExecutionBackend;
 use crate::scheduled_runner::{
+  ScheduledRunnerGateway, build_gateway as build_scheduled_runner_gateway,
   run_control as run_scheduled_runner_control, run_executor as run_scheduled_runner_executor,
 };
 use crate::scheduler::{
@@ -644,7 +645,12 @@ async fn build_serve_lifecycle(
   mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
 ) -> Result<ServeLifecycle, Box<dyn Error>> {
   let scheduled_delivery = build_scheduled_delivery_provider(config)?;
-  let scheduled_executor = if config.scheduler.run_claims_enabled {
+  let (scheduled_executor, runner_gateway) = if config.scheduler.run_claims_enabled
+    && config.agent.scheduled_codex.execution_backend == ScheduledExecutionBackend::RemoteRunner
+  {
+    let (executor, gateway) = build_scheduled_runner_gateway(config, state.clone()).await?;
+    (Some(executor), Some(gateway))
+  } else if config.scheduler.run_claims_enabled {
     let built = build_production_scheduled_codex_executor(&config.agent.scheduled_codex).map_err(
       |failure| {
         io::Error::other(format!(
@@ -673,16 +679,19 @@ async fn build_serve_lifecycle(
         now,
       )
       .await?;
-    Some(ScheduledExecutor::new(Arc::new(
-      CodexScheduledExecutionBackend::new(
-        state.clone(),
-        built,
-        config.agent.scheduled_codex.clone(),
-        scheduled_worker_config(&config.scheduler),
-      ),
-    )))
+    (
+      Some(ScheduledExecutor::new(Arc::new(
+        CodexScheduledExecutionBackend::new(
+          state.clone(),
+          built,
+          config.agent.scheduled_codex.clone(),
+          scheduled_worker_config(&config.scheduler),
+        ),
+      ))),
+      None,
+    )
   } else {
-    None
+    (None, None)
   };
   let scheduled_executor_probe = scheduled_executor.as_ref().map(|executor| {
     let executor = executor.clone();
@@ -708,6 +717,7 @@ async fn build_serve_lifecycle(
     telemetry,
     operational_server,
     mcp_server,
+    runner_gateway,
   )?)
 }
 
@@ -768,6 +778,7 @@ impl ServeLifecycle {
     telemetry: Arc<PrometheusSchedulerTelemetry>,
     operational_server: OperationalHttpServer,
     mcp_server: Option<McpTcpServer<ServeChannelContextProvider>>,
+    runner_gateway: Option<ScheduledRunnerGateway>,
   ) -> Result<Self, StateError> {
     let mut lifecycle = Self {
       scheduled_worker: spawn_scheduled_worker(
@@ -790,6 +801,9 @@ impl ServeLifecycle {
     lifecycle.spawn_operational_http_server(operational_server);
     if let Some(server) = mcp_server {
       lifecycle.spawn_mcp_server(server);
+    }
+    if let Some(gateway) = runner_gateway {
+      lifecycle.spawn_scheduled_runner_gateway(gateway);
     }
     Ok(lifecycle)
   }
@@ -868,6 +882,16 @@ impl ServeLifecycle {
         .map_err(|error| Box::new(error) as ServeTaskError)?;
       Ok(ServeTaskExit::Cancelled)
     });
+  }
+
+  fn spawn_scheduled_runner_gateway(&mut self, gateway: ScheduledRunnerGateway) {
+    let shutdown = self.background_tasks.subscribe();
+    self
+      .background_tasks
+      .spawn("scheduled runner gateway", async move {
+        gateway.run_until(shutdown).await?;
+        Ok(ServeTaskExit::Cancelled)
+      });
   }
 
   async fn request_shutdown(&self) {
@@ -3012,9 +3036,8 @@ fn run_worker(
       Ok(())
     }
     WorkerCommand::ScheduledRunnerControl => {
-      let child_config_path = config_path.clone();
       let config = load_config(config_path, state_dir)?;
-      run_scheduled_runner_control(config, child_config_path)
+      run_scheduled_runner_control(config)
     }
     WorkerCommand::ScheduledRunnerExecutor => {
       let config = load_config(config_path, state_dir)?;

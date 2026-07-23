@@ -10,13 +10,20 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Exact commit SHA to publish without moving latest
+        description: Exact lowercase 40-character commit SHA
         required: true
         type: string
+      channel:
+        description: Production requires ancestry from origin/main; candidate never moves production tags
+        required: true
+        default: candidate
+        type: choice
+        options:
+          - candidate
+          - production
 
 permissions:
   contents: read
-  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,12 +32,15 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,26 +64,45 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          fetch-depth: 0
 
       - name: Resolve immutable source revision
         id: source
         env:
           EVENT_NAME: ${{ github.event_name }}
           REQUESTED_REF: ${{ inputs.ref }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
         run: |
           resolved_sha="$(git rev-parse HEAD)"
-          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUESTED_REF" != "$resolved_sha" ]; then
-            echo "workflow_dispatch ref must be the exact 40-character commit SHA" >&2
-            exit 1
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            if [[ ! "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "workflow_dispatch ref must be an exact lowercase 40-character commit SHA" >&2
+              exit 1
+            fi
+            if [ "$REQUESTED_REF" != "$resolved_sha" ]; then
+              echo "workflow_dispatch checkout does not match requested commit" >&2
+              exit 1
+            fi
+            if [ "$RELEASE_CHANNEL" = production ] && ! git merge-base --is-ancestor "$resolved_sha" origin/main; then
+              echo "production publication requires a commit reachable from origin/main" >&2
+              exit 1
+            fi
           fi
           echo "sha=$resolved_sha" >> "$GITHUB_OUTPUT"
-          echo "short_sha=$(git rev-parse --short=7 "$resolved_sha")" >> "$GITHUB_OUTPUT"
+          production=false
+          if [ "$EVENT_NAME" != workflow_dispatch ] || [ "$RELEASE_CHANNEL" = production ]; then
+            production=true
+          fi
+          echo "production=$production" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -93,13 +122,15 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=sha-${{ steps.source.outputs.short_sha }}
+            type=raw,value=sha-${{ steps.source.outputs.sha }},enable=${{ steps.source.outputs.production == 'true' }}
+            type=raw,value=candidate-sha-${{ steps.source.outputs.sha }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.channel == 'candidate' }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=ref,event=tag,enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
           labels: |
             org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
 
       - name: Build and push image
+        id: publish
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -112,3 +143,11 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record published digest
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+          SOURCE_REVISION: ${{ steps.source.outputs.sha }}
+        run: |
+          echo "source_revision=$SOURCE_REVISION" >> "$GITHUB_STEP_SUMMARY"
+          echo "image_digest=$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"

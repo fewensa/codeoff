@@ -30,6 +30,8 @@ use codeoff_core::AttestedCapabilityProfile;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use tempfile::TempDir as RuntimeTempDir;
 
 #[cfg(unix)]
 use nix::errno::Errno;
@@ -39,6 +41,8 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::signal::{Signal, killpg};
 #[cfg(unix)]
 use nix::unistd::Pid;
+#[cfg(unix)]
+use nix::unistd::{Gid, Uid, chown};
 
 #[cfg(unix)]
 use crate::scheduled_artifacts::{
@@ -63,6 +67,7 @@ const GITHUB_MCP_NAME: &str = "github";
 const GITHUB_MCP_SERVER_INFO_NAME: &str = "github-mcp-server";
 const GITHUB_MCP_HEALTH_TOOL: &str = "get_me";
 pub const GITHUB_MCP_ACCESS_TOKEN_ENV: &str = "CODEOFF_SCHEDULED_GITHUB_MCP_BEARER_TOKEN";
+const CODEX_SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
 const GITHUB_MCP_ACCESS_AUTH_MODE: &str = "bearer-token-env-v1";
 const OUTPUT_SCHEMA_REVISION: &str = "scheduled-result-v1";
 const OUTPUT_SCHEMA_VERSION: u64 = 1;
@@ -620,6 +625,7 @@ pub(crate) struct StdioScheduledJsonlTransport {
   receiver: Receiver<ReaderEvent>,
   process_group: Pid,
   runtime_evidence: ScheduledRuntimeEvidence,
+  state_home: Option<RuntimeTempDir>,
 }
 
 #[cfg(unix)]
@@ -649,15 +655,23 @@ impl StdioScheduledJsonlTransport {
     if profile.config_sha256 != runtime_evidence.config_sha256 {
       return Err("scheduled_config_digest_mismatch_before_spawn".to_owned());
     }
+    let child_identity =
+      child_identity.ok_or_else(|| "scheduled_codex_state_home_requires_supervisor".to_owned())?;
+    let state_home = create_runtime_state_home(profile, artifacts, child_identity)?;
     let mut verified = verified_command(
       artifacts,
       &["codex", "app-server", "--listen", "stdio://"],
-      true,
-      child_identity,
+      false,
+      Some(child_identity),
     )?;
+    let log_dir = encode_toml_path(&state_home.path().join("log"))?;
     verified
       .command
+      .arg("-c")
+      .arg(format!("log_dir={log_dir}"))
+      .env("CODEX_HOME", state_home.path())
       .env(GITHUB_MCP_ACCESS_TOKEN_ENV, github_mcp_access_token)
+      .env(CODEX_SQLITE_HOME_ENV, state_home.path().join("sqlite"))
       .stdin(Stdio::piped())
       .stdout(Stdio::piped())
       .stderr(Stdio::null())
@@ -729,6 +743,7 @@ impl StdioScheduledJsonlTransport {
       receiver,
       process_group,
       runtime_evidence,
+      state_home: Some(state_home),
     })
   }
 
@@ -767,6 +782,7 @@ impl StdioScheduledJsonlTransport {
         .map_err(|error| format!("reap scheduled codex app server: {error}"))?;
       self.join_finished_reader();
       if self.process_group_is_gone()? {
+        finalize_runtime_state_home(&mut self.state_home, ProcessExit::Exited);
         return Ok(ProcessExit::Exited);
       }
       if Instant::now() >= deadline {
@@ -854,9 +870,88 @@ impl Drop for StdioScheduledJsonlTransport {
       return;
     }
     let _ = self.signal_process_group(Signal::SIGKILL);
-    if let Some(deadline) = Instant::now().checked_add(Duration::from_millis(100)) {
-      let _ = self.wait_process_group_until(deadline);
+    let confirmed_exit = Instant::now()
+      .checked_add(Duration::from_millis(100))
+      .and_then(|deadline| self.wait_process_group_until(deadline).ok())
+      == Some(ProcessExit::Exited);
+    if !confirmed_exit {
+      finalize_runtime_state_home(&mut self.state_home, ProcessExit::TimedOut);
     }
+  }
+}
+
+#[cfg(unix)]
+fn encode_toml_path(path: &Path) -> Result<String, String> {
+  let path = path
+    .to_str()
+    .ok_or_else(|| "scheduled Codex path is not UTF-8".to_owned())?;
+  serde_json::to_string(path).map_err(|error| format!("encode scheduled Codex path: {error}"))
+}
+
+#[cfg(unix)]
+fn create_runtime_state_home(
+  profile: &RequestedCapabilityProfile,
+  artifacts: &Arc<VerifiedScheduledArtifacts>,
+  child_identity: (u32, u32),
+) -> Result<RuntimeTempDir, String> {
+  let state_home = tempfile::Builder::new()
+    .prefix("session-")
+    .tempdir_in(profile.codex_home.join("state"))
+    .map_err(|error| format!("create scheduled Codex state home: {error}"))?;
+  let runtime_config = state_home.path().join("config.toml");
+  let mut config = OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .open(&runtime_config)
+    .map_err(|error| format!("create scheduled runtime config: {error}"))?;
+  config
+    .write_all(artifacts.config_contents.as_bytes())
+    .map_err(|error| format!("write scheduled runtime config: {error}"))?;
+  config
+    .sync_all()
+    .map_err(|error| format!("sync scheduled runtime config: {error}"))?;
+  drop(config);
+  for path in [
+    state_home.path().to_path_buf(),
+    state_home.path().join("sqlite"),
+    state_home.path().join("log"),
+  ] {
+    if path != state_home.path() {
+      fs::create_dir(&path)
+        .map_err(|error| format!("create scheduled Codex state subdirectory: {error}"))?;
+    }
+    chown(
+      &path,
+      Some(Uid::from_raw(child_identity.0)),
+      Some(Gid::from_raw(child_identity.1)),
+    )
+    .map_err(|error| format!("own scheduled Codex state directory: {error}"))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+      .map_err(|error| format!("protect scheduled Codex state directory: {error}"))?;
+  }
+  chown(
+    &runtime_config,
+    Some(Uid::from_raw(child_identity.0)),
+    Some(Gid::from_raw(child_identity.1)),
+  )
+  .map_err(|error| format!("own scheduled runtime config: {error}"))?;
+  fs::set_permissions(&runtime_config, fs::Permissions::from_mode(0o600))
+    .map_err(|error| format!("protect scheduled runtime config: {error}"))?;
+  Ok(state_home)
+}
+
+#[cfg(unix)]
+fn finalize_runtime_state_home(
+  state_home: &mut Option<RuntimeTempDir>,
+  process_exit: ProcessExit,
+) -> Option<PathBuf> {
+  let state_home = state_home.take()?;
+  match process_exit {
+    ProcessExit::Exited => {
+      drop(state_home);
+      None
+    }
+    ProcessExit::TimedOut => Some(state_home.keep()),
   }
 }
 
@@ -1331,6 +1426,13 @@ pub fn prepare_scheduled_codex_home(
       format!("sync scheduled config: {error}"),
     )
   })?;
+  let state_root = profile.codex_home.join("state");
+  fs::create_dir(&state_root).map_err(|error| {
+    ScheduledFailure::new(
+      ScheduledFailureKind::InvalidRequest,
+      format!("create scheduled state root: {error}"),
+    )
+  })?;
   #[cfg(unix)]
   {
     fs::set_permissions(&config_path, fs::Permissions::from_mode(0o444)).map_err(|error| {
@@ -1347,6 +1449,12 @@ pub fn prepare_scheduled_codex_home(
         )
       },
     )?;
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o511)).map_err(|error| {
+      ScheduledFailure::new(
+        ScheduledFailureKind::InvalidRequest,
+        format!("protect scheduled state root: {error}"),
+      )
+    })?;
   }
   Ok(())
 }
@@ -2704,8 +2812,11 @@ fn validate_isolation_permit(
 #[cfg(test)]
 mod tests {
   use std::collections::VecDeque;
+  use std::io::Read as _;
+  use std::net::{SocketAddr, TcpListener, TcpStream};
   use std::os::unix::fs::MetadataExt;
   use std::sync::{Arc, Mutex};
+  use std::thread::JoinHandle as ThreadJoinHandle;
 
   use codeoff_agent_contract::{InvocationPrincipal, SessionMode};
   use ring::rand::SystemRandom;
@@ -2728,6 +2839,201 @@ mod tests {
     evidence: ScheduledRuntimeEvidence,
     reads: VecDeque<TimedRead>,
     actions: Arc<Mutex<Actions>>,
+  }
+
+  #[derive(Debug, Default)]
+  struct FakeMcpObservations {
+    authorization_headers: Vec<String>,
+    methods: Vec<String>,
+  }
+
+  struct FakeAuthenticatedMcpServer {
+    address: SocketAddr,
+    observations: Arc<Mutex<FakeMcpObservations>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<ThreadJoinHandle<()>>,
+  }
+
+  impl FakeAuthenticatedMcpServer {
+    fn start(expected_bearer: &str) -> Self {
+      let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake MCP");
+      listener
+        .set_nonblocking(true)
+        .expect("nonblocking fake MCP");
+      let address = listener.local_addr().expect("fake MCP address");
+      let observations = Arc::new(Mutex::new(FakeMcpObservations::default()));
+      let thread_observations = Arc::clone(&observations);
+      let stop = Arc::new(AtomicBool::new(false));
+      let thread_stop = Arc::clone(&stop);
+      let expected_authorization = format!("Bearer {expected_bearer}");
+      let thread = thread::Builder::new()
+        .name("fake-authenticated-mcp".to_owned())
+        .spawn(move || {
+          while !thread_stop.load(Ordering::Acquire) {
+            match listener.accept() {
+              Ok((mut stream, _)) => {
+                handle_fake_mcp_connection(
+                  &mut stream,
+                  &expected_authorization,
+                  &thread_observations,
+                );
+              }
+              Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+              }
+              Err(_) => return,
+            }
+          }
+        })
+        .expect("start fake MCP");
+      Self {
+        address,
+        observations,
+        stop,
+        thread: Some(thread),
+      }
+    }
+
+    fn url(&self) -> String {
+      format!("http://{}/mcp", self.address)
+    }
+  }
+
+  impl Drop for FakeAuthenticatedMcpServer {
+    fn drop(&mut self) {
+      self.stop.store(true, Ordering::Release);
+      let _ = TcpStream::connect(self.address);
+      if let Some(thread) = self.thread.take() {
+        let _ = thread.join();
+      }
+    }
+  }
+
+  #[allow(clippy::too_many_lines)]
+  fn handle_fake_mcp_connection(
+    stream: &mut TcpStream,
+    expected_authorization: &str,
+    observations: &Arc<Mutex<FakeMcpObservations>>,
+  ) {
+    stream
+      .set_read_timeout(Some(Duration::from_secs(2)))
+      .expect("fake MCP read timeout");
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4 * 1024];
+    let header_end = loop {
+      let read = stream.read(&mut buffer).expect("read fake MCP request");
+      assert_ne!(read, 0, "fake MCP request ended before headers");
+      request.extend_from_slice(&buffer[..read]);
+      if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+        break index + 4;
+      }
+      assert!(request.len() <= 64 * 1024, "fake MCP headers too large");
+    };
+    let headers = String::from_utf8(request[..header_end].to_vec()).expect("MCP headers UTF-8");
+    let request_method = headers
+      .lines()
+      .next()
+      .and_then(|line| line.split_whitespace().next())
+      .expect("fake MCP request method");
+    let content_length = headers
+      .lines()
+      .find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name
+          .eq_ignore_ascii_case("content-length")
+          .then(|| value.trim().parse::<usize>().expect("content length"))
+      })
+      .unwrap_or(0);
+    if request_method == "GET" {
+      write_fake_mcp_response(stream, "405 Method Not Allowed", None);
+      return;
+    }
+    if request_method == "DELETE" {
+      write_fake_mcp_response(stream, "200 OK", None);
+      return;
+    }
+    assert_eq!(request_method, "POST", "unexpected fake MCP HTTP method");
+    while request.len() - header_end < content_length {
+      let read = stream.read(&mut buffer).expect("read fake MCP body");
+      assert_ne!(read, 0, "fake MCP request ended before body");
+      request.extend_from_slice(&buffer[..read]);
+    }
+    let authorization = headers
+      .lines()
+      .find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name
+          .eq_ignore_ascii_case("authorization")
+          .then(|| value.trim().to_owned())
+      })
+      .unwrap_or_default();
+    let body: Value = serde_json::from_slice(&request[header_end..header_end + content_length])
+      .expect("fake MCP JSON-RPC body");
+    let method = body["method"].as_str().unwrap_or("notification").to_owned();
+    {
+      let mut observations = observations.lock().expect("fake MCP observations");
+      observations
+        .authorization_headers
+        .push(authorization.clone());
+      observations.methods.push(method.clone());
+    }
+    if authorization != expected_authorization {
+      write_fake_mcp_response(
+        stream,
+        "401 Unauthorized",
+        Some(json!({"error":"unauthorized"})),
+      );
+      return;
+    }
+    let Some(id) = body.get("id").cloned() else {
+      write_fake_mcp_response(stream, "202 Accepted", None);
+      return;
+    };
+    let result = match method.as_str() {
+      "initialize" => json!({
+        "capabilities": {"tools": {"listChanged": false}},
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {"name": GITHUB_MCP_SERVER_INFO_NAME, "version": GITHUB_MCP_SERVER_VERSION},
+      }),
+      "tools/list" => json!({
+        "tools": EXPECTED_GITHUB_TOOLS.iter().map(|name| json!({
+          "annotations": {"readOnlyHint": true},
+          "description": format!("read-only fixture tool {name}"),
+          "inputSchema": {"additionalProperties": false, "properties": {}, "type": "object"},
+          "name": name,
+        })).collect::<Vec<_>>()
+      }),
+      "tools/call" => {
+        assert_eq!(
+          body["params"]["name"].as_str(),
+          Some(GITHUB_MCP_HEALTH_TOOL)
+        );
+        health()
+      }
+      "resources/list" => json!({"resources": []}),
+      "resources/templates/list" => json!({"resourceTemplates": []}),
+      "prompts/list" => json!({"prompts": []}),
+      "ping" => json!({}),
+      _ => panic!("unexpected fake MCP method: {method}"),
+    };
+    write_fake_mcp_response(
+      stream,
+      "200 OK",
+      Some(json!({"id": id, "jsonrpc": "2.0", "result": result})),
+    );
+  }
+
+  fn write_fake_mcp_response(stream: &mut TcpStream, status: &str, body: Option<Value>) {
+    let body = body.map_or_else(Vec::new, |body| body.to_string().into_bytes());
+    let response = format!(
+      "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nMcp-Session-Id: codeoff-test-session\r\nConnection: close\r\n\r\n",
+      body.len()
+    );
+    stream
+      .write_all(response.as_bytes())
+      .expect("write fake MCP headers");
+    stream.write_all(&body).expect("write fake MCP body");
+    stream.flush().expect("flush fake MCP response");
   }
 
   impl JsonlTransport for MockTransport {
@@ -3603,6 +3909,209 @@ mod tests {
     }
   }
 
+  #[cfg(unix)]
+  #[test]
+  #[ignore = "requires CODEOFF_TEST_PINNED_CODEX_PROGRAM and CODEOFF_TEST_PINNED_GITHUB_MCP_ARTIFACT"]
+  #[allow(clippy::too_many_lines)]
+  fn pinned_app_server_attests_fake_authenticated_mcp_without_external_credentials() {
+    let codex_source = PathBuf::from(
+      std::env::var_os("CODEOFF_TEST_PINNED_CODEX_PROGRAM").expect("pinned Codex program path"),
+    );
+    let github_mcp_source = PathBuf::from(
+      std::env::var_os("CODEOFF_TEST_PINNED_GITHUB_MCP_ARTIFACT")
+        .expect("pinned GitHub MCP artifact path"),
+    );
+    assert_eq!(
+      sha256_file(&github_mcp_source).expect("staged GitHub MCP digest"),
+      GITHUB_MCP_ARTIFACT_SHA256_X86_64
+    );
+    let bearer = "fixture-bearer-token-with-no-external-authority-0000000000000000";
+    let fake_mcp = FakeAuthenticatedMcpServer::start(bearer);
+    let temp = TempDir::new_in("/code/helixbox").expect("production regression tempdir");
+    let codex_program = temp.path().join("codex");
+    fs::copy(&codex_source, &codex_program).expect("stage pinned Codex");
+    fs::set_permissions(&codex_program, fs::Permissions::from_mode(0o555))
+      .expect("protect pinned Codex");
+    let github_mcp_artifact = temp.path().join("github-mcp-server");
+    fs::copy(&github_mcp_source, &github_mcp_artifact).expect("stage pinned GitHub MCP");
+    fs::set_permissions(&github_mcp_artifact, fs::Permissions::from_mode(0o555))
+      .expect("protect pinned GitHub MCP");
+    let codex_home = temp.path().join("codex-home");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir(&cwd).expect("create scheduled workspace");
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o555))
+      .expect("protect scheduled workspace");
+    let attestation_path = temp.path().join("isolation-attestation.json");
+    let trust_bundle_path = temp.path().join("isolation-trust-bundle.json");
+    fs::write(&attestation_path, "{}").expect("write fixture attestation");
+    fs::write(&trust_bundle_path, "{}").expect("write fixture trust bundle");
+    fs::set_permissions(&attestation_path, fs::Permissions::from_mode(0o444))
+      .expect("protect fixture attestation");
+    fs::set_permissions(&trust_bundle_path, fs::Permissions::from_mode(0o444))
+      .expect("protect fixture trust bundle");
+    let mut config = ScheduledCodexConfig {
+      execution_backend: codeoff_config::ScheduledExecutionBackend::default(),
+      remote_runner: codeoff_config::ScheduledRemoteRunnerConfig::default(),
+      codex_program: codex_program.clone(),
+      codex_program_sha256: sha256_file(&codex_program).expect("pinned Codex digest"),
+      codex_home,
+      cwd,
+      github_mcp_url: fake_mcp.url(),
+      github_mcp_artifact_path: github_mcp_artifact,
+      github_mcp_artifact_sha256: GITHUB_MCP_ARTIFACT_SHA256_X86_64.to_owned(),
+      github_mcp_endpoint_identity: "fake-authenticated-github-mcp".to_owned(),
+      github_mcp_access_auth_mode: GITHUB_MCP_ACCESS_AUTH_MODE.to_owned(),
+      github_mcp_access_token_revision: "fake-mcp-channel-v1".to_owned(),
+      credential_reference: "local-fixture-only".to_owned(),
+      permission_policy_revision: "github-issues-read-v1".to_owned(),
+      config_revision: "scheduled-codex-v1".to_owned(),
+      config_sha256: String::new(),
+      gateway_image_digest: format!("sha256:{}", "e".repeat(64)),
+      runner_image_digest: format!("sha256:{}", "f".repeat(64)),
+      runner_workload_identity: "spiffe://codeoff/runner/production-regression".to_owned(),
+      runner_client_cert_public_key_fingerprint: "1".repeat(64),
+      credential_revision: "fixture-credential-v1".to_owned(),
+      isolation_attestation_path: attestation_path,
+      isolation_trust_bundle_path: trust_bundle_path,
+      trusted_owner_uid: 0,
+      trusted_owner_gid: 0,
+      runtime_uid: 65_534,
+      runtime_gid: 65_534,
+    };
+    let mut profile = requested_profile(&config);
+    config.config_sha256 = sha256_hex(profile.dedicated_config().as_bytes());
+    profile.config_sha256.clone_from(&config.config_sha256);
+    prepare_scheduled_codex_home(&profile).expect("prepare scheduled CODEX_HOME");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555))
+      .expect("protect production regression root");
+    let artifacts = Arc::new(
+      verify_scheduled_artifacts_for_test(&config, &profile)
+        .expect("verify exact production regression artifacts"),
+    );
+    let state_root = profile.codex_home.join("state");
+    let runtime_evidence = ScheduledRuntimeEvidence {
+      codex_version: CODEX_CLI_VERSION.to_owned(),
+      app_server_schema_sha256: CODEX_APP_SERVER_SCHEMA_SHA256.to_owned(),
+      codex_program_sha256: profile.codex_program_sha256.clone(),
+      config_sha256: profile.config_sha256.clone(),
+      runner_image_digest: profile.runner_image_digest.clone(),
+    };
+    let transport_artifacts = Arc::clone(&artifacts);
+    let executor = ScheduledCodexExecutor::new(move |requested| {
+      StdioScheduledJsonlTransport::spawn(
+        &requested,
+        runtime_evidence.clone(),
+        &transport_artifacts,
+        Some((65_534, 65_534)),
+        bearer,
+      )
+    });
+    let scheduled_request = request(profile.clone());
+    let prepared = prepare_test(&executor, scheduled_request).expect("real App Server preparation");
+    let attested = prepared
+      .shutdown_without_execute()
+      .expect("bounded real App Server shutdown");
+    assert_eq!(
+      fs::read_dir(&state_root)
+        .expect("read cleaned state root")
+        .count(),
+      0,
+      "completed process state must not survive the session"
+    );
+    assert!(!profile.codex_home.join("installation_id").exists());
+    assert_eq!(
+      attested.github_mcp_health_credential_revision,
+      "fixture-credential-v1"
+    );
+    assert!(!attested.github_mcp_health_result_sha256.is_empty());
+    let observations = fake_mcp.observations.lock().expect("fake MCP observations");
+    assert!(
+      observations
+        .authorization_headers
+        .iter()
+        .all(|header| header == &format!("Bearer {bearer}"))
+    );
+    assert!(
+      observations
+        .methods
+        .iter()
+        .any(|method| method == "initialize")
+    );
+    assert!(
+      observations
+        .methods
+        .iter()
+        .any(|method| method == "tools/list")
+    );
+    assert!(
+      observations
+        .methods
+        .iter()
+        .any(|method| method == "tools/call")
+    );
+    assert!(!attested.canonical_json().contains(bearer));
+
+    let sandbox_home = create_runtime_state_home(&profile, &artifacts, (65_534, 65_534))
+      .expect("isolated sandbox probe home");
+    let mut sandbox = verified_command(
+      &artifacts,
+      &[
+        "codex",
+        "sandbox",
+        "-c",
+        "sandbox_mode=\"danger-full-access\"",
+        "/usr/bin/env",
+      ],
+      false,
+      Some((65_534, 65_534)),
+    )
+    .expect("verified pinned sandbox command");
+    let output = sandbox
+      .command
+      .env("CODEX_HOME", sandbox_home.path())
+      .env(CODEX_SQLITE_HOME_ENV, sandbox_home.path().join("sqlite"))
+      .env(GITHUB_MCP_ACCESS_TOKEN_ENV, bearer)
+      .output()
+      .expect("run pinned sandbox environment probe");
+    assert!(output.status.success(), "sandbox environment probe failed");
+    let combined = [output.stdout, output.stderr].concat();
+    let combined = String::from_utf8(combined).expect("sandbox output UTF-8");
+    assert!(!combined.contains(bearer));
+    assert!(!combined.contains(GITHUB_MCP_ACCESS_TOKEN_ENV));
+    assert!(!combined.contains("CODEX_HOME"));
+    assert!(!combined.contains(CODEX_SQLITE_HOME_ENV));
+    drop(sandbox_home);
+    assert_eq!(
+      fs::read_dir(&state_root)
+        .expect("read sandbox-cleaned state root")
+        .count(),
+      0
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn runtime_state_is_deleted_only_after_exit_and_quarantined_on_unknown() {
+    let root = TempDir::new_in("/code/helixbox").expect("state lifecycle root");
+    let exited = tempfile::tempdir_in(root.path()).expect("exited state");
+    let exited_path = exited.path().to_path_buf();
+    let mut exited = Some(exited);
+    assert_eq!(
+      finalize_runtime_state_home(&mut exited, ProcessExit::Exited),
+      None
+    );
+    assert!(!exited_path.exists());
+
+    let unknown = tempfile::tempdir_in(root.path()).expect("unknown state");
+    let unknown_path = unknown.path().to_path_buf();
+    let mut unknown = Some(unknown);
+    assert_eq!(
+      finalize_runtime_state_home(&mut unknown, ProcessExit::TimedOut),
+      Some(unknown_path.clone())
+    );
+    assert!(unknown_path.exists());
+  }
+
   #[test]
   fn signed_isolation_attestation_rejects_bad_signature_and_legacy_or_unknown_shapes() {
     let profile = profile();
@@ -4180,6 +4689,8 @@ mod tests {
     let codex_home = temp.path().join("codex-home");
     let cwd = temp.path().join("cwd");
     fs::create_dir(&codex_home).expect("CODEX_HOME");
+    fs::create_dir(codex_home.join("state")).expect("state root");
+    fs::write(codex_home.join("config.toml"), "").expect("config");
     fs::create_dir(&cwd).expect("cwd");
     let artifacts = Arc::new(test_artifacts(&program, &codex_home, &cwd));
     let replacement = temp.path().join("replacement");
@@ -4223,11 +4734,12 @@ mod tests {
     let runtime = evidence(&profile);
     let started = Instant::now();
     let artifacts = Arc::new(test_artifacts(&program, &codex_home, &cwd));
+    let program_metadata = fs::metadata(&program).expect("program metadata");
     let transport = StdioScheduledJsonlTransport::spawn(
       &profile,
       runtime,
       &artifacts,
-      None,
+      Some((program_metadata.uid(), program_metadata.gid())),
       &"t".repeat(MIN_MCP_ACCESS_TOKEN_BYTES),
     )
     .expect("spawn");
@@ -4250,6 +4762,7 @@ mod tests {
 
     fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700)).expect("unprotect home");
     fs::remove_file(codex_home.join("config.toml")).expect("remove config");
+    fs::remove_dir(codex_home.join("state")).expect("remove state root");
     fs::remove_file(&pid_file).expect("remove pid");
     fs::remove_dir(&codex_home).expect("remove home");
     fs::remove_dir(&cwd).expect("remove cwd");

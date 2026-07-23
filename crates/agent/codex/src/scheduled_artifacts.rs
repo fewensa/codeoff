@@ -26,12 +26,18 @@ const MAX_TRUST_BUNDLE_BYTES: u64 = 64 * 1024;
 pub(super) struct VerifiedScheduledArtifacts {
   pub program: File,
   pub codex_home: File,
+  #[allow(
+    dead_code,
+    reason = "retains the verified per-session state parent inode for the executor lifetime"
+  )]
+  pub state_root: File,
   pub cwd: File,
   #[allow(
     dead_code,
     reason = "retains the verified config inode for the executor lifetime"
   )]
   config: File,
+  pub config_contents: String,
   #[allow(
     dead_code,
     reason = "retains the verified MCP artifact inode for the executor lifetime"
@@ -215,6 +221,11 @@ fn verify_scheduled_artifacts_with_policy(
     ArtifactKind::Directory { immutable: true },
     policy,
   )?;
+  let state_root = open_verified(
+    &profile.codex_home.join("state"),
+    ArtifactKind::Directory { immutable: true },
+    policy,
+  )?;
   let cwd = open_verified(
     &profile.cwd,
     ArtifactKind::Directory { immutable: false },
@@ -264,8 +275,10 @@ fn verify_scheduled_artifacts_with_policy(
   Ok(VerifiedScheduledArtifacts {
     program,
     codex_home,
+    state_root,
     cwd,
     config: config_file,
+    config_contents,
     github_mcp_artifact,
     attestation,
     attestation_contents,
@@ -304,6 +317,9 @@ pub(super) fn test_artifacts(
   cwd: &Path,
 ) -> VerifiedScheduledArtifacts {
   let program = File::open(program).expect("test program");
+  let state_root = File::open(codex_home.join("state")).expect("test scheduled state root");
+  let config_contents =
+    std::fs::read_to_string(codex_home.join("config.toml")).expect("test config contents");
   let codex_home = File::open(codex_home).expect("test CODEX_HOME");
   let cwd = File::open(cwd).expect("test cwd");
   let trust_bundle = program.try_clone().expect("test trust bundle placeholder");
@@ -313,7 +329,9 @@ pub(super) fn test_artifacts(
     attestation: program.try_clone().expect("test attestation placeholder"),
     program,
     codex_home,
+    state_root,
     cwd,
+    config_contents,
     attestation_contents: String::new(),
     trust_bundle,
     trust_bundle_contents: String::new(),
@@ -576,6 +594,52 @@ mod tests {
     fs::set_permissions(&program, fs::Permissions::from_mode(0o555)).expect("protect program");
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o557)).expect("writable tempdir");
     assert!(open_verified(&program, ArtifactKind::Executable, policy()).is_err());
+  }
+
+  #[test]
+  fn scheduled_state_parent_requires_root_owned_immutable_real_directory() {
+    let temp = TempDir::new_in("/code/helixbox").expect("state parent tempdir");
+    let state = temp.path().join("state");
+    fs::create_dir(&state).expect("state parent");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o511)).expect("state parent mode");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555)).expect("protect tempdir");
+    open_verified(
+      &state,
+      ArtifactKind::Directory { immutable: true },
+      policy(),
+    )
+    .expect("exact state parent must verify");
+
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o711)).expect("mutable state parent");
+    assert!(
+      open_verified(
+        &state,
+        ArtifactKind::Directory { immutable: true },
+        policy()
+      )
+      .is_err()
+    );
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o511)).expect("restore state parent");
+    let mut wrong_owner = policy();
+    wrong_owner.trusted_uid = wrong_owner.trusted_uid.saturating_add(1);
+    assert!(
+      open_verified(
+        &state,
+        ArtifactKind::Directory { immutable: true },
+        wrong_owner,
+      )
+      .is_err()
+    );
+
+    let linked_root = TempDir::new_in("/code/helixbox").expect("linked state tempdir");
+    let target = linked_root.path().join("target");
+    fs::create_dir(&target).expect("linked state target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o511)).expect("target mode");
+    let link = linked_root.path().join("state");
+    symlink(&target, &link).expect("state symlink");
+    fs::set_permissions(linked_root.path(), fs::Permissions::from_mode(0o555))
+      .expect("protect linked root");
+    assert!(open_verified(&link, ArtifactKind::Directory { immutable: true }, policy()).is_err());
   }
 
   #[test]

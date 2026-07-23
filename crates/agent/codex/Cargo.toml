@@ -16,10 +16,10 @@ nix.workspace = true
 ring.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 codeoff-state = { path = "../../state", features = ["test-support"] }
-tempfile.workspace = true
 
 [lints]
 workspace = true

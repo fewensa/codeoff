@@ -424,6 +424,70 @@ fn validate_executor_evidence(
   Ok(())
 }
 
+fn accept_authenticated_prepared(
+  session: &mut RemoteSessionState,
+  config: &ScheduledRunnerBrokerConfig,
+  ready: &RemoteFrame,
+  frame: &RemoteFrame,
+  now: u64,
+) -> Result<(), ScheduledRunnerBrokerError> {
+  let RemoteMessage::Prepared(prepared) = &frame.message else {
+    return Err(ScheduledRunnerBrokerError::ProtocolRejected);
+  };
+  let payload_digest = prepared_evidence_payload_digest(prepared);
+  validate_executor_evidence(
+    config,
+    ready,
+    ExpectedRunnerEvidence {
+      kind: RunnerEvidenceKind::Prepared,
+      sequence: frame.sequence,
+      observed_profile_digest: &prepared.attested_profile_digest,
+      payload_digest: &payload_digest,
+    },
+    &prepared.signed_evidence_json,
+    now,
+  )?;
+  session
+    .accept(RemoteSessionRole::Runner, frame.clone(), now)
+    .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
+  Ok(())
+}
+
+fn accept_authenticated_result(
+  session: &mut RemoteSessionState,
+  config: &ScheduledRunnerBrokerConfig,
+  ready: &ReadyFrame,
+  executor_observed_profile_digest: &str,
+  frame: &RemoteFrame,
+  now: u64,
+) -> Result<(), ScheduledRunnerBrokerError> {
+  let RemoteMessage::Result(result) = &frame.message else {
+    return Err(ScheduledRunnerBrokerError::ProtocolRejected);
+  };
+  let payload_digest = result_evidence_payload_digest(result);
+  validate_executor_evidence(
+    config,
+    &RemoteFrame {
+      version: REMOTE_PROTOCOL_VERSION,
+      session_nonce: frame.session_nonce.clone(),
+      sequence: 1,
+      message: RemoteMessage::Ready(ready.clone()),
+    },
+    ExpectedRunnerEvidence {
+      kind: RunnerEvidenceKind::Result,
+      sequence: frame.sequence,
+      observed_profile_digest: executor_observed_profile_digest,
+      payload_digest: &payload_digest,
+    },
+    &result.signed_evidence_json,
+    now,
+  )?;
+  session
+    .accept(RemoteSessionRole::Runner, frame.clone(), now)
+    .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
+  Ok(())
+}
+
 struct SessionRegistration {
   broker: ScheduledRunnerBroker,
   session: Arc<RegisteredRunnerSession>,
@@ -741,18 +805,12 @@ async fn drive_prepare(
       .map_err(|_| ScheduledRunnerBrokerError::Transport)?
       .ok_or(ScheduledRunnerBrokerError::ConnectionClosed)?;
     match &frame.message {
-      RemoteMessage::Prepared(prepared) => {
-        let payload_digest = prepared_evidence_payload_digest(prepared);
-        validate_executor_evidence(
+      RemoteMessage::Prepared(_) => {
+        accept_authenticated_prepared(
+          &mut session,
           evidence_config,
           ready,
-          ExpectedRunnerEvidence {
-            kind: RunnerEvidenceKind::Prepared,
-            sequence: 2,
-            observed_profile_digest: &prepared.attested_profile_digest,
-            payload_digest: &payload_digest,
-          },
-          &prepared.signed_evidence_json,
+          &frame,
           unix_millis()?,
         )?;
       }
@@ -763,9 +821,11 @@ async fn drive_prepare(
       }
       _ => return Err(ScheduledRunnerBrokerError::ProtocolRejected),
     }
-    session
-      .accept(RemoteSessionRole::Runner, frame.clone(), unix_millis()?)
-      .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
+    if !matches!(frame.message, RemoteMessage::Prepared(_)) {
+      session
+        .accept(RemoteSessionRole::Runner, frame.clone(), unix_millis()?)
+        .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
+    }
     match frame.message {
       RemoteMessage::Prepared(mut prepared) => {
         let executor_observed_profile_digest = prepared.attested_profile_digest.clone();
@@ -844,24 +904,20 @@ async fn drive_start(
         let Ok(Some(frame)) = incoming else {
           return Ok(disconnect_terminal(session.disconnect()));
         };
-        if let RemoteMessage::Result(result) = &frame.message {
-          let payload_digest = result_evidence_payload_digest(result);
-          validate_executor_evidence(
+        if matches!(frame.message, RemoteMessage::Result(_)) {
+          accept_authenticated_result(
+            session,
             evidence_config,
-            &RemoteFrame { version: REMOTE_PROTOCOL_VERSION, session_nonce: frame.session_nonce.clone(), sequence: 1, message: RemoteMessage::Ready(ready.clone()) },
-            ExpectedRunnerEvidence {
-              kind: RunnerEvidenceKind::Result,
-              sequence: 3,
-              observed_profile_digest: executor_observed_profile_digest,
-              payload_digest: &payload_digest,
-            },
-            &result.signed_evidence_json,
+            ready,
+            executor_observed_profile_digest,
+            &frame,
             unix_millis()?,
           )?;
+        } else {
+          session
+            .accept(RemoteSessionRole::Runner, frame.clone(), unix_millis()?)
+            .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
         }
-        session
-          .accept(RemoteSessionRole::Runner, frame.clone(), unix_millis()?)
-          .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
         match frame.message {
           RemoteMessage::Result(result) => return Ok(RemoteExecutionTerminal::Result(result)),
           RemoteMessage::Heartbeat(heartbeat)
@@ -1557,6 +1613,208 @@ mod tests {
       )
       .is_err()
     );
+  }
+
+  #[test]
+  fn authenticated_runner_failures_do_not_advance_prepare_or_result_state() {
+    let config = config();
+    let nonce = "9".repeat(64);
+    let challenge = "8".repeat(64);
+    let ready = ready_frame(
+      &nonce,
+      &challenge,
+      config.deployment_epoch,
+      &config.runner_workload_identity,
+      &config.runner_client_spki_sha256,
+    );
+    let authority = ScheduledPrepareAuthority::for_remote_session_test("run-1", "job-1", 1, 7);
+    let mut session =
+      RemoteSessionState::new(nonce.clone(), authority.clone()).expect("session state");
+    let now = unix_millis().expect("time");
+    session
+      .accept(RemoteSessionRole::Runner, ready.clone(), now)
+      .expect("ready");
+    session
+      .accept(
+        RemoteSessionRole::Gateway,
+        RemoteFrame {
+          version: REMOTE_PROTOCOL_VERSION,
+          session_nonce: nonce.clone(),
+          sequence: 1,
+          message: RemoteMessage::Admission(AdmissionFrame {
+            challenge: challenge.clone(),
+            admission_nonce: "7".repeat(64),
+            expires_at_unix_millis: now + 4_000,
+            deployment_epoch: config.deployment_epoch,
+            profile_digest: config.profile_digest.clone(),
+          }),
+        },
+        now,
+      )
+      .expect("admission");
+    let binding = RunBinding {
+      run_id: "run-1".to_owned(),
+      job_id: "job-1".to_owned(),
+      attempt: 1,
+      fence_token: 7,
+      authority_digest: authority.digest().to_owned(),
+      profile_digest: config.profile_digest.clone(),
+      deployment_epoch: config.deployment_epoch,
+      credential_revision: config.credential_revision.clone(),
+    };
+    session
+      .accept(
+        RemoteSessionRole::Gateway,
+        RemoteFrame {
+          version: REMOTE_PROTOCOL_VERSION,
+          session_nonce: nonce.clone(),
+          sequence: 2,
+          message: RemoteMessage::Prepare(PrepareFrame {
+            binding: binding.clone(),
+            isolation_permit_envelope_json: "{\"schema_version\":1}".to_owned(),
+            task_json: "{\"schema_version\":1}".to_owned(),
+            definition_json: "{\"schema_version\":1}".to_owned(),
+            capability_json: "{\"schema_version\":1}".to_owned(),
+            targets_json: "[]".to_owned(),
+          }),
+        },
+        now,
+      )
+      .expect("prepare");
+
+    let profile_json = "{}".to_owned();
+    let profile_digest = format!("{:x}", Sha256::digest(profile_json.as_bytes()));
+    let mut prepared = PreparedFrame {
+      signed_evidence_json: String::new(),
+      binding: binding.clone(),
+      preparation_nonce: "6".repeat(64),
+      attested_profile_json: profile_json,
+      attested_profile_digest: profile_digest.clone(),
+    };
+    let prepared_payload = prepared_evidence_payload_digest(&prepared);
+    prepared.signed_evidence_json = sign_runner_evidence(
+      &RunnerEvidenceClaims {
+        kind: RunnerEvidenceKind::Prepared,
+        algorithm_version: "ed25519-v1".to_owned(),
+        signer_identity: config.executor_evidence_signer_identity.clone(),
+        key_revision: config.executor_evidence_key_revision.clone(),
+        session_nonce: nonce.clone(),
+        challenge: challenge.clone(),
+        sequence: 2,
+        issued_at_unix_millis: now,
+        expires_at_unix_millis: now + 4_000,
+        deployment_epoch: config.deployment_epoch,
+        deployment_profile_digest: config.profile_digest.clone(),
+        observed_profile_digest: profile_digest.clone(),
+        executor_identity: config.executor_identity.clone(),
+        credential_revision: config.credential_revision.clone(),
+        payload_digest: prepared_payload,
+      },
+      &config.executor_evidence_key_id,
+      &evidence_keys().0,
+    )
+    .expect("prepared signature")
+    .canonical_json();
+    let prepared_frame = RemoteFrame {
+      version: REMOTE_PROTOCOL_VERSION,
+      session_nonce: nonce.clone(),
+      sequence: 2,
+      message: RemoteMessage::Prepared(prepared),
+    };
+    let mut translated = prepared_frame.clone();
+    let RemoteMessage::Prepared(translated_payload) = &mut translated.message else {
+      unreachable!()
+    };
+    translated_payload.preparation_nonce = "5".repeat(64);
+    assert!(
+      accept_authenticated_prepared(&mut session, &config, &ready, &translated, now).is_err()
+    );
+    accept_authenticated_prepared(&mut session, &config, &ready, &prepared_frame, now)
+      .expect("valid prepared remains acceptable");
+    session
+      .accept(
+        RemoteSessionRole::Gateway,
+        RemoteFrame {
+          version: REMOTE_PROTOCOL_VERSION,
+          session_nonce: nonce.clone(),
+          sequence: 3,
+          message: RemoteMessage::Start(StartFrame {
+            binding: binding.clone(),
+            preparation_nonce: "6".repeat(64),
+          }),
+        },
+        now,
+      )
+      .expect("start");
+
+    let mut result = ResultFrame {
+      signed_evidence_json: String::new(),
+      binding,
+      preparation_nonce: "6".repeat(64),
+      kind: RemoteResultKind::Completed,
+      result_json: "{\"schema_version\":1,\"summary\":\"done\"}".to_owned(),
+    };
+    let result_payload = result_evidence_payload_digest(&result);
+    result.signed_evidence_json = sign_runner_evidence(
+      &RunnerEvidenceClaims {
+        kind: RunnerEvidenceKind::Result,
+        algorithm_version: "ed25519-v1".to_owned(),
+        signer_identity: config.executor_evidence_signer_identity.clone(),
+        key_revision: config.executor_evidence_key_revision.clone(),
+        session_nonce: nonce.clone(),
+        challenge,
+        sequence: 3,
+        issued_at_unix_millis: now,
+        expires_at_unix_millis: now + 4_000,
+        deployment_epoch: config.deployment_epoch,
+        deployment_profile_digest: config.profile_digest.clone(),
+        observed_profile_digest: profile_digest.clone(),
+        executor_identity: config.executor_identity.clone(),
+        credential_revision: config.credential_revision.clone(),
+        payload_digest: result_payload,
+      },
+      &config.executor_evidence_key_id,
+      &evidence_keys().0,
+    )
+    .expect("result signature")
+    .canonical_json();
+    let result_frame = RemoteFrame {
+      version: REMOTE_PROTOCOL_VERSION,
+      session_nonce: nonce,
+      sequence: 3,
+      message: RemoteMessage::Result(result),
+    };
+    let mut translated = result_frame.clone();
+    let RemoteMessage::Result(translated_payload) = &mut translated.message else {
+      unreachable!()
+    };
+    translated_payload.kind = RemoteResultKind::OutcomeUnknown;
+    assert!(
+      accept_authenticated_result(
+        &mut session,
+        &config,
+        match &ready.message {
+          RemoteMessage::Ready(ready) => ready,
+          _ => unreachable!(),
+        },
+        &profile_digest,
+        &translated,
+        now,
+      )
+      .is_err()
+    );
+    accept_authenticated_result(
+      &mut session,
+      &config,
+      match &ready.message {
+        RemoteMessage::Ready(ready) => ready,
+        _ => unreachable!(),
+      },
+      &profile_digest,
+      &result_frame,
+      now,
+    )
+    .expect("valid result remains acceptable");
   }
 
   #[test]

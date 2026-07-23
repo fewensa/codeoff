@@ -579,6 +579,23 @@ printf normal-child-launch
     .expect("copy process helper");
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
       .expect("process helper permissions");
+    let evidence_private_key = temp.path().join("executor-evidence.pk8");
+    fs::write(&evidence_private_key, "executor-private-key-sentinel")
+      .expect("write evidence key sentinel");
+    fs::set_permissions(&evidence_private_key, fs::Permissions::from_mode(0o400))
+      .expect("evidence key mode");
+    let codex_read = Command::new("/bin/sh")
+      .args(["-c", "test -r \"$EVIDENCE_PRIVATE_KEY\""])
+      .env_clear()
+      .env("EVIDENCE_PRIVATE_KEY", &evidence_private_key)
+      .uid(65_534)
+      .gid(65_534)
+      .status()
+      .expect("run Codex identity key probe");
+    assert!(
+      !codex_read.success(),
+      "Codex child identity read executor key"
+    );
     let helper = "scheduled_runner_executor::tests::independent_runner_process_helper";
     let executor = Command::new(&executable)
       .args(["--exact", helper, "--nocapture"])
@@ -586,6 +603,7 @@ printf normal-child-launch
       .env("CODEOFF_TEST_RUNNER_ROLE", "executor")
       .env("CODEOFF_TEST_RUNNER_SOCKET", &socket_path)
       .env("EXECUTOR_PROFILE_SENTINEL", "present")
+      .env("EVIDENCE_PRIVATE_KEY", &evidence_private_key)
       .stdin(Stdio::null())
       .stdout(Stdio::piped())
       .stderr(Stdio::piped())
@@ -598,6 +616,7 @@ printf normal-child-launch
       .env("CODEOFF_TEST_RUNNER_ROLE", "control")
       .env("CODEOFF_TEST_RUNNER_SOCKET", &socket_path)
       .env("CONTROL_BROKER_KEY_SENTINEL", "present")
+      .env("EVIDENCE_PRIVATE_KEY", &evidence_private_key)
       .uid(65_533)
       .gid(65_533)
       .stdin(Stdio::null())
@@ -635,6 +654,12 @@ printf normal-child-launch
         );
         assert!(std::env::var_os("CONTROL_BROKER_KEY_SENTINEL").is_none());
         assert!(std::env::var_os("GITHUB_PAT").is_none());
+        let evidence_private_key =
+          PathBuf::from(std::env::var_os("EVIDENCE_PRIVATE_KEY").expect("evidence key path"));
+        assert_eq!(
+          fs::read_to_string(evidence_private_key).expect("executor reads evidence key"),
+          "executor-private-key-sentinel"
+        );
         runtime.block_on(async {
           let listener = ProtectedScheduledExecutorListener::bind(ScheduledRunnerExecutorConfig {
             socket_path: path,
@@ -668,6 +693,9 @@ printf normal-child-launch
         );
         assert!(std::env::var_os("OPENAI_API_KEY").is_none());
         assert!(std::env::var_os("GITHUB_PAT").is_none());
+        let evidence_private_key =
+          PathBuf::from(std::env::var_os("EVIDENCE_PRIVATE_KEY").expect("evidence key path"));
+        assert!(fs::read(evidence_private_key).is_err());
         runtime.block_on(async {
           let mut connection =
             ScheduledRunnerControlConnection::connect(&ScheduledRunnerControlConfig {

@@ -38,6 +38,7 @@ tracing-subscriber.workspace = true
 assert_cmd.workspace = true
 codeoff-state = { path = "../state", features = ["test-support"] }
 predicates = "3"
+ring.workspace = true
 tempfile.workspace = true
 
 [lints]

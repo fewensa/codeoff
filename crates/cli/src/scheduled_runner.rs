@@ -26,6 +26,8 @@ use codeoff_runtime::scheduled_runner_evidence::{
   RunnerEvidenceClaims, RunnerEvidenceKind, RunnerEvidenceSigner, prepared_evidence_payload_digest,
   ready_evidence_payload_digest, result_evidence_payload_digest,
 };
+#[cfg(test)]
+use codeoff_runtime::scheduled_runner_evidence::{RunnerEvidenceVerifier, SignedRunnerEvidence};
 use codeoff_runtime::scheduled_runner_executor::{
   ProtectedScheduledExecutorListener, ScheduledRunnerExecutorConfig, current_process_credentials,
   decode_scheduled_remote_task, harden_scheduled_executor_process,
@@ -1058,6 +1060,10 @@ mod tests {
   use super::*;
   use codeoff_runtime::scheduled_remote_protocol::{PrepareFrame, PreparedFrame};
   use codeoff_runtime::scheduled_runner_tls::ScheduledRunnerFramed;
+  use ring::rand::SystemRandom;
+  use ring::signature::{Ed25519KeyPair, KeyPair};
+  use std::fs;
+  use std::os::unix::fs::PermissionsExt;
 
   #[test]
   fn gateway_rejects_only_dedicated_runner_secret_environment() {
@@ -1103,6 +1109,63 @@ mod tests {
     assert!(reconnect_delay(32) <= Duration::from_millis(15_250));
   }
 
+  #[test]
+  fn production_executor_rejects_arbitrary_mcp_artifact_before_opening_files() {
+    let mut profile = codeoff_agent_codex::RequestedCapabilityProfile {
+      codex_program: "/opt/codeoff/bin/codex".into(),
+      codex_program_sha256: "1".repeat(64),
+      codex_home: "/var/lib/codeoff/scheduled-codex".into(),
+      cwd: "/work/codeoff-scheduled".into(),
+      github_mcp_url: "http://127.0.0.1:8090/mcp".to_owned(),
+      github_mcp_artifact_sha256: "2".repeat(64),
+      github_mcp_endpoint_identity: "github-mcp-scheduled-v1".to_owned(),
+      credential_reference: "kubernetes:codeoff/github-mcp".to_owned(),
+      permission_policy_revision: "scheduled-read-only-v1".to_owned(),
+      config_revision: "scheduled-codex-v1".to_owned(),
+      config_sha256: String::new(),
+      gateway_image_digest: format!("sha256:{}", "3".repeat(64)),
+      runner_image_digest: format!("sha256:{}", "4".repeat(64)),
+      runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
+      runner_client_cert_public_key_fingerprint: "5".repeat(64),
+      credential_revision: "github-readonly-2026-07".to_owned(),
+    };
+    profile.config_sha256 = sha256_hex(profile.dedicated_config().as_bytes());
+    let config = codeoff_config::ScheduledCodexConfig {
+      execution_backend: codeoff_config::ScheduledExecutionBackend::RemoteRunner,
+      remote_runner: codeoff_config::ScheduledRemoteRunnerConfig::default(),
+      codex_program: profile.codex_program,
+      codex_program_sha256: profile.codex_program_sha256,
+      codex_home: profile.codex_home,
+      cwd: profile.cwd,
+      github_mcp_url: profile.github_mcp_url,
+      github_mcp_artifact_path: "/opt/codeoff/bin/untrusted-github-mcp".into(),
+      github_mcp_artifact_sha256: profile.github_mcp_artifact_sha256,
+      github_mcp_endpoint_identity: profile.github_mcp_endpoint_identity,
+      credential_reference: profile.credential_reference,
+      permission_policy_revision: profile.permission_policy_revision,
+      config_revision: profile.config_revision,
+      config_sha256: profile.config_sha256,
+      gateway_image_digest: profile.gateway_image_digest,
+      runner_image_digest: profile.runner_image_digest,
+      runner_workload_identity: profile.runner_workload_identity,
+      runner_client_cert_public_key_fingerprint: profile.runner_client_cert_public_key_fingerprint,
+      credential_revision: profile.credential_revision,
+      isolation_attestation_path: "/run/codeoff/isolation-attestation.json".into(),
+      isolation_trust_bundle_path: "/opt/codeoff/isolation-trust-bundle.json".into(),
+      trusted_owner_uid: 0,
+      trusted_owner_gid: 0,
+      runtime_uid: 65_534,
+      runtime_gid: 65_534,
+    };
+    let failure = build_supervised_scheduled_codex_executor(&config, 65_534, 65_534)
+      .err()
+      .expect("arbitrary MCP artifact must fail closed");
+    assert_eq!(
+      failure.message,
+      "github_mcp_artifact_digest_not_pinned_v1_6_0"
+    );
+  }
+
   #[tokio::test]
   #[allow(
     clippy::too_many_lines,
@@ -1122,6 +1185,30 @@ mod tests {
     };
     let preparation_nonce = "d".repeat(64);
     let temp = tempfile::tempdir().expect("temporary directory");
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("evidence key");
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse evidence key");
+    let private_key = temp.path().join("executor.pk8");
+    let public_key = temp.path().join("executor.pub");
+    fs::write(&private_key, pkcs8.as_ref()).expect("private key");
+    fs::write(&public_key, key_pair.public_key().as_ref()).expect("public key");
+    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o400)).expect("private mode");
+    fs::set_permissions(&public_key, fs::Permissions::from_mode(0o400)).expect("public mode");
+    let signer = RunnerEvidenceSigner::load(&private_key, "executor-key-1").expect("root signer");
+    let verifier =
+      RunnerEvidenceVerifier::load(&public_key, "executor-key-1").expect("gateway verifier");
+    let evidence_role = codeoff_config::ScheduledRunnerExecutorConfig {
+      local_socket_path: temp.path().join("executor.sock"),
+      evidence_private_key_path: private_key,
+      evidence_key_id: "executor-key-1".to_owned(),
+      evidence_key_revision: "executor-evidence-2026-07".to_owned(),
+      evidence_signer_identity: "spiffe://codeoff/executor/production".to_owned(),
+      expected_control_uid: current_process_credentials().uid,
+      expected_control_gid: current_process_credentials().gid,
+      codex_child_uid: 65_534,
+      codex_child_gid: 65_534,
+      accept_timeout_ms: 2_000,
+      frame_timeout_ms: 2_000,
+    };
     let (mut remote_relay, mut remote_gateway) =
       local_framed_pair(temp.path().join("remote.sock")).await;
     let (mut local_relay, mut local_executor) =
@@ -1165,7 +1252,20 @@ mod tests {
         .await
         .expect("prepared read")
         .expect("prepared frame");
-      assert!(matches!(prepared.message, RemoteMessage::Prepared(_)));
+      let RemoteMessage::Prepared(prepared_payload) = &prepared.message else {
+        panic!("prepared frame expected")
+      };
+      let evidence =
+        SignedRunnerEvidence::parse_canonical_json(&prepared_payload.signed_evidence_json)
+          .expect("opaque prepared evidence");
+      let claims = verifier
+        .verify(&evidence, unix_millis().expect("time"))
+        .expect("prepared verify");
+      assert_eq!(claims.kind, RunnerEvidenceKind::Prepared);
+      assert_eq!(
+        claims.payload_digest,
+        prepared_evidence_payload_digest(prepared_payload)
+      );
       remote_gateway
         .write_frame(&test_remote_frame(
           &nonce,
@@ -1182,7 +1282,20 @@ mod tests {
         .await
         .expect("result read")
         .expect("result frame");
-      assert!(matches!(result.message, RemoteMessage::Result(_)));
+      let RemoteMessage::Result(result_payload) = &result.message else {
+        panic!("result frame expected")
+      };
+      let evidence =
+        SignedRunnerEvidence::parse_canonical_json(&result_payload.signed_evidence_json)
+          .expect("opaque result evidence");
+      let claims = verifier
+        .verify(&evidence, unix_millis().expect("time"))
+        .expect("result verify");
+      assert_eq!(claims.kind, RunnerEvidenceKind::Result);
+      assert_eq!(
+        claims.payload_digest,
+        result_evidence_payload_digest(result_payload)
+      );
     };
     let executor = async {
       for expected in ["admission", "prepare"] {
@@ -1200,17 +1313,37 @@ mod tests {
           expected
         );
       }
+      let now = unix_millis().expect("time");
+      let mut prepared = PreparedFrame {
+        signed_evidence_json: String::new(),
+        binding: executor_binding.clone(),
+        preparation_nonce: executor_preparation_nonce.clone(),
+        attested_profile_json: "{}".to_owned(),
+        attested_profile_digest: "1".repeat(64),
+      };
+      let payload_digest = prepared_evidence_payload_digest(&prepared);
+      prepared.signed_evidence_json = signer
+        .sign(&runner_evidence_claims(
+          &evidence_role,
+          RunnerEvidenceKind::Prepared,
+          &nonce,
+          &"e".repeat(64),
+          2,
+          now,
+          now + 5_000,
+          executor_binding.deployment_epoch,
+          &executor_binding.profile_digest,
+          &prepared.attested_profile_digest,
+          &executor_binding.credential_revision,
+          &payload_digest,
+        ))
+        .expect("prepared sign")
+        .canonical_json();
       local_executor
         .write_frame(&test_remote_frame(
           &nonce,
           2,
-          RemoteMessage::Prepared(PreparedFrame {
-            signed_evidence_json: "{}".to_owned(),
-            binding: executor_binding.clone(),
-            preparation_nonce: executor_preparation_nonce.clone(),
-            attested_profile_json: "{}".to_owned(),
-            attested_profile_digest: "1".repeat(64),
-          }),
+          RemoteMessage::Prepared(prepared),
         ))
         .await
         .expect("prepared");
@@ -1220,18 +1353,33 @@ mod tests {
         .expect("start read")
         .expect("start frame");
       assert!(matches!(start.message, RemoteMessage::Start(_)));
-      local_executor
-        .write_frame(&test_remote_frame(
+      let mut result = ResultFrame {
+        signed_evidence_json: String::new(),
+        binding: executor_binding,
+        preparation_nonce: executor_preparation_nonce,
+        kind: RemoteResultKind::Completed,
+        result_json: r#"{"schema_version":1,"summary":"ok"}"#.to_owned(),
+      };
+      let payload_digest = result_evidence_payload_digest(&result);
+      result.signed_evidence_json = signer
+        .sign(&runner_evidence_claims(
+          &evidence_role,
+          RunnerEvidenceKind::Result,
           &nonce,
+          &"e".repeat(64),
           3,
-          RemoteMessage::Result(ResultFrame {
-            signed_evidence_json: "{}".to_owned(),
-            binding: executor_binding,
-            preparation_nonce: executor_preparation_nonce,
-            kind: RemoteResultKind::Completed,
-            result_json: r#"{"schema_version":1,"summary":"ok"}"#.to_owned(),
-          }),
+          now,
+          now + 5_000,
+          result.binding.deployment_epoch,
+          &result.binding.profile_digest,
+          &"1".repeat(64),
+          &result.binding.credential_revision,
+          &payload_digest,
         ))
+        .expect("result sign")
+        .canonical_json();
+      local_executor
+        .write_frame(&test_remote_frame(&nonce, 3, RemoteMessage::Result(result)))
         .await
         .expect("result");
     };

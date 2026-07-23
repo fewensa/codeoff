@@ -151,9 +151,11 @@ impl RequestedCapabilityProfile {
       .collect::<Vec<_>>()
       .join(", ");
     format!(
-      "web_search = \"disabled\"\n\n[mcp_servers.{GITHUB_MCP_NAME}]\nurl = {url:?}\nenabled = true\nrequired = true\nbearer_token_env_var = {token_env:?}\nenabled_tools = [{tools}]\n",
+      "web_search = \"disabled\"\n\n[shell_environment_policy]\ninherit = \"none\"\nignore_default_excludes = false\nexclude = [{token_env:?}]\ninclude_only = [\"PATH\", \"LANG\", \"LC_ALL\"]\nset = {{ PATH = {child_path:?}, LANG = {child_locale:?}, LC_ALL = {child_locale:?} }}\n\n[mcp_servers.{GITHUB_MCP_NAME}]\nurl = {url:?}\nenabled = true\nrequired = true\nbearer_token_env_var = {token_env:?}\nenabled_tools = [{tools}]\n",
       url = self.github_mcp_url,
       token_env = GITHUB_MCP_ACCESS_TOKEN_ENV,
+      child_path = CHILD_PATH,
+      child_locale = CHILD_LOCALE,
     )
   }
 
@@ -1521,6 +1523,17 @@ fn prepare_protocol<T: ScheduledJsonlTransport + Send + 'static>(
     "sandbox": "read-only",
     "config": {
       "web_search": "disabled",
+      "shell_environment_policy": {
+        "inherit": "none",
+        "ignore_default_excludes": false,
+        "exclude": [GITHUB_MCP_ACCESS_TOKEN_ENV],
+        "include_only": ["PATH", "LANG", "LC_ALL"],
+        "set": {
+          "PATH": CHILD_PATH,
+          "LANG": CHILD_LOCALE,
+          "LC_ALL": CHILD_LOCALE,
+        },
+      },
       "mcp_servers": {
         GITHUB_MCP_NAME: {
           "url": request.profile.github_mcp_url,
@@ -3123,6 +3136,24 @@ mod tests {
       .iter()
       .filter_map(|message| message["method"].as_str())
       .collect();
+    let thread_start = writes
+      .iter()
+      .find(|message| message["method"] == "thread/start")
+      .expect("thread start request");
+    assert_eq!(
+      thread_start["params"]["config"]["shell_environment_policy"],
+      json!({
+        "inherit": "none",
+        "ignore_default_excludes": false,
+        "exclude": [GITHUB_MCP_ACCESS_TOKEN_ENV],
+        "include_only": ["PATH", "LANG", "LC_ALL"],
+        "set": {
+          "PATH": CHILD_PATH,
+          "LANG": CHILD_LOCALE,
+          "LC_ALL": CHILD_LOCALE,
+        },
+      })
+    );
     assert_eq!(
       methods,
       [
@@ -3824,6 +3855,14 @@ mod tests {
     let profile = profile();
     let config = profile.dedicated_config();
     assert!(config.contains("web_search = \"disabled\""));
+    assert!(config.contains("[shell_environment_policy]"));
+    assert!(config.contains("inherit = \"none\""));
+    assert!(config.contains("ignore_default_excludes = false"));
+    assert!(config.contains(&format!("exclude = [\"{GITHUB_MCP_ACCESS_TOKEN_ENV}\"]")));
+    assert!(config.contains("include_only = [\"PATH\", \"LANG\", \"LC_ALL\"]"));
+    assert!(config.contains(&format!(
+      "set = {{ PATH = {CHILD_PATH:?}, LANG = {CHILD_LOCALE:?}, LC_ALL = {CHILD_LOCALE:?} }}"
+    )));
     assert!(config.contains("[mcp_servers.github]"));
     assert!(config.contains("required = true"));
     assert!(config.contains(&format!(

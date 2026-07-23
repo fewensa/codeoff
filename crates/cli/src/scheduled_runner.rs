@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use codeoff_agent_codex::{
-  RemoteIsolationPermitEnvelope, ScheduledCodexRequest, ScheduledExecutionIdentity,
-  ScheduledExecutionResult, ScheduledFailureKind, build_supervised_scheduled_codex_executor,
-  load_trusted_owner_scheduled_deployment_authority,
+  GITHUB_MCP_ACCESS_TOKEN_ENV, RemoteIsolationPermitEnvelope, ScheduledCodexRequest,
+  ScheduledExecutionIdentity, ScheduledExecutionResult, ScheduledFailureKind,
+  build_supervised_scheduled_codex_executor, load_trusted_owner_scheduled_deployment_authority,
 };
 use codeoff_config::{CodeoffConfig, ScheduledRunnerRole, SchedulerRuntimeConfig, SlackConfig};
 use codeoff_runtime::scheduled_execution::ScheduledExecutor;
@@ -909,6 +909,8 @@ const DEDICATED_RUNNER_SECRET_ENVIRONMENT: [&str; 4] = [
 fn validate_gateway_environment(present: impl Fn(&str) -> bool) -> Result<(), Box<dyn Error>> {
   if let Some(name) = DEDICATED_RUNNER_SECRET_ENVIRONMENT
     .iter()
+    .copied()
+    .chain(std::iter::once(GITHUB_MCP_ACCESS_TOKEN_ENV))
     .find(|name| present(name))
   {
     return Err(
@@ -971,6 +973,9 @@ fn validate_dedicated_worker_surface_with(
     config.slack.signing_secret_env.as_str(),
   ];
   forbidden.extend(DEDICATED_RUNNER_SECRET_ENVIRONMENT);
+  if role != ScheduledRunnerRole::Executor {
+    forbidden.push(GITHUB_MCP_ACCESS_TOKEN_ENV);
+  }
   forbidden.extend(
     config
       .slack
@@ -987,6 +992,14 @@ fn validate_dedicated_worker_surface_with(
     return Err(
       io::Error::other(format!(
         "scheduled runner {role_name} forbids ambient secret environment {name}"
+      ))
+      .into(),
+    );
+  }
+  if role == ScheduledRunnerRole::Executor && !present(GITHUB_MCP_ACCESS_TOKEN_ENV) {
+    return Err(
+      io::Error::other(format!(
+        "scheduled runner executor requires {GITHUB_MCP_ACCESS_TOKEN_ENV}"
       ))
       .into(),
     );
@@ -1021,6 +1034,7 @@ mod tests {
       validate_gateway_environment(|name| name == "CODEOFF_SCHEDULED_RUNNER_CLIENT_PRIVATE_KEY")
         .is_err()
     );
+    assert!(validate_gateway_environment(|name| name == GITHUB_MCP_ACCESS_TOKEN_ENV).is_err());
   }
 
   #[test]
@@ -1029,6 +1043,22 @@ mod tests {
     assert!(
       validate_dedicated_worker_surface_with(&config, ScheduledRunnerRole::Control, |_| false)
         .is_ok()
+    );
+    assert!(
+      validate_dedicated_worker_surface_with(&config, ScheduledRunnerRole::Control, |name| {
+        name == GITHUB_MCP_ACCESS_TOKEN_ENV
+      })
+      .is_err()
+    );
+    assert!(
+      validate_dedicated_worker_surface_with(&config, ScheduledRunnerRole::Executor, |_| false)
+        .is_err()
+    );
+    assert!(
+      validate_dedicated_worker_surface_with(&config, ScheduledRunnerRole::Executor, |name| {
+        name == GITHUB_MCP_ACCESS_TOKEN_ENV
+      })
+      .is_ok()
     );
     assert!(
       validate_dedicated_worker_surface_with(&config, ScheduledRunnerRole::Executor, |name| {

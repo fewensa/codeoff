@@ -40,6 +40,27 @@ impl BundledTimeZone {
     Timestamp::from_second(timestamp).is_ok()
   }
 
+  pub(super) fn transition_timestamps(
+    &self,
+    start: i64,
+    end: i64,
+    limit: u32,
+  ) -> Result<Vec<i64>, ()> {
+    let start = Timestamp::from_second(start).map_err(|_| ())?;
+    let mut transitions = Vec::new();
+    for transition in self.timezone.following(start) {
+      let timestamp = transition.timestamp().as_second();
+      if timestamp >= end {
+        break;
+      }
+      if transitions.len() >= usize::try_from(limit).map_err(|_| ())? {
+        return Err(());
+      }
+      transitions.push(timestamp);
+    }
+    Ok(transitions)
+  }
+
   fn local_offset(&self, local: &NaiveDateTime) -> MappedLocalTime<BundledOffset> {
     let Ok(local) = to_civil(local) else {
       return MappedLocalTime::None;

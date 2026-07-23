@@ -609,8 +609,14 @@ async fn run_scheduled_delivery_tick_with_timeline(
         return Ok(ScheduledDeliveryTickOutcome::Cancelled);
       }
       let claim_time = timeline.fresh_now();
+      let claim_clock = || timeline.fresh_now();
       let Some(claim) = state
-        .claim_scheduled_delivery_from_snapshot(&authority, lease_owner, claim_time)
+        .claim_scheduled_delivery_from_snapshot_with_clock(
+          &authority,
+          lease_owner,
+          claim_time,
+          &claim_clock,
+        )
         .await?
       else {
         return Ok(ScheduledDeliveryTickOutcome::Idle);

@@ -175,6 +175,10 @@ struct SchedulerEvidenceFile {
 }
 
 pub(crate) trait SchedulerAuthorityVerifier: Send + Sync {
+  fn ensure_available(&self) -> Result<(), SchedulerCommandError> {
+    Ok(())
+  }
+
   fn verify(
     &self,
     authority: &[u8],
@@ -186,6 +190,13 @@ pub(crate) trait SchedulerAuthorityVerifier: Send + Sync {
 pub(crate) struct UnavailableSchedulerAuthorityVerifier;
 
 impl SchedulerAuthorityVerifier for UnavailableSchedulerAuthorityVerifier {
+  fn ensure_available(&self) -> Result<(), SchedulerCommandError> {
+    Err(command_error(
+      "authority_verifier_unavailable",
+      "scheduler mutation authority verifier is not available",
+    ))
+  }
+
   fn verify(
     &self,
     _authority: &[u8],
@@ -460,9 +471,6 @@ async fn execute_scheduler_operator_command(
         .list_scheduled_delivery_reconcile_candidates(now, limit)
         .await
         .map_err(state_command_error)?;
-      let next_attempt_at = now
-        .checked_add(i64::from(policy.run_retry_base_seconds))
-        .ok_or_else(|| command_error("invalid_policy", "scheduler retry timing overflowed"))?;
       let run_plan = run_candidates
         .iter()
         .map(|candidate| {
@@ -485,8 +493,6 @@ async fn execute_scheduler_operator_command(
       let plan = json!({
         "delivery_candidates": delivery_plan,
         "limit": limit,
-        "max_attempts": policy.run_max_attempts,
-        "next_attempt_at": next_attempt_at,
         "now": now,
         "run_candidates": run_plan,
         "schema_version": 1,
@@ -506,12 +512,7 @@ async fn execute_scheduler_operator_command(
       let mut run_results = Vec::with_capacity(run_candidates.len());
       for candidate in &run_candidates {
         let outcome = state
-          .reconcile_scheduled_run_candidate(
-            candidate,
-            i64::from(policy.run_max_attempts),
-            next_attempt_at,
-            now,
-          )
+          .reconcile_scheduled_run_candidate(candidate, now)
           .await;
         run_results.push(json!({
           "run_id": candidate.run_id(),
@@ -553,10 +554,27 @@ async fn execute_scheduler_operator_command(
       reject_ambiguous_stdin(&[&reason_file, &authority_file])?;
       let reason = read_reason_file(&reason_file)?;
       let authority = read_bounded_file(&authority_file)?;
+      authority_verifier.ensure_available()?;
       let expected_state = retry_run_state(expected_state);
-      let next_attempt_at = now
-        .checked_add(i64::from(policy.run_retry_base_seconds))
-        .ok_or_else(|| command_error("invalid_policy", "scheduler retry timing overflowed"))?;
+      let next_attempt_at = state
+        .scheduled_run_operator_retry_at(&run_id, expected_attempt, expected_fence, now)
+        .await
+        .map_err(state_command_error)?;
+      let (next_attempt_at, occurred_at) = if let Some(next_attempt_at) = next_attempt_at {
+        (next_attempt_at, now)
+      } else {
+        let replay = state
+          .scheduled_run_operator_retry_replay_timing(
+            &request_id,
+            &run_id,
+            expected_attempt,
+            expected_fence,
+          )
+          .await
+          .map_err(state_command_error)?
+          .ok_or_else(|| command_error("not_eligible", "scheduled run retry is exhausted"))?;
+        (replay.effective_at, replay.occurred_at)
+      };
       let provisional = SchedulerOperatorRequest::for_run_retry(
         provisional_principal(),
         &request_id,
@@ -567,7 +585,7 @@ async fn execute_scheduler_operator_command(
         &reason.canonical_json,
         &reason.digest,
         next_attempt_at,
-        now,
+        occurred_at,
       )
       .map_err(value_command_error)?;
       let principal = authority_verifier.verify(&authority, &provisional.request_digest)?;
@@ -581,7 +599,7 @@ async fn execute_scheduler_operator_command(
         &reason.canonical_json,
         &reason.digest,
         next_attempt_at,
-        now,
+        occurred_at,
       )
       .map_err(value_command_error)?;
       let outcome = state
@@ -615,6 +633,26 @@ async fn execute_scheduler_operator_command(
       reject_ambiguous_stdin(&[&reason_file, &authority_file])?;
       let reason = read_reason_file(&reason_file)?;
       let authority = read_bounded_file(&authority_file)?;
+      authority_verifier.ensure_available()?;
+      let next_attempt_at = state
+        .scheduled_delivery_operator_retry_at(&delivery_id, expected_attempt, expected_fence, now)
+        .await
+        .map_err(state_command_error)?;
+      let (next_attempt_at, occurred_at) = if let Some(next_attempt_at) = next_attempt_at {
+        (next_attempt_at, now)
+      } else {
+        let replay = state
+          .scheduled_delivery_operator_retry_replay_timing(
+            &request_id,
+            &delivery_id,
+            expected_attempt,
+            expected_fence,
+          )
+          .await
+          .map_err(state_command_error)?
+          .ok_or_else(|| command_error("not_eligible", "scheduled delivery retry is exhausted"))?;
+        (replay.effective_at, replay.occurred_at)
+      };
       let provisional = SchedulerOperatorRequest::for_delivery_retry(
         provisional_principal(),
         &request_id,
@@ -623,7 +661,8 @@ async fn execute_scheduler_operator_command(
         expected_fence,
         &reason.canonical_json,
         &reason.digest,
-        now,
+        next_attempt_at,
+        occurred_at,
       )
       .map_err(value_command_error)?;
       let principal = authority_verifier.verify(&authority, &provisional.request_digest)?;
@@ -635,7 +674,8 @@ async fn execute_scheduler_operator_command(
         expected_fence,
         &reason.canonical_json,
         &reason.digest,
-        now,
+        next_attempt_at,
+        occurred_at,
       )
       .map_err(value_command_error)?;
       let outcome = state
@@ -681,6 +721,7 @@ async fn execute_scheduler_operator_command(
         acknowledge_duplicate_risk,
       )?;
       let authority = read_bounded_file(&authority_file)?;
+      authority_verifier.ensure_available()?;
       let provisional = SchedulerOperatorRequest::for_delivery_action(
         provisional_principal(),
         &request_id,

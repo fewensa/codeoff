@@ -951,16 +951,51 @@ fn prove_cron_minimum_cadence(
   if timezone != "UTC" && !fixed_daily {
     return Err(StateValueError::CadenceProofUnavailable);
   }
-  let proof_limit = if fixed_daily {
-    proof_limit.max(146_100)
-  } else {
-    proof_limit
-  };
   let cron = CronParser::new()
     .parse(expression)
     .map_err(|_| StateValueError::InvalidCron)?;
   let timezone =
     BundledTimeZone::parse(timezone).map_err(|()| StateValueError::CadenceProofUnavailable)?;
+  if fixed_daily {
+    let transitions = timezone
+      .transition_timestamps(GREGORIAN_CYCLE_START, GREGORIAN_CYCLE_END, proof_limit)
+      .map_err(|()| StateValueError::CadenceProofExhausted)?;
+    for checkpoint in std::iter::once(GREGORIAN_CYCLE_START)
+      .chain(transitions)
+      .chain(std::iter::once(GREGORIAN_CYCLE_END - 1))
+    {
+      let checkpoint = DateTime::<Utc>::from_timestamp(checkpoint, 0)
+        .ok_or(StateValueError::CadenceProofUnavailable)?
+        .with_timezone(&timezone);
+      let previous = cron
+        .find_previous_occurrence(&checkpoint, false)
+        .map_err(|_| StateValueError::CadenceProofUnavailable)?
+        .timestamp();
+      let next = cron
+        .find_next_occurrence(&checkpoint, true)
+        .map_err(|_| StateValueError::CadenceProofUnavailable)?
+        .timestamp();
+      if next.checked_sub(previous).is_none_or(|gap| gap < minimum) {
+        return Ok(false);
+      }
+    }
+    let cycle = GREGORIAN_CYCLE_END - GREGORIAN_CYCLE_START;
+    let start = DateTime::<Utc>::from_timestamp(GREGORIAN_CYCLE_START - 1, 0)
+      .ok_or(StateValueError::CadenceProofUnavailable)?
+      .with_timezone(&timezone);
+    let end = DateTime::<Utc>::from_timestamp(GREGORIAN_CYCLE_END, 0)
+      .ok_or(StateValueError::CadenceProofUnavailable)?
+      .with_timezone(&timezone);
+    let first = cron
+      .find_next_occurrence(&start, false)
+      .map_err(|_| StateValueError::CadenceProofUnavailable)?
+      .timestamp();
+    let last = cron
+      .find_previous_occurrence(&end, false)
+      .map_err(|_| StateValueError::CadenceProofUnavailable)?
+      .timestamp();
+    return Ok(first + cycle - last >= minimum);
+  }
   let mut previous = None;
   let mut first = None;
   let mut reference = GREGORIAN_CYCLE_START - 1;
@@ -1697,6 +1732,7 @@ pub struct ScheduledRunReconcileCandidate {
   fence: i64,
   lease_owner: String,
   lease_expires_at: i64,
+  next_attempt_at: Option<i64>,
 }
 
 impl ScheduledRunReconcileCandidate {
@@ -1733,6 +1769,8 @@ impl ScheduledRunReconcileCandidate {
       "fence": self.fence,
       "lease_expires_at": self.lease_expires_at,
       "lease_owner_digest": sha256_hex(self.lease_owner.as_bytes()),
+      "next_attempt_at": self.next_attempt_at,
+      "retry_eligible": self.next_attempt_at.is_some(),
       "run_id": self.run_id,
       "state": self.state.as_str(),
     })
@@ -2074,6 +2112,12 @@ pub struct SchedulerOperatorRequest {
   pub occurred_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerOperatorReplayTiming {
+  pub effective_at: i64,
+  pub occurred_at: i64,
+}
+
 impl SchedulerOperatorRequest {
   /// Builds authority for one exact manual run retry.
   ///
@@ -2143,6 +2187,7 @@ impl SchedulerOperatorRequest {
     expected_fence: i64,
     reason_json: &str,
     reason_digest: &str,
+    effective_at: i64,
     occurred_at: i64,
   ) -> Result<Self, StateValueError> {
     principal.validate()?;
@@ -2150,7 +2195,8 @@ impl SchedulerOperatorRequest {
     validate_text("operator request id", &request_id)?;
     validate_text("operator delivery id", delivery_id)?;
     validate_operator_reason(reason_json, reason_digest)?;
-    if expected_attempt <= 0 || expected_fence <= 0 || occurred_at < 0 {
+    if expected_attempt <= 0 || expected_fence <= 0 || occurred_at < 0 || effective_at < occurred_at
+    {
       return Err(StateValueError::InvalidVersion);
     }
     Ok(Self {
@@ -2170,7 +2216,7 @@ impl SchedulerOperatorRequest {
         None,
         None,
         false,
-        occurred_at,
+        effective_at,
       ),
       occurred_at,
     })
@@ -3083,7 +3129,7 @@ mod tests {
       .expect("fixed UTC daily cadence is statically proven");
     ScheduleSpec::cron("0 3 * * *", "America/New_York")
       .expect("valid timezone daily cron")
-      .validate_minimum_cadence(1_800_000_000, 23 * 3_600, 1)
+      .validate_minimum_cadence(1_800_000_000, 23 * 3_600, 1_000)
       .expect("full-cycle timezone proof includes DST transitions");
   }
 
@@ -3103,5 +3149,28 @@ mod tests {
         .expect_err("variable timezone expression is not canonically provable"),
       StateValueError::CadenceProofUnavailable
     );
+    let bounded = ScheduleSpec::cron("0 3 * * *", "America/New_York").expect("valid cron");
+    assert_eq!(
+      bounded
+        .validate_minimum_cadence(1_800_000_000, 61, 1)
+        .expect_err("timezone transition proof must respect configured bound"),
+      StateValueError::CadenceProofExhausted
+    );
+  }
+
+  #[test]
+  fn cron_cadence_proof_covers_folds_gaps_leap_days_and_cycle_wrap() {
+    let fallback = ScheduleSpec::cron("30 1 * * *", "America/New_York").expect("fold cron");
+    fallback
+      .validate_minimum_cadence(1_800_000_000, 23 * 3_600, 1_000)
+      .expect("fall-back resolution remains above the minimum");
+    ScheduleSpec::cron("30 2 * * *", "America/New_York")
+      .expect("gap cron")
+      .validate_minimum_cadence(1_800_000_000, 23 * 3_600, 1_000)
+      .expect("spring gap and later transitions remain above the minimum");
+    ScheduleSpec::cron("0 0 29 2 *", "UTC")
+      .expect("leap-day cron")
+      .validate_minimum_cadence(1_800_000_000, 365 * 86_400, 1_000)
+      .expect("Gregorian leap days and the 400-year wrap are proven");
   }
 }

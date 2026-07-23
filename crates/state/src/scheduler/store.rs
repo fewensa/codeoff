@@ -27,9 +27,9 @@ use super::{
   ScheduledRunLateEvidenceKind, ScheduledRunOperatorProjection, ScheduledRunReconcileCandidate,
   ScheduledRunReconcileOutcome, ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
   SchedulerObservabilitySnapshot, SchedulerOperatorActionSummary, SchedulerOperatorMutationOutcome,
-  SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError, TransactionalMutationOutcome,
-  UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json, invalid_occurrence,
-  invalid_value, materialized_run, operator_action_request_digest,
+  SchedulerOperatorReplayTiming, SchedulerOperatorRequest, SkippedNoneBaselinePolicy, StateError,
+  TransactionalMutationOutcome, UpdateExecutionBaseline, UpdateScheduledJob, Value, invalid_json,
+  invalid_occurrence, invalid_value, materialized_run, operator_action_request_digest,
   operator_delivery_evidence_binding, positive_u32, scheduler_error, validate_lowercase_sha256,
   validate_text,
 };
@@ -441,7 +441,9 @@ impl StateStore {
   /// # Errors
   /// Returns an error when the request is invalid or `SQLite` rejects the transaction.
   pub async fn create_scheduled_job(&self, request: &CreateScheduledJob) -> Result<(), StateError> {
-    let next_run_at = validate_create_request(request, &self.scheduler_policy)?;
+    let next_run_at = validate_create_request(request, &self.scheduler_policy, false)?;
+    let cadence_proof =
+      generate_cadence_proof(&request.schedule, request.now, &self.scheduler_policy)?;
     let policy_json = scheduler_policy_json(&self.scheduler_policy)?;
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     acquire_scheduler_policy_lock(&mut transaction, request.now).await?;
@@ -452,7 +454,14 @@ impl StateStore {
       None,
     )
     .await?;
-    insert_scheduled_job(&mut transaction, request, next_run_at, &policy_json).await?;
+    insert_scheduled_job(
+      &mut transaction,
+      request,
+      next_run_at,
+      &policy_json,
+      &cadence_proof,
+    )
+    .await?;
     transaction.commit().await.map_err(scheduler_error)
   }
 
@@ -468,7 +477,9 @@ impl StateStore {
     &self,
     request: &UpdateScheduledJob,
   ) -> Result<i64, StateError> {
-    validate_update_request(request, &self.scheduler_policy)?;
+    validate_update_request(request, &self.scheduler_policy, false)?;
+    let cadence_proof =
+      generate_cadence_proof(&request.schedule, request.now, &self.scheduler_policy)?;
     let policy_json = scheduler_policy_json(&self.scheduler_policy)?;
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     apply_update(
@@ -476,6 +487,7 @@ impl StateStore {
       request,
       &self.scheduler_policy,
       &policy_json,
+      &cadence_proof,
     )
     .await?;
     transaction.commit().await.map_err(scheduler_error)?;
@@ -515,6 +527,7 @@ impl StateStore {
     if let Some(audit) = audit {
       validate_mutation_audit(mutation, idempotency, audit)?;
     }
+    let cadence_proof = self.prevalidate_schedule_mutation(mutation).await?;
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     let decision = claim_idempotency_in_transaction(
       &mut transaction,
@@ -528,7 +541,13 @@ impl StateStore {
     .await?;
     match decision {
       IdempotencyDecision::Claimed => {
-        apply_typed_mutation(&mut transaction, mutation, &self.scheduler_policy).await?;
+        apply_typed_mutation(
+          &mut transaction,
+          mutation,
+          &self.scheduler_policy,
+          cadence_proof.as_ref(),
+        )
+        .await?;
         if let Some(audit) = audit {
           insert_mutation_audit(&mut transaction, audit).await?;
         }
@@ -1587,18 +1606,57 @@ impl StateStore {
     now: i64,
     lease_expires_at: i64,
   ) -> Result<Option<ClaimedScheduledDelivery>, StateError> {
+    self
+      .claim_scheduled_delivery_inner(authority, lease_owner, now, Some(lease_expires_at), &|| now)
+      .await
+  }
+
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps exact delivery claim and attempt authority in one transaction"
+  )]
+  async fn claim_scheduled_delivery_inner(
+    &self,
+    authority: &ScheduledDeliveryAuthority,
+    lease_owner: &str,
+    now: i64,
+    lease_expires_at: Option<i64>,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+  ) -> Result<Option<ClaimedScheduledDelivery>, StateError> {
     validate_text("scheduled delivery lease owner", lease_owner).map_err(invalid_value)?;
     validate_scheduled_delivery_authority(authority)?;
-    if now < 0 || lease_expires_at <= now {
+    if now < 0 || lease_expires_at.is_some_and(|expires_at| expires_at <= now) {
       return Err(StateError::InvalidSchedulerState {
         reason: "scheduled delivery lease must expire after claim time".to_owned(),
       });
     }
-    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    let mut transaction = self
+      .pool
+      .begin_with("BEGIN IMMEDIATE")
+      .await
+      .map_err(scheduler_error)?;
+    let mutation_now = clock().max(now);
+    let lease_expires_at = lease_expires_at.map_or_else(
+      || {
+        mutation_now
+          .checked_add(i64::from(
+            authority.scheduler_policy().delivery_lease_seconds,
+          ))
+          .ok_or_else(|| StateError::InvalidSchedulerState {
+            reason: "scheduled delivery lease overflows".to_owned(),
+          })
+      },
+      Ok,
+    )?;
+    if lease_expires_at <= mutation_now {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduled delivery lease must expire after transaction claim time".to_owned(),
+      });
+    }
     let terminalized = sqlx::query(
-      "update scheduled_run_deliveries set state = 'failed_terminal', next_attempt_at = null, provider_outcome = 'confirmed_no_write_terminal', error_kind = case when payload_created_at > 9223372036854775807 - cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) or ?1 >= payload_created_at + cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) then 'delivery_deadline_exceeded' else 'delivery_retry_exhausted' end, error_message = null, updated_at = ?1 where delivery_id = ?2 and state = ?3 and target_json = ?4 and target_snapshot_digest = ?5 and payload_digest = ?6 and intent_key = ?7 and (attempt >= cast(json_extract(scheduler_policy_json, '$.delivery_max_attempts') as integer) or payload_created_at > 9223372036854775807 - cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) or ?1 >= payload_created_at + cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer))",
+      "update scheduled_run_deliveries set state = 'failed_terminal', next_attempt_at = null, lease_owner = null, lease_expires_at = null, provider_receipt = null, provider_outcome = 'confirmed_no_write_terminal', error_kind = case when payload_created_at > 9223372036854775807 - cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) or ?1 >= payload_created_at + cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) then 'delivery_deadline_exceeded' else 'delivery_retry_exhausted' end, error_message = 'provider rejected exact delivery target during readiness', updated_at = ?1 where delivery_id = ?2 and state = ?3 and target_json = ?4 and target_snapshot_digest = ?5 and payload_digest = ?6 and intent_key = ?7 and (attempt >= cast(json_extract(scheduler_policy_json, '$.delivery_max_attempts') as integer) or payload_created_at > 9223372036854775807 - cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer) or ?1 >= payload_created_at + cast(json_extract(scheduler_policy_json, '$.delivery_deadline_seconds') as integer))",
     )
-    .bind(now)
+    .bind(mutation_now)
     .bind(authority.delivery_id())
     .bind(authority.source_state().as_str())
     .bind(authority.target_json())
@@ -1613,7 +1671,7 @@ impl StateStore {
       return Ok(None);
     }
     if authority.source_state() == ScheduledDeliveryState::FailedRetryable
-      && !requeue_exact_retryable_delivery(&mut transaction, authority, now).await?
+      && !requeue_exact_retryable_delivery(&mut transaction, authority, mutation_now).await?
     {
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(None);
@@ -1623,7 +1681,7 @@ impl StateStore {
     )
     .bind(lease_owner)
     .bind(lease_expires_at)
-    .bind(now)
+    .bind(mutation_now)
     .bind(authority.delivery_id())
     .bind(authority.target_json())
     .bind(authority.target_digest())
@@ -1668,7 +1726,7 @@ impl StateStore {
         .try_get::<i64, _>("claimed_baseline_version")
         .map_err(scheduler_error)?,
     )
-    .bind(now)
+    .bind(mutation_now)
     .execute(&mut *transaction)
     .await
     .map_err(scheduler_error)?;
@@ -1715,24 +1773,24 @@ impl StateStore {
     lease_owner: &str,
     now: i64,
   ) -> Result<Option<ClaimedScheduledDelivery>, StateError> {
-    let Some(deadline) = authority
-      .scheduler_policy()
-      .delivery_deadline_at(authority.payload_created_at())
-    else {
-      return Ok(None);
-    };
-    if now >= deadline {
-      return Ok(None);
-    }
-    let lease_expires_at = now
-      .checked_add(i64::from(
-        authority.scheduler_policy().delivery_lease_seconds,
-      ))
-      .ok_or_else(|| StateError::InvalidSchedulerState {
-        reason: "scheduled delivery lease overflows".to_owned(),
-      })?;
     self
-      .claim_scheduled_delivery(authority, lease_owner, now, lease_expires_at)
+      .claim_scheduled_delivery_inner(authority, lease_owner, now, None, &|| now)
+      .await
+  }
+
+  /// Claims exact snapshot authority using a fresh clock after acquiring the write transaction.
+  ///
+  /// # Errors
+  /// Returns an error for invalid delivery authority, lease arithmetic, or storage failure.
+  pub async fn claim_scheduled_delivery_from_snapshot_with_clock(
+    &self,
+    authority: &ScheduledDeliveryAuthority,
+    lease_owner: &str,
+    now: i64,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+  ) -> Result<Option<ClaimedScheduledDelivery>, StateError> {
+    self
+      .claim_scheduled_delivery_inner(authority, lease_owner, now, None, clock)
       .await
   }
 
@@ -2131,7 +2189,7 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     let result = sqlx::query(
-      "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id in (select delivery_id from scheduled_run_deliveries where state = 'failed_retryable' and next_attempt_at <= ?1 order by next_attempt_at, delivery_id limit ?2)",
+    "update scheduled_run_deliveries set state = 'pending', updated_at = next_attempt_at, next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null where delivery_id in (select delivery_id from scheduled_run_deliveries where state = 'failed_retryable' and next_attempt_at <= ?1 order by next_attempt_at, delivery_id limit ?2)",
     )
     .bind(now)
     .bind(i64::from(limit))
@@ -3515,8 +3573,7 @@ where run.run_id = ?2
     expected_fence: i64,
     expected_lease_owner: &str,
     expected_lease_expires_at: i64,
-    max_attempts: i64,
-    next_attempt_at: i64,
+    expected_next_attempt_at: Option<i64>,
     now: i64,
   ) -> Result<ScheduledRunReconcileOutcome, StateError> {
     validate_text("scheduled run reconciliation id", run_id).map_err(invalid_value)?;
@@ -3528,8 +3585,6 @@ where run.run_id = ?2
     ) || expected_attempt <= 0
       || expected_fence <= 0
       || expected_lease_expires_at < 0
-      || max_attempts <= 0
-      || next_attempt_at <= now
       || now < 0
     {
       return Err(StateError::InvalidSchedulerState {
@@ -3581,6 +3636,25 @@ where run.run_id = ?2
     };
     let safe_execution_retry =
       state == "executing" && persisted_profile_allows_recovery(&binding, &row)?;
+    let policy = scheduler_policy_from_snapshot(
+      row
+        .try_get("scheduler_policy_version")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("scheduler_policy_json")
+        .map_err(scheduler_error)?,
+    )?;
+    let next_attempt_at = policy.run_retry_at(
+      run_id,
+      attempt,
+      row.try_get("scheduled_for").map_err(scheduler_error)?,
+      now,
+    );
+    if next_attempt_at != expected_next_attempt_at {
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(ScheduledRunReconcileOutcome::Stale);
+    }
+    let max_attempts = next_attempt_at.map_or(attempt, |_| i64::from(policy.run_max_attempts));
     let transition = expired_reclaim_transition(
       &state,
       run_id,
@@ -3589,7 +3663,9 @@ where run.run_id = ?2
       max_attempts,
       safe_execution_retry,
     );
-    let retry_at = (transition.run_state == "pending").then_some(next_attempt_at);
+    let retry_at = (transition.run_state == "pending")
+      .then_some(next_attempt_at)
+      .flatten();
     let run = sqlx::query(
       "update scheduled_runs set state = ?1, next_attempt_at = ?2, lease_owner = null, lease_expires_at = null, overlap_slot = ?3, error_kind = case when ?1 in ('failed', 'outcome_unknown') then ?4 else null end, error_message = case when ?1 in ('failed', 'outcome_unknown') then ?4 else null end, updated_at = ?5 where run_id = ?6 and job_id = ?7 and attempt = ?8 and fence = ?9 and lease_owner = ?10 and state = ?11 and lease_expires_at = ?12 and lease_expires_at <= ?5 and updated_at <= ?5",
     )
@@ -3656,7 +3732,7 @@ where run.run_id = ?2
       });
     }
     let rows = sqlx::query(
-      "select run_id, state, attempt, fence, lease_owner, lease_expires_at from scheduled_runs where state in ('leased', 'executing') and lease_expires_at <= ?1 and updated_at <= ?1 order by lease_expires_at, run_id limit ?2",
+      "select run_id, state, attempt, fence, lease_owner, lease_expires_at, scheduled_for, scheduler_policy_version, scheduler_policy_json from scheduled_runs where state in ('leased', 'executing') and lease_expires_at <= ?1 and updated_at <= ?1 order by lease_expires_at, run_id limit ?2",
     )
     .bind(now)
     .bind(i64::from(limit))
@@ -3671,15 +3747,32 @@ where run.run_id = ?2
           .map_err(scheduler_error)?
           .parse()?;
         let lease_owner: String = row.try_get("lease_owner").map_err(scheduler_error)?;
+        let run_id: String = row.try_get("run_id").map_err(scheduler_error)?;
+        let attempt: i64 = row.try_get("attempt").map_err(scheduler_error)?;
+        let policy = scheduler_policy_from_snapshot(
+          row
+            .try_get("scheduler_policy_version")
+            .map_err(scheduler_error)?,
+          row
+            .try_get("scheduler_policy_json")
+            .map_err(scheduler_error)?,
+        )?;
+        let next_attempt_at = policy.run_retry_at(
+          &run_id,
+          attempt,
+          row.try_get("scheduled_for").map_err(scheduler_error)?,
+          now,
+        );
         validate_text("persisted run reconcile lease owner", &lease_owner)
           .map_err(invalid_value)?;
         Ok(ScheduledRunReconcileCandidate {
-          run_id: row.try_get("run_id").map_err(scheduler_error)?,
+          run_id,
           state,
-          attempt: row.try_get("attempt").map_err(scheduler_error)?,
+          attempt,
           fence: row.try_get("fence").map_err(scheduler_error)?,
           lease_owner,
           lease_expires_at: row.try_get("lease_expires_at").map_err(scheduler_error)?,
+          next_attempt_at,
         })
       })
       .collect()
@@ -3693,8 +3786,6 @@ where run.run_id = ?2
   pub async fn reconcile_scheduled_run_candidate(
     &self,
     candidate: &ScheduledRunReconcileCandidate,
-    max_attempts: i64,
-    next_attempt_at: i64,
     now: i64,
   ) -> Result<ScheduledRunReconcileOutcome, StateError> {
     self
@@ -3705,9 +3796,76 @@ where run.run_id = ?2
         candidate.fence,
         &candidate.lease_owner,
         candidate.lease_expires_at,
-        max_attempts,
-        next_attempt_at,
+        candidate.next_attempt_at,
         now,
+      )
+      .await
+  }
+
+  /// Requeues one conclusively terminal run under idempotent trusted-operator authority.
+  ///
+  /// # Errors
+  /// Returns an error for invalid authority, stale CAS, unknown execution outcome, or storage
+  /// failure.
+  #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+  pub async fn scheduled_run_operator_retry_at(
+    &self,
+    run_id: &str,
+    expected_attempt: i64,
+    expected_fence: i64,
+    now: i64,
+  ) -> Result<Option<i64>, StateError> {
+    let row = sqlx::query(
+      "select state, scheduled_for, scheduler_policy_version, scheduler_policy_json from scheduled_runs where run_id = ?1 and attempt = ?2 and fence = ?3 and result_artifact_id is null",
+    )
+    .bind(run_id)
+    .bind(expected_attempt)
+    .bind(expected_fence)
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(row) = row else {
+      return Ok(None);
+    };
+    let state: String = row.try_get("state").map_err(scheduler_error)?;
+    if !matches!(state.as_str(), "failed" | "timed_out" | "cancelled") {
+      return Ok(None);
+    }
+    let policy = scheduler_policy_from_snapshot(
+      row
+        .try_get("scheduler_policy_version")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("scheduler_policy_json")
+        .map_err(scheduler_error)?,
+    )?;
+    Ok(policy.run_retry_at(
+      run_id,
+      expected_attempt,
+      row.try_get("scheduled_for").map_err(scheduler_error)?,
+      now,
+    ))
+  }
+
+  /// Returns persisted timing only for one unambiguous run-retry replay identity.
+  ///
+  /// # Errors
+  /// Returns an error for invalid identity fields or storage failure.
+  pub async fn scheduled_run_operator_retry_replay_timing(
+    &self,
+    request_id: &str,
+    run_id: &str,
+    expected_attempt: i64,
+    expected_fence: i64,
+  ) -> Result<Option<SchedulerOperatorReplayTiming>, StateError> {
+    self
+      .operator_retry_replay_timing(
+        "retry_run",
+        "run",
+        request_id,
+        run_id,
+        expected_attempt,
+        expected_fence,
       )
       .await
   }
@@ -3769,7 +3927,7 @@ where run.run_id = ?2
       return Ok(outcome);
     }
     let row = sqlx::query(
-      "select state, result_artifact_id from scheduled_runs where run_id = ?1 and attempt = ?2 and fence = ?3",
+      "select state, result_artifact_id, scheduled_for, scheduler_policy_version, scheduler_policy_json from scheduled_runs where run_id = ?1 and attempt = ?2 and fence = ?3",
     )
     .bind(run_id)
     .bind(expected_attempt)
@@ -3786,6 +3944,23 @@ where run.run_id = ?2
         .try_get::<Option<String>, _>("result_artifact_id")
         .map_err(scheduler_error)?
         .is_some()
+    {
+      return Ok(SchedulerOperatorMutationOutcome::Conflict);
+    }
+    let policy = scheduler_policy_from_snapshot(
+      row
+        .try_get("scheduler_policy_version")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("scheduler_policy_json")
+        .map_err(scheduler_error)?,
+    )?;
+    if policy.run_retry_at(
+      run_id,
+      expected_attempt,
+      row.try_get("scheduled_for").map_err(scheduler_error)?,
+      request.occurred_at,
+    ) != Some(next_attempt_at)
     {
       return Ok(SchedulerOperatorMutationOutcome::Conflict);
     }
@@ -3839,6 +4014,108 @@ where run.run_id = ?2
   /// # Errors
   /// Returns an error for invalid authority, stale CAS, malformed evidence, or storage failure.
   #[allow(clippy::too_many_arguments)]
+  pub async fn scheduled_delivery_operator_retry_at(
+    &self,
+    delivery_id: &str,
+    expected_attempt: i64,
+    expected_fence: i64,
+    now: i64,
+  ) -> Result<Option<i64>, StateError> {
+    let row = sqlx::query(
+      "select payload_created_at, scheduler_policy_version, scheduler_policy_json from scheduled_run_deliveries where delivery_id = ?1 and attempt = ?2 and fence = ?3 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null",
+    )
+    .bind(delivery_id)
+    .bind(expected_attempt)
+    .bind(expected_fence)
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    let Some(row) = row else {
+      return Ok(None);
+    };
+    let policy = scheduler_policy_from_snapshot(
+      row
+        .try_get("scheduler_policy_version")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("scheduler_policy_json")
+        .map_err(scheduler_error)?,
+    )?;
+    Ok(policy.delivery_retry_at(
+      delivery_id,
+      expected_attempt,
+      row.try_get("payload_created_at").map_err(scheduler_error)?,
+      now,
+      None,
+    ))
+  }
+
+  /// Returns persisted timing only for one unambiguous delivery-retry replay identity.
+  ///
+  /// # Errors
+  /// Returns an error for invalid identity fields or storage failure.
+  pub async fn scheduled_delivery_operator_retry_replay_timing(
+    &self,
+    request_id: &str,
+    delivery_id: &str,
+    expected_attempt: i64,
+    expected_fence: i64,
+  ) -> Result<Option<SchedulerOperatorReplayTiming>, StateError> {
+    self
+      .operator_retry_replay_timing(
+        "retry_delivery",
+        "delivery",
+        request_id,
+        delivery_id,
+        expected_attempt,
+        expected_fence,
+      )
+      .await
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  async fn operator_retry_replay_timing(
+    &self,
+    action: &str,
+    target_kind: &str,
+    request_id: &str,
+    target_id: &str,
+    expected_attempt: i64,
+    expected_fence: i64,
+  ) -> Result<Option<SchedulerOperatorReplayTiming>, StateError> {
+    validate_text("operator replay request id", request_id).map_err(invalid_value)?;
+    validate_text("operator replay target id", target_id).map_err(invalid_value)?;
+    if expected_attempt <= 0 || expected_fence <= 0 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "invalid operator replay authority".to_owned(),
+      });
+    }
+    let rows = sqlx::query(
+      "select effective_at, occurred_at from scheduler_operator_actions where action = ?1 and target_kind = ?2 and request_id = ?3 and target_id = ?4 and expected_attempt = ?5 and expected_fence = ?6 limit 2",
+    )
+    .bind(action)
+    .bind(target_kind)
+    .bind(request_id)
+    .bind(target_id)
+    .bind(expected_attempt)
+    .bind(expected_fence)
+    .fetch_all(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    if rows.len() != 1 {
+      return Ok(None);
+    }
+    Ok(Some(SchedulerOperatorReplayTiming {
+      effective_at: rows[0].try_get("effective_at").map_err(scheduler_error)?,
+      occurred_at: rows[0].try_get("occurred_at").map_err(scheduler_error)?,
+    }))
+  }
+
+  /// Requeues one exact conclusively unwritten delivery under trusted-operator authority.
+  ///
+  /// # Errors
+  /// Returns an error for invalid authority, stale CAS, malformed evidence, or storage failure.
+  #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
   pub async fn operator_retry_scheduled_delivery(
     &self,
     request: &SchedulerOperatorRequest,
@@ -3870,6 +4147,65 @@ where run.run_id = ?2
         reason: "invalid operator delivery retry authority".to_owned(),
       });
     }
+    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
+    if let Some((request_digest, effective_at, occurred_at)) =
+      existing_delivery_retry_request(&mut transaction, request).await?
+    {
+      if request_digest != request.request_digest || occurred_at != request.occurred_at {
+        return Ok(SchedulerOperatorMutationOutcome::Conflict);
+      }
+      validate_operator_action_request(
+        request,
+        &OperatorActionInsert {
+          action: "retry_delivery",
+          target_kind: "delivery",
+          target_id: delivery_id,
+          expected_attempt,
+          expected_fence,
+          before_state: "failed_retryable",
+          after_state: "pending",
+          evidence_json: Some(reason_json),
+          evidence_digest: Some(reason_digest),
+          reason_json: None,
+          reason_digest: None,
+          provider_receipt: None,
+          duplicate_risk_acknowledged: false,
+          effective_at,
+        },
+      )?;
+      transaction.commit().await.map_err(scheduler_error)?;
+      return Ok(SchedulerOperatorMutationOutcome::Replay);
+    }
+    let row = sqlx::query(
+      "select payload_created_at, scheduler_policy_version, scheduler_policy_json from scheduled_run_deliveries where delivery_id = ?1 and attempt = ?2 and fence = ?3 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null",
+    )
+    .bind(delivery_id)
+    .bind(expected_attempt)
+    .bind(expected_fence)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(scheduler_error)?
+    ;
+    let Some(row) = row else {
+      return Ok(SchedulerOperatorMutationOutcome::Conflict);
+    };
+    let policy = scheduler_policy_from_snapshot(
+      row
+        .try_get("scheduler_policy_version")
+        .map_err(scheduler_error)?,
+      row
+        .try_get("scheduler_policy_json")
+        .map_err(scheduler_error)?,
+    )?;
+    let Some(next_attempt_at) = policy.delivery_retry_at(
+      delivery_id,
+      expected_attempt,
+      row.try_get("payload_created_at").map_err(scheduler_error)?,
+      request.occurred_at,
+      None,
+    ) else {
+      return Ok(SchedulerOperatorMutationOutcome::Conflict);
+    };
     let action = OperatorActionInsert {
       action: "retry_delivery",
       target_kind: "delivery",
@@ -3884,27 +4220,9 @@ where run.run_id = ?2
       reason_digest: None,
       provider_receipt: None,
       duplicate_risk_acknowledged: false,
-      effective_at: request.occurred_at,
+      effective_at: next_attempt_at,
     };
     validate_operator_action_request(request, &action)?;
-    let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
-    if let Some(outcome) = existing_operator_request(&mut transaction, request).await? {
-      transaction.commit().await.map_err(scheduler_error)?;
-      return Ok(outcome);
-    }
-    let next_attempt_at: Option<i64> = sqlx::query_scalar(
-      "select next_attempt_at from scheduled_run_deliveries where delivery_id = ?1 and attempt = ?2 and fence = ?3 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null",
-    )
-    .bind(delivery_id)
-    .bind(expected_attempt)
-    .bind(expected_fence)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(scheduler_error)?
-    .flatten();
-    if next_attempt_at.is_none_or(|retry_at| retry_at <= request.occurred_at) {
-      return Ok(SchedulerOperatorMutationOutcome::Conflict);
-    }
     match insert_operator_action(&mut transaction, request, &action).await? {
       OperatorActionInsertOutcome::Replay => {
         transaction.commit().await.map_err(scheduler_error)?;
@@ -3916,9 +4234,9 @@ where run.run_id = ?2
       OperatorActionInsertOutcome::Inserted => {}
     }
     let updated = sqlx::query(
-      "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id = ?2 and attempt = ?3 and fence = ?4 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null and next_attempt_at > ?1",
+      "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id = ?2 and attempt = ?3 and fence = ?4 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null",
     )
-    .bind(request.occurred_at)
+    .bind(next_attempt_at)
     .bind(delivery_id)
     .bind(expected_attempt)
     .bind(expected_fence)
@@ -4345,6 +4663,9 @@ where run.run_id = ?2
     expected_generation: i64,
     now: i64,
   ) -> Result<i64, StateError> {
+    let cadence_proof = self
+      .validate_resume_cadence(job_id, expected_generation, now)
+      .await?;
     let policy_json = scheduler_policy_json(&self.scheduler_policy)?;
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
     apply_resume(
@@ -4354,10 +4675,69 @@ where run.run_id = ?2
       now,
       &self.scheduler_policy,
       &policy_json,
+      &cadence_proof,
     )
     .await?;
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(expected_generation + 1)
+  }
+
+  async fn prevalidate_schedule_mutation(
+    &self,
+    mutation: &ScheduledJobMutation,
+  ) -> Result<Option<CadenceProofArtifact>, StateError> {
+    match mutation {
+      ScheduledJobMutation::Create(request) => {
+        validate_create_request(request, &self.scheduler_policy, false)?;
+        generate_cadence_proof(&request.schedule, request.now, &self.scheduler_policy).map(Some)
+      }
+      ScheduledJobMutation::Update(request) => {
+        validate_update_request(request, &self.scheduler_policy, false)?;
+        generate_cadence_proof(&request.schedule, request.now, &self.scheduler_policy).map(Some)
+      }
+      ScheduledJobMutation::Resume {
+        job_id,
+        expected_generation,
+        now,
+      } => {
+        validate_lifecycle_mutation(job_id, *expected_generation)?;
+        self
+          .validate_resume_cadence(job_id, *expected_generation, *now)
+          .await
+          .map(Some)
+      }
+      ScheduledJobMutation::Pause {
+        job_id,
+        expected_generation,
+        ..
+      }
+      | ScheduledJobMutation::Delete {
+        job_id,
+        expected_generation,
+        ..
+      } => {
+        validate_lifecycle_mutation(job_id, *expected_generation)?;
+        Ok(None)
+      }
+    }
+  }
+
+  async fn validate_resume_cadence(
+    &self,
+    job_id: &str,
+    expected_generation: i64,
+    now: i64,
+  ) -> Result<CadenceProofArtifact, StateError> {
+    let row = sqlx::query(
+      "select s.kind, s.canonical_spec, s.timezone, s.once_at, s.anchor_at, s.interval_seconds from schedules s join scheduled_jobs j on j.job_id = s.job_id where j.job_id = ?1 and j.status = 'paused' and j.generation = ?2",
+    )
+    .bind(job_id)
+    .bind(expected_generation)
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(scheduler_error)?
+    .ok_or(StateError::SchedulerGenerationConflict)?;
+    generate_cadence_proof(&schedule_from_row(&row)?, now, &self.scheduler_policy)
   }
 
   /// Atomically materializes one due coalesced occurrence as a pending immutable run snapshot.
@@ -5277,7 +5657,7 @@ async fn requeue_exact_retryable_delivery(
     return Ok(false);
   }
   let requeued = sqlx::query(
-    "update scheduled_run_deliveries set state = 'pending', next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null, updated_at = ?1 where delivery_id = ?2 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null and target_json = ?3 and target_snapshot_digest = ?4 and payload_digest = ?5 and intent_key = ?6 and next_attempt_at <= ?1 and attempt < cast(json_extract(scheduler_policy_json, '$.delivery_max_attempts') as integer) and attempt < 9223372036854775807 and fence < 9223372036854775807 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.delivery_id <> scheduled_run_deliveries.delivery_id and active.job_id = scheduled_run_deliveries.job_id and active.target_identity_digest = scheduled_run_deliveries.target_identity_digest and active.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and active.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and active.render_version = scheduled_run_deliveries.render_version and active.hash_algorithm = scheduled_run_deliveries.hash_algorithm) and not exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest)",
+    "update scheduled_run_deliveries set state = 'pending', updated_at = next_attempt_at, next_attempt_at = null, claimed_baseline_version = null, provider_outcome = null, error_kind = null, error_message = null where delivery_id = ?2 and state = 'failed_retryable' and authority_kind = 'intent_v1' and payload_snapshot is not null and target_json = ?3 and target_snapshot_digest = ?4 and payload_digest = ?5 and intent_key = ?6 and next_attempt_at <= ?1 and attempt < cast(json_extract(scheduler_policy_json, '$.delivery_max_attempts') as integer) and attempt < 9223372036854775807 and fence < 9223372036854775807 and not exists (select 1 from scheduled_run_deliveries active where active.state = 'sending' and active.delivery_id <> scheduled_run_deliveries.delivery_id and active.job_id = scheduled_run_deliveries.job_id and active.target_identity_digest = scheduled_run_deliveries.target_identity_digest and active.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and active.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and active.render_version = scheduled_run_deliveries.render_version and active.hash_algorithm = scheduled_run_deliveries.hash_algorithm) and not exists (select 1 from scheduled_delivery_baselines baseline where baseline.job_id = scheduled_run_deliveries.job_id and baseline.target_identity_digest = scheduled_run_deliveries.target_identity_digest and baseline.target_snapshot_digest_algorithm = scheduled_run_deliveries.target_snapshot_digest_algorithm and baseline.target_snapshot_digest = scheduled_run_deliveries.target_snapshot_digest and baseline.delivery_policy_version = scheduled_run_deliveries.delivery_policy_version and baseline.render_version = scheduled_run_deliveries.render_version and baseline.hash_algorithm = scheduled_run_deliveries.hash_algorithm and baseline.accepted_payload_digest = scheduled_run_deliveries.payload_digest)",
   )
   .bind(now)
   .bind(authority.delivery_id())
@@ -5612,9 +5992,92 @@ async fn replace_delivery_targets(
   Ok(())
 }
 
+#[derive(Clone)]
+struct CadenceProofArtifact {
+  canonical_json: String,
+  schedule_digest: String,
+  policy_digest: String,
+}
+
+impl CadenceProofArtifact {
+  fn verify(
+    &self,
+    schedule: &ScheduleSpec,
+    policy: &SchedulerOperationalPolicy,
+  ) -> Result<(), StateError> {
+    let (schedule_digest, policy_digest, _) = cadence_proof_identity(schedule, policy)?;
+    if self.schedule_digest != schedule_digest || self.policy_digest != policy_digest {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "cadence proof authority does not match schedule and policy".to_owned(),
+      });
+    }
+    Ok(())
+  }
+}
+
+fn generate_cadence_proof(
+  schedule: &ScheduleSpec,
+  now: i64,
+  policy: &SchedulerOperationalPolicy,
+) -> Result<CadenceProofArtifact, StateError> {
+  schedule
+    .validate_minimum_cadence(
+      now,
+      policy.minimum_schedule_cadence_seconds,
+      policy.occurrence_search_limit,
+    )
+    .map_err(invalid_value)?;
+  let (schedule_digest, policy_digest, kind) = cadence_proof_identity(schedule, policy)?;
+  let canonical_json = json!({
+    "kind": kind,
+    "minimum_seconds": policy.minimum_schedule_cadence_seconds,
+    "occurrence_limit": policy.occurrence_search_limit,
+    "policy_digest": policy_digest,
+    "result": "valid",
+    "schedule_digest": schedule_digest,
+    "schema_version": 1,
+  })
+  .to_string();
+  Ok(CadenceProofArtifact {
+    canonical_json,
+    schedule_digest,
+    policy_digest,
+  })
+}
+
+fn cadence_proof_identity(
+  schedule: &ScheduleSpec,
+  policy: &SchedulerOperationalPolicy,
+) -> Result<(String, String, &'static str), StateError> {
+  let (schedule_json, kind) = match schedule {
+    ScheduleSpec::Once { at } => (json!({"at": at, "kind": "once"}), "once"),
+    ScheduleSpec::FixedInterval {
+      anchor,
+      every_seconds,
+    } => (
+      json!({"anchor": anchor, "every_seconds": every_seconds, "kind": "fixed_interval"}),
+      "fixed_interval",
+    ),
+    ScheduleSpec::Cron {
+      expression,
+      timezone,
+    } => (
+      json!({"expression": expression, "kind": "cron", "timezone": timezone}),
+      "bounded_cron_cycle",
+    ),
+  };
+  let policy_json = scheduler_policy_json(policy)?;
+  Ok((
+    sha256_hex(schedule_json.to_string().as_bytes()),
+    sha256_hex(policy_json.as_bytes()),
+    kind,
+  ))
+}
+
 fn validate_create_request(
   request: &CreateScheduledJob,
   policy: &SchedulerOperationalPolicy,
+  validate_cadence: bool,
 ) -> Result<i64, StateError> {
   validate_text("job id", &request.job_id).map_err(invalid_value)?;
   validate_text("schedule id", &request.schedule_id).map_err(invalid_value)?;
@@ -5626,14 +6089,9 @@ fn validate_create_request(
     .schedule
     .validate_for_create(request.now)
     .map_err(invalid_value)?;
-  request
-    .schedule
-    .validate_minimum_cadence(
-      request.now,
-      policy.minimum_schedule_cadence_seconds,
-      policy.occurrence_search_limit,
-    )
-    .map_err(invalid_value)?;
+  if validate_cadence {
+    generate_cadence_proof(&request.schedule, request.now, policy)?;
+  }
   validate_definition_policy(&request.definition, policy)?;
   validate_delivery_targets(&request.targets)?;
   request
@@ -5659,7 +6117,12 @@ async fn insert_scheduled_job(
   request: &CreateScheduledJob,
   next_run_at: i64,
   policy_json: &str,
+  cadence_proof: &CadenceProofArtifact,
 ) -> Result<(), StateError> {
+  cadence_proof.verify(
+    &request.schedule,
+    &scheduler_policy_from_snapshot(1, policy_json)?,
+  )?;
   sqlx::query(
     "insert into scheduled_jobs (job_id, definition_version, definition_json, creator_kind, creator_provider, creator_tenant, creator_subject, owner_kind, owner_provider, owner_tenant, owner_subject, status, generation, capability_schema_version, capability_digest, capability_json, scheduler_policy_version, scheduler_policy_json, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', 0, ?12, ?13, ?14, 1, ?15, ?16, ?16)",
   )
@@ -5685,7 +6148,7 @@ async fn insert_scheduled_job(
   let (kind, canonical_spec, timezone, once_at, anchor_at, interval_seconds) =
     request.schedule.storage_parts();
   sqlx::query(
-    "insert into schedules (schedule_id, job_id, kind, canonical_spec, timezone, once_at, anchor_at, interval_seconds, next_run_at, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+    "insert into schedules (schedule_id, job_id, kind, canonical_spec, timezone, once_at, anchor_at, interval_seconds, next_run_at, cadence_proof_version, cadence_proof_json, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?11)",
   )
   .bind(&request.schedule_id)
   .bind(&request.job_id)
@@ -5696,6 +6159,7 @@ async fn insert_scheduled_job(
   .bind(anchor_at)
   .bind(interval_seconds)
   .bind(next_run_at)
+  .bind(&cadence_proof.canonical_json)
   .bind(request.now)
   .execute(&mut **transaction)
   .await
@@ -5714,7 +6178,9 @@ async fn apply_update(
   request: &UpdateScheduledJob,
   policy: &SchedulerOperationalPolicy,
   policy_json: &str,
+  cadence_proof: &CadenceProofArtifact,
 ) -> Result<(), StateError> {
+  cadence_proof.verify(&request.schedule, policy)?;
   acquire_scheduler_policy_lock(transaction, request.now).await?;
   let row = sqlx::query(
     "select status, owner_kind, owner_provider, owner_tenant, owner_subject from scheduled_jobs where job_id = ?1 and generation = ?2 and status in ('active', 'paused')",
@@ -5767,7 +6233,7 @@ async fn apply_update(
   let (kind, canonical_spec, timezone, once_at, anchor_at, interval_seconds) =
     request.schedule.storage_parts();
   sqlx::query(
-    "update schedules set kind = ?1, canonical_spec = ?2, timezone = ?3, once_at = ?4, anchor_at = ?5, interval_seconds = ?6, next_run_at = ?7, generation = generation + 1, updated_at = ?8 where job_id = ?9",
+    "update schedules set kind = ?1, canonical_spec = ?2, timezone = ?3, once_at = ?4, anchor_at = ?5, interval_seconds = ?6, next_run_at = ?7, cadence_proof_version = 1, cadence_proof_json = ?8, generation = generation + 1, updated_at = ?9 where job_id = ?10",
   )
   .bind(kind)
   .bind(canonical_spec)
@@ -5776,6 +6242,7 @@ async fn apply_update(
   .bind(anchor_at)
   .bind(interval_seconds)
   .bind(next_run_at)
+  .bind(&cadence_proof.canonical_json)
   .bind(request.now)
   .bind(&request.job_id)
   .execute(&mut **transaction)
@@ -5823,6 +6290,7 @@ async fn apply_resume(
   now: i64,
   policy: &SchedulerOperationalPolicy,
   policy_json: &str,
+  cadence_proof: &CadenceProofArtifact,
 ) -> Result<(), StateError> {
   acquire_scheduler_policy_lock(transaction, now).await?;
   let row = sqlx::query(
@@ -5835,13 +6303,7 @@ async fn apply_resume(
   .map_err(scheduler_error)?
   .ok_or(StateError::SchedulerGenerationConflict)?;
   let schedule = schedule_from_row(&row)?;
-  schedule
-    .validate_minimum_cadence(
-      now,
-      policy.minimum_schedule_cadence_seconds,
-      policy.occurrence_search_limit,
-    )
-    .map_err(invalid_value)?;
+  cadence_proof.verify(&schedule, policy)?;
   let owner = owner_from_row(&row)?;
   enforce_active_job_limits(transaction, policy, &owner, None).await?;
   let next_run_at = schedule.next_after(now).map_err(|error| {
@@ -5861,8 +6323,9 @@ async fn apply_resume(
   .execute(&mut **transaction)
   .await
   .map_err(scheduler_error)?;
-  sqlx::query("update schedules set next_run_at = ?1, generation = generation + 1, updated_at = ?2 where job_id = ?3")
+  sqlx::query("update schedules set next_run_at = ?1, cadence_proof_version = 1, cadence_proof_json = ?2, generation = generation + 1, updated_at = ?3 where job_id = ?4")
     .bind(next_run_at)
+    .bind(&cadence_proof.canonical_json)
     .bind(now)
     .bind(job_id)
     .execute(&mut **transaction)
@@ -5875,18 +6338,32 @@ async fn apply_typed_mutation(
   transaction: &mut Transaction<'_, Sqlite>,
   mutation: &ScheduledJobMutation,
   policy: &SchedulerOperationalPolicy,
+  cadence_proof: Option<&CadenceProofArtifact>,
 ) -> Result<(), StateError> {
   let policy_json = scheduler_policy_json(policy)?;
   match mutation {
     ScheduledJobMutation::Create(request) => {
-      let next_run_at = validate_create_request(request, policy)?;
+      let next_run_at = validate_create_request(request, policy, false)?;
+      let cadence_proof = cadence_proof.ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "create mutation is missing cadence proof authority".to_owned(),
+      })?;
       acquire_scheduler_policy_lock(transaction, request.now).await?;
       enforce_active_job_limits(transaction, policy, &request.owner, None).await?;
-      insert_scheduled_job(transaction, request, next_run_at, &policy_json).await
+      insert_scheduled_job(
+        transaction,
+        request,
+        next_run_at,
+        &policy_json,
+        cadence_proof,
+      )
+      .await
     }
     ScheduledJobMutation::Update(request) => {
-      validate_update_request(request, policy)?;
-      apply_update(transaction, request, policy, &policy_json).await
+      validate_update_request(request, policy, false)?;
+      let cadence_proof = cadence_proof.ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "update mutation is missing cadence proof authority".to_owned(),
+      })?;
+      apply_update(transaction, request, policy, &policy_json, cadence_proof).await
     }
     ScheduledJobMutation::Pause {
       job_id,
@@ -5902,6 +6379,9 @@ async fn apply_typed_mutation(
       now,
     } => {
       validate_lifecycle_mutation(job_id, *expected_generation)?;
+      let cadence_proof = cadence_proof.ok_or_else(|| StateError::InvalidSchedulerState {
+        reason: "resume mutation is missing cadence proof authority".to_owned(),
+      })?;
       apply_resume(
         transaction,
         job_id,
@@ -5909,6 +6389,7 @@ async fn apply_typed_mutation(
         *now,
         policy,
         &policy_json,
+        cadence_proof,
       )
       .await
     }
@@ -6210,20 +6691,16 @@ async fn cancel_pre_execution_runs(
 fn validate_update_request(
   request: &UpdateScheduledJob,
   policy: &SchedulerOperationalPolicy,
+  validate_cadence: bool,
 ) -> Result<(), StateError> {
   validate_text("job id", &request.job_id).map_err(invalid_value)?;
   request
     .schedule
     .validate_for_create(request.now)
     .map_err(invalid_value)?;
-  request
-    .schedule
-    .validate_minimum_cadence(
-      request.now,
-      policy.minimum_schedule_cadence_seconds,
-      policy.occurrence_search_limit,
-    )
-    .map_err(invalid_value)?;
+  if validate_cadence {
+    generate_cadence_proof(&request.schedule, request.now, policy)?;
+  }
   request.definition.validate().map_err(invalid_value)?;
   validate_definition_policy(&request.definition, policy)?;
   request.capability.validate().map_err(invalid_value)?;
@@ -6836,8 +7313,8 @@ async fn existing_operator_request(
   transaction: &mut Transaction<'_, Sqlite>,
   request: &SchedulerOperatorRequest,
 ) -> Result<Option<SchedulerOperatorMutationOutcome>, StateError> {
-  let persisted: Option<String> = sqlx::query_scalar(
-    "select request_digest from scheduler_operator_actions where principal_kind = ?1 and principal_provider = ?2 and principal_tenant = ?3 and principal_subject = ?4 and request_id = ?5",
+  let persisted: Option<(String, i64)> = sqlx::query_as(
+    "select request_digest, occurred_at from scheduler_operator_actions where principal_kind = ?1 and principal_provider = ?2 and principal_tenant = ?3 and principal_subject = ?4 and request_id = ?5",
   )
   .bind(request.principal.kind())
   .bind(request.principal.provider())
@@ -6847,13 +7324,39 @@ async fn existing_operator_request(
   .fetch_optional(&mut **transaction)
   .await
   .map_err(scheduler_error)?;
-  Ok(persisted.map(|digest| {
-    if digest == request.request_digest {
+  Ok(persisted.map(|(digest, occurred_at)| {
+    if digest == request.request_digest && occurred_at == request.occurred_at {
       SchedulerOperatorMutationOutcome::Replay
     } else {
       SchedulerOperatorMutationOutcome::Conflict
     }
   }))
+}
+
+async fn existing_delivery_retry_request(
+  transaction: &mut Transaction<'_, Sqlite>,
+  request: &SchedulerOperatorRequest,
+) -> Result<Option<(String, i64, i64)>, StateError> {
+  let row = sqlx::query(
+    "select request_digest, effective_at, occurred_at from scheduler_operator_actions where principal_kind = ?1 and principal_provider = ?2 and principal_tenant = ?3 and principal_subject = ?4 and request_id = ?5",
+  )
+  .bind(request.principal.kind())
+  .bind(request.principal.provider())
+  .bind(request.principal.tenant())
+  .bind(request.principal.subject())
+  .bind(&request.request_id)
+  .fetch_optional(&mut **transaction)
+  .await
+  .map_err(scheduler_error)?;
+  row
+    .map(|row| {
+      Ok((
+        row.try_get("request_digest").map_err(scheduler_error)?,
+        row.try_get("effective_at").map_err(scheduler_error)?,
+        row.try_get("occurred_at").map_err(scheduler_error)?,
+      ))
+    })
+    .transpose()
 }
 
 fn validate_operator_delivery_target_binding(

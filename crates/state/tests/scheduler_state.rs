@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use codeoff_core::SchedulerOperationalPolicy;
@@ -12,11 +12,11 @@ use codeoff_state::{
   CreateScheduledJob, DeliveryPayloadSnapshot, DeliveryTargetSnapshot, ExpiredRunReclaimOutcome,
   LateEvidenceAppendOutcome, MaterializationOutcome, OccurrenceError, PreflightFailureDisposition,
   PreparedScheduledDelivery, PrincipalKey, RetentionPolicy, ScheduleMutationIdempotency,
-  ScheduleSpec, ScheduledDeliveryFailure, ScheduledDeliveryReconcileOutcome,
-  ScheduledDeliveryState, ScheduledDeliveryUnknownAction, ScheduledDeliveryWork,
-  ScheduledExecutionDisposition, ScheduledExecutionTerminal, ScheduledExecutorAdmission,
-  ScheduledExecutorEpochAuthority, ScheduledExecutorEpochRegistration, ScheduledJobDefinition,
-  ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
+  ScheduleSpec, ScheduledDeliveryAuthority, ScheduledDeliveryFailure,
+  ScheduledDeliveryReconcileOutcome, ScheduledDeliveryState, ScheduledDeliveryUnknownAction,
+  ScheduledDeliveryWork, ScheduledExecutionDisposition, ScheduledExecutionTerminal,
+  ScheduledExecutorAdmission, ScheduledExecutorEpochAuthority, ScheduledExecutorEpochRegistration,
+  ScheduledJobDefinition, ScheduledJobMutation, ScheduledJobStatus, ScheduledPrepareAuthority,
   ScheduledRunExecutionOutcome, ScheduledRunLateEvidenceKind, ScheduledRunReconcileOutcome,
   ScheduledRunResult, ScheduledRunState, ScheduledRunSuccessOutcome,
   SchedulerOperatorMutationOutcome, SchedulerOperatorRequest, SkippedNoneBaselinePolicy,
@@ -875,6 +875,99 @@ async fn scheduler_policy_enforces_owner_limit_and_minimum_cadence() {
 }
 
 #[tokio::test]
+async fn scheduler_cadence_proof_artifact_is_versioned_and_bound_to_schedule_and_policy() {
+  let temp = tempdir().expect("tempdir");
+  let state_dir = temp.path().join("state");
+  let policy = SchedulerOperationalPolicy {
+    occurrence_search_limit: 1_000,
+    minimum_schedule_cadence_seconds: 23 * 3_600,
+    ..SchedulerOperationalPolicy::default()
+  };
+  let store = StateStore::initialize_with_scheduler_policy(&state_dir, None, policy.clone())
+    .await
+    .expect("state");
+  let now = 1_800_000_000;
+  store
+    .create_scheduled_job(&create_request(
+      "cadence-artifact",
+      ScheduleSpec::cron("0 3 * * *", "America/New_York").expect("daily cron"),
+      now,
+    ))
+    .await
+    .expect("create schedule");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let (version, proof_json): (i64, String) = sqlx::query_as(
+    "select cadence_proof_version, cadence_proof_json from schedules where job_id = 'cadence-artifact'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read cadence proof");
+  let proof: Value = serde_json::from_str(&proof_json).expect("parse cadence proof");
+  assert_eq!(version, 1);
+  assert_eq!(proof["schema_version"], 1);
+  assert_eq!(proof["kind"], "bounded_cron_cycle");
+  assert_eq!(proof["minimum_seconds"], 23 * 3_600);
+  assert_eq!(proof["occurrence_limit"], policy.occurrence_search_limit);
+  assert_eq!(proof["result"], "valid");
+  assert_eq!(
+    proof["schedule_digest"]
+      .as_str()
+      .expect("schedule digest")
+      .len(),
+    64
+  );
+  assert_eq!(
+    proof["policy_digest"]
+      .as_str()
+      .expect("policy digest")
+      .len(),
+    64
+  );
+
+  let updated = UpdateScheduledJob {
+    job_id: "cadence-artifact".to_owned(),
+    expected_generation: 0,
+    definition: ScheduledJobDefinition::new(2, r#"{"prompt":"updated"}"#).expect("definition"),
+    capability: CapabilityProfileSnapshot::new(2, "profile-v2", r#"{"tools":[]}"#)
+      .expect("capability"),
+    targets: vec![target("cadence-artifact-updated")],
+    schedule: ScheduleSpec::cron("30 2 * * *", "America/New_York").expect("gap cron"),
+    now: now + 1,
+  };
+  assert_eq!(
+    store.update_scheduled_job(&updated).await.expect("update"),
+    1
+  );
+  let updated_proof_json: String = sqlx::query_scalar(
+    "select cadence_proof_json from schedules where job_id = 'cadence-artifact'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read updated cadence proof");
+  let updated_proof: Value =
+    serde_json::from_str(&updated_proof_json).expect("parse updated cadence proof");
+  assert_ne!(updated_proof["schedule_digest"], proof["schedule_digest"]);
+  assert_eq!(updated_proof["policy_digest"], proof["policy_digest"]);
+  store
+    .pause_scheduled_job("cadence-artifact", 1, now + 2)
+    .await
+    .expect("pause");
+  store
+    .resume_scheduled_job("cadence-artifact", 2, now + 3)
+    .await
+    .expect("resume");
+  let resumed_proof_json: String = sqlx::query_scalar(
+    "select cadence_proof_json from schedules where job_id = 'cadence-artifact'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read resumed cadence proof");
+  assert_eq!(resumed_proof_json, updated_proof_json);
+}
+
+#[tokio::test]
 async fn scheduler_global_active_limit_has_one_winner_across_stores() {
   let temp = tempdir().expect("tempdir");
   let state_dir = temp.path().join("state");
@@ -1493,6 +1586,16 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
   let upgrade_reason =
     r#"{"reason":"approved after upgrade","reason_code":"upgrade_retry","schema_version":1}"#;
   let upgrade_reason_digest = test_sha256_hex(upgrade_reason);
+  let upgrade_retry_at = store
+    .scheduled_run_operator_retry_at(
+      legacy_probe.binding.run_id(),
+      legacy_probe.binding.attempt(),
+      legacy_probe.binding.fence(),
+      113,
+    )
+    .await
+    .expect("upgrade retry policy")
+    .expect("upgrade retry eligible");
   let upgrade_request = SchedulerOperatorRequest::for_run_retry(
     owner(),
     "upgrade-valid-retry",
@@ -1502,7 +1605,7 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
     ScheduledRunState::Failed,
     upgrade_reason,
     &upgrade_reason_digest,
-    120,
+    upgrade_retry_at,
     113,
   )
   .expect("build reason-bound upgrade authority");
@@ -1515,7 +1618,7 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
         legacy_probe.binding.fence(),
         upgrade_reason,
         &upgrade_reason_digest,
-        120,
+        upgrade_retry_at,
       )
       .await
       .expect("apply reason-bound upgrade retry"),
@@ -6190,6 +6293,16 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
   let reason =
     r#"{"reason":"operator approved retry","reason_code":"manual_retry","schema_version":1}"#;
   let reason_digest = test_sha256_hex(reason);
+  let retry_at = store
+    .scheduled_run_operator_retry_at(
+      claim.binding.run_id(),
+      claim.binding.attempt(),
+      claim.binding.fence(),
+      113,
+    )
+    .await
+    .expect("retry policy")
+    .expect("eligible retry");
   let request = SchedulerOperatorRequest::for_run_retry(
     owner(),
     "retry-request",
@@ -6199,7 +6312,7 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
     ScheduledRunState::Failed,
     reason,
     &reason_digest,
-    120,
+    retry_at,
     113,
   )
   .expect("operator request");
@@ -6212,7 +6325,7 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
     ScheduledRunState::Failed,
     reason,
     &reason_digest,
-    120,
+    retry_at,
     113,
   )
   .expect("stale operator request");
@@ -6225,7 +6338,7 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
         claim.binding.fence() + 1,
         reason,
         &reason_digest,
-        120,
+        retry_at,
       )
       .await
       .expect("reject stale retry"),
@@ -6240,7 +6353,7 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
         claim.binding.fence(),
         reason,
         &reason_digest,
-        120,
+        retry_at,
       )
       .await
       .expect("apply retry"),
@@ -6255,11 +6368,28 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
         claim.binding.fence(),
         reason,
         &reason_digest,
-        120,
+        retry_at,
       )
       .await
       .expect("replay retry"),
     SchedulerOperatorMutationOutcome::Replay
+  );
+  let mut changed_time_request = request.clone();
+  changed_time_request.occurred_at += 1;
+  assert_eq!(
+    store
+      .operator_retry_scheduled_run(
+        &changed_time_request,
+        claim.binding.run_id(),
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        reason,
+        &reason_digest,
+        retry_at,
+      )
+      .await
+      .expect("changed timestamp conflict"),
+    SchedulerOperatorMutationOutcome::Conflict
   );
   let changed_reason =
     r#"{"reason":"changed operator reason","reason_code":"manual_retry","schema_version":1}"#;
@@ -6273,7 +6403,7 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
     ScheduledRunState::Failed,
     changed_reason,
     &changed_reason_digest,
-    120,
+    retry_at,
     113,
   )
   .expect("changed reason request");
@@ -6286,7 +6416,7 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
         claim.binding.fence(),
         changed_reason,
         &changed_reason_digest,
-        120,
+        retry_at,
       )
       .await
       .expect("changed reason conflict"),
@@ -6335,7 +6465,7 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
     .expect("list runs");
   assert_eq!(projections.len(), 1);
   assert_eq!(projections[0].state, ScheduledRunState::Pending);
-  assert_eq!(projections[0].next_attempt_at, Some(120));
+  assert_eq!(projections[0].next_attempt_at, Some(retry_at));
   let exact = store
     .get_scheduled_run_operator_projection(claim.binding.run_id())
     .await
@@ -6448,10 +6578,20 @@ async fn test_operator_run_retry_is_conclusive_idempotent_audited_and_bounded() 
 async fn test_exact_run_reconciliation_uses_observed_lease_authority_across_stores() {
   let temp = tempdir().expect("create tempdir");
   let state_dir = temp.path().join("state");
-  let first = StateStore::initialize(&state_dir, None)
+  let policy = SchedulerOperationalPolicy {
+    run_retry_base_seconds: 10,
+    run_retry_max_seconds: 10,
+    ..SchedulerOperationalPolicy::legacy_compatible()
+  };
+  let first = StateStore::initialize_with_scheduler_policy(&state_dir, None, policy.clone())
     .await
     .expect("initialize first store");
-  let second = StateStore::initialize(&state_dir, None)
+  let drifted_policy = SchedulerOperationalPolicy {
+    run_retry_base_seconds: 300,
+    run_retry_max_seconds: 300,
+    ..SchedulerOperationalPolicy::legacy_compatible()
+  };
+  let second = StateStore::initialize_with_scheduler_policy(&state_dir, None, drifted_policy)
     .await
     .expect("initialize second store");
   first
@@ -6479,17 +6619,38 @@ async fn test_exact_run_reconciliation_uses_observed_lease_authority_across_stor
     .next()
     .expect("candidate");
   assert_eq!(candidate.run_id(), claim.binding.run_id());
+  let plan: Value = serde_json::from_str(&candidate.canonical_plan_snapshot()).expect("plan");
   assert!(!candidate.canonical_plan_snapshot().contains("worker"));
+  assert_eq!(
+    plan["next_attempt_at"],
+    policy
+      .run_retry_at(claim.binding.run_id(), claim.binding.attempt(), 110, 121)
+      .expect("durable retry")
+  );
+  assert_eq!(
+    first
+      .reconcile_scheduled_run_candidate(&candidate, 122)
+      .await
+      .expect("reject drifted plan decision"),
+    ScheduledRunReconcileOutcome::Stale
+  );
+  let candidate = second
+    .list_scheduled_run_reconcile_candidates(122, 10)
+    .await
+    .expect("refresh reconcile candidates")
+    .into_iter()
+    .next()
+    .expect("refreshed candidate");
   assert!(matches!(
     first
-      .reconcile_scheduled_run_candidate(&candidate, 3, 130, 121)
+      .reconcile_scheduled_run_candidate(&candidate, 122)
       .await
       .expect("reconcile exact run"),
     ScheduledRunReconcileOutcome::Applied(ExpiredRunReclaimOutcome::Retried { .. })
   ));
   assert_eq!(
     second
-      .reconcile_scheduled_run_candidate(&candidate, 3, 130, 121)
+      .reconcile_scheduled_run_candidate(&candidate, 122)
       .await
       .expect("reject stale observation"),
     ScheduledRunReconcileOutcome::Stale
@@ -6522,6 +6683,16 @@ async fn test_operator_delivery_retry_is_exact_idempotent_and_audited() {
     .expect("record retryable failure");
   let reason = r#"{"reason":"operator approved early retry","reason_code":"provider_recovered","schema_version":1}"#;
   let reason_digest = test_sha256_hex(reason);
+  let effective_at = store
+    .scheduled_delivery_operator_retry_at(
+      claim.binding.delivery_id(),
+      claim.binding.attempt(),
+      claim.binding.fence(),
+      120,
+    )
+    .await
+    .expect("retry policy")
+    .expect("eligible retry");
   let request = SchedulerOperatorRequest::for_delivery_retry(
     owner(),
     "delivery-retry-request",
@@ -6530,6 +6701,7 @@ async fn test_operator_delivery_retry_is_exact_idempotent_and_audited() {
     claim.binding.fence(),
     reason,
     &reason_digest,
+    effective_at,
     120,
   )
   .expect("operator request");
@@ -6602,6 +6774,22 @@ async fn test_operator_delivery_retry_is_exact_idempotent_and_audited() {
       .await
       .expect("replay retry"),
     SchedulerOperatorMutationOutcome::Replay
+  );
+  let mut changed_time_request = request.clone();
+  changed_time_request.occurred_at += 1;
+  assert_eq!(
+    store
+      .operator_retry_scheduled_delivery(
+        &changed_time_request,
+        claim.binding.delivery_id(),
+        claim.binding.attempt(),
+        claim.binding.fence(),
+        reason,
+        &reason_digest,
+      )
+      .await
+      .expect("changed timestamp conflict"),
+    SchedulerOperatorMutationOutcome::Conflict
   );
   let changed_reason =
     r#"{"reason":"changed operator reason","reason_code":"manual_override","schema_version":1}"#;
@@ -11128,6 +11316,140 @@ async fn prepare_operator_sending_delivery(
     resolved_slack_target(job_id, "channel", "C1", None),
   )
   .await
+}
+
+async fn prepare_pending_delivery_authority(
+  store: &StateStore,
+  job_id: &str,
+  scheduled_for: i64,
+) -> ScheduledDeliveryAuthority {
+  let mut request = create_request(job_id, ScheduleSpec::once(scheduled_for), 100);
+  request.targets = vec![resolved_slack_target(job_id, "channel", "C1", None)];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create pending delivery job");
+  let run = complete_due_run(store, job_id, scheduled_for, scheduled_for + 3).await;
+  let delivery_id = store
+    .list_scheduled_delivery_operator_projections(None, 100)
+    .await
+    .expect("list pending deliveries")
+    .into_iter()
+    .find(|delivery| delivery.run_id == run.binding.run_id())
+    .expect("pending delivery")
+    .delivery_id;
+  let PreparedScheduledDelivery::Pending(_) = store
+    .prepare_scheduled_delivery(
+      &delivery_id,
+      "text/plain; charset=utf-8",
+      &format!("payload-{job_id}"),
+      1,
+      scheduled_for + 4,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare pending delivery")
+  else {
+    panic!("delivery must remain pending");
+  };
+  let ScheduledDeliveryWork::ProviderRequired(authority) = store
+    .peek_scheduled_delivery_work(scheduled_for + 5)
+    .await
+    .expect("peek pending delivery")
+  else {
+    panic!("delivery must require its provider");
+  };
+  authority
+}
+
+#[tokio::test]
+async fn delivery_claim_refreshes_time_after_write_lock_and_claims_once_before_deadline() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let authority = prepare_pending_delivery_authority(&store, "lock-deadline", 110).await;
+  let deadline = authority
+    .scheduler_policy()
+    .delivery_deadline_at(authority.payload_created_at())
+    .expect("delivery deadline");
+  let blocker_pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect blocker");
+  let blocker = blocker_pool
+    .begin_with("BEGIN IMMEDIATE")
+    .await
+    .expect("acquire write lock");
+  let clock = Arc::new(AtomicI64::new(115));
+  let started = Arc::new(Barrier::new(2));
+  let task_store = store.clone();
+  let task_authority = authority.clone();
+  let task_clock = Arc::clone(&clock);
+  let task_started = Arc::clone(&started);
+  let claim_task = tokio::spawn(async move {
+    task_started.wait().await;
+    task_store
+      .claim_scheduled_delivery_from_snapshot_with_clock(
+        &task_authority,
+        "deadline-worker",
+        115,
+        &|| task_clock.load(Ordering::SeqCst),
+      )
+      .await
+  });
+  started.wait().await;
+  clock.store(deadline, Ordering::SeqCst);
+  drop(blocker);
+  assert!(
+    claim_task
+      .await
+      .expect("join deadline claim")
+      .expect("deadline claim")
+      .is_none()
+  );
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let terminal: (String, i64, i64, i64) = sqlx::query_as(
+    "select state, attempt, fence, (select count(*) from scheduled_delivery_attempts where delivery_id = ?1) from scheduled_run_deliveries where delivery_id = ?1",
+  )
+  .bind(authority.delivery_id())
+  .fetch_one(&pool)
+  .await
+  .expect("deadline authority");
+  assert_eq!(terminal, ("failed_terminal".to_owned(), 0, 0, 0));
+
+  let live = prepare_pending_delivery_authority(&store, "before-deadline", 210).await;
+  let live_deadline = live
+    .scheduler_policy()
+    .delivery_deadline_at(live.payload_created_at())
+    .expect("live deadline");
+  let claimed = store
+    .claim_scheduled_delivery_from_snapshot_with_clock(&live, "live-worker", 215, &|| {
+      live_deadline - 1
+    })
+    .await
+    .expect("claim before deadline")
+    .expect("live claim");
+  assert_eq!(claimed.binding.attempt(), 1);
+  assert_eq!(claimed.binding.fence(), 1);
+  assert!(
+    store
+      .claim_scheduled_delivery_from_snapshot_with_clock(&live, "duplicate-worker", 215, &|| {
+        live_deadline - 1
+      },)
+      .await
+      .expect("reject duplicate claim")
+      .is_none()
+  );
+  let attempts: i64 =
+    sqlx::query_scalar("select count(*) from scheduled_delivery_attempts where delivery_id = ?1")
+      .bind(live.delivery_id())
+      .fetch_one(&pool)
+      .await
+      .expect("count live attempts");
+  assert_eq!(attempts, 1);
 }
 
 async fn prepare_operator_unknown_delivery(

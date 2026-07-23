@@ -141,6 +141,7 @@ pub struct ErrorFrame {
 pub enum RemoteProtocolError {
   FrameTooLarge,
   InvalidJson,
+  NonCanonicalJson,
   InvalidShape(&'static str),
   InvalidField(&'static str),
   VersionMismatch,
@@ -243,6 +244,9 @@ impl RemoteFrame {
       message: RemoteMessage::from_value(required(object, "message")?)?,
     };
     frame.validate_at(now_unix_millis)?;
+    if frame.encode()?.as_slice() != bytes {
+      return Err(RemoteProtocolError::NonCanonicalJson);
+    }
     Ok(frame)
   }
 
@@ -988,6 +992,32 @@ mod tests {
     assert_eq!(
       RemoteFrame::decode(&vec![b'x'; MAX_REMOTE_FRAME_BYTES + 1], NOW),
       Err(RemoteProtocolError::FrameTooLarge)
+    );
+  }
+
+  #[test]
+  fn decode_rejects_every_noncanonical_json_representation() {
+    let canonical = ready(1).encode().expect("canonical frame");
+    let canonical_text = String::from_utf8(canonical.clone()).expect("UTF-8 frame");
+    let value: Value = serde_json::from_slice(&canonical).expect("frame value");
+    let object = value.as_object().expect("frame object");
+    let reordered = format!(
+      r#"{{"version":{},"session_nonce":{},"sequence":{},"message":{}}}"#,
+      object["version"], object["session_nonce"], object["sequence"], object["message"]
+    );
+    let duplicate = format!("{},\"version\":1}}", canonical_text.trim_end_matches('}'));
+    let trailing = format!("{canonical_text}\n");
+    let leading = format!(" {canonical_text}");
+
+    for encoded in [reordered, duplicate, trailing, leading] {
+      assert_eq!(
+        RemoteFrame::decode(encoded.as_bytes(), NOW),
+        Err(RemoteProtocolError::NonCanonicalJson)
+      );
+    }
+    assert_eq!(
+      RemoteFrame::decode(&canonical, NOW).expect("canonical decode"),
+      ready(1)
     );
   }
 

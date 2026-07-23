@@ -1,8 +1,10 @@
 //! TLS and framed-I/O authority for the scheduled runner transport.
 //!
 //! The gateway terminates mutual TLS in-process.  Certificate-chain verification is delegated to
-//! rustls/webpki; this module adds the deployment-specific exact SPKI check and binds the
-//! canonical runner workload identity to the TLS exporter used by the session challenge.
+//! rustls/webpki; this module adds the deployment-specific exact SPKI check. Trusted static
+//! configuration maps that pinned key to one canonical application runner identifier, and the
+//! TLS exporter binds the resulting authorization mapping to the session challenge. The
+//! application identifier is not asserted to be a certificate URI SAN.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -31,28 +33,37 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use crate::scheduled_remote_protocol::{MAX_REMOTE_FRAME_BYTES, RemoteFrame, RemoteProtocolError};
 
 pub const RUNNER_TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-codeoff-scheduled-runner-v1";
+const SESSION_NONCE_DOMAIN: &[u8] = b"codeoff-runner-session-nonce-v1";
+const SESSION_CHALLENGE_DOMAIN: &[u8] = b"codeoff-runner-session-challenge-v1";
 const TLS_EXPORTER_BYTES: usize = 32;
 const FRAME_LENGTH_BYTES: usize = 4;
+const ROOT_FILE_OWNER: ExpectedFileOwner = ExpectedFileOwner { uid: 0, gid: 0 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpectedFileOwner {
+  uid: u32,
+  gid: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScheduledRunnerTlsIdentity {
-  pub workload_identity: RunnerWorkloadIdentity,
+pub struct ScheduledRunnerAuthorizedPeer {
+  pub runner_identity: RunnerWorkloadIdentity,
   pub client_spki_sha256: String,
 }
 
-impl ScheduledRunnerTlsIdentity {
-  /// Parses and binds the configured SPIFFE workload identity to the expected client SPKI.
+impl ScheduledRunnerAuthorizedPeer {
+  /// Parses the configured application runner identifier and binds it to one expected client key.
   pub fn new(
     workload_identity: &str,
     client_spki_sha256: &str,
   ) -> Result<Self, ScheduledRunnerTlsError> {
-    let workload_identity = RunnerWorkloadIdentity::parse(workload_identity)
-      .map_err(|_| ScheduledRunnerTlsError::InvalidWorkloadIdentity)?;
+    let runner_identity = RunnerWorkloadIdentity::parse(workload_identity)
+      .map_err(|_| ScheduledRunnerTlsError::InvalidRunnerIdentifier)?;
     if !is_lowercase_sha256(client_spki_sha256) {
       return Err(ScheduledRunnerTlsError::InvalidSpkiFingerprint);
     }
     Ok(Self {
-      workload_identity,
+      runner_identity,
       client_spki_sha256: client_spki_sha256.to_owned(),
     })
   }
@@ -87,7 +98,7 @@ impl ScheduledRunnerIoPolicy {
 #[derive(Debug)]
 pub enum ScheduledRunnerTlsError {
   InvalidTimeout,
-  InvalidWorkloadIdentity,
+  InvalidRunnerIdentifier,
   InvalidSpkiFingerprint,
   InvalidServerName,
   InvalidPath,
@@ -128,7 +139,7 @@ impl From<RemoteProtocolError> for ScheduledRunnerTlsError {
 
 pub struct ScheduledRunnerTlsServer {
   acceptor: TlsAcceptor,
-  expected_identity: ScheduledRunnerTlsIdentity,
+  expected_peer: ScheduledRunnerAuthorizedPeer,
   io_policy: ScheduledRunnerIoPolicy,
 }
 
@@ -136,13 +147,22 @@ impl ScheduledRunnerTlsServer {
   /// Loads root-owned TLS material without following symlinks and constructs a TLS1.3-only server.
   pub fn load(
     paths: &ScheduledRunnerTlsPaths,
-    expected_identity: ScheduledRunnerTlsIdentity,
+    expected_peer: ScheduledRunnerAuthorizedPeer,
     io_policy: ScheduledRunnerIoPolicy,
   ) -> Result<Self, ScheduledRunnerTlsError> {
+    Self::load_with_owner(paths, expected_peer, io_policy, ROOT_FILE_OWNER)
+  }
+
+  fn load_with_owner(
+    paths: &ScheduledRunnerTlsPaths,
+    expected_peer: ScheduledRunnerAuthorizedPeer,
+    io_policy: ScheduledRunnerIoPolicy,
+    expected_owner: ExpectedFileOwner,
+  ) -> Result<Self, ScheduledRunnerTlsError> {
     let io_policy = io_policy.validate()?;
-    let certificates = load_certificates(&paths.certificate_chain)?;
-    let private_key = load_private_key(&paths.private_key)?;
-    let roots = load_roots(&paths.trust_bundle)?;
+    let certificates = load_certificates(&paths.certificate_chain, expected_owner)?;
+    let private_key = load_private_key(&paths.private_key, expected_owner)?;
+    let roots = load_roots(&paths.trust_bundle, expected_owner)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
       .build()
@@ -155,12 +175,12 @@ impl ScheduledRunnerTlsServer {
       .map_err(|_| ScheduledRunnerTlsError::TlsConfiguration)?;
     Ok(Self {
       acceptor: TlsAcceptor::from(Arc::new(config)),
-      expected_identity,
+      expected_peer,
       io_policy,
     })
   }
 
-  /// Completes mutual TLS, checks the actual validated client SPKI, and derives channel binding.
+  /// Completes mutual TLS, authorizes the actual validated client SPKI, and derives channel binding.
   pub async fn accept(
     &self,
     stream: TcpStream,
@@ -180,12 +200,12 @@ impl ScheduledRunnerTlsServer {
     let parsed = ParsedCertificate::try_from(peer)
       .map_err(|_| ScheduledRunnerTlsError::CertificateRejected)?;
     let client_spki_sha256 = sha256_hex(parsed.subject_public_key_info().as_ref());
-    if client_spki_sha256 != self.expected_identity.client_spki_sha256 {
+    if client_spki_sha256 != self.expected_peer.client_spki_sha256 {
       return Err(ScheduledRunnerTlsError::PeerSpkiMismatch);
     }
     let channel_binding = export_server_channel_binding(connection)?;
     Ok(ScheduledRunnerServerConnection {
-      identity: self.expected_identity.clone(),
+      authorized_peer: self.expected_peer.clone(),
       channel_binding,
       framed: ScheduledRunnerFramed::new(
         stream,
@@ -209,10 +229,19 @@ impl ScheduledRunnerTlsClient {
     server_name: &str,
     io_policy: ScheduledRunnerIoPolicy,
   ) -> Result<Self, ScheduledRunnerTlsError> {
+    Self::load_with_owner(paths, server_name, io_policy, ROOT_FILE_OWNER)
+  }
+
+  fn load_with_owner(
+    paths: &ScheduledRunnerTlsPaths,
+    server_name: &str,
+    io_policy: ScheduledRunnerIoPolicy,
+    expected_owner: ExpectedFileOwner,
+  ) -> Result<Self, ScheduledRunnerTlsError> {
     let io_policy = io_policy.validate()?;
-    let certificates = load_certificates(&paths.certificate_chain)?;
-    let private_key = load_private_key(&paths.private_key)?;
-    let roots = load_roots(&paths.trust_bundle)?;
+    let certificates = load_certificates(&paths.certificate_chain, expected_owner)?;
+    let private_key = load_private_key(&paths.private_key, expected_owner)?;
+    let roots = load_roots(&paths.trust_bundle, expected_owner)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
       .build()
@@ -263,7 +292,7 @@ impl ScheduledRunnerTlsClient {
 }
 
 pub struct ScheduledRunnerServerConnection {
-  pub identity: ScheduledRunnerTlsIdentity,
+  pub authorized_peer: ScheduledRunnerAuthorizedPeer,
   pub channel_binding: [u8; TLS_EXPORTER_BYTES],
   pub framed: ScheduledRunnerFramed<ServerTlsStream<TcpStream>>,
 }
@@ -271,6 +300,16 @@ pub struct ScheduledRunnerServerConnection {
 pub struct ScheduledRunnerClientConnection {
   pub channel_binding: [u8; TLS_EXPORTER_BYTES],
   pub framed: ScheduledRunnerFramed<ClientTlsStream<TcpStream>>,
+}
+
+#[must_use]
+pub fn session_nonce(channel_binding: &[u8; TLS_EXPORTER_BYTES]) -> String {
+  domain_bound_sha256(SESSION_NONCE_DOMAIN, channel_binding)
+}
+
+#[must_use]
+pub fn session_challenge(channel_binding: &[u8; TLS_EXPORTER_BYTES]) -> String {
+  domain_bound_sha256(SESSION_CHALLENGE_DOMAIN, channel_binding)
 }
 
 pub struct ScheduledRunnerFramed<S> {
@@ -354,9 +393,12 @@ where
   }
 }
 
-fn load_roots(path: &Path) -> Result<RootCertStore, ScheduledRunnerTlsError> {
+fn load_roots(
+  path: &Path,
+  expected_owner: ExpectedFileOwner,
+) -> Result<RootCertStore, ScheduledRunnerTlsError> {
   let mut roots = RootCertStore::empty();
-  for certificate in load_certificates(path)? {
+  for certificate in load_certificates(path, expected_owner)? {
     roots
       .add(certificate)
       .map_err(|_| ScheduledRunnerTlsError::CertificateRejected)?;
@@ -367,8 +409,11 @@ fn load_roots(path: &Path) -> Result<RootCertStore, ScheduledRunnerTlsError> {
   Ok(roots)
 }
 
-fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, ScheduledRunnerTlsError> {
-  let file = open_root_owned_file(path)?;
+fn load_certificates(
+  path: &Path,
+  expected_owner: ExpectedFileOwner,
+) -> Result<Vec<CertificateDer<'static>>, ScheduledRunnerTlsError> {
+  let file = open_owned_file(path, expected_owner)?;
   let certificates = CertificateDer::pem_reader_iter(BufReader::new(file))
     .collect::<Result<Vec<_>, _>>()
     .map_err(|_| ScheduledRunnerTlsError::CertificateRejected)?;
@@ -378,13 +423,19 @@ fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, Schedu
   Ok(certificates)
 }
 
-fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ScheduledRunnerTlsError> {
-  let file = open_root_owned_file(path)?;
+fn load_private_key(
+  path: &Path,
+  expected_owner: ExpectedFileOwner,
+) -> Result<PrivateKeyDer<'static>, ScheduledRunnerTlsError> {
+  let file = open_owned_file(path, expected_owner)?;
   PrivateKeyDer::from_pem_reader(BufReader::new(file))
     .map_err(|_| ScheduledRunnerTlsError::PrivateKeyRejected)
 }
 
-fn open_root_owned_file(path: &Path) -> Result<File, ScheduledRunnerTlsError> {
+fn open_owned_file(
+  path: &Path,
+  expected_owner: ExpectedFileOwner,
+) -> Result<File, ScheduledRunnerTlsError> {
   if !path.is_absolute() {
     return Err(ScheduledRunnerTlsError::InvalidPath);
   }
@@ -410,19 +461,20 @@ fn open_root_owned_file(path: &Path) -> Result<File, ScheduledRunnerTlsError> {
     let opened = openat(&current, *component, flags, Mode::empty())
       .map_err(|_| ScheduledRunnerTlsError::FileRejected("open"))?;
     let opened = File::from(opened);
-    verify_root_owned_component(&opened, component, final_component)?;
+    verify_owned_component(&opened, component, final_component, expected_owner)?;
     current = opened;
   }
   Ok(current)
 }
 
-fn verify_root_owned_component(
+fn verify_owned_component(
   file: &File,
   _name: impl AsRef<OsStr>,
   final_component: bool,
+  expected_owner: ExpectedFileOwner,
 ) -> Result<(), ScheduledRunnerTlsError> {
   let stat = fstat(file).map_err(|_| ScheduledRunnerTlsError::FileRejected("metadata"))?;
-  if stat.st_uid != 0 || stat.st_gid != 0 {
+  if stat.st_uid != expected_owner.uid || stat.st_gid != expected_owner.gid {
     return Err(ScheduledRunnerTlsError::FileRejected("owner"));
   }
   let file_type = file
@@ -476,4 +528,179 @@ fn is_lowercase_sha256(value: &str) -> bool {
 
 fn sha256_hex(bytes: &[u8]) -> String {
   format!("{:x}", Sha256::digest(bytes))
+}
+
+fn domain_bound_sha256(domain: &[u8], value: &[u8]) -> String {
+  let mut digest = Sha256::new();
+  digest.update(domain);
+  digest.update([0]);
+  digest.update(value);
+  format!("{:x}", digest.finalize())
+}
+
+#[cfg(all(test, unix))]
+#[path = "scheduled_runner_tls_integration_tests.rs"]
+mod integration_tests;
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::scheduled_remote_protocol::{REMOTE_PROTOCOL_VERSION, ReadyFrame, RemoteMessage};
+  use std::fs;
+  use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+  use tokio::io::{AsyncWriteExt, duplex};
+
+  const NOW: u64 = 1_000_000;
+
+  fn ready() -> RemoteFrame {
+    RemoteFrame {
+      version: REMOTE_PROTOCOL_VERSION,
+      session_nonce: "a".repeat(64),
+      sequence: 1,
+      message: RemoteMessage::Ready(ReadyFrame {
+        challenge: "b".repeat(64),
+        ready_until_unix_millis: NOW + 5_000,
+        deployment_epoch: 1,
+        profile_digest: "c".repeat(64),
+        gateway_image_digest: format!("sha256:{}", "d".repeat(64)),
+        runner_image_digest: format!("sha256:{}", "e".repeat(64)),
+        runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
+        runner_client_cert_public_key_fingerprint: "f".repeat(64),
+        credential_revision: "credential-v1".to_owned(),
+      }),
+    }
+  }
+
+  fn framed(stream: tokio::io::DuplexStream) -> ScheduledRunnerFramed<tokio::io::DuplexStream> {
+    ScheduledRunnerFramed::new(stream, Duration::from_millis(20), Duration::from_millis(20))
+  }
+
+  #[tokio::test]
+  async fn framed_io_round_trips_canonical_frame_and_accepts_only_clean_boundary_eof() {
+    let (writer_stream, reader_stream) = duplex(MAX_REMOTE_FRAME_BYTES + FRAME_LENGTH_BYTES);
+    let mut writer = framed(writer_stream);
+    let mut reader = framed(reader_stream);
+    writer.write_frame(&ready()).await.expect("frame write");
+    assert_eq!(
+      reader.read_frame(NOW).await.expect("frame read"),
+      Some(ready())
+    );
+    drop(writer);
+    assert_eq!(reader.read_frame(NOW).await.expect("clean EOF"), None);
+  }
+
+  #[tokio::test]
+  async fn framed_io_rejects_truncated_length_body_and_oversized_length() {
+    for bytes in [vec![0, 0], [4_u32.to_be_bytes().as_slice(), b"{}"].concat()] {
+      let (mut writer, reader_stream) = duplex(32);
+      writer.write_all(&bytes).await.expect("partial frame write");
+      drop(writer);
+      assert!(matches!(
+        framed(reader_stream).read_frame(NOW).await,
+        Err(ScheduledRunnerTlsError::FrameTruncated)
+      ));
+    }
+
+    let (mut writer, reader_stream) = duplex(32);
+    let oversized = u32::try_from(MAX_REMOTE_FRAME_BYTES + 1).expect("bounded test length");
+    writer
+      .write_all(&oversized.to_be_bytes())
+      .await
+      .expect("oversized length write");
+    assert!(matches!(
+      framed(reader_stream).read_frame(NOW).await,
+      Err(ScheduledRunnerTlsError::FrameTooLarge)
+    ));
+  }
+
+  #[tokio::test]
+  async fn framed_io_times_out_at_length_and_body_boundaries() {
+    let (_writer, reader_stream) = duplex(32);
+    assert!(matches!(
+      framed(reader_stream).read_frame(NOW).await,
+      Err(ScheduledRunnerTlsError::FrameTimeout)
+    ));
+
+    let (mut writer, reader_stream) = duplex(32);
+    writer
+      .write_all(&4_u32.to_be_bytes())
+      .await
+      .expect("length write");
+    assert!(matches!(
+      framed(reader_stream).read_frame(NOW).await,
+      Err(ScheduledRunnerTlsError::FrameTimeout)
+    ));
+  }
+
+  #[tokio::test]
+  async fn framed_io_rejects_noncanonical_and_trailing_json() {
+    for encoded in [
+      format!(
+        " {}",
+        String::from_utf8(ready().encode().expect("encode")).expect("UTF-8")
+      ),
+      format!(
+        "{}\n",
+        String::from_utf8(ready().encode().expect("encode")).expect("UTF-8")
+      ),
+    ] {
+      let (mut writer, reader_stream) = duplex(MAX_REMOTE_FRAME_BYTES + FRAME_LENGTH_BYTES);
+      writer
+        .write_all(
+          &[
+            u32::try_from(encoded.len())
+              .expect("bounded frame")
+              .to_be_bytes()
+              .as_slice(),
+            encoded.as_bytes(),
+          ]
+          .concat(),
+        )
+        .await
+        .expect("noncanonical write");
+      assert!(matches!(
+        framed(reader_stream).read_frame(NOW).await,
+        Err(ScheduledRunnerTlsError::Protocol(
+          RemoteProtocolError::NonCanonicalJson
+        ))
+      ));
+    }
+  }
+
+  #[test]
+  fn secure_file_loader_enforces_explicit_owner_mode_and_no_symlinks() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("tls.pem");
+    fs::write(&path, b"test").expect("fixture write");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("fixture permissions");
+    let metadata = fs::metadata(temp.path()).expect("fixture metadata");
+    let owner = ExpectedFileOwner {
+      uid: metadata.uid(),
+      gid: metadata.gid(),
+    };
+    open_owned_file(&path, owner).expect("matching owner");
+
+    let wrong_owner = ExpectedFileOwner {
+      uid: owner.uid.saturating_add(1),
+      gid: owner.gid,
+    };
+    assert!(matches!(
+      open_owned_file(&path, wrong_owner),
+      Err(ScheduledRunnerTlsError::FileRejected("owner"))
+    ));
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("loose permissions");
+    assert!(matches!(
+      open_owned_file(&path, owner),
+      Err(ScheduledRunnerTlsError::FileRejected("permissions"))
+    ));
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("restore permissions");
+    let link = temp.path().join("tls-link.pem");
+    symlink(&path, &link).expect("fixture symlink");
+    assert!(matches!(
+      open_owned_file(&link, owner),
+      Err(ScheduledRunnerTlsError::FileRejected("open"))
+    ));
+  }
 }

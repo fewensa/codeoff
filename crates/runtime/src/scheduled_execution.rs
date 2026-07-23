@@ -101,6 +101,11 @@ impl ScheduledExecutor {
   pub fn is_ready(&self) -> bool {
     self.backend.readiness() == ExecutorReadiness::Ready
   }
+
+  #[must_use]
+  fn is_configured(&self) -> bool {
+    self.backend.is_configured()
+  }
 }
 
 impl ScheduledWorkerHandle {
@@ -154,7 +159,7 @@ pub fn spawn_scheduled_worker(
   if config.run_claims_enabled
     && executor
       .as_ref()
-      .is_none_or(|executor| !executor.is_ready())
+      .is_none_or(|executor| !executor.is_configured())
   {
     return Err(StateError::InvalidSchedulerState {
       reason: "scheduled run claims require a validated executor".to_owned(),
@@ -343,7 +348,12 @@ async fn run_scheduled_worker_tick(
   if !orchestrator.run_claims_enabled {
     return Ok(TickOutcome::Unavailable);
   }
-  if orchestrator.backend.refresh_admission().await == RefreshedExecutorAdmission::Unavailable {
+  if orchestrator
+    .backend
+    .refresh_materialization_admission()
+    .await
+    == RefreshedExecutorAdmission::Unavailable
+  {
     return Ok(TickOutcome::Unavailable);
   }
   let due_jobs = tokio::select! {
@@ -361,7 +371,10 @@ async fn run_scheduled_worker_tick(
     let Some(job) = job else {
       continue;
     };
-    let admission = orchestrator.backend.refresh_admission().await;
+    let admission = orchestrator
+      .backend
+      .refresh_materialization_admission()
+      .await;
     if admission == RefreshedExecutorAdmission::Unavailable {
       return Ok(TickOutcome::Unavailable);
     }
@@ -588,6 +601,7 @@ pub struct BackendPrepared {
   authority_digest: String,
   attested_profile_json: String,
   attested_profile_digest: String,
+  remote_profile_binding: Option<(String, u64)>,
   pub execution: Box<dyn PreparedExecution>,
 }
 
@@ -604,6 +618,26 @@ impl BackendPrepared {
       authority,
       attested_profile_json,
       attested_profile_digest,
+      remote_profile_binding: None,
+      execution,
+    }
+  }
+
+  #[must_use]
+  pub fn new_remote(
+    authority: ScheduledPrepareAuthority,
+    attested_profile_json: String,
+    attested_profile_digest: String,
+    deployment_profile_digest: String,
+    deployment_epoch: u64,
+    execution: Box<dyn PreparedExecution>,
+  ) -> Self {
+    Self {
+      authority_digest: authority.digest().to_owned(),
+      authority,
+      attested_profile_json,
+      attested_profile_digest,
+      remote_profile_binding: Some((deployment_profile_digest, deployment_epoch)),
       execution,
     }
   }
@@ -636,6 +670,9 @@ impl BackendAuthorization {
 
 #[async_trait]
 pub trait ScheduledExecutionBackend: Send + Sync {
+  fn is_configured(&self) -> bool {
+    self.readiness() == ExecutorReadiness::Ready
+  }
   fn readiness(&self) -> ExecutorReadiness;
   async fn refresh_readiness(&self) -> ExecutorReadiness {
     self.readiness()
@@ -645,6 +682,9 @@ pub trait ScheduledExecutionBackend: Send + Sync {
       ExecutorReadiness::Ready => RefreshedExecutorAdmission::Ready,
       ExecutorReadiness::Unavailable => RefreshedExecutorAdmission::Unavailable,
     }
+  }
+  async fn refresh_materialization_admission(&self) -> RefreshedExecutorAdmission {
+    self.refresh_admission().await
   }
   async fn authorize(&self, _input: &PrepareInput) -> Result<BackendAuthorization, PrepareFailure> {
     Ok(BackendAuthorization::new(()))
@@ -667,6 +707,10 @@ struct UnavailableScheduledExecutionBackend;
 
 #[async_trait]
 impl ScheduledExecutionBackend for UnavailableScheduledExecutionBackend {
+  fn is_configured(&self) -> bool {
+    false
+  }
+
   fn readiness(&self) -> ExecutorReadiness {
     ExecutorReadiness::Unavailable
   }
@@ -711,6 +755,16 @@ impl PreparedRun {
       ),
       2 => expected_authority
         .recovery_attestation_matches(&canonical_profile, &prepared.attested_profile_digest),
+      3 => prepared.remote_profile_binding.as_ref().is_some_and(
+        |(deployment_profile_digest, deployment_epoch)| {
+          expected_authority.remote_recovery_attestation_matches(
+            &canonical_profile,
+            &prepared.attested_profile_digest,
+            deployment_profile_digest,
+            *deployment_epoch,
+          )
+        },
+      ),
       _ => false,
     };
     if prepared.authority != *expected_authority
@@ -1899,6 +1953,7 @@ mod tests {
         authority: input.authority,
         attested_profile_json: profile.clone(),
         attested_profile_digest: sha256_hex(profile.as_bytes()),
+        remote_profile_binding: None,
         execution: Box::new(FakePrepared {
           result: self.result.clone(),
           execution_delay: self.execution_delay,
@@ -2058,6 +2113,7 @@ mod tests {
         authority: swapped,
         attested_profile_json: profile.clone(),
         attested_profile_digest: sha256_hex(profile.as_bytes()),
+        remote_profile_binding: None,
         execution: Box::new(CountingPrepared(Arc::clone(&self.executions))),
       })
     }

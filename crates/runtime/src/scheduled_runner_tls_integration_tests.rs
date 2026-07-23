@@ -1,18 +1,19 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use codeoff_runtime::scheduled_remote_protocol::{
-  AdmissionFrame, REMOTE_PROTOCOL_VERSION, ReadyFrame, RemoteFrame, RemoteMessage,
+use super::{
+  ExpectedFileOwner, ScheduledRunnerAuthorizedPeer, ScheduledRunnerIoPolicy,
+  ScheduledRunnerTlsClient, ScheduledRunnerTlsError, ScheduledRunnerTlsPaths,
+  ScheduledRunnerTlsServer,
 };
-use codeoff_runtime::scheduled_runner_tls::{
-  ScheduledRunnerIoPolicy, ScheduledRunnerTlsClient, ScheduledRunnerTlsError,
-  ScheduledRunnerTlsIdentity, ScheduledRunnerTlsPaths, ScheduledRunnerTlsServer,
+use crate::scheduled_remote_protocol::{
+  AdmissionFrame, REMOTE_PROTOCOL_VERSION, ReadyFrame, RemoteFrame, RemoteMessage,
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -27,7 +28,7 @@ const SERVER_NAME: &str = "gateway.codeoff.test";
 const WORKLOAD_IDENTITY: &str = "spiffe://codeoff/runner/production";
 
 struct CertificateFixture {
-  _temp: TempDir,
+  temp: TempDir,
   ca_certificate: PathBuf,
   server_certificate: PathBuf,
   server_key: PathBuf,
@@ -199,7 +200,7 @@ impl CertificateFixture {
       Sha256::digest(fs::read(client_spki).expect("client SPKI"))
     );
     Self {
-      _temp: temp,
+      temp,
       ca_certificate,
       server_certificate,
       server_key,
@@ -222,6 +223,14 @@ impl CertificateFixture {
       certificate_chain: self.client_certificate.clone(),
       private_key: self.client_key.clone(),
       trust_bundle: self.ca_certificate.clone(),
+    }
+  }
+
+  fn owner(&self) -> ExpectedFileOwner {
+    let metadata = fs::metadata(self.temp.path()).expect("fixture owner metadata");
+    ExpectedFileOwner {
+      uid: metadata.uid(),
+      gid: metadata.gid(),
     }
   }
 }
@@ -285,14 +294,25 @@ fn ready(session_nonce: &str, challenge: String, fingerprint: &str, now: u64) ->
 #[tokio::test]
 async fn real_mutual_tls_exchanges_challenge_bound_ready_and_admission() {
   let fixture = CertificateFixture::new("good");
-  let identity = ScheduledRunnerTlsIdentity::new(WORKLOAD_IDENTITY, &fixture.client_spki_sha256)
-    .expect("identity");
+  let authorized_peer =
+    ScheduledRunnerAuthorizedPeer::new(WORKLOAD_IDENTITY, &fixture.client_spki_sha256)
+      .expect("authorized peer");
   let server = Arc::new(
-    ScheduledRunnerTlsServer::load(&fixture.server_paths(), identity, io_policy())
-      .expect("TLS server"),
+    ScheduledRunnerTlsServer::load_with_owner(
+      &fixture.server_paths(),
+      authorized_peer,
+      io_policy(),
+      fixture.owner(),
+    )
+    .expect("TLS server"),
   );
-  let client = ScheduledRunnerTlsClient::load(&fixture.client_paths(), SERVER_NAME, io_policy())
-    .expect("TLS client");
+  let client = ScheduledRunnerTlsClient::load_with_owner(
+    &fixture.client_paths(),
+    SERVER_NAME,
+    io_policy(),
+    fixture.owner(),
+  )
+  .expect("TLS client");
   let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
   let address = listener.local_addr().expect("listener address");
   let session_nonce = "d".repeat(64);
@@ -319,7 +339,7 @@ async fn real_mutual_tls_exchanges_challenge_bound_ready_and_admission() {
     );
     assert_eq!(
       ready.runner_workload_identity,
-      connection.identity.workload_identity.as_str()
+      connection.authorized_peer.runner_identity.as_str()
     );
     connection
       .framed
@@ -368,11 +388,12 @@ async fn real_mutual_tls_exchanges_challenge_bound_ready_and_admission() {
 async fn mutual_tls_rejects_missing_client_certificate() {
   let fixture = CertificateFixture::new("missing-client");
   let server = Arc::new(
-    ScheduledRunnerTlsServer::load(
+    ScheduledRunnerTlsServer::load_with_owner(
       &fixture.server_paths(),
-      ScheduledRunnerTlsIdentity::new(WORKLOAD_IDENTITY, &fixture.client_spki_sha256)
-        .expect("identity"),
+      ScheduledRunnerAuthorizedPeer::new(WORKLOAD_IDENTITY, &fixture.client_spki_sha256)
+        .expect("authorized peer"),
       io_policy(),
+      fixture.owner(),
     )
     .expect("TLS server"),
   );
@@ -412,7 +433,7 @@ async fn mutual_tls_rejects_wrong_ca_hostname_tls12_and_spki() {
   let fixture = CertificateFixture::new("primary");
   let other = CertificateFixture::new("other");
 
-  let wrong_ca_client = ScheduledRunnerTlsClient::load(
+  let wrong_ca_client = ScheduledRunnerTlsClient::load_with_owner(
     &ScheduledRunnerTlsPaths {
       certificate_chain: fixture.client_certificate.clone(),
       private_key: fixture.client_key.clone(),
@@ -420,28 +441,39 @@ async fn mutual_tls_rejects_wrong_ca_hostname_tls12_and_spki() {
     },
     SERVER_NAME,
     io_policy(),
+    fixture.owner(),
   )
   .expect("wrong CA client config");
   assert_handshake_fails(&fixture, wrong_ca_client).await;
 
-  let wrong_name_client =
-    ScheduledRunnerTlsClient::load(&fixture.client_paths(), "wrong.codeoff.test", io_policy())
-      .expect("wrong hostname client config");
+  let wrong_name_client = ScheduledRunnerTlsClient::load_with_owner(
+    &fixture.client_paths(),
+    "wrong.codeoff.test",
+    io_policy(),
+    fixture.owner(),
+  )
+  .expect("wrong hostname client config");
   assert_handshake_fails(&fixture, wrong_name_client).await;
 
   assert_tls12_fails(&fixture).await;
 
   let server = Arc::new(
-    ScheduledRunnerTlsServer::load(
+    ScheduledRunnerTlsServer::load_with_owner(
       &fixture.server_paths(),
-      ScheduledRunnerTlsIdentity::new(WORKLOAD_IDENTITY, &other.client_spki_sha256)
-        .expect("wrong SPKI identity"),
+      ScheduledRunnerAuthorizedPeer::new(WORKLOAD_IDENTITY, &other.client_spki_sha256)
+        .expect("wrong SPKI authorization mapping"),
       io_policy(),
+      fixture.owner(),
     )
     .expect("TLS server"),
   );
-  let client = ScheduledRunnerTlsClient::load(&fixture.client_paths(), SERVER_NAME, io_policy())
-    .expect("TLS client");
+  let client = ScheduledRunnerTlsClient::load_with_owner(
+    &fixture.client_paths(),
+    SERVER_NAME,
+    io_policy(),
+    fixture.owner(),
+  )
+  .expect("TLS client");
   let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
   let address = listener.local_addr().expect("address");
   let server_task = tokio::spawn(async move {
@@ -457,11 +489,12 @@ async fn mutual_tls_rejects_wrong_ca_hostname_tls12_and_spki() {
 
 async fn assert_handshake_fails(fixture: &CertificateFixture, client: ScheduledRunnerTlsClient) {
   let server = Arc::new(
-    ScheduledRunnerTlsServer::load(
+    ScheduledRunnerTlsServer::load_with_owner(
       &fixture.server_paths(),
-      ScheduledRunnerTlsIdentity::new(WORKLOAD_IDENTITY, &fixture.client_spki_sha256)
-        .expect("identity"),
+      ScheduledRunnerAuthorizedPeer::new(WORKLOAD_IDENTITY, &fixture.client_spki_sha256)
+        .expect("authorized peer"),
       io_policy(),
+      fixture.owner(),
     )
     .expect("TLS server"),
   );
@@ -477,11 +510,12 @@ async fn assert_handshake_fails(fixture: &CertificateFixture, client: ScheduledR
 
 async fn assert_tls12_fails(fixture: &CertificateFixture) {
   let server = Arc::new(
-    ScheduledRunnerTlsServer::load(
+    ScheduledRunnerTlsServer::load_with_owner(
       &fixture.server_paths(),
-      ScheduledRunnerTlsIdentity::new(WORKLOAD_IDENTITY, &fixture.client_spki_sha256)
-        .expect("identity"),
+      ScheduledRunnerAuthorizedPeer::new(WORKLOAD_IDENTITY, &fixture.client_spki_sha256)
+        .expect("authorized peer"),
       io_policy(),
+      fixture.owner(),
     )
     .expect("TLS server"),
   );

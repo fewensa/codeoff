@@ -35,6 +35,7 @@ use crate::scheduled_runner_evidence::{
   RunnerEvidenceKind, SignedRunnerEvidence, prepared_evidence_payload_digest,
   ready_evidence_payload_digest, result_evidence_payload_digest, verify_runner_evidence,
 };
+use crate::scheduled_runner_grant::{RemoteExecutionGrantClaims, RemoteExecutionGrantSigner};
 use crate::scheduled_runner_tls::{
   ScheduledRunnerAuthorizedPeer, ScheduledRunnerServerConnection, session_challenge, session_nonce,
 };
@@ -59,6 +60,8 @@ pub struct ScheduledRunnerBrokerConfig {
   pub github_mcp_configured_endpoint_identity: String,
   pub github_mcp_access_auth_mode: String,
   pub github_mcp_access_token_revision: String,
+  pub execution_grant_key_revision: String,
+  pub execution_grant_signer_identity: String,
   pub executor_evidence_public_key: Vec<u8>,
   pub executor_evidence_key_id: String,
   pub executor_evidence_key_revision: String,
@@ -78,6 +81,12 @@ impl ScheduledRunnerBrokerConfig {
       || self.admission_ttl > Duration::from_millis(MAX_ADMISSION_TTL_MILLIS)
       || self.executor_evidence_public_key.len() != 32
       || EvidenceKeyId::parse(&self.executor_evidence_key_id).is_err()
+      || self.execution_grant_key_revision.is_empty()
+      || self.execution_grant_key_revision != self.execution_grant_key_revision.trim()
+      || self.execution_grant_key_revision.len() > 128
+      || self.execution_grant_signer_identity.is_empty()
+      || self.execution_grant_signer_identity != self.execution_grant_signer_identity.trim()
+      || self.execution_grant_signer_identity.len() > 128
     {
       return Err(ScheduledRunnerBrokerError::InvalidConfiguration);
     }
@@ -143,17 +152,22 @@ pub struct ScheduledRunnerBroker {
 
 struct BrokerInner {
   config: ScheduledRunnerBrokerConfig,
+  grant_signer: Arc<RemoteExecutionGrantSigner>,
   connections: Arc<Semaphore>,
   current: Mutex<Option<Arc<RegisteredRunnerSession>>>,
 }
 
 impl ScheduledRunnerBroker {
-  pub fn new(config: ScheduledRunnerBrokerConfig) -> Result<Self, ScheduledRunnerBrokerError> {
+  pub fn new(
+    config: ScheduledRunnerBrokerConfig,
+    grant_signer: Arc<RemoteExecutionGrantSigner>,
+  ) -> Result<Self, ScheduledRunnerBrokerError> {
     config.validate()?;
     Ok(Self {
       inner: Arc::new(BrokerInner {
         connections: Arc::new(Semaphore::new(config.max_connections)),
         config,
+        grant_signer,
         current: Mutex::new(None),
       }),
     })
@@ -203,6 +217,7 @@ impl ScheduledRunnerBroker {
       ready,
       commands,
       evidence_config: self.inner.config.clone(),
+      grant_signer: Arc::clone(&self.inner.grant_signer),
       connected: AtomicBool::new(true),
       slot: Mutex::new(None),
     });
@@ -541,6 +556,7 @@ impl Drop for SessionRegistration {
 struct ProtocolAdmission {
   nonce: String,
   expires_at_unix_millis: u64,
+  grant_issued: bool,
 }
 
 struct RegisteredRunnerSession {
@@ -549,6 +565,7 @@ struct RegisteredRunnerSession {
   ready: ReadyFrame,
   commands: mpsc::Sender<BrokerCommand>,
   evidence_config: ScheduledRunnerBrokerConfig,
+  grant_signer: Arc<RemoteExecutionGrantSigner>,
   connected: AtomicBool,
   slot: Mutex<Option<ProtocolAdmission>>,
 }
@@ -583,19 +600,24 @@ impl RegisteredRunnerSession {
     *slot = Some(ProtocolAdmission {
       nonce: random_sha256()?,
       expires_at_unix_millis: expires_at,
+      grant_issued: false,
     });
     Ok(())
   }
 
-  fn reservation(&self, now: u64) -> Result<ProtocolAdmission, ScheduledRunnerBrokerError> {
+  fn reserve_grant(&self, now: u64) -> Result<ProtocolAdmission, ScheduledRunnerBrokerError> {
     let mut slot = self.slot.lock().expect("runner execution slot");
-    let Some(reservation) = slot.as_ref() else {
+    let Some(reservation) = slot.as_mut() else {
       return Err(ScheduledRunnerBrokerError::SessionUnavailable);
     };
     if reservation.expires_at_unix_millis <= now || !self.is_connected() {
       *slot = None;
       return Err(ScheduledRunnerBrokerError::SessionExpired);
     }
+    if reservation.grant_issued {
+      return Err(ScheduledRunnerBrokerError::SessionBusy);
+    }
+    reservation.grant_issued = true;
     Ok(reservation.clone())
   }
 
@@ -608,7 +630,8 @@ impl RegisteredRunnerSession {
     input: &PrepareInput,
     isolation_permit_envelope_json: String,
   ) -> Result<VerifiedPrepared, ScheduledRunnerBrokerError> {
-    let reservation = self.reservation(unix_millis()?)?;
+    let now = unix_millis()?;
+    let reservation = self.reserve_grant(now)?;
     let binding = remote_binding(input, &self.ready)?;
     let task_json = remote_task_json(input, &binding)?;
     let admission = RemoteFrame {
@@ -617,24 +640,45 @@ impl RegisteredRunnerSession {
       sequence: 1,
       message: RemoteMessage::Admission(AdmissionFrame {
         challenge: self.ready.challenge.clone(),
-        admission_nonce: reservation.nonce,
+        admission_nonce: reservation.nonce.clone(),
         expires_at_unix_millis: reservation.expires_at_unix_millis,
         deployment_epoch: self.ready.deployment_epoch,
         profile_digest: self.ready.profile_digest.clone(),
       }),
     };
+    let mut prepare_message = PrepareFrame {
+      binding,
+      execution_grant_json: String::new(),
+      isolation_permit_envelope_json,
+      task_json,
+      definition_json: input.definition_json.clone(),
+      capability_json: input.capability_json.clone(),
+      targets_json: input.targets_json.clone(),
+    };
+    let grant_claims = RemoteExecutionGrantClaims::for_prepare(
+      random_sha256()?,
+      1,
+      self.evidence_config.execution_grant_signer_identity.clone(),
+      self.evidence_config.execution_grant_key_revision.clone(),
+      self.session_nonce.clone(),
+      self.ready.challenge.clone(),
+      reservation.nonce,
+      now,
+      reservation.expires_at_unix_millis,
+      self.ready.deployment_epoch,
+      self.ready.profile_digest.clone(),
+      &prepare_message,
+    );
+    prepare_message.execution_grant_json = self
+      .grant_signer
+      .sign(&grant_claims)
+      .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?
+      .canonical_json();
     let prepare = RemoteFrame {
       version: REMOTE_PROTOCOL_VERSION,
       session_nonce: self.session_nonce.clone(),
       sequence: 2,
-      message: RemoteMessage::Prepare(PrepareFrame {
-        binding,
-        isolation_permit_envelope_json,
-        task_json,
-        definition_json: input.definition_json.clone(),
-        capability_json: input.capability_json.clone(),
-        targets_json: input.targets_json.clone(),
-      }),
+      message: RemoteMessage::Prepare(prepare_message),
     };
     let (response, receiver) = oneshot::channel();
     self
@@ -1324,6 +1368,9 @@ mod tests {
   use crate::scheduled_runner_executor::{
     ProtectedScheduledExecutorListener, ScheduledRunnerExecutorConfig,
   };
+  use crate::scheduled_runner_grant::{
+    ExpectedRemoteExecutionGrant, RemoteExecutionGrantVerifier, SignedRemoteExecutionGrant,
+  };
   use crate::scheduled_runner_tls::integration_tests::CertificateFixture;
   use crate::scheduled_runner_tls::{
     ScheduledRunnerIoPolicy, ScheduledRunnerTlsClient, ScheduledRunnerTlsPaths,
@@ -1352,6 +1399,22 @@ mod tests {
       let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("pair");
       (pkcs8.as_ref().to_vec(), pair.public_key().as_ref().to_vec())
     })
+  }
+
+  fn grant_keys() -> &'static (Vec<u8>, Vec<u8>) {
+    static KEYS: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
+    KEYS.get_or_init(|| {
+      let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("grant key");
+      let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("grant pair");
+      (pkcs8.as_ref().to_vec(), pair.public_key().as_ref().to_vec())
+    })
+  }
+
+  fn grant_signer() -> Arc<RemoteExecutionGrantSigner> {
+    Arc::new(
+      RemoteExecutionGrantSigner::from_pkcs8(&grant_keys().0, "gateway-grant-key-1")
+        .expect("grant signer"),
+    )
   }
 
   #[test]
@@ -1647,6 +1710,7 @@ mod tests {
       ready,
       commands,
       evidence_config: config,
+      grant_signer: grant_signer(),
       connected: AtomicBool::new(true),
       slot: Mutex::new(None),
     })
@@ -1919,6 +1983,7 @@ mod tests {
           sequence: 2,
           message: RemoteMessage::Prepare(PrepareFrame {
             binding: binding.clone(),
+            execution_grant_json: "{\"schema_version\":1}".to_owned(),
             isolation_permit_envelope_json: "{\"schema_version\":1}".to_owned(),
             task_json: "{\"schema_version\":1}".to_owned(),
             definition_json: "{\"schema_version\":1}".to_owned(),
@@ -2172,7 +2237,7 @@ mod tests {
   #[test]
   fn ready_admission_rejects_stale_or_mismatched_runner_authority() {
     let config = config();
-    let broker = ScheduledRunnerBroker::new(config.clone()).expect("broker");
+    let broker = ScheduledRunnerBroker::new(config.clone(), grant_signer()).expect("broker");
     let authorized_peer = broker.expected_authorized_peer();
     let nonce = "1".repeat(64);
     let challenge = "2".repeat(64);
@@ -2269,7 +2334,8 @@ mod tests {
     ));
     let mut rotated_config = config.clone();
     rotated_config.github_mcp_access_token_revision = "mcp-channel-v2".to_owned();
-    let rotated = ScheduledRunnerBroker::new(rotated_config).expect("rotated broker");
+    let rotated =
+      ScheduledRunnerBroker::new(rotated_config, grant_signer()).expect("rotated broker");
     assert!(matches!(
       rotated.validate_ready(
         &rotated.expected_authorized_peer(),
@@ -2289,7 +2355,8 @@ mod tests {
         }
         _ => unreachable!(),
       }
-      let configured = ScheduledRunnerBroker::new(configured).expect("configured claim broker");
+      let configured =
+        ScheduledRunnerBroker::new(configured, grant_signer()).expect("configured claim broker");
       assert!(matches!(
         configured.validate_ready(
           &configured.expected_authorized_peer(),
@@ -2306,7 +2373,7 @@ mod tests {
 
   #[test]
   fn broker_allows_one_active_session_and_one_claim_reservation() {
-    let broker = ScheduledRunnerBroker::new(config()).expect("broker");
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
     let first = registered_session(&"1".repeat(64));
     let second = registered_session(&"2".repeat(64));
     broker.register(&first).expect("first registration");
@@ -2323,6 +2390,15 @@ mod tests {
 
     let (_, claim_session) = broker.state_admission(true).expect("claim admission");
     assert!(claim_session.slot.lock().expect("slot").is_some());
+    let now = unix_millis().expect("time");
+    let issued = claim_session
+      .reserve_grant(now)
+      .expect("first grant issuance reservation");
+    assert!(issued.grant_issued);
+    assert!(matches!(
+      claim_session.reserve_grant(now),
+      Err(ScheduledRunnerBrokerError::SessionBusy)
+    ));
     assert!(matches!(
       broker.state_admission(true),
       Err(ScheduledRunnerBrokerError::SessionUnavailable)
@@ -2400,7 +2476,7 @@ mod tests {
     let signer =
       RunnerEvidenceSigner::load(&evidence_key_path, &broker_config.executor_evidence_key_id)
         .expect("root evidence signer");
-    let broker = ScheduledRunnerBroker::new(broker_config.clone()).expect("broker");
+    let broker = ScheduledRunnerBroker::new(broker_config.clone(), grant_signer()).expect("broker");
     let server = ScheduledRunnerTlsServer::load(
       &fixture.server_paths(),
       broker.expected_authorized_peer(),
@@ -2578,22 +2654,48 @@ mod tests {
     let executor_profile_digest = profile_digest.clone();
     let executor_ready = ready.clone();
     let executor_authority_digest = input.authority.digest().to_owned();
+    let executor_grant_public_key = grant_keys().1.clone();
     let executor = tokio::spawn(async move {
-      for expected in ["admission", "prepare"] {
-        let frame = local
-          .read_frame(unix_millis().expect("time"))
-          .await
-          .expect("gateway frame read")
-          .expect("gateway frame");
-        assert_eq!(
-          match frame.message {
-            RemoteMessage::Admission(_) => "admission",
-            RemoteMessage::Prepare(_) => "prepare",
-            _ => "unexpected",
+      let admission_frame = local
+        .read_frame(unix_millis().expect("time"))
+        .await
+        .expect("admission frame read")
+        .expect("admission frame");
+      let RemoteMessage::Admission(admission) = admission_frame.message else {
+        panic!("admission expected")
+      };
+      let prepare_frame = local
+        .read_frame(unix_millis().expect("time"))
+        .await
+        .expect("prepare frame read")
+        .expect("prepare frame");
+      let RemoteMessage::Prepare(prepare) = prepare_frame.message else {
+        panic!("prepare expected")
+      };
+      let grant_verifier =
+        RemoteExecutionGrantVerifier::new(executor_grant_public_key, "gateway-grant-key-1")
+          .expect("grant verifier");
+      let signed_grant =
+        SignedRemoteExecutionGrant::parse_canonical_json(&prepare.execution_grant_json)
+          .expect("canonical gateway grant");
+      grant_verifier
+        .verify_and_consume(
+          &signed_grant,
+          &ExpectedRemoteExecutionGrant {
+            signer_identity: &executor_config.execution_grant_signer_identity,
+            key_revision: &executor_config.execution_grant_key_revision,
+            grant_sequence: 1,
+            session_nonce: &readiness_request.session_nonce,
+            challenge: &executor_ready.challenge,
+            admission_nonce: &admission.admission_nonce,
+            expires_at_unix_millis: admission.expires_at_unix_millis,
+            deployment_epoch: executor_config.deployment_epoch,
+            profile_digest: &executor_config.profile_digest,
+            now_unix_millis: unix_millis().expect("time"),
           },
-          expected
-        );
-      }
+          &prepare,
+        )
+        .expect("authenticate and consume exact relayed prepare grant");
       let binding = RunBinding {
         run_id: "run-1".to_owned(),
         job_id: "job-1".to_owned(),
@@ -2604,6 +2706,7 @@ mod tests {
         deployment_epoch: executor_config.deployment_epoch,
         credential_revision: executor_config.credential_revision.clone(),
       };
+      assert_eq!(prepare.binding, binding);
       let mut prepared = PreparedFrame {
         signed_evidence_json: String::new(),
         binding: binding.clone(),
@@ -2727,7 +2830,7 @@ mod tests {
     };
     let mut broker_config = config();
     broker_config.runner_client_spki_sha256 = fixture.client_spki_sha256.clone();
-    let broker = ScheduledRunnerBroker::new(broker_config.clone()).expect("broker");
+    let broker = ScheduledRunnerBroker::new(broker_config.clone(), grant_signer()).expect("broker");
     let server = ScheduledRunnerTlsServer::load(
       &fixture.server_paths(),
       broker.expected_authorized_peer(),
@@ -2783,7 +2886,7 @@ mod tests {
 
   #[tokio::test]
   async fn remote_backend_is_configured_but_fail_closed_without_a_ready_session() {
-    let broker = ScheduledRunnerBroker::new(config()).expect("broker");
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
     let backend =
       RemoteScheduledExecutionBackend::new(broker, Handle::current(), Arc::new(TestPermitIssuer));
     assert!(backend.is_configured());
@@ -2852,6 +2955,8 @@ mod tests {
       github_mcp_configured_endpoint_identity: "test-endpoint".to_owned(),
       github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
       github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
+      execution_grant_key_revision: "gateway-grant-2026-07".to_owned(),
+      execution_grant_signer_identity: "spiffe://codeoff/gateway/production".to_owned(),
       executor_evidence_public_key: evidence_keys().1.clone(),
       executor_evidence_key_id: "executor-key-1".to_owned(),
       executor_evidence_key_revision: "executor-evidence-2026-07".to_owned(),

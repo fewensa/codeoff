@@ -87,6 +87,7 @@ pub struct RunBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareFrame {
   pub binding: RunBinding,
+  pub execution_grant_json: String,
   pub isolation_permit_envelope_json: String,
   pub task_json: String,
   pub definition_json: String,
@@ -525,7 +526,7 @@ impl AdmissionFrame {
 }
 
 impl RunBinding {
-  fn validate(&self) -> Result<(), RemoteProtocolError> {
+  pub(crate) fn validate(&self) -> Result<(), RemoteProtocolError> {
     require_critical_id("binding.run_id", &self.run_id)?;
     require_critical_id("binding.job_id", &self.job_id)?;
     require_hex("binding.authority_digest", &self.authority_digest, 64)?;
@@ -537,7 +538,7 @@ impl RunBinding {
     Ok(())
   }
 
-  fn to_value(&self) -> Value {
+  pub(crate) fn to_value(&self) -> Value {
     json!({
       "run_id": self.run_id,
       "job_id": self.job_id,
@@ -550,7 +551,7 @@ impl RunBinding {
     })
   }
 
-  fn from_value(value: &Value) -> Result<Self, RemoteProtocolError> {
+  pub(crate) fn from_value(value: &Value) -> Result<Self, RemoteProtocolError> {
     let object = exact_object(
       value,
       &[
@@ -582,6 +583,7 @@ impl RunBinding {
 impl PrepareFrame {
   fn validate(&self) -> Result<(), RemoteProtocolError> {
     self.binding.validate()?;
+    require_json_field("prepare.execution_grant_json", &self.execution_grant_json)?;
     require_json_field(
       "prepare.isolation_permit_envelope_json",
       &self.isolation_permit_envelope_json,
@@ -595,6 +597,7 @@ impl PrepareFrame {
   fn to_value(&self) -> Value {
     json!({
       "binding": self.binding.to_value(),
+      "execution_grant_json": self.execution_grant_json,
       "isolation_permit_envelope_json": self.isolation_permit_envelope_json,
       "task_json": self.task_json,
       "definition_json": self.definition_json,
@@ -608,6 +611,7 @@ impl PrepareFrame {
       value,
       &[
         "binding",
+        "execution_grant_json",
         "isolation_permit_envelope_json",
         "task_json",
         "definition_json",
@@ -618,6 +622,7 @@ impl PrepareFrame {
     )?;
     Ok(Self {
       binding: RunBinding::from_value(required(object, "binding")?)?,
+      execution_grant_json: required_string(object, "execution_grant_json")?,
       isolation_permit_envelope_json: required_string(object, "isolation_permit_envelope_json")?,
       task_json: required_string(object, "task_json")?,
       definition_json: required_string(object, "definition_json")?,
@@ -1038,6 +1043,7 @@ mod tests {
       sequence,
       message: RemoteMessage::Prepare(PrepareFrame {
         binding: binding(),
+        execution_grant_json: r#"{"schema_version":1}"#.to_owned(),
         isolation_permit_envelope_json: r#"{"schema_version":1}"#.to_owned(),
         task_json: r#"{"instruction":"check"}"#.to_owned(),
         definition_json: r#"{"prompt":"check"}"#.to_owned(),

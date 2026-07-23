@@ -12,7 +12,10 @@ use codeoff_agent_codex::{
   build_supervised_scheduled_codex_executor, enable_scheduled_executor_subreaper,
   load_trusted_owner_scheduled_deployment_authority,
 };
-use codeoff_config::{CodeoffConfig, ScheduledRunnerRole, SchedulerRuntimeConfig, SlackConfig};
+use codeoff_config::{
+  CodeoffConfig, ScheduledRunnerGatewayConfig, ScheduledRunnerRole, SchedulerRuntimeConfig,
+  SlackConfig,
+};
 use codeoff_runtime::scheduled_execution::ScheduledExecutor;
 use codeoff_runtime::scheduled_remote_protocol::{
   AdmissionFrame, ErrorFrame, MAX_READY_TTL_MILLIS, PreparedFrame, REMOTE_PROTOCOL_VERSION,
@@ -35,6 +38,10 @@ use codeoff_runtime::scheduled_runner_evidence::{RunnerEvidenceVerifier, SignedR
 use codeoff_runtime::scheduled_runner_executor::{
   ProtectedScheduledExecutorListener, ScheduledRunnerExecutorConfig, current_process_credentials,
   decode_scheduled_remote_task, harden_scheduled_executor_process,
+};
+use codeoff_runtime::scheduled_runner_grant::{
+  ExpectedRemoteExecutionGrant, RemoteExecutionGrantSigner, RemoteExecutionGrantVerifier,
+  SignedRemoteExecutionGrant,
 };
 use codeoff_runtime::scheduled_runner_tls::{
   ScheduledRunnerIoPolicy, ScheduledRunnerTlsClient, ScheduledRunnerTlsError,
@@ -110,6 +117,15 @@ impl ScheduledRunnerGateway {
   }
 }
 
+fn load_gateway_grant_signer(
+  role: &ScheduledRunnerGatewayConfig,
+) -> Result<Arc<RemoteExecutionGrantSigner>, Box<dyn Error>> {
+  Ok(Arc::new(RemoteExecutionGrantSigner::load(
+    &role.execution_grant_private_key_path,
+    &role.execution_grant_key_id,
+  )?))
+}
+
 pub(crate) async fn build_gateway(
   config: &CodeoffConfig,
   state: StateStore,
@@ -144,38 +160,44 @@ pub(crate) async fn build_gateway(
       now_seconds,
     )
     .await?;
-  let broker = ScheduledRunnerBroker::new(ScheduledRunnerBrokerConfig {
-    schema_version: authority.schema_version,
-    deployment_epoch: u64::try_from(authority.deployment_epoch)?,
-    attestation_id: authority.attestation_id.clone(),
-    profile_digest: authority.profile_digest.clone(),
-    signed_not_after_unix_seconds: i64::try_from(authority.expires_at_unix_seconds)?,
-    gateway_image_digest: profile.gateway_image_digest.clone(),
-    runner_image_digest: profile.runner_image_digest.clone(),
-    runner_workload_identity: profile.runner_workload_identity.clone(),
-    runner_client_spki_sha256: profile.runner_client_cert_public_key_fingerprint.clone(),
-    credential_revision: profile.credential_revision.clone(),
-    github_mcp_configured_artifact_sha256: profile.github_mcp_configured_artifact_sha256.clone(),
-    github_mcp_configured_endpoint_identity: profile
-      .github_mcp_configured_endpoint_identity
-      .clone(),
-    github_mcp_access_auth_mode: authority.github_mcp_access_auth_mode.clone(),
-    github_mcp_access_token_revision: authority.github_mcp_access_token_revision.clone(),
-    executor_evidence_public_key: load_root_owned_bounded_file(
-      &role.executor_evidence_public_key_path,
-      32,
-    )?,
-    executor_evidence_key_id: role.executor_evidence_key_id.clone(),
-    executor_evidence_key_revision: role.executor_evidence_key_revision.clone(),
-    executor_evidence_signer_identity: role.executor_evidence_signer_identity.clone(),
-    executor_identity: format!(
-      "uid:{}:gid:{}",
-      config.agent.scheduled_codex.trusted_owner_uid,
-      config.agent.scheduled_codex.trusted_owner_gid
-    ),
-    max_connections: role.max_connections,
-    admission_ttl: Duration::from_millis(role.readiness_ttl_ms),
-  })?;
+  let grant_signer = load_gateway_grant_signer(role)?;
+  let broker = ScheduledRunnerBroker::new(
+    ScheduledRunnerBrokerConfig {
+      schema_version: authority.schema_version,
+      deployment_epoch: u64::try_from(authority.deployment_epoch)?,
+      attestation_id: authority.attestation_id.clone(),
+      profile_digest: authority.profile_digest.clone(),
+      signed_not_after_unix_seconds: i64::try_from(authority.expires_at_unix_seconds)?,
+      gateway_image_digest: profile.gateway_image_digest.clone(),
+      runner_image_digest: profile.runner_image_digest.clone(),
+      runner_workload_identity: profile.runner_workload_identity.clone(),
+      runner_client_spki_sha256: profile.runner_client_cert_public_key_fingerprint.clone(),
+      credential_revision: profile.credential_revision.clone(),
+      github_mcp_configured_artifact_sha256: profile.github_mcp_configured_artifact_sha256.clone(),
+      github_mcp_configured_endpoint_identity: profile
+        .github_mcp_configured_endpoint_identity
+        .clone(),
+      github_mcp_access_auth_mode: authority.github_mcp_access_auth_mode.clone(),
+      github_mcp_access_token_revision: authority.github_mcp_access_token_revision.clone(),
+      execution_grant_key_revision: role.execution_grant_key_revision.clone(),
+      execution_grant_signer_identity: role.execution_grant_signer_identity.clone(),
+      executor_evidence_public_key: load_root_owned_bounded_file(
+        &role.executor_evidence_public_key_path,
+        32,
+      )?,
+      executor_evidence_key_id: role.executor_evidence_key_id.clone(),
+      executor_evidence_key_revision: role.executor_evidence_key_revision.clone(),
+      executor_evidence_signer_identity: role.executor_evidence_signer_identity.clone(),
+      executor_identity: format!(
+        "uid:{}:gid:{}",
+        config.agent.scheduled_codex.trusted_owner_uid,
+        config.agent.scheduled_codex.trusted_owner_gid
+      ),
+      max_connections: role.max_connections,
+      admission_ttl: Duration::from_millis(role.readiness_ttl_ms),
+    },
+    grant_signer,
+  )?;
   let tls = Arc::new(ScheduledRunnerTlsServer::load(
     &ScheduledRunnerTlsPaths {
       certificate_chain: role.server_certificate_path.clone(),
@@ -427,6 +449,10 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
   .map_err(|failure| io::Error::other(failure.message))?;
   let evidence_signer =
     RunnerEvidenceSigner::load(&role.evidence_private_key_path, &role.evidence_key_id)?;
+  let grant_verifier = RemoteExecutionGrantVerifier::load(
+    &role.execution_grant_public_key_path,
+    &role.execution_grant_key_id,
+  )?;
   let now = unix_millis()?;
   let readiness_frame = framed
     .read_frame(now)
@@ -518,6 +544,24 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
     &prepare.binding,
     &built.authority,
     &built.profile.credential_revision,
+  )?;
+  let signed_grant =
+    SignedRemoteExecutionGrant::parse_canonical_json(&prepare.execution_grant_json)?;
+  grant_verifier.verify_and_consume(
+    &signed_grant,
+    &ExpectedRemoteExecutionGrant {
+      signer_identity: &role.execution_grant_signer_identity,
+      key_revision: &role.execution_grant_key_revision,
+      grant_sequence: 1,
+      session_nonce: &prepare_frame.session_nonce,
+      challenge: &readiness.challenge,
+      admission_nonce: &admission.admission_nonce,
+      expires_at_unix_millis: admission.expires_at_unix_millis,
+      deployment_epoch: u64::try_from(built.authority.deployment_epoch)?,
+      profile_digest: &built.authority.profile_digest,
+      now_unix_millis: unix_millis()?,
+    },
+    prepare,
   )?;
   let identity = execution_identity(&prepare.binding)?;
   let permit = RemoteIsolationPermitEnvelope::import(
@@ -1249,6 +1293,10 @@ mod tests {
       RunnerEvidenceVerifier::load(&public_key, "executor-key-1").expect("gateway verifier");
     let evidence_role = codeoff_config::ScheduledRunnerExecutorConfig {
       local_socket_path: temp.path().join("executor.sock"),
+      execution_grant_public_key_path: public_key.clone(),
+      execution_grant_key_id: "gateway-grant-key-1".to_owned(),
+      execution_grant_key_revision: "gateway-grant-2026-07".to_owned(),
+      execution_grant_signer_identity: "spiffe://codeoff/gateway/production".to_owned(),
       evidence_private_key_path: private_key,
       evidence_key_id: "executor-key-1".to_owned(),
       evidence_key_revision: "executor-evidence-2026-07".to_owned(),
@@ -1289,6 +1337,7 @@ mod tests {
           2,
           RemoteMessage::Prepare(PrepareFrame {
             binding: binding.clone(),
+            execution_grant_json: r#"{"schema_version":1}"#.to_owned(),
             isolation_permit_envelope_json: r#"{"schema_version":1}"#.to_owned(),
             task_json: r#"{"instruction":"check"}"#.to_owned(),
             definition_json: r#"{"prompt":"check"}"#.to_owned(),

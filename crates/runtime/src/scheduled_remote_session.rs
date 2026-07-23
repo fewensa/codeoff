@@ -605,6 +605,7 @@ mod tests {
   fn prepare(binding: RunBinding) -> RemoteMessage {
     RemoteMessage::Prepare(PrepareFrame {
       binding,
+      execution_grant_json: r#"{"schema_version":1}"#.to_owned(),
       isolation_permit_envelope_json: r#"{"schema_version":1}"#.to_owned(),
       task_json: r#"{"instruction":"check"}"#.to_owned(),
       definition_json: r#"{"prompt":"check"}"#.to_owned(),

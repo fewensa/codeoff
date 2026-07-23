@@ -24,6 +24,7 @@ pub mod scheduled_runner_broker;
 pub mod scheduled_runner_control;
 pub mod scheduled_runner_evidence;
 pub mod scheduled_runner_executor;
+pub mod scheduled_runner_grant;
 pub mod scheduled_runner_tls;
 pub mod scheduler_observability;
 

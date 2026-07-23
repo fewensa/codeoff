@@ -950,6 +950,10 @@ pub struct ScheduledRunnerGatewayConfig {
   pub server_certificate_path: PathBuf,
   pub server_private_key_path: PathBuf,
   pub client_ca_bundle_path: PathBuf,
+  pub execution_grant_private_key_path: PathBuf,
+  pub execution_grant_key_id: String,
+  pub execution_grant_key_revision: String,
+  pub execution_grant_signer_identity: String,
   pub executor_evidence_public_key_path: PathBuf,
   pub executor_evidence_key_id: String,
   pub executor_evidence_key_revision: String,
@@ -988,11 +992,23 @@ impl ScheduledRunnerGatewayConfig {
         &self.client_ca_bundle_path,
       ),
       (
+        "scheduled_codex.remote_runner.gateway.execution_grant_private_key_path",
+        &self.execution_grant_private_key_path,
+      ),
+      (
         "scheduled_codex.remote_runner.gateway.executor_evidence_public_key_path",
         &self.executor_evidence_public_key_path,
       ),
     ])?;
     for (field, value) in [
+      (
+        "scheduled_codex.remote_runner.gateway.execution_grant_key_revision",
+        self.execution_grant_key_revision.as_str(),
+      ),
+      (
+        "scheduled_codex.remote_runner.gateway.execution_grant_signer_identity",
+        self.execution_grant_signer_identity.as_str(),
+      ),
       (
         "scheduled_codex.remote_runner.gateway.executor_evidence_key_revision",
         self.executor_evidence_key_revision.as_str(),
@@ -1012,6 +1028,12 @@ impl ScheduledRunnerGatewayConfig {
     EvidenceKeyId::parse(&self.executor_evidence_key_id).map_err(|_| {
       invalid_scheduled_codex(
         "scheduled_codex.remote_runner.gateway.executor_evidence_key_id",
+        "must use 1..=128 lowercase ASCII alphanumeric/hyphen bytes",
+      )
+    })?;
+    EvidenceKeyId::parse(&self.execution_grant_key_id).map_err(|_| {
+      invalid_scheduled_codex(
+        "scheduled_codex.remote_runner.gateway.execution_grant_key_id",
         "must use 1..=128 lowercase ASCII alphanumeric/hyphen bytes",
       )
     })?;
@@ -1134,6 +1156,10 @@ impl ScheduledRunnerControlConfig {
 #[serde(deny_unknown_fields)]
 pub struct ScheduledRunnerExecutorConfig {
   pub local_socket_path: PathBuf,
+  pub execution_grant_public_key_path: PathBuf,
+  pub execution_grant_key_id: String,
+  pub execution_grant_key_revision: String,
+  pub execution_grant_signer_identity: String,
   pub evidence_private_key_path: PathBuf,
   pub evidence_key_id: String,
   pub evidence_key_revision: String,
@@ -1154,11 +1180,23 @@ impl ScheduledRunnerExecutorConfig {
         &self.local_socket_path,
       ),
       (
+        "scheduled_codex.remote_runner.executor.execution_grant_public_key_path",
+        &self.execution_grant_public_key_path,
+      ),
+      (
         "scheduled_codex.remote_runner.executor.evidence_private_key_path",
         &self.evidence_private_key_path,
       ),
     ])?;
     for (field, value) in [
+      (
+        "scheduled_codex.remote_runner.executor.execution_grant_key_revision",
+        self.execution_grant_key_revision.as_str(),
+      ),
+      (
+        "scheduled_codex.remote_runner.executor.execution_grant_signer_identity",
+        self.execution_grant_signer_identity.as_str(),
+      ),
       (
         "scheduled_codex.remote_runner.executor.evidence_key_revision",
         self.evidence_key_revision.as_str(),
@@ -1178,6 +1216,12 @@ impl ScheduledRunnerExecutorConfig {
     EvidenceKeyId::parse(&self.evidence_key_id).map_err(|_| {
       invalid_scheduled_codex(
         "scheduled_codex.remote_runner.executor.evidence_key_id",
+        "must use 1..=128 lowercase ASCII alphanumeric/hyphen bytes",
+      )
+    })?;
+    EvidenceKeyId::parse(&self.execution_grant_key_id).map_err(|_| {
+      invalid_scheduled_codex(
+        "scheduled_codex.remote_runner.executor.execution_grant_key_id",
         "must use 1..=128 lowercase ASCII alphanumeric/hyphen bytes",
       )
     })?;

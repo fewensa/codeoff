@@ -624,6 +624,8 @@ mod tests {
         runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
         runner_client_cert_public_key_fingerprint: "f".repeat(64),
         credential_revision: "credential-v1".to_owned(),
+        github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+        github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       }),
     }
   }

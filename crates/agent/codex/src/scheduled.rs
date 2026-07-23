@@ -263,6 +263,8 @@ pub struct ScheduledDeploymentAuthority {
   pub attestation_digest: String,
   pub trust_key_id: String,
   pub profile_digest: String,
+  pub github_mcp_access_auth_mode: String,
+  pub github_mcp_access_token_revision: String,
   pub isolation_revision: String,
   pub issued_at_unix_seconds: u64,
   pub expires_at_unix_seconds: u64,
@@ -2351,6 +2353,8 @@ fn load_signed_isolation_authority_contents(
     attestation_digest: sha256_hex(contents.as_bytes()),
     trust_key_id: trust_key_id.clone(),
     profile_digest: profile_binding_digest.to_owned(),
+    github_mcp_access_auth_mode: profile.github_mcp_access_auth_mode.clone(),
+    github_mcp_access_token_revision: profile.github_mcp_access_token_revision.clone(),
     isolation_revision: isolation_revision.to_owned(),
     issued_at_unix_seconds: issued_at,
     expires_at_unix_seconds: expires_at,
@@ -2492,6 +2496,8 @@ fn isolation_profile_binding_digest(
       "web_search": "disabled",
     },
     "github_mcp_artifact_sha256": profile.github_mcp_artifact_sha256,
+    "github_mcp_access_auth_mode": profile.github_mcp_access_auth_mode,
+    "github_mcp_access_token_revision": profile.github_mcp_access_token_revision,
     "github_mcp_endpoint_identity": profile.github_mcp_endpoint_identity,
     "github_mcp_url": profile.github_mcp_url,
     "github_mcp_version": GITHUB_MCP_SERVER_VERSION,
@@ -3250,6 +3256,14 @@ mod tests {
       attestation_digest: "b".repeat(64),
       trust_key_id: "c".repeat(64),
       profile_digest: permit.profile_digest.clone(),
+      github_mcp_access_auth_mode: scheduled_request
+        .profile
+        .github_mcp_access_auth_mode
+        .clone(),
+      github_mcp_access_token_revision: scheduled_request
+        .profile
+        .github_mcp_access_token_revision
+        .clone(),
       isolation_revision: permit.isolation_revision.clone(),
       issued_at_unix_seconds: now_unix_seconds().saturating_sub(1),
       expires_at_unix_seconds: permit.expires_at_unix_seconds,
@@ -3352,6 +3366,14 @@ mod tests {
     let authority = load_signed_isolation_authority(&profile, &path, &trust_bundle)
       .expect("valid signed attestation");
     assert_eq!(authority.deployment_epoch, 1);
+    assert_eq!(
+      authority.github_mcp_access_auth_mode,
+      profile.github_mcp_access_auth_mode
+    );
+    assert_eq!(
+      authority.github_mcp_access_token_revision,
+      profile.github_mcp_access_token_revision
+    );
 
     let mut other_profile = profile.clone();
     other_profile.github_mcp_endpoint_identity = "different-endpoint".to_owned();
@@ -3362,6 +3384,24 @@ mod tests {
       failure.message,
       "scheduled_isolation_profile_binding_mismatch"
     );
+
+    for mutation in ["auth-mode", "token-revision"] {
+      let mut other_profile = profile.clone();
+      match mutation {
+        "auth-mode" => other_profile.github_mcp_access_auth_mode = "legacy-bearer".to_owned(),
+        "token-revision" => {
+          other_profile.github_mcp_access_token_revision = "mcp-channel-v0".to_owned();
+        }
+        _ => unreachable!(),
+      }
+      let path = write_signed_attestation(&temp, &key, &isolation_payload(&other_profile));
+      let failure = load_signed_isolation_authority(&profile, &path, &trust_bundle)
+        .expect_err("MCP access authority mutation must fail");
+      assert_eq!(
+        failure.message, "scheduled_isolation_profile_binding_mismatch",
+        "mutation={mutation}"
+      );
+    }
 
     let now = now_unix_seconds();
     let mut expired = isolation_payload(&profile);

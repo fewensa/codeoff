@@ -55,6 +55,8 @@ pub struct ScheduledRunnerBrokerConfig {
   pub runner_workload_identity: String,
   pub runner_client_spki_sha256: String,
   pub credential_revision: String,
+  pub github_mcp_access_auth_mode: String,
+  pub github_mcp_access_token_revision: String,
   pub executor_evidence_public_key: Vec<u8>,
   pub executor_evidence_key_id: String,
   pub executor_evidence_key_revision: String,
@@ -91,6 +93,11 @@ impl ScheduledRunnerBrokerConfig {
     .map_err(|_| ScheduledRunnerBrokerError::InvalidConfiguration)?;
     CredentialRevision::parse(&self.credential_revision)
       .map_err(|_| ScheduledRunnerBrokerError::InvalidConfiguration)?;
+    if self.github_mcp_access_auth_mode != "bearer-token-env-v1"
+      || CredentialRevision::parse(&self.github_mcp_access_token_revision).is_err()
+    {
+      return Err(ScheduledRunnerBrokerError::InvalidConfiguration);
+    }
     Ok(())
   }
 }
@@ -240,6 +247,8 @@ impl ScheduledRunnerBroker {
       || ready.runner_workload_identity != config.runner_workload_identity
       || ready.runner_client_cert_public_key_fingerprint != config.runner_client_spki_sha256
       || ready.credential_revision != config.credential_revision
+      || ready.github_mcp_access_auth_mode != config.github_mcp_access_auth_mode
+      || ready.github_mcp_access_token_revision != config.github_mcp_access_token_revision
       || authorized_peer.runner_identity.as_str() != config.runner_workload_identity
       || authorized_peer.client_spki_sha256 != config.runner_client_spki_sha256
     {
@@ -257,6 +266,8 @@ impl ScheduledRunnerBroker {
       || attested.runner_workload_identity != config.runner_workload_identity
       || attested.runner_client_cert_public_key_fingerprint != config.runner_client_spki_sha256
       || attested.credential_revision != config.credential_revision
+      || attested.github_mcp_access_auth_mode != config.github_mcp_access_auth_mode
+      || attested.github_mcp_access_token_revision != config.github_mcp_access_token_revision
     {
       return Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch);
     }
@@ -434,6 +445,18 @@ fn accept_authenticated_prepared(
   let RemoteMessage::Prepared(prepared) = &frame.message else {
     return Err(ScheduledRunnerBrokerError::ProtocolRejected);
   };
+  if prepared.github_mcp_access_auth_mode != config.github_mcp_access_auth_mode
+    || prepared.github_mcp_access_token_revision != config.github_mcp_access_token_revision
+  {
+    return Err(ScheduledRunnerBrokerError::ProtocolRejected);
+  }
+  let attested = AttestedCapabilityProfile::parse_canonical_json(&prepared.attested_profile_json)
+    .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
+  if attested.github_mcp_access_auth_mode != config.github_mcp_access_auth_mode
+    || attested.github_mcp_access_token_revision != config.github_mcp_access_token_revision
+  {
+    return Err(ScheduledRunnerBrokerError::ProtocolRejected);
+  }
   let payload_digest = prepared_evidence_payload_digest(prepared);
   validate_executor_evidence(
     config,
@@ -1473,6 +1496,8 @@ mod tests {
       runner_workload_identity: workload_identity.to_owned(),
       runner_client_cert_public_key_fingerprint: spki.to_owned(),
       credential_revision: config.credential_revision.clone(),
+      github_mcp_access_auth_mode: config.github_mcp_access_auth_mode.clone(),
+      github_mcp_access_token_revision: config.github_mcp_access_token_revision.clone(),
     };
     let payload_digest = ready_evidence_payload_digest(&ready);
     ready.signed_evidence_json = sign_runner_evidence(
@@ -1725,6 +1750,8 @@ mod tests {
       preparation_nonce: "3".repeat(64),
       attested_profile_json: "{\"profile\":1}".to_owned(),
       attested_profile_digest: "4".repeat(64),
+      github_mcp_access_auth_mode: config.github_mcp_access_auth_mode.clone(),
+      github_mcp_access_token_revision: config.github_mcp_access_token_revision.clone(),
     };
     let payload_digest = prepared_evidence_payload_digest(&prepared);
     prepared.signed_evidence_json = sign_runner_evidence(
@@ -1883,7 +1910,7 @@ mod tests {
       )
       .expect("prepare");
 
-    let profile_json = "{}".to_owned();
+    let profile_json = capability_profile(&config).canonical_json();
     let profile_digest = format!("{:x}", Sha256::digest(profile_json.as_bytes()));
     let mut prepared = PreparedFrame {
       signed_evidence_json: String::new(),
@@ -1891,6 +1918,8 @@ mod tests {
       preparation_nonce: "6".repeat(64),
       attested_profile_json: profile_json,
       attested_profile_digest: profile_digest.clone(),
+      github_mcp_access_auth_mode: config.github_mcp_access_auth_mode.clone(),
+      github_mcp_access_token_revision: config.github_mcp_access_token_revision.clone(),
     };
     let prepared_payload = prepared_evidence_payload_digest(&prepared);
     prepared.signed_evidence_json = sign_runner_evidence(
@@ -1922,14 +1951,22 @@ mod tests {
       sequence: 2,
       message: RemoteMessage::Prepared(prepared),
     };
-    let mut translated = prepared_frame.clone();
-    let RemoteMessage::Prepared(translated_payload) = &mut translated.message else {
-      unreachable!()
-    };
-    translated_payload.preparation_nonce = "5".repeat(64);
-    assert!(
-      accept_authenticated_prepared(&mut session, &config, &ready, &translated, now).is_err()
-    );
+    for mutation in 0..3 {
+      let mut translated = prepared_frame.clone();
+      let RemoteMessage::Prepared(translated_payload) = &mut translated.message else {
+        unreachable!()
+      };
+      match mutation {
+        0 => translated_payload.preparation_nonce = "5".repeat(64),
+        1 => translated_payload.github_mcp_access_auth_mode = "legacy-bearer".to_owned(),
+        2 => translated_payload.github_mcp_access_token_revision = "mcp-channel-v0".to_owned(),
+        _ => unreachable!(),
+      }
+      assert!(
+        accept_authenticated_prepared(&mut session, &config, &ready, &translated, now).is_err(),
+        "prepared auth mutation {mutation} advanced state"
+      );
+    }
     accept_authenticated_prepared(&mut session, &config, &ready, &prepared_frame, now)
       .expect("valid prepared remains acceptable");
     assert!(
@@ -2180,6 +2217,35 @@ mod tests {
       broker.validate_ready(&wrong_mapping, &valid, valid_ready, &nonce, &challenge),
       Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch)
     ));
+    let mut legacy_mode = valid.clone();
+    let RemoteMessage::Ready(legacy_mode_ready) = &mut legacy_mode.message else {
+      unreachable!()
+    };
+    legacy_mode_ready.github_mcp_access_auth_mode = "legacy-bearer".to_owned();
+    let legacy_mode_ready = legacy_mode_ready.clone();
+    assert!(matches!(
+      broker.validate_ready(
+        &authorized_peer,
+        &legacy_mode,
+        &legacy_mode_ready,
+        &nonce,
+        &challenge,
+      ),
+      Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch)
+    ));
+    let mut rotated_config = config.clone();
+    rotated_config.github_mcp_access_token_revision = "mcp-channel-v2".to_owned();
+    let rotated = ScheduledRunnerBroker::new(rotated_config).expect("rotated broker");
+    assert!(matches!(
+      rotated.validate_ready(
+        &rotated.expected_authorized_peer(),
+        &valid,
+        valid_ready,
+        &nonce,
+        &challenge,
+      ),
+      Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch)
+    ));
     assert!(broker.session().is_none());
   }
 
@@ -2384,6 +2450,8 @@ mod tests {
       runner_workload_identity: broker_config.runner_workload_identity.clone(),
       runner_client_cert_public_key_fingerprint: broker_config.runner_client_spki_sha256.clone(),
       credential_revision: broker_config.credential_revision.clone(),
+      github_mcp_access_auth_mode: broker_config.github_mcp_access_auth_mode.clone(),
+      github_mcp_access_token_revision: broker_config.github_mcp_access_token_revision.clone(),
     };
     ready.signed_evidence_json = signer
       .sign(&production_claims(
@@ -2487,6 +2555,8 @@ mod tests {
         preparation_nonce: "6".repeat(64),
         attested_profile_digest: executor_profile_digest.clone(),
         attested_profile_json: executor_profile_json,
+        github_mcp_access_auth_mode: executor_config.github_mcp_access_auth_mode.clone(),
+        github_mcp_access_token_revision: executor_config.github_mcp_access_token_revision.clone(),
       };
       prepared.signed_evidence_json = executor_signer
         .sign(&production_claims(
@@ -2723,6 +2793,8 @@ mod tests {
       runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
       runner_client_spki_sha256: "e".repeat(64),
       credential_revision: "credential-v1".to_owned(),
+      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       executor_evidence_public_key: evidence_keys().1.clone(),
       executor_evidence_key_id: "executor-key-1".to_owned(),
       executor_evidence_key_revision: "executor-evidence-2026-07".to_owned(),

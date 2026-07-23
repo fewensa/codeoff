@@ -59,6 +59,8 @@ pub struct ReadyFrame {
   pub runner_workload_identity: String,
   pub runner_client_cert_public_key_fingerprint: String,
   pub credential_revision: String,
+  pub github_mcp_access_auth_mode: String,
+  pub github_mcp_access_token_revision: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +101,8 @@ pub struct PreparedFrame {
   pub preparation_nonce: String,
   pub attested_profile_json: String,
   pub attested_profile_digest: String,
+  pub github_mcp_access_auth_mode: String,
+  pub github_mcp_access_token_revision: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +398,14 @@ impl ReadyFrame {
       64,
     )?;
     require_credential_revision("ready.credential_revision", &self.credential_revision)?;
+    require_github_mcp_access_auth_mode(
+      "ready.github_mcp_access_auth_mode",
+      &self.github_mcp_access_auth_mode,
+    )?;
+    require_credential_revision(
+      "ready.github_mcp_access_token_revision",
+      &self.github_mcp_access_token_revision,
+    )?;
     if self.deployment_epoch == 0
       || (now != 0
         && (self.ready_until_unix_millis <= now
@@ -417,6 +429,8 @@ impl ReadyFrame {
       "runner_workload_identity": self.runner_workload_identity,
       "runner_client_cert_public_key_fingerprint": self.runner_client_cert_public_key_fingerprint,
       "credential_revision": self.credential_revision,
+      "github_mcp_access_auth_mode": self.github_mcp_access_auth_mode,
+      "github_mcp_access_token_revision": self.github_mcp_access_token_revision,
       "signed_evidence_json": self.signed_evidence_json,
     })
   }
@@ -436,6 +450,8 @@ impl ReadyFrame {
         "runner_workload_identity",
         "runner_client_cert_public_key_fingerprint",
         "credential_revision",
+        "github_mcp_access_auth_mode",
+        "github_mcp_access_token_revision",
         "signed_evidence_json",
       ],
       "ready",
@@ -455,6 +471,11 @@ impl ReadyFrame {
         "runner_client_cert_public_key_fingerprint",
       )?,
       credential_revision: required_string(object, "credential_revision")?,
+      github_mcp_access_auth_mode: required_string(object, "github_mcp_access_auth_mode")?,
+      github_mcp_access_token_revision: required_string(
+        object,
+        "github_mcp_access_token_revision",
+      )?,
       signed_evidence_json: required_string(object, "signed_evidence_json")?,
     })
   }
@@ -619,6 +640,14 @@ impl PreparedFrame {
       &self.attested_profile_digest,
       64,
     )?;
+    require_github_mcp_access_auth_mode(
+      "prepared.github_mcp_access_auth_mode",
+      &self.github_mcp_access_auth_mode,
+    )?;
+    require_credential_revision(
+      "prepared.github_mcp_access_token_revision",
+      &self.github_mcp_access_token_revision,
+    )?;
     require_json_field("prepared.signed_evidence_json", &self.signed_evidence_json)
   }
 
@@ -628,6 +657,8 @@ impl PreparedFrame {
       "preparation_nonce": self.preparation_nonce,
       "attested_profile_json": self.attested_profile_json,
       "attested_profile_digest": self.attested_profile_digest,
+      "github_mcp_access_auth_mode": self.github_mcp_access_auth_mode,
+      "github_mcp_access_token_revision": self.github_mcp_access_token_revision,
       "signed_evidence_json": self.signed_evidence_json,
     })
   }
@@ -640,6 +671,8 @@ impl PreparedFrame {
         "preparation_nonce",
         "attested_profile_json",
         "attested_profile_digest",
+        "github_mcp_access_auth_mode",
+        "github_mcp_access_token_revision",
         "signed_evidence_json",
       ],
       "prepared",
@@ -649,6 +682,11 @@ impl PreparedFrame {
       preparation_nonce: required_string(object, "preparation_nonce")?,
       attested_profile_json: required_string(object, "attested_profile_json")?,
       attested_profile_digest: required_string(object, "attested_profile_digest")?,
+      github_mcp_access_auth_mode: required_string(object, "github_mcp_access_auth_mode")?,
+      github_mcp_access_token_revision: required_string(
+        object,
+        "github_mcp_access_token_revision",
+      )?,
       signed_evidence_json: required_string(object, "signed_evidence_json")?,
     })
   }
@@ -901,6 +939,16 @@ fn require_credential_revision(
     .map_err(|_| RemoteProtocolError::InvalidField(field))
 }
 
+fn require_github_mcp_access_auth_mode(
+  field: &'static str,
+  value: &str,
+) -> Result<(), RemoteProtocolError> {
+  if value != "bearer-token-env-v1" {
+    return Err(RemoteProtocolError::InvalidField(field));
+  }
+  Ok(())
+}
+
 fn require_json_field(field: &'static str, value: &str) -> Result<(), RemoteProtocolError> {
   require_bounded(field, value, MAX_JSON_FIELD_BYTES)?;
   let parsed: Value =
@@ -977,6 +1025,8 @@ mod tests {
         runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
         runner_client_cert_public_key_fingerprint: "1".repeat(64),
         credential_revision: "github-readonly-2026-07".to_owned(),
+        github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+        github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       }),
     }
   }
@@ -1021,6 +1071,8 @@ mod tests {
           preparation_nonce: "3".repeat(64),
           attested_profile_json: r#"{"profile":"bound"}"#.to_owned(),
           attested_profile_digest: "4".repeat(64),
+          github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+          github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
         }),
         ..ready(4)
       },
@@ -1136,6 +1188,35 @@ mod tests {
     };
     payload.runner_image_digest = "sha-runner-latest".to_owned();
     assert!(movable.encode().is_err());
+  }
+
+  #[test]
+  fn ready_and_prepared_require_canonical_mcp_access_authority() {
+    let mut invalid_ready = ready(1);
+    let RemoteMessage::Ready(ready_payload) = &mut invalid_ready.message else {
+      unreachable!()
+    };
+    ready_payload.github_mcp_access_auth_mode = "legacy-bearer".to_owned();
+    assert!(invalid_ready.encode().is_err());
+
+    let mut invalid_prepared = RemoteFrame {
+      sequence: 2,
+      message: RemoteMessage::Prepared(PreparedFrame {
+        signed_evidence_json: "{}".to_owned(),
+        binding: binding(),
+        preparation_nonce: "3".repeat(64),
+        attested_profile_json: r#"{"profile":"bound"}"#.to_owned(),
+        attested_profile_digest: "4".repeat(64),
+        github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+        github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
+      }),
+      ..ready(2)
+    };
+    let RemoteMessage::Prepared(prepared) = &mut invalid_prepared.message else {
+      unreachable!()
+    };
+    prepared.github_mcp_access_token_revision = " invalid".to_owned();
+    assert!(invalid_prepared.encode().is_err());
   }
 
   #[test]

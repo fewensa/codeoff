@@ -152,6 +152,8 @@ pub(crate) async fn build_gateway(
     runner_workload_identity: profile.runner_workload_identity.clone(),
     runner_client_spki_sha256: profile.runner_client_cert_public_key_fingerprint.clone(),
     credential_revision: profile.credential_revision.clone(),
+    github_mcp_access_auth_mode: authority.github_mcp_access_auth_mode.clone(),
+    github_mcp_access_token_revision: authority.github_mcp_access_token_revision.clone(),
     executor_evidence_public_key: load_root_owned_bounded_file(
       &role.executor_evidence_public_key_path,
       32,
@@ -452,6 +454,8 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
       .runner_client_cert_public_key_fingerprint
       .clone(),
     credential_revision: attested.credential_revision.clone(),
+    github_mcp_access_auth_mode: attested.github_mcp_access_auth_mode.clone(),
+    github_mcp_access_token_revision: attested.github_mcp_access_token_revision.clone(),
   };
   let ready_payload_digest = ready_evidence_payload_digest(&ready_message);
   ready_message.signed_evidence_json = evidence_signer
@@ -553,6 +557,14 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
     preparation_nonce: preparation_nonce.clone(),
     attested_profile_digest: capability_profile_digest.clone(),
     attested_profile_json: capability_profile,
+    github_mcp_access_auth_mode: prepared
+      .attested_profile()
+      .github_mcp_access_auth_mode
+      .clone(),
+    github_mcp_access_token_revision: prepared
+      .attested_profile()
+      .github_mcp_access_token_revision
+      .clone(),
   };
   let prepared_payload_digest = prepared_evidence_payload_digest(&prepared_message);
   prepared_message.signed_evidence_json = evidence_signer
@@ -1303,6 +1315,8 @@ mod tests {
         preparation_nonce: executor_preparation_nonce.clone(),
         attested_profile_json: "{}".to_owned(),
         attested_profile_digest: "1".repeat(64),
+        github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+        github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
       };
       let payload_digest = prepared_evidence_payload_digest(&prepared);
       prepared.signed_evidence_json = signer

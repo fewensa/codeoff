@@ -586,6 +586,8 @@ mod tests {
       runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
       runner_client_cert_public_key_fingerprint: "1".repeat(64),
       credential_revision: "github-readonly-2026-07".to_owned(),
+      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
     })
   }
 
@@ -620,6 +622,8 @@ mod tests {
       preparation_nonce: "3".repeat(64),
       attested_profile_digest: hex_sha256(attested_profile_json.as_bytes()),
       attested_profile_json,
+      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
     })
   }
 

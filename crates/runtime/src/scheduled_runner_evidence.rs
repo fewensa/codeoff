@@ -428,6 +428,8 @@ pub fn ready_evidence_payload_digest(ready: &ReadyFrame) -> String {
       "credential_revision": ready.credential_revision,
       "deployment_epoch": ready.deployment_epoch,
       "gateway_image_digest": ready.gateway_image_digest,
+      "github_mcp_access_auth_mode": ready.github_mcp_access_auth_mode,
+      "github_mcp_access_token_revision": ready.github_mcp_access_token_revision,
       "kind": "ready",
       "profile_digest": ready.profile_digest,
       "ready_until_unix_millis": ready.ready_until_unix_millis,
@@ -449,6 +451,8 @@ pub fn prepared_evidence_payload_digest(prepared: &PreparedFrame) -> String {
       "attested_profile_json": prepared.attested_profile_json,
       "binding": binding_value(&prepared.binding),
       "kind": "prepared",
+      "github_mcp_access_auth_mode": prepared.github_mcp_access_auth_mode,
+      "github_mcp_access_token_revision": prepared.github_mcp_access_token_revision,
       "preparation_nonce": prepared.preparation_nonce,
       "schema_version": 1,
     })
@@ -719,6 +723,8 @@ mod tests {
       runner_workload_identity: "spiffe://codeoff/runner".to_owned(),
       runner_client_cert_public_key_fingerprint: "7".repeat(64),
       credential_revision: "credential-v1".to_owned(),
+      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
     };
     let ready_digest = ready_evidence_payload_digest(&ready);
     let mut mutations = Vec::new();
@@ -755,6 +761,12 @@ mod tests {
     let mut value = ready.clone();
     value.credential_revision.push('x');
     mutations.push(value);
+    let mut value = ready.clone();
+    value.github_mcp_access_auth_mode.push('x');
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.github_mcp_access_token_revision.push('x');
+    mutations.push(value);
     assert!(
       mutations
         .iter()
@@ -767,6 +779,8 @@ mod tests {
       preparation_nonce: "3".repeat(64),
       attested_profile_json: "{\"profile\":1}".to_owned(),
       attested_profile_digest: "4".repeat(64),
+      github_mcp_access_auth_mode: "bearer-token-env-v1".to_owned(),
+      github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
     };
     let prepared_digest = prepared_evidence_payload_digest(&prepared);
     let mut value = prepared.clone();
@@ -777,6 +791,12 @@ mod tests {
     assert_ne!(prepared_evidence_payload_digest(&value), prepared_digest);
     let mut value = prepared.clone();
     value.attested_profile_digest = "5".repeat(64);
+    assert_ne!(prepared_evidence_payload_digest(&value), prepared_digest);
+    let mut value = prepared.clone();
+    value.github_mcp_access_auth_mode.push('x');
+    assert_ne!(prepared_evidence_payload_digest(&value), prepared_digest);
+    let mut value = prepared.clone();
+    value.github_mcp_access_token_revision.push('x');
     assert_ne!(prepared_evidence_payload_digest(&value), prepared_digest);
     for index in 0..8 {
       let mut value = prepared.clone();

@@ -52,6 +52,25 @@ advance only after the authoritative transaction accepts the outcome. Rollback a
 scrapes do not increment them. In particular, `delivery_retry` is durable and independent of an
 Agent execution, so the no-Agent delivery retry invariant can be checked directly.
 
+Decision counters use durable identity rather than polling frequency. `overlap_suppressed` advances
+once for each new `(job, scheduled_for)` decision, even across restart. Counter-exhaustion policy
+limits advance once per affected run or delivery; request policy limits advance once per scoped
+principal, operation, and `request_id`; terminal deadline/retry limits advance once with the
+accepted terminal transition.
+`stale_fence_rejected` advances once for each rejected authoritative CAS, stale exact reconcile, or
+late completion/failure that is accepted only as diagnostic evidence. A repeated stale attempt is a
+new rejected attempt and therefore advances again.
+
+Executor validation is classified at the typed failure source. Only exact
+`profile_validation_failed`, `artifact_validation_failed`, and `tool_list_validation_failed`
+preflight transitions advance those three counters; general schedule request validation is not
+reclassified as an artifact failure.
+
+Worker gauges follow the actual spawned topology. An enabled scheduler has one execution worker;
+it has one delivery worker when a provider is available, otherwise one standalone delivery
+preparation worker. A worker's available slot changes from `1` to `0` at `tick/started` and returns
+to `1` at the matching terminal tick status. Nested attempts do not change slot availability.
+
 The SQLite snapshot refreshes every 5 seconds, is capped at 100,000 rows/counts and 30 days of age, and has a 500 ms timeout. A failed refresh preserves the last bounded gauge values but marks the snapshot unavailable for readiness.
 
 Labels never contain job, run, delivery, owner, channel, user, thread, Slack, or Codex ids;

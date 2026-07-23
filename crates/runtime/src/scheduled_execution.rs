@@ -258,6 +258,14 @@ async fn run_scheduled_worker(
       break;
     }
     let started_at = Instant::now();
+    record_execution_event(
+      telemetry.as_ref(),
+      SchedulerOperation::Tick,
+      SchedulerOperationStatus::Started,
+      None,
+      Duration::ZERO,
+      None,
+    );
     let tick = Box::pin(run_scheduled_worker_tick(
       &state,
       &orchestrator,
@@ -634,7 +642,7 @@ impl BackendAuthorization {
       .0
       .downcast::<T>()
       .map(|value| *value)
-      .map_err(|_| PrepareFailure::fatal("scheduled_backend_authorization_type_mismatch"))
+      .map_err(|_| PrepareFailure::artifact("scheduled_backend_authorization_type_mismatch"))
   }
 }
 
@@ -699,14 +707,14 @@ impl PreparedRun {
     prepared: BackendPrepared,
   ) -> Result<Self, PrepareFailure> {
     let profile: Value = serde_json::from_str(&prepared.attested_profile_json)
-      .map_err(|error| PrepareFailure::fatal(error.to_string()))?;
-    let canonical_profile =
-      serde_json::to_string(&profile).map_err(|error| PrepareFailure::fatal(error.to_string()))?;
+      .map_err(|_| PrepareFailure::profile("scheduled_attested_profile_json_invalid"))?;
+    let canonical_profile = serde_json::to_string(&profile)
+      .map_err(|_| PrepareFailure::profile("scheduled_attested_profile_canonicalization_failed"))?;
     let schema_version = profile
       .get("schema_version")
       .and_then(Value::as_u64)
       .and_then(|value| u32::try_from(value).ok())
-      .ok_or_else(|| PrepareFailure::fatal("scheduled_attested_profile_schema_missing"))?;
+      .ok_or_else(|| PrepareFailure::profile("scheduled_attested_profile_schema_missing"))?;
     let authority_matches = match schema_version {
       1 => expected_authority.attestation_matches(
         &canonical_profile,
@@ -721,7 +729,7 @@ impl PreparedRun {
       || prepared.authority_digest != expected_authority.digest()
       || !authority_matches
     {
-      return Err(PrepareFailure::fatal(
+      return Err(PrepareFailure::profile(
         "scheduled_attested_profile_authority_mismatch",
       ));
     }
@@ -731,7 +739,7 @@ impl PreparedRun {
       "sha256-v1",
       prepared.attested_profile_digest,
     )
-    .map_err(|error| PrepareFailure::fatal(error.to_string()))?;
+    .map_err(|_| PrepareFailure::profile("scheduled_attested_profile_snapshot_invalid"))?;
     Ok(Self {
       authority: prepared.authority,
       attested_profile,
@@ -758,26 +766,27 @@ pub struct PrepareFailure {
 impl PrepareFailure {
   #[must_use]
   pub fn fatal(message: impl Into<String>) -> Self {
-    let message = message.into();
+    Self::classified("preflight_rejected", message)
+  }
+
+  fn profile(message: impl Into<String>) -> Self {
+    Self::classified("profile_validation_failed", message)
+  }
+
+  fn artifact(message: impl Into<String>) -> Self {
+    Self::classified("artifact_validation_failed", message)
+  }
+
+  fn tool_list(message: impl Into<String>) -> Self {
+    Self::classified("tool_list_validation_failed", message)
+  }
+
+  fn classified(kind: &str, message: impl Into<String>) -> Self {
     Self {
       retryable: false,
-      kind: prepare_failure_kind(&message).to_owned(),
-      message,
+      kind: kind.to_owned(),
+      message: message.into(),
     }
-  }
-}
-
-fn prepare_failure_kind(message: &str) -> &'static str {
-  if message.contains("profile") {
-    "profile_validation_failed"
-  } else if message.contains("artifact") || message.contains("prepared_authority") {
-    "artifact_validation_failed"
-  } else if message.contains("capability_tool_list")
-    || message == "scheduled_capability_exposes_dynamic_tools"
-  {
-    "tool_list_validation_failed"
-  } else {
-    "preflight_rejected"
   }
 }
 
@@ -1170,7 +1179,10 @@ impl ScheduledRunOrchestrator {
         Ok(prepared) if prepared.matches(&authority) => prepared,
         Ok(_) => {
           let outcome = self
-            .record_preflight_failure(&claim, PrepareFailure::fatal("prepared_authority_mismatch"))
+            .record_preflight_failure(
+              &claim,
+              PrepareFailure::artifact("prepared_authority_mismatch"),
+            )
             .await;
           stop_heartbeat(&mut heartbeat).await;
           return outcome;
@@ -1600,14 +1612,14 @@ fn task_from_claim(
 
 fn reject_dynamic_tool_exposure(capability_json: &str) -> Result<(), PrepareFailure> {
   let capability: Value = serde_json::from_str(capability_json)
-    .map_err(|_| PrepareFailure::fatal("scheduled_capability_tool_list_invalid"))?;
+    .map_err(|_| PrepareFailure::tool_list("scheduled_capability_tool_list_invalid"))?;
   let prohibited = CHANNEL_DYNAMIC_TOOL_NAMES
     .iter()
     .chain(SCHEDULE_DYNAMIC_TOOL_NAMES)
     .copied()
     .collect::<Vec<_>>();
   if contains_prohibited_tool(&capability, &prohibited) {
-    return Err(PrepareFailure::fatal(
+    return Err(PrepareFailure::tool_list(
       "scheduled_capability_exposes_dynamic_tools",
     ));
   }
@@ -3048,19 +3060,25 @@ mod tests {
 
   #[test]
   fn test_prepare_validation_failure_kinds_are_fixed_and_sanitized() {
-    for (message, expected) in [
+    for (failure, expected) in [
       (
-        "scheduled_attested_profile_schema_missing",
+        PrepareFailure::profile("malformed profile JSON"),
         "profile_validation_failed",
       ),
-      ("prepared_authority_mismatch", "artifact_validation_failed"),
       (
-        "scheduled_capability_exposes_dynamic_tools",
+        PrepareFailure::artifact("prepared authority mismatch"),
+        "artifact_validation_failed",
+      ),
+      (
+        PrepareFailure::tool_list("unexpected tool inventory"),
         "tool_list_validation_failed",
       ),
-      ("provider-specific text", "preflight_rejected"),
+      (
+        PrepareFailure::fatal("provider-specific text"),
+        "preflight_rejected",
+      ),
     ] {
-      assert_eq!(PrepareFailure::fatal(message).kind, expected);
+      assert_eq!(failure.kind, expected);
     }
   }
 

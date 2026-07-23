@@ -38,6 +38,7 @@ pub enum ScheduleServiceError {
   Unauthorized,
   NotVisible,
   InvalidRequest(String),
+  PolicyLimit(String),
   ResolverUnavailable,
   TargetUnavailable,
   ResolverNotAllowed,
@@ -58,6 +59,7 @@ impl fmt::Display for ScheduleServiceError {
       ),
       Self::NotVisible => write!(formatter, "schedule was not found or is not visible"),
       Self::InvalidRequest(reason) => write!(formatter, "invalid schedule request: {reason}"),
+      Self::PolicyLimit(reason) => write!(formatter, "schedule policy rejected request: {reason}"),
       Self::ResolverUnavailable => write!(formatter, "target resolver is unavailable"),
       Self::TargetUnavailable => write!(formatter, "target is unavailable"),
       Self::ResolverNotAllowed => write!(formatter, "target is not allowed"),
@@ -100,6 +102,7 @@ impl ScheduleServiceError {
       Self::Unauthorized => "unauthorized",
       Self::NotVisible => "not_found_or_not_visible",
       Self::InvalidRequest(_) => "validation_failed",
+      Self::PolicyLimit(_) => "policy_limit_rejected",
       Self::ResolverUnavailable => "resolver_unavailable",
       Self::TargetUnavailable => "target_unavailable",
       Self::ResolverNotAllowed => "resolver_not_allowed",
@@ -220,7 +223,7 @@ impl ScheduleService {
   ) -> Result<(), ScheduleServiceError> {
     let policy = self.state.scheduler_operational_policy();
     if instruction.len() > usize::try_from(policy.max_prompt_bytes).unwrap_or(usize::MAX) {
-      return Err(ScheduleServiceError::InvalidRequest(
+      return Err(ScheduleServiceError::PolicyLimit(
         "instruction exceeds max_prompt_bytes".to_owned(),
       ));
     }
@@ -230,7 +233,7 @@ impl ScheduleService {
         policy.minimum_schedule_cadence_seconds,
         policy.occurrence_search_limit,
       )
-      .map_err(|error| ScheduleServiceError::InvalidRequest(error.to_string()))
+      .map_err(|error| ScheduleServiceError::PolicyLimit(error.to_string()))
   }
 
   #[must_use]

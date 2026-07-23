@@ -1878,13 +1878,17 @@ async fn worker_shutdown_joins_in_flight_send_without_new_claims() {
   assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
   {
     let events = telemetry.events.lock().expect("telemetry events");
-    let attempt = events
+    let attempts = events
       .iter()
-      .find(|event| event.operation == SchedulerOperation::Attempt)
-      .expect("delivery attempt telemetry");
-    assert_eq!(attempt.worker, SchedulerWorker::Delivery);
-    assert_eq!(attempt.status, SchedulerOperationStatus::Unknown);
-    assert_eq!(attempt.attempt, Some(1));
+      .filter(|event| event.operation == SchedulerOperation::Attempt)
+      .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].worker, SchedulerWorker::Delivery);
+    assert_eq!(attempts[0].status, SchedulerOperationStatus::Started);
+    assert_eq!(attempts[0].attempt, Some(1));
+    assert_eq!(attempts[1].worker, SchedulerWorker::Delivery);
+    assert_eq!(attempts[1].status, SchedulerOperationStatus::Unknown);
+    assert_eq!(attempts[1].attempt, Some(1));
   }
   assert_eq!(
     store

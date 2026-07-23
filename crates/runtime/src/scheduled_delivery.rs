@@ -224,24 +224,73 @@ async fn run_scheduled_delivery_preparation_worker_inner(
       return Ok(());
     }
     let started_at = Instant::now();
-    let preparation = tokio::select! {
-      biased;
-      () = cancellation_requested(shutdown.clone()) => return Ok(()),
-      preparation = prepare_next_scheduled_delivery(&state, timeline.fresh_now()) => preparation,
-    };
     record_delivery_event(
       telemetry.as_ref(),
       SchedulerWorker::DeliveryPreparation,
       SchedulerOperation::Tick,
-      match &preparation {
-        Ok(Some(_)) => SchedulerOperationStatus::Completed,
-        Ok(None) => SchedulerOperationStatus::Idle,
-        Err(_) => SchedulerOperationStatus::Failed,
+      SchedulerOperationStatus::Started,
+      None,
+      Duration::ZERO,
+      None,
+    );
+    record_delivery_event(
+      telemetry.as_ref(),
+      SchedulerWorker::DeliveryPreparation,
+      SchedulerOperation::Attempt,
+      SchedulerOperationStatus::Started,
+      None,
+      Duration::ZERO,
+      None,
+    );
+    let preparation = tokio::select! {
+      biased;
+      () = cancellation_requested(shutdown.clone()) => {
+        record_delivery_event(
+          telemetry.as_ref(),
+          SchedulerWorker::DeliveryPreparation,
+          SchedulerOperation::Attempt,
+          SchedulerOperationStatus::Cancelled,
+          None,
+          started_at.elapsed(),
+          None,
+        );
+        record_delivery_event(
+          telemetry.as_ref(),
+          SchedulerWorker::DeliveryPreparation,
+          SchedulerOperation::Tick,
+          SchedulerOperationStatus::Cancelled,
+          None,
+          started_at.elapsed(),
+          None,
+        );
+        return Ok(());
       },
-      preparation
-        .as_ref()
-        .err()
-        .map(|_| SchedulerTelemetryErrorKind::State),
+      preparation = prepare_next_scheduled_delivery(&state, timeline.fresh_now()) => preparation,
+    };
+    let preparation_status = match &preparation {
+      Ok(Some(_)) => SchedulerOperationStatus::Completed,
+      Ok(None) => SchedulerOperationStatus::Idle,
+      Err(_) => SchedulerOperationStatus::Failed,
+    };
+    let preparation_error = preparation
+      .as_ref()
+      .err()
+      .map(|_| SchedulerTelemetryErrorKind::State);
+    record_delivery_event(
+      telemetry.as_ref(),
+      SchedulerWorker::DeliveryPreparation,
+      SchedulerOperation::Attempt,
+      preparation_status,
+      preparation_error,
+      started_at.elapsed(),
+      None,
+    );
+    record_delivery_event(
+      telemetry.as_ref(),
+      SchedulerWorker::DeliveryPreparation,
+      SchedulerOperation::Tick,
+      preparation_status,
+      preparation_error,
       started_at.elapsed(),
       None,
     );
@@ -368,6 +417,15 @@ async fn run_scheduled_delivery_worker_inner(
       return Ok(());
     }
     let started_at = Instant::now();
+    record_delivery_event(
+      telemetry.as_ref(),
+      SchedulerWorker::Delivery,
+      SchedulerOperation::Tick,
+      SchedulerOperationStatus::Started,
+      None,
+      Duration::ZERO,
+      None,
+    );
     let tick = run_scheduled_delivery_tick_with_timeline(
       &state,
       provider.as_ref(),

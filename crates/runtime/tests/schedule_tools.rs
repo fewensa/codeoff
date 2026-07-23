@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use codeoff_agent_contract::{
   ChannelReplyStrategy, ChannelTaskContext, ConversationKind, InvocationPrincipal, InvocationSource,
 };
+use codeoff_core::SchedulerOperationalPolicy;
 use codeoff_runtime::schedule_service::ScheduleInvocation;
 use codeoff_runtime::schedule_service::{
   CapabilityRegistry, CapabilityRequest, ChannelTargetVerifier, ConfiguredOperatorIdentityPolicy,
@@ -13,7 +14,8 @@ use codeoff_runtime::schedule_service::{
 };
 use codeoff_runtime::schedule_tools::{SCHEDULE_DYNAMIC_TOOL_NAMES, ScheduleDynamicToolHandler};
 use codeoff_state::{
-  CapabilityProfileSnapshot, DeliveryTargetSnapshot, PrincipalKey, ScheduleSpec, StateStore,
+  CapabilityProfileSnapshot, DeliveryTargetSnapshot, PrincipalKey, ScheduleSpec,
+  SchedulerTransitionKind, StateStore,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -593,6 +595,92 @@ async fn test_direct_schedule_service_call_records_exactly_one_attempt_audit() {
   assert_eq!(audit.len(), 1);
   assert_eq!(audit[0].outcome, "denied");
   assert_eq!(audit[0].decision, "deny");
+}
+
+#[tokio::test]
+async fn test_policy_limit_metric_deduplicates_request_replay_and_survives_restart() {
+  let temp = tempdir().expect("tempdir");
+  let state_dir = temp.path().join("state");
+  let policy = SchedulerOperationalPolicy {
+    max_active_jobs: 1,
+    max_active_jobs_per_owner: 1,
+    minimum_schedule_cadence_seconds: 1,
+    ..SchedulerOperationalPolicy::legacy_compatible()
+  };
+  let store = StateStore::initialize_with_scheduler_policy(&state_dir, None, policy)
+    .await
+    .expect("state");
+  let service = ScheduleService::new(store.clone());
+  service
+    .create(
+      &invocation("U1"),
+      CreateScheduleRequest {
+        request_id: "policy-accepted".to_owned(),
+        instruction: "Accepted schedule.".to_owned(),
+        previous_success: PreviousSuccessPolicy::None,
+        schedule: ScheduleSpec::once(200),
+        target: DeliveryTargetRequest::None,
+        capability: "none".to_owned(),
+        now: 100,
+      },
+    )
+    .await
+    .expect("accepted create");
+
+  for (subject, request_id) in [
+    ("U1", "policy-rejected"),
+    ("U1", "policy-rejected"),
+    ("U1", "policy-rejected-second"),
+    ("U2", "policy-rejected"),
+  ] {
+    let error = service
+      .create(
+        &invocation(subject),
+        CreateScheduleRequest {
+          request_id: request_id.to_owned(),
+          instruction: "Rejected schedule.".to_owned(),
+          previous_success: PreviousSuccessPolicy::None,
+          schedule: ScheduleSpec::once(201),
+          target: DeliveryTargetRequest::None,
+          capability: "none".to_owned(),
+          now: 101,
+        },
+      )
+      .await
+      .expect_err("active limit rejection");
+    assert_eq!(error.code(), "active_job_limit_exceeded");
+  }
+  let snapshot = store
+    .scheduler_observability_snapshot(101, 10, 100)
+    .await
+    .expect("policy metric");
+  assert_eq!(
+    snapshot
+      .transition_totals
+      .iter()
+      .find(|total| total.kind == SchedulerTransitionKind::PolicyLimitRejected)
+      .expect("policy metric kind")
+      .value,
+    3
+  );
+  drop(service);
+  drop(store);
+  let restarted = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("restart state");
+  let snapshot = restarted
+    .scheduler_observability_snapshot(101, 10, 100)
+    .await
+    .expect("restart policy metric");
+  assert_eq!(
+    snapshot
+      .transition_totals
+      .iter()
+      .find(|total| total.kind == SchedulerTransitionKind::PolicyLimitRejected)
+      .expect("policy metric kind")
+      .value,
+    3
+  );
 }
 
 #[tokio::test]

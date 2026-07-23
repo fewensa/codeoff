@@ -178,10 +178,9 @@ impl PrometheusSchedulerTelemetry {
         worker: worker_name(worker),
       };
       let capacity = i64::from(match worker {
-        SchedulerWorker::Execution => scheduler.enabled && scheduler.run_claims_enabled,
-        SchedulerWorker::DeliveryPreparation | SchedulerWorker::Delivery => {
-          scheduler.enabled && scheduler.delivery_claims_enabled
-        }
+        SchedulerWorker::Execution => scheduler.enabled,
+        SchedulerWorker::DeliveryPreparation => scheduler.enabled && !delivery_provider_available,
+        SchedulerWorker::Delivery => scheduler.enabled && delivery_provider_available,
       });
       state_metrics
         .worker_capacity
@@ -397,7 +396,7 @@ impl SchedulerTelemetry for PrometheusSchedulerTelemetry {
         }
       }
     }
-    if event.operation == SchedulerOperation::Attempt {
+    if event.operation == SchedulerOperation::Tick {
       let available = i64::from(event.status != SchedulerOperationStatus::Started);
       self
         .state_metrics
@@ -1205,10 +1204,94 @@ mod tests {
       status: SchedulerOperationStatus::Started,
       error_kind: None,
       duration: Duration::ZERO,
+      attempt: Some(1),
+    });
+    let still_available = telemetry.encode_metrics().expect("attempt metrics");
+    assert!(
+      still_available.contains("codeoff_scheduler_worker_available_slots{worker=\"execution\"} 1")
+    );
+
+    telemetry.record(SchedulerTelemetryEvent {
+      worker: SchedulerWorker::Execution,
+      operation: SchedulerOperation::Tick,
+      status: SchedulerOperationStatus::Started,
+      error_kind: None,
+      duration: Duration::ZERO,
       attempt: None,
     });
     let busy = telemetry.encode_metrics().expect("busy metrics");
     assert!(busy.contains("codeoff_scheduler_worker_available_slots{worker=\"execution\"} 0"));
+    for status in [
+      SchedulerOperationStatus::Completed,
+      SchedulerOperationStatus::Failed,
+      SchedulerOperationStatus::Cancelled,
+      SchedulerOperationStatus::Stopped,
+    ] {
+      telemetry.record(SchedulerTelemetryEvent {
+        worker: SchedulerWorker::Execution,
+        operation: SchedulerOperation::Tick,
+        status,
+        error_kind: None,
+        duration: Duration::ZERO,
+        attempt: None,
+      });
+      let available = telemetry.encode_metrics().expect("available metrics");
+      assert!(
+        available.contains("codeoff_scheduler_worker_available_slots{worker=\"execution\"} 1")
+      );
+      telemetry.record(SchedulerTelemetryEvent {
+        worker: SchedulerWorker::Execution,
+        operation: SchedulerOperation::Tick,
+        status: SchedulerOperationStatus::Started,
+        error_kind: None,
+        duration: Duration::ZERO,
+        attempt: None,
+      });
+    }
+  }
+
+  #[test]
+  fn test_worker_metrics_follow_spawn_topology() {
+    for (config, provider_available, expected) in [
+      (
+        scheduler_config(false, true, true),
+        true,
+        [
+          ("execution", 0),
+          ("delivery_preparation", 0),
+          ("delivery", 0),
+        ],
+      ),
+      (
+        scheduler_config(true, false, false),
+        true,
+        [
+          ("execution", 1),
+          ("delivery_preparation", 0),
+          ("delivery", 1),
+        ],
+      ),
+      (
+        scheduler_config(true, true, true),
+        false,
+        [
+          ("execution", 1),
+          ("delivery_preparation", 1),
+          ("delivery", 0),
+        ],
+      ),
+    ] {
+      let telemetry = PrometheusSchedulerTelemetry::new(&config, provider_available, true);
+      let metrics = telemetry.encode_metrics().expect("worker topology metrics");
+      for (worker, capacity) in expected {
+        assert!(metrics.contains(&format!(
+          "codeoff_scheduler_worker_capacity{{worker=\"{worker}\"}} {capacity}"
+        )));
+        assert!(metrics.contains(&format!(
+          "codeoff_scheduler_worker_available_slots{{worker=\"{worker}\"}} {capacity}"
+        )));
+      }
+    }
   }
 
   #[tokio::test]

@@ -1453,6 +1453,7 @@ async fn test_operator_target_bound_migration_preserves_audit_and_expands_only_d
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
       && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
       && entry.file_name() != "20260722150000_scheduler_transition_metrics.sql"
+      && entry.file_name() != "20260722160000_scheduler_telemetry_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -1862,8 +1863,42 @@ async fn test_interval_coalesces_and_overlap_forbid_blocks_next_run() {
       .expect("blocked"),
     MaterializationOutcome::Blocked
   );
-  assert!(
+  assert_eq!(
     store
+      .materialize_due_schedule("interval", 0, 200)
+      .await
+      .expect("repeated blocked poll"),
+    MaterializationOutcome::Blocked
+  );
+  let snapshot = store
+    .scheduler_observability_snapshot(200, 10, 100)
+    .await
+    .expect("overlap metric");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::OverlapSuppressed),
+    1
+  );
+  drop(store);
+  let restarted = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("restart state store");
+  assert_eq!(
+    restarted
+      .materialize_due_schedule("interval", 0, 200)
+      .await
+      .expect("blocked after restart"),
+    MaterializationOutcome::Blocked
+  );
+  let snapshot = restarted
+    .scheduler_observability_snapshot(200, 10, 100)
+    .await
+    .expect("restart overlap metric");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::OverlapSuppressed),
+    1
+  );
+  assert!(
+    restarted
       .list_due_scheduled_jobs(200, 10)
       .await
       .expect("due")
@@ -2073,7 +2108,8 @@ async fn scheduler_cadence_migration_upgrades_pre_and_exact_policy_checkpoints()
     for entry in std::fs::read_dir(&source).expect("read migrations") {
       let entry = entry.expect("migration entry");
       let file_name = entry.file_name();
-      if file_name == "20260722150000_scheduler_transition_metrics.sql"
+      if file_name == "20260722160000_scheduler_telemetry_authority.sql"
+        || file_name == "20260722150000_scheduler_transition_metrics.sql"
         || file_name == "20260722140000_scheduler_cadence_proof.sql"
         || (!include_policy_migration
           && file_name == "20260722130000_scheduler_operational_policy.sql")
@@ -2152,7 +2188,9 @@ async fn scheduler_transition_metrics_migration_upgrades_exact_cadence_checkpoin
   let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
   for entry in std::fs::read_dir(source).expect("read migrations") {
     let entry = entry.expect("migration entry");
-    if entry.file_name() != "20260722150000_scheduler_transition_metrics.sql" {
+    if entry.file_name() != "20260722150000_scheduler_transition_metrics.sql"
+      && entry.file_name() != "20260722160000_scheduler_telemetry_authority.sql"
+    {
       std::fs::copy(entry.path(), checkpoint.join(entry.file_name()))
         .expect("copy checkpoint migration");
     }
@@ -2200,6 +2238,76 @@ async fn scheduler_transition_metrics_migration_upgrades_exact_cadence_checkpoin
 }
 
 #[tokio::test]
+async fn scheduler_telemetry_authority_migration_upgrades_exact_metrics_checkpoint() {
+  let temp = tempdir().expect("tempdir");
+  let checkpoint = temp.path().join("metrics-checkpoint");
+  std::fs::create_dir(&checkpoint).expect("create checkpoint migrations");
+  let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+  for entry in std::fs::read_dir(source).expect("read migrations") {
+    let entry = entry.expect("migration entry");
+    if entry.file_name() != "20260722160000_scheduler_telemetry_authority.sql" {
+      std::fs::copy(entry.path(), checkpoint.join(entry.file_name()))
+        .expect("copy checkpoint migration");
+    }
+  }
+  let state_dir = temp.path().join("state");
+  std::fs::create_dir(&state_dir).expect("create state dir");
+  let options = SqliteConnectOptions::from_str(&database_url(&state_dir))
+    .expect("parse database URL")
+    .create_if_missing(true)
+    .foreign_keys(true);
+  let pool = SqlitePoolOptions::new()
+    .max_connections(1)
+    .connect_with(options)
+    .await
+    .expect("connect checkpoint");
+  Migrator::new(checkpoint)
+    .await
+    .expect("load checkpoint migrations")
+    .run(&pool)
+    .await
+    .expect("run checkpoint migrations");
+  let metrics_checksum: Vec<u8> =
+    sqlx::query_scalar("select checksum from _sqlx_migrations where version = 20260722150000")
+      .fetch_one(&pool)
+      .await
+      .expect("read metrics migration checksum");
+  pool.close().await;
+
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("upgrade metrics checkpoint");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("reconnect upgraded database");
+  let upgraded_checksum: Vec<u8> =
+    sqlx::query_scalar("select checksum from _sqlx_migrations where version = 20260722150000")
+      .fetch_one(&pool)
+      .await
+      .expect("read upgraded metrics checksum");
+  assert_eq!(upgraded_checksum, metrics_checksum);
+  let authority_tables: i64 = sqlx::query_scalar(
+    "select count(*) from sqlite_schema where type = 'table' and name in ('scheduler_transition_cursors', 'scheduler_metric_request_decisions')",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read telemetry authority tables");
+  assert_eq!(authority_tables, 2);
+  let counter_columns: i64 = sqlx::query_scalar(
+    "select (select count(*) from pragma_table_info('scheduled_runs') where name = 'telemetry_counter_limit_recorded') + (select count(*) from pragma_table_info('scheduled_run_deliveries') where name = 'telemetry_counter_limit_recorded')",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("read telemetry authority columns");
+  assert_eq!(counter_columns, 2);
+  drop(pool);
+  drop(store);
+  StateStore::initialize(&state_dir, None)
+    .await
+    .expect("repeat upgraded initialize");
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() {
   let temp = tempdir().expect("create tempdir");
@@ -2226,6 +2334,7 @@ async fn test_current_schema_upgrades_forward_and_repeated_initialize_is_safe() 
           | "20260722100000_scheduler_delivery_retention_null_safety.sql"
           | "20260722140000_scheduler_cadence_proof.sql"
           | "20260722150000_scheduler_transition_metrics.sql"
+          | "20260722160000_scheduler_telemetry_authority.sql"
       )
     ) {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
@@ -2839,6 +2948,7 @@ async fn test_execution_hardening_migration_rejects_mismatched_current_attempt()
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
       && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
       && entry.file_name() != "20260722150000_scheduler_transition_metrics.sql"
+      && entry.file_name() != "20260722160000_scheduler_telemetry_authority.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -2930,6 +3040,7 @@ async fn test_execution_hardening_migration_rejects_exhausted_invalid_baseline()
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
       && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
       && entry.file_name() != "20260722150000_scheduler_transition_metrics.sql"
+      && entry.file_name() != "20260722160000_scheduler_telemetry_authority.sql"
     {
       std::fs::copy(entry.path(), old_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -3019,6 +3130,7 @@ async fn test_delivery_authority_migration_quarantines_unverifiable_issue_06_pay
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
       && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
       && entry.file_name() != "20260722150000_scheduler_transition_metrics.sql"
+      && entry.file_name() != "20260722160000_scheduler_telemetry_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy issue-06 migration");
@@ -3205,6 +3317,7 @@ async fn test_delivery_authority_migration_conservatively_maps_legacy_states_and
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
       && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
       && entry.file_name() != "20260722150000_scheduler_transition_metrics.sql"
+      && entry.file_name() != "20260722160000_scheduler_telemetry_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -3471,6 +3584,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_parent_foreign_key
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
       && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
       && entry.file_name() != "20260722150000_scheduler_transition_metrics.sql"
+      && entry.file_name() != "20260722160000_scheduler_telemetry_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -3552,6 +3666,7 @@ async fn test_delivery_intent_migration_rolls_back_on_invalid_existing_target_id
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
       && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
       && entry.file_name() != "20260722150000_scheduler_transition_metrics.sql"
+      && entry.file_name() != "20260722160000_scheduler_telemetry_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -3646,6 +3761,7 @@ async fn test_delivery_intent_migration_rolls_back_on_existing_blob_target_ident
       && entry.file_name() != "20260722130000_scheduler_operational_policy.sql"
       && entry.file_name() != "20260722140000_scheduler_cadence_proof.sql"
       && entry.file_name() != "20260722150000_scheduler_transition_metrics.sql"
+      && entry.file_name() != "20260722160000_scheduler_telemetry_authority.sql"
     {
       std::fs::copy(entry.path(), parent_migrations.join(entry.file_name()))
         .expect("copy parent migration");
@@ -3977,6 +4093,18 @@ async fn assert_counter_exhaustion(exhaust_attempt: bool) {
     store.claim_next_scheduled_run("worker", 111, 141).await,
     Err(StateError::ScheduledRunCounterExhausted)
   ));
+  assert!(matches!(
+    store.claim_next_scheduled_run("worker", 111, 141).await,
+    Err(StateError::ScheduledRunCounterExhausted)
+  ));
+  let snapshot = store
+    .scheduler_observability_snapshot(111, 10, 100)
+    .await
+    .expect("counter limit metric");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::PolicyLimitRejected),
+    1
+  );
   let unchanged: (String, i64, i64, Option<String>, i64) = sqlx::query_as(
     "select state, attempt, fence, lease_owner, (select count(*) from scheduled_run_attempts where run_id = ?1) from scheduled_runs where run_id = ?1",
   )
@@ -3985,6 +4113,137 @@ async fn assert_counter_exhaustion(exhaust_attempt: bool) {
   .await
   .expect("read unchanged run");
   assert_eq!(unchanged, ("pending".to_owned(), attempt, fence, None, 0));
+}
+
+#[tokio::test]
+async fn test_counter_limit_metric_counts_each_entity_once_across_restart() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  for job_id in ["exhausted-first", "exhausted-second"] {
+    store
+      .create_scheduled_job(&create_request(job_id, ScheduleSpec::once(110), 100))
+      .await
+      .expect("create job");
+    let MaterializationOutcome::Created(run) = store
+      .materialize_due_schedule(job_id, 0, 110)
+      .await
+      .expect("materialize")
+    else {
+      panic!("expected run");
+    };
+    sqlx::query("update scheduled_runs set attempt = 9223372036854775807 where run_id = ?1")
+      .bind(run.run_id)
+      .execute(&pool)
+      .await
+      .expect("seed exhausted run");
+  }
+  for _ in 0..2 {
+    assert!(matches!(
+      store.claim_next_scheduled_run("worker", 111, 141).await,
+      Err(StateError::ScheduledRunCounterExhausted)
+    ));
+  }
+  let snapshot = store
+    .scheduler_observability_snapshot(111, 10, 100)
+    .await
+    .expect("counter limit metric");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::PolicyLimitRejected),
+    2
+  );
+  drop(pool);
+  drop(store);
+  let restarted = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("restart store");
+  assert!(matches!(
+    restarted.claim_next_scheduled_run("worker", 111, 141).await,
+    Err(StateError::ScheduledRunCounterExhausted)
+  ));
+  let snapshot = restarted
+    .scheduler_observability_snapshot(111, 10, 100)
+    .await
+    .expect("restart counter limit metric");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::PolicyLimitRejected),
+    2
+  );
+}
+
+#[tokio::test]
+async fn test_typed_preflight_validation_metrics_count_only_accepted_transitions() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  for (index, error_kind) in [
+    "profile_validation_failed",
+    "artifact_validation_failed",
+    "tool_list_validation_failed",
+    "preflight_rejected",
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let job_id = format!("typed-validation-{index}");
+    store
+      .create_scheduled_job(&create_request(&job_id, ScheduleSpec::once(110), 100))
+      .await
+      .expect("create job");
+    store
+      .materialize_due_schedule(&job_id, 0, 110)
+      .await
+      .expect("materialize");
+    let claim = store
+      .claim_next_scheduled_run("worker", 111, 141)
+      .await
+      .expect("claim")
+      .expect("claimed run");
+    store
+      .record_scheduled_run_preflight_failure(
+        &claim.binding,
+        PreflightFailureDisposition::Fail,
+        error_kind,
+        "bounded failure",
+        112,
+      )
+      .await
+      .expect("record preflight failure");
+    assert!(matches!(
+      store
+        .record_scheduled_run_preflight_failure(
+          &claim.binding,
+          PreflightFailureDisposition::Fail,
+          error_kind,
+          "stale replay",
+          113,
+        )
+        .await,
+      Err(StateError::ScheduledRunLostLease)
+    ));
+  }
+  let snapshot = store
+    .scheduler_observability_snapshot(113, 10, 100)
+    .await
+    .expect("validation metrics");
+  for kind in [
+    SchedulerTransitionKind::ProfileValidationFailed,
+    SchedulerTransitionKind::ArtifactValidationFailed,
+    SchedulerTransitionKind::ToolListValidationFailed,
+  ] {
+    assert_eq!(transition_total(&snapshot, kind), 1, "kind={kind:?}");
+  }
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::StaleFenceRejected),
+    4
+  );
 }
 
 #[tokio::test]
@@ -5317,6 +5576,14 @@ async fn test_success_completion_rolls_back_on_post_write_sqlite_interrupt() {
   );
   assert_uncommitted_success_authority(&state_dir, &claim, "interrupt-completion").await;
   fault.reset().await.expect("remove interrupt hooks");
+  let snapshot = store
+    .scheduler_observability_snapshot(120, 10, 100)
+    .await
+    .expect("rolled-back transition metrics");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::RunCompleted),
+    0
+  );
   assert_eq!(
     store
       .complete_scheduled_run_success(
@@ -5329,6 +5596,14 @@ async fn test_success_completion_rolls_back_on_post_write_sqlite_interrupt() {
         "complete after interrupt reset ({writes_observed} writes): {error}"
       )),
     ScheduledRunSuccessOutcome::Committed
+  );
+  let snapshot = store
+    .scheduler_observability_snapshot(120, 10, 100)
+    .await
+    .expect("committed transition metrics");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::RunCompleted),
+    1
   );
 }
 
@@ -5657,6 +5932,184 @@ async fn test_stale_fence_completion_only_records_late_evidence() {
       0,
       1
     )
+  );
+  let snapshot = store
+    .scheduler_observability_snapshot(140, 10, 100)
+    .await
+    .expect("stale completion metric");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::StaleFenceRejected),
+    1
+  );
+}
+
+#[tokio::test]
+async fn test_stale_run_heartbeat_and_preflight_cas_each_count_once() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  store
+    .create_scheduled_job(&create_request(
+      "stale-run-cas",
+      ScheduleSpec::once(110),
+      100,
+    ))
+    .await
+    .expect("create job");
+  store
+    .materialize_due_schedule("stale-run-cas", 0, 110)
+    .await
+    .expect("materialize");
+  let stale = store
+    .claim_next_scheduled_run("worker-a", 111, 120)
+    .await
+    .expect("claim")
+    .expect("claimed run");
+  assert!(matches!(
+    store
+      .reclaim_next_expired_scheduled_run(121, 3, 130)
+      .await
+      .expect("reclaim"),
+    ExpiredRunReclaimOutcome::Retried { .. }
+  ));
+  assert!(matches!(
+    store
+      .heartbeat_scheduled_run(&stale.binding, 121, 150)
+      .await,
+    Err(StateError::ScheduledRunLostLease)
+  ));
+  let profile =
+    AttestedExecutionProfileSnapshot::new(1, "{}", "sha256-v1", "profile").expect("profile");
+  assert!(matches!(
+    store
+      .mark_scheduled_run_executing(&stale.binding, &profile, 121)
+      .await,
+    Err(StateError::ScheduledRunLostLease)
+  ));
+  assert!(matches!(
+    store
+      .record_scheduled_run_preflight_failure(
+        &stale.binding,
+        PreflightFailureDisposition::Fail,
+        "profile_validation_failed",
+        "stale preflight",
+        121,
+      )
+      .await,
+    Err(StateError::ScheduledRunLostLease)
+  ));
+  let snapshot = store
+    .scheduler_observability_snapshot(121, 10, 100)
+    .await
+    .expect("stale CAS metrics");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::StaleFenceRejected),
+    3
+  );
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::ProfileValidationFailed),
+    0
+  );
+}
+
+#[tokio::test]
+async fn test_stale_delivery_heartbeat_and_terminal_cas_each_count_once() {
+  let temp = tempdir().expect("create tempdir");
+  let state_dir = temp.path().join("state");
+  let store = StateStore::initialize(&state_dir, None)
+    .await
+    .expect("initialize store");
+  let pool = SqlitePool::connect(&database_url(&state_dir))
+    .await
+    .expect("connect database");
+  let job_id = "stale-delivery-cas";
+  let mut request = create_request(job_id, ScheduleSpec::once(110), 100);
+  request.targets = vec![second_target(job_id)];
+  store
+    .create_scheduled_job(&request)
+    .await
+    .expect("create job");
+  let run = complete_due_run(&store, job_id, 110, 120).await;
+  let delivery_id: String =
+    sqlx::query_scalar("select delivery_id from scheduled_run_deliveries where run_id = ?1")
+      .bind(run.binding.run_id())
+      .fetch_one(&pool)
+      .await
+      .expect("delivery id");
+  store
+    .prepare_scheduled_delivery(
+      &delivery_id,
+      "text/plain; charset=utf-8",
+      "payload",
+      1,
+      121,
+      SkippedNoneBaselinePolicy::DoNotAdvance,
+    )
+    .await
+    .expect("prepare delivery");
+  let stale = store
+    .claim_next_scheduled_delivery("worker-a", 122, 130)
+    .await
+    .expect("claim delivery")
+    .expect("delivery claim");
+  assert_eq!(
+    store
+      .reclaim_expired_scheduled_deliveries(131, 1)
+      .await
+      .expect("reclaim delivery"),
+    1
+  );
+  assert!(matches!(
+    store
+      .heartbeat_scheduled_delivery(&stale.binding, 131, 160)
+      .await,
+    Err(StateError::ScheduledDeliveryLostLease)
+  ));
+  assert!(matches!(
+    store
+      .complete_scheduled_delivery_delivered(&stale.binding, "receipt", 131)
+      .await,
+    Err(StateError::ScheduledDeliveryLostLease)
+  ));
+  let snapshot = store
+    .scheduler_observability_snapshot(131, 10, 100)
+    .await
+    .expect("stale delivery metrics");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::StaleFenceRejected),
+    2
+  );
+}
+
+#[tokio::test]
+async fn test_stale_delivery_reconcile_counts_one_rejected_attempt() {
+  let temp = tempdir().expect("create tempdir");
+  let store = StateStore::initialize(&temp.path().join("state"), None)
+    .await
+    .expect("initialize store");
+  assert_eq!(
+    store
+      .reconcile_expired_scheduled_delivery(
+        "missing-delivery",
+        ScheduledDeliveryState::Sending,
+        1,
+        1,
+        100,
+        101,
+      )
+      .await
+      .expect("reconcile stale delivery"),
+    ScheduledDeliveryReconcileOutcome::Stale
+  );
+  let snapshot = store
+    .scheduler_observability_snapshot(101, 10, 100)
+    .await
+    .expect("stale reconcile metric");
+  assert_eq!(
+    transition_total(&snapshot, SchedulerTransitionKind::StaleFenceRejected),
+    1
   );
 }
 

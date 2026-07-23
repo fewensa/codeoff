@@ -222,6 +222,21 @@ fn scheduler_transition_kind(value: &str) -> Result<SchedulerTransitionKind, Sta
 }
 
 impl StateStore {
+  async fn record_stale_fence_rejection(&self) -> Result<(), StateError> {
+    let updated = sqlx::query(
+      "update scheduler_transition_totals set value = value + min(1, 9223372036854775807 - value) where kind = 'stale_fence_rejected'",
+    )
+    .execute(&self.pool)
+    .await
+    .map_err(scheduler_error)?;
+    if updated.rows_affected() != 1 {
+      return Err(StateError::InvalidSchedulerState {
+        reason: "scheduler transition metric vocabulary is incomplete".to_owned(),
+      });
+    }
+    Ok(())
+  }
+
   /// Registers or resumes the highest trusted scheduled executor deployment epoch.
   ///
   /// # Errors
@@ -1041,10 +1056,17 @@ impl StateStore {
       .await
       .map_err(scheduler_error)?;
       if exhausted != 0 {
+        let newly_recorded = sqlx::query(
+          "update scheduled_runs set telemetry_counter_limit_recorded = 1 where state = 'pending' and (next_attempt_at is null or next_attempt_at <= ?1) and (attempt = 9223372036854775807 or fence = 9223372036854775807) and telemetry_counter_limit_recorded = 0",
+        )
+        .bind(mutation_now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(scheduler_error)?;
         increment_scheduler_transition_total(
           &mut transaction,
           SchedulerTransitionKind::PolicyLimitRejected,
-          1,
+          newly_recorded.rows_affected(),
         )
         .await?;
         ensure_executor_admission_not_cancelled(admission, cancellation)?;
@@ -1162,6 +1184,8 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     if run.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledRunLostLease);
     }
     let attempt = sqlx::query(
@@ -1178,6 +1202,8 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     if attempt.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledRunLostLease);
     }
     transaction.commit().await.map_err(scheduler_error)
@@ -1209,6 +1235,8 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     if run.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledRunLostLease);
     }
     let attempt = sqlx::query(
@@ -1228,6 +1256,8 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     if attempt.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledRunLostLease);
     }
     transaction.commit().await.map_err(scheduler_error)
@@ -1599,10 +1629,16 @@ impl StateStore {
       .await
       .map_err(scheduler_error)?;
       if exhausted != 0 {
+        let newly_recorded = sqlx::query(
+          "update scheduled_run_deliveries set telemetry_counter_limit_recorded = 1 where state = 'pending' and authority_kind = 'intent_v1' and payload_snapshot is not null and (attempt = 9223372036854775807 or fence = 9223372036854775807) and telemetry_counter_limit_recorded = 0",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(scheduler_error)?;
         increment_scheduler_transition_total(
           &mut transaction,
           SchedulerTransitionKind::PolicyLimitRejected,
-          1,
+          newly_recorded.rows_affected(),
         )
         .await?;
       }
@@ -1638,6 +1674,8 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     if inserted.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledDeliveryLostLease);
     }
     let payload = delivery_payload_from_row(&row)?;
@@ -1749,10 +1787,18 @@ impl StateStore {
       .await
       .map_err(scheduler_error)?;
       if exhausted != 0 {
+        let newly_recorded = sqlx::query(
+          "update scheduled_run_deliveries set telemetry_counter_limit_recorded = 1 where delivery_id = ?1 and state = ?2 and (attempt = 9223372036854775807 or fence = 9223372036854775807) and telemetry_counter_limit_recorded = 0",
+        )
+        .bind(authority.delivery_id())
+        .bind("pending")
+        .execute(&mut *transaction)
+        .await
+        .map_err(scheduler_error)?;
         increment_scheduler_transition_total(
           &mut transaction,
           SchedulerTransitionKind::PolicyLimitRejected,
-          1,
+          newly_recorded.rows_affected(),
         )
         .await?;
       }
@@ -1788,6 +1834,8 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     if inserted.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledDeliveryLostLease);
     }
     let payload = delivery_payload_from_row(&row)?;
@@ -1906,6 +1954,8 @@ impl StateStore {
     .await
     .map_err(scheduler_error)?;
     if delivery.rows_affected() != 1 || attempt.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledDeliveryLostLease);
     }
     transaction.commit().await.map_err(scheduler_error)
@@ -2116,6 +2166,8 @@ impl StateStore {
       .await
       .map_err(scheduler_error)?;
       if delivery.rows_affected() != 1 || updated.rows_affected() != 1 {
+        transaction.rollback().await.map_err(scheduler_error)?;
+        self.record_stale_fence_rejection().await?;
         return Err(StateError::ScheduledDeliveryLostLease);
       }
       reclaimed += 1;
@@ -2138,7 +2190,7 @@ impl StateStore {
     validate_text("scheduled delivery provider receipt", provider_receipt)
       .map_err(invalid_value)?;
     let mut transaction = self.pool.begin().await.map_err(scheduler_error)?;
-    transition_delivery_terminal(
+    let transition = transition_delivery_terminal(
       &mut transaction,
       binding,
       "delivered",
@@ -2149,7 +2201,13 @@ impl StateStore {
       None,
       completed_at,
     )
-    .await?;
+    .await;
+    if matches!(transition, Err(StateError::ScheduledDeliveryLostLease)) {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
+      return Err(StateError::ScheduledDeliveryLostLease);
+    }
+    transition?;
     if !advance_accepted_delivery_baseline_in_transaction(
       &mut transaction,
       binding.delivery_id(),
@@ -2226,8 +2284,12 @@ impl StateStore {
       .bind(completed_at)
       .fetch_optional(&mut *transaction)
       .await
-      .map_err(scheduler_error)?
-      .ok_or(StateError::ScheduledDeliveryLostLease)?;
+      .map_err(scheduler_error)?;
+      let Some(row) = row else {
+        transaction.rollback().await.map_err(scheduler_error)?;
+        self.record_stale_fence_rejection().await?;
+        return Err(StateError::ScheduledDeliveryLostLease);
+      };
       let policy = scheduler_policy_from_snapshot(
         row
           .try_get("scheduler_policy_version")
@@ -2247,7 +2309,7 @@ impl StateStore {
         next_attempt_at = None;
       }
     }
-    transition_delivery_terminal(
+    let transition = transition_delivery_terminal(
       &mut transaction,
       binding,
       state,
@@ -2258,7 +2320,13 @@ impl StateStore {
       next_attempt_at,
       completed_at,
     )
-    .await?;
+    .await;
+    if matches!(transition, Err(StateError::ScheduledDeliveryLostLease)) {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
+      return Err(StateError::ScheduledDeliveryLostLease);
+    }
+    transition?;
     transaction.commit().await.map_err(scheduler_error)
   }
 
@@ -3017,6 +3085,12 @@ where run.run_id = ?2
         completed_at,
       )
       .await?;
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::StaleFenceRejected,
+        1,
+      )
+      .await?;
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledRunSuccessOutcome::LateEvidence(evidence));
     };
@@ -3239,6 +3313,12 @@ where run.run_id = ?2
       observed_at,
     )
     .await?;
+    increment_scheduler_transition_total(
+      &mut transaction,
+      SchedulerTransitionKind::StaleFenceRejected,
+      1,
+    )
+    .await?;
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(ScheduledRunSuccessOutcome::LateEvidence(evidence))
   }
@@ -3291,6 +3371,10 @@ where run.run_id = ?2
       .await
   }
 
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps the fenced preflight transition and stale rejection accounting atomic"
+  )]
   async fn record_scheduled_run_preflight_failure_inner(
     &self,
     binding: &RunLeaseBinding,
@@ -3320,8 +3404,12 @@ where run.run_id = ?2
       .bind(now)
       .fetch_optional(&mut *transaction)
       .await
-      .map_err(scheduler_error)?
-      .ok_or(StateError::ScheduledRunLostLease)?;
+      .map_err(scheduler_error)?;
+      let Some(row) = row else {
+        transaction.rollback().await.map_err(scheduler_error)?;
+        self.record_stale_fence_rejection().await?;
+        return Err(StateError::ScheduledRunLostLease);
+      };
       let policy = scheduler_policy_from_snapshot(
         row
           .try_get("scheduler_policy_version")
@@ -3375,6 +3463,8 @@ where run.run_id = ?2
     .await
     .map_err(scheduler_error)?;
     if run.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledRunLostLease);
     }
     let attempt = sqlx::query(
@@ -3393,6 +3483,8 @@ where run.run_id = ?2
     .await
     .map_err(scheduler_error)?;
     if attempt.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledRunLostLease);
     }
     transaction.commit().await.map_err(scheduler_error)
@@ -3405,6 +3497,10 @@ where run.run_id = ?2
   ///
   /// # Errors
   /// Returns an error for invalid policy data, malformed persisted authority, or storage failure.
+  #[allow(
+    clippy::too_many_lines,
+    reason = "keeps the fenced execution transition and stale evidence accounting atomic"
+  )]
   pub async fn record_scheduled_run_execution_outcome(
     &self,
     binding: &RunLeaseBinding,
@@ -3464,6 +3560,12 @@ where run.run_id = ?2
         now,
       )
       .await?;
+      increment_scheduler_transition_total(
+        &mut transaction,
+        SchedulerTransitionKind::StaleFenceRejected,
+        1,
+      )
+      .await?;
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(ScheduledRunExecutionOutcome::LateEvidence(evidence));
     };
@@ -3487,6 +3589,8 @@ where run.run_id = ?2
     .await
     .map_err(scheduler_error)?;
     if run.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledRunLostLease);
     }
     let attempt = sqlx::query(
@@ -3505,6 +3609,8 @@ where run.run_id = ?2
     .await
     .map_err(scheduler_error)?;
     if attempt.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledRunLostLease);
     }
     transaction.commit().await.map_err(scheduler_error)?;
@@ -3627,6 +3733,8 @@ where run.run_id = ?2
     .await
     .map_err(scheduler_error)?;
     if updated.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledRunLostLease);
     }
     let attempt_updated = sqlx::query(
@@ -3645,6 +3753,8 @@ where run.run_id = ?2
     .await
     .map_err(scheduler_error)?;
     if attempt_updated.rows_affected() != 1 {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
       return Err(StateError::ScheduledRunLostLease);
     }
     increment_scheduler_transition_total(
@@ -4484,7 +4594,7 @@ where run.run_id = ?2
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(SchedulerOperatorMutationOutcome::Applied);
     }
-    apply_unknown_delivery_operator_action(
+    let transition = apply_unknown_delivery_operator_action(
       &mut transaction,
       delivery_id,
       expected_attempt,
@@ -4492,7 +4602,13 @@ where run.run_id = ?2
       action,
       request.occurred_at,
     )
-    .await?;
+    .await;
+    if matches!(transition, Err(StateError::ScheduledDeliveryLostLease)) {
+      transaction.rollback().await.map_err(scheduler_error)?;
+      self.record_stale_fence_rejection().await?;
+      return Err(StateError::ScheduledDeliveryLostLease);
+    }
+    transition?;
     transaction.commit().await.map_err(scheduler_error)?;
     Ok(SchedulerOperatorMutationOutcome::Applied)
   }
@@ -4978,6 +5094,7 @@ where run.run_id = ?2
     {
       return Ok(MaterializationOutcome::NotDue);
     }
+    let due = required_due(next_run_at)?;
     let blocked: i64 = sqlx::query_scalar(
       "select exists(select 1 from scheduled_runs where job_id = ?1 and overlap_slot = 1)",
     )
@@ -4986,16 +5103,25 @@ where run.run_id = ?2
     .await
     .map_err(scheduler_error)?;
     if blocked != 0 {
-      increment_scheduler_transition_total(
-        &mut transaction,
-        SchedulerTransitionKind::OverlapSuppressed,
-        1,
+      let recorded = sqlx::query(
+        "insert into scheduler_transition_cursors (kind, entity_id, cursor_value) values ('overlap_suppressed', ?1, ?2) on conflict(kind, entity_id) do update set cursor_value = excluded.cursor_value where excluded.cursor_value > scheduler_transition_cursors.cursor_value",
       )
-      .await?;
+      .bind(job_id)
+      .bind(due)
+      .execute(&mut *transaction)
+      .await
+      .map_err(scheduler_error)?;
+      if recorded.rows_affected() == 1 {
+        increment_scheduler_transition_total(
+          &mut transaction,
+          SchedulerTransitionKind::OverlapSuppressed,
+          1,
+        )
+        .await?;
+      }
       transaction.commit().await.map_err(scheduler_error)?;
       return Ok(MaterializationOutcome::Blocked);
     }
-    let due = required_due(next_run_at)?;
     let schedule = schedule_from_row(&row)?;
     let scheduler_policy_version: i64 = row
       .try_get("scheduler_policy_version")

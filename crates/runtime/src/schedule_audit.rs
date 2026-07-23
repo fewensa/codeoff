@@ -95,7 +95,11 @@ fn classify_error(error: &ScheduleServiceError) -> AuditClassification {
   let (outcome, decision) = match error {
     ScheduleServiceError::Unauthorized => ("denied", "deny"),
     ScheduleServiceError::NotVisible => ("not_visible", "deny"),
-    ScheduleServiceError::InvalidRequest(_) => ("validation", "deny"),
+    ScheduleServiceError::InvalidRequest(_)
+    | ScheduleServiceError::PolicyLimit(_)
+    | ScheduleServiceError::State(StateError::ScheduledActiveJobLimitExceeded { .. }) => {
+      ("validation", "deny")
+    }
     ScheduleServiceError::ResolverUnavailable => ("resolver_unavailable", "error"),
     ScheduleServiceError::TargetUnavailable => ("target_unavailable", "deny"),
     ScheduleServiceError::ResolverNotAllowed => ("resolver_not_allowed", "deny"),

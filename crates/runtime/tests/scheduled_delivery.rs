@@ -1119,41 +1119,45 @@ async fn shutdown_observed_before_tick_never_polls_provider_or_mutates_delivery(
 
 #[tokio::test]
 async fn shutdown_between_readiness_and_claim_leaves_authority_unmodified() {
-  let (_temp, store, delivery_id, _) =
-    prepared_delivery("delivery-shutdown-after-readiness", "body").await;
-  let provider = Arc::new(BlockingReadinessProvider {
-    readiness_started: Notify::new(),
-    release_readiness: Notify::new(),
-    sends: AtomicUsize::new(0),
-  });
-  let (shutdown_tx, shutdown_rx) = watch::channel(false);
-  let task_store = store.clone();
-  let task_provider = Arc::clone(&provider);
-  let task = tokio::spawn(async move {
-    run_scheduled_delivery_tick_with_clock(
-      &task_store,
-      task_provider.as_ref(),
-      "worker",
-      clock(122),
-      shutdown_rx,
-    )
-    .await
-  });
-  provider.readiness_started.notified().await;
-  shutdown_tx.send(true).expect("shutdown");
-  provider.release_readiness.notify_one();
-  assert_eq!(
-    task.await.expect("task").expect("tick"),
-    ScheduledDeliveryTickOutcome::Cancelled
-  );
-  assert_eq!(provider.sends.load(Ordering::SeqCst), 0);
-  assert_eq!(
-    store
-      .scheduled_delivery_authority_for_tests(&delivery_id)
+  for iteration in 0..20 {
+    let job_id = format!("delivery-shutdown-after-readiness-{iteration}");
+    let (_temp, store, delivery_id, _) = prepared_delivery(&job_id, "body").await;
+    let provider = Arc::new(BlockingReadinessProvider {
+      readiness_started: Notify::new(),
+      release_readiness: Notify::new(),
+      sends: AtomicUsize::new(0),
+    });
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task_store = store.clone();
+    let task_provider = Arc::clone(&provider);
+    let task = tokio::spawn(async move {
+      run_scheduled_delivery_tick_with_clock(
+        &task_store,
+        task_provider.as_ref(),
+        "worker",
+        clock(122),
+        shutdown_rx,
+      )
       .await
-      .expect("authority"),
-    ("pending".to_owned(), 0, 0, 0)
-  );
+    });
+    provider.readiness_started.notified().await;
+    shutdown_tx.send(true).expect("shutdown");
+    provider.release_readiness.notify_one();
+    assert_eq!(
+      task.await.expect("task").expect("tick"),
+      ScheduledDeliveryTickOutcome::Cancelled,
+      "iteration={iteration}"
+    );
+    assert_eq!(provider.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(
+      store
+        .scheduled_delivery_authority_for_tests(&delivery_id)
+        .await
+        .expect("authority"),
+      ("pending".to_owned(), 0, 0, 0),
+      "iteration={iteration}"
+    );
+  }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1848,55 +1852,62 @@ async fn shutdown_during_preclaim_storage_wait_stops_without_dispatch() {
 
 #[tokio::test]
 async fn worker_shutdown_joins_in_flight_send_without_new_claims() {
-  let (_temp, store, _, _) = prepared_delivery("delivery-worker-shutdown", "body").await;
-  let second_delivery_id =
-    prepare_next_delivery(&store, "delivery-worker-shutdown", "second body").await;
-  let provider = Arc::new(BlockingProvider {
-    calls: AtomicUsize::new(0),
-    started: Notify::new(),
-    release: Notify::new(),
-  });
-  let (shutdown_tx, shutdown_rx) = watch::channel(false);
-  let task_store = store.clone();
-  let task_provider: Arc<dyn DeliveryProvider> = provider.clone();
-  let telemetry = Arc::new(RecordingTelemetry::default());
-  let task = tokio::spawn(run_scheduled_delivery_worker_with_clock(
-    task_store,
-    task_provider,
-    "worker".to_owned(),
-    clock(122),
-    shutdown_rx,
-    telemetry.clone(),
-  ));
-  provider.started.notified().await;
-  shutdown_tx.send(true).expect("shutdown");
-  tokio::time::timeout(Duration::from_secs(1), task)
-    .await
-    .expect("worker join deadline")
-    .expect("worker task")
-    .expect("worker result");
-  assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-  {
-    let events = telemetry.events.lock().expect("telemetry events");
-    let attempts = events
-      .iter()
-      .filter(|event| event.operation == SchedulerOperation::Attempt)
-      .collect::<Vec<_>>();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].worker, SchedulerWorker::Delivery);
-    assert_eq!(attempts[0].status, SchedulerOperationStatus::Started);
-    assert_eq!(attempts[0].attempt, Some(1));
-    assert_eq!(attempts[1].worker, SchedulerWorker::Delivery);
-    assert_eq!(attempts[1].status, SchedulerOperationStatus::Unknown);
-    assert_eq!(attempts[1].attempt, Some(1));
+  for iteration in 0..20 {
+    let job_id = format!("delivery-worker-shutdown-{iteration}");
+    let (_temp, store, first_delivery_id, _) = prepared_delivery(&job_id, "body").await;
+    let second_delivery_id = prepare_next_delivery(&store, &job_id, "second body").await;
+    let provider = Arc::new(BlockingProvider {
+      calls: AtomicUsize::new(0),
+      started: Notify::new(),
+      release: Notify::new(),
+    });
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task_store = store.clone();
+    let task_provider: Arc<dyn DeliveryProvider> = provider.clone();
+    let telemetry = Arc::new(RecordingTelemetry::default());
+    let task = tokio::spawn(run_scheduled_delivery_worker_with_clock(
+      task_store,
+      task_provider,
+      "worker".to_owned(),
+      clock(122),
+      shutdown_rx,
+      telemetry.clone(),
+    ));
+    provider.started.notified().await;
+    shutdown_tx.send(true).expect("shutdown");
+    task.await.expect("worker task").expect("worker result");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    {
+      let events = telemetry.events.lock().expect("telemetry events");
+      let attempts = events
+        .iter()
+        .filter(|event| event.operation == SchedulerOperation::Attempt)
+        .collect::<Vec<_>>();
+      assert_eq!(attempts.len(), 2, "iteration={iteration}");
+      assert_eq!(attempts[0].worker, SchedulerWorker::Delivery);
+      assert_eq!(attempts[0].status, SchedulerOperationStatus::Started);
+      assert_eq!(attempts[0].attempt, Some(1));
+      assert_eq!(attempts[1].worker, SchedulerWorker::Delivery);
+      assert_eq!(attempts[1].status, SchedulerOperationStatus::Unknown);
+      assert_eq!(attempts[1].attempt, Some(1));
+    }
+    assert_eq!(
+      store
+        .scheduled_delivery_authority_for_tests(&first_delivery_id)
+        .await
+        .expect("first authority"),
+      ("delivery_unknown".to_owned(), 1, 1, 1),
+      "iteration={iteration}"
+    );
+    assert_eq!(
+      store
+        .scheduled_delivery_authority_for_tests(&second_delivery_id)
+        .await
+        .expect("second authority"),
+      ("pending".to_owned(), 0, 0, 0),
+      "iteration={iteration}"
+    );
   }
-  assert_eq!(
-    store
-      .scheduled_delivery_authority_for_tests(&second_delivery_id)
-      .await
-      .expect("second authority"),
-    ("pending".to_owned(), 0, 0, 0)
-  );
 }
 
 #[tokio::test]

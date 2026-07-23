@@ -18,6 +18,8 @@ use codeoff_state::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -816,6 +818,18 @@ struct ScheduledRunOrchestrator {
   run_claims_enabled: bool,
   policy: ExecutionPolicy,
   telemetry: Arc<dyn SchedulerTelemetry>,
+  #[cfg(test)]
+  test_hooks: ScheduledExecutionTestHooks,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct ScheduledExecutionTestHooks {
+  shutdown_cancellation_grace_started: Option<Arc<Notify>>,
+  terminal_commit_reached: Option<Arc<Notify>>,
+  terminal_commit_release: Option<Arc<Notify>>,
+  terminal_fallback_reached: Option<Arc<Notify>>,
+  terminal_fallback_release: Option<Arc<Notify>>,
 }
 
 impl ScheduledRunOrchestrator {
@@ -836,6 +850,8 @@ impl ScheduledRunOrchestrator {
       run_claims_enabled: true,
       policy: ExecutionPolicy::default(),
       telemetry: Arc::new(NoopSchedulerTelemetry),
+      #[cfg(test)]
+      test_hooks: ScheduledExecutionTestHooks::default(),
     }
   }
 
@@ -1254,6 +1270,10 @@ impl ScheduledRunOrchestrator {
       biased;
       () = cancellation_requested(shutdown.clone()) => {
         cancellation.store(true, Ordering::Release);
+        #[cfg(test)]
+        if let Some(started) = &self.test_hooks.shutdown_cancellation_grace_started {
+          started.notify_one();
+        }
         let result = if let Ok(result) = tokio::time::timeout(
           self.policy.cancellation_grace,
           &mut execution,
@@ -1513,6 +1533,8 @@ impl ScheduledRunOrchestrator {
     mut shutdown: Option<watch::Receiver<bool>>,
   ) -> Result<TickOutcome, StateError> {
     loop {
+      #[cfg(test)]
+      self.wait_for_terminal_commit_test_boundary().await;
       let commit = tokio::time::timeout_at(
         terminal_deadline,
         self.commit_execution_result(claim, result.clone()),
@@ -1549,6 +1571,8 @@ impl ScheduledRunOrchestrator {
         Err(_) => break,
       }
     }
+    #[cfg(test)]
+    self.wait_for_terminal_fallback_test_boundary().await;
     let fallback = self.state.record_scheduled_run_execution_outcome(
       &claim.binding,
       ScheduledExecutionDisposition::Terminal(ScheduledExecutionTerminal::OutcomeUnknown),
@@ -1564,6 +1588,28 @@ impl ScheduledRunOrchestrator {
       Ok(Err(StateError::ScheduledRunLostLease)) | Err(_) => Ok(TickOutcome::LostLease),
       Ok(Err(error)) if error.is_transient_storage_contention() => Ok(TickOutcome::LostLease),
       Ok(Err(error)) => Err(error),
+    }
+  }
+
+  #[cfg(test)]
+  async fn wait_for_terminal_commit_test_boundary(&self) {
+    if let (Some(reached), Some(release)) = (
+      &self.test_hooks.terminal_commit_reached,
+      &self.test_hooks.terminal_commit_release,
+    ) {
+      reached.notify_one();
+      release.notified().await;
+    }
+  }
+
+  #[cfg(test)]
+  async fn wait_for_terminal_fallback_test_boundary(&self) {
+    if let (Some(reached), Some(release)) = (
+      &self.test_hooks.terminal_fallback_reached,
+      &self.test_hooks.terminal_fallback_release,
+    ) {
+      reached.notify_one();
+      release.notified().await;
     }
   }
 }
@@ -1813,7 +1859,10 @@ mod tests {
     prepare_delay: Duration,
     execution_delay: Duration,
     honor_execution_cancellation: bool,
+    prepare_gate: Option<Arc<PrepareTestGate>>,
     completion_barrier: Option<Arc<Barrier>>,
+    execution_started: Option<Arc<Notify>>,
+    execution_exited: Option<Arc<Notify>>,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
   }
@@ -1826,7 +1875,10 @@ mod tests {
         prepare_delay: Duration::ZERO,
         execution_delay: Duration::ZERO,
         honor_execution_cancellation: true,
+        prepare_gate: None,
         completion_barrier: None,
+        execution_started: None,
+        execution_exited: None,
         active: Arc::new(AtomicUsize::new(0)),
         max_active: Arc::new(AtomicUsize::new(0)),
       }
@@ -1843,6 +1895,10 @@ mod tests {
       input: PrepareInput,
       _authorization: BackendAuthorization,
     ) -> Result<BackendPrepared, PrepareFailure> {
+      if let Some(gate) = &self.prepare_gate {
+        gate.reached.wait();
+        gate.release.wait();
+      }
       if !self.prepare_delay.is_zero() {
         std::thread::sleep(self.prepare_delay);
       }
@@ -1862,6 +1918,8 @@ mod tests {
           execution_delay: self.execution_delay,
           honor_cancellation: self.honor_execution_cancellation,
           completion_barrier: self.completion_barrier.clone(),
+          execution_started: self.execution_started.clone(),
+          execution_exited: self.execution_exited.clone(),
           active: Arc::clone(&self.active),
           max_active: Arc::clone(&self.max_active),
         }),
@@ -1952,8 +2010,30 @@ mod tests {
     execution_delay: Duration,
     honor_cancellation: bool,
     completion_barrier: Option<Arc<Barrier>>,
+    execution_started: Option<Arc<Notify>>,
+    execution_exited: Option<Arc<Notify>>,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
+  }
+
+  struct PrepareTestGate {
+    reached: Barrier,
+    release: Barrier,
+  }
+
+  impl PrepareTestGate {
+    fn new() -> Self {
+      Self {
+        reached: Barrier::new(2),
+        release: Barrier::new(2),
+      }
+    }
+  }
+
+  async fn wait_at_test_barrier(gate: Arc<Barrier>) {
+    tokio::task::spawn_blocking(move || gate.wait())
+      .await
+      .expect("test barrier waiter");
   }
 
   struct SwappingBackend {
@@ -2012,6 +2092,9 @@ mod tests {
     fn execute(self: Box<Self>, cancellation: Arc<AtomicBool>) -> ExecutionResult {
       let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
       self.max_active.fetch_max(active, Ordering::AcqRel);
+      if let Some(started) = &self.execution_started {
+        started.notify_one();
+      }
       let started = std::time::Instant::now();
       while started.elapsed() < self.execution_delay
         && (!self.honor_cancellation || !cancellation.load(Ordering::Acquire))
@@ -2022,6 +2105,9 @@ mod tests {
         barrier.wait();
       }
       self.active.fetch_sub(1, Ordering::AcqRel);
+      if let Some(exited) = &self.execution_exited {
+        exited.notify_one();
+      }
       self.result
     }
   }
@@ -2131,6 +2217,7 @@ mod tests {
         ..ExecutionPolicy::default()
       },
       telemetry: Arc::new(NoopSchedulerTelemetry),
+      test_hooks: ScheduledExecutionTestHooks::default(),
     }
   }
 
@@ -2898,6 +2985,7 @@ mod tests {
       run_claims_enabled: true,
       policy: ExecutionPolicy::default(),
       telemetry: Arc::new(NoopSchedulerTelemetry),
+      test_hooks: ScheduledExecutionTestHooks::default(),
     });
     let scheduled = {
       let runtime = runtime.clone();
@@ -3352,245 +3440,356 @@ mod tests {
 
   #[tokio::test]
   async fn test_hung_prepare_fails_preflight_but_guardian_retains_permit_until_exit() {
-    let (_temp, state) = fixture(&[("hung-prepare", 110)]).await;
-    let mut backend = FakeBackend::new(ExecutionResult::Completed {
-      summary: "must not execute".to_owned(),
-    });
-    backend.prepare_delay = Duration::from_millis(150);
-    let mut runtime = orchestrator(
-      state,
-      Arc::new(backend),
-      Arc::new(TestClock(AtomicI64::new(111), 1)),
-      1,
-    );
-    runtime.policy.total_timeout = Duration::from_millis(50);
-    runtime.policy.prepare_grace = Duration::from_millis(5);
-    assert_eq!(runtime.run_once().await.expect("tick"), TickOutcome::Failed);
-    assert_eq!(runtime.budget.available_permits(), 0);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(runtime.budget.available_permits(), 1);
+    let mut fixtures = Vec::new();
+    for iteration in 0..20 {
+      let job_id = format!("hung-prepare-{iteration}");
+      fixtures.push(fixture(&[(&job_id, 110)]).await);
+    }
+    for (iteration, (_temp, state)) in fixtures.into_iter().enumerate() {
+      let gate = Arc::new(PrepareTestGate::new());
+      let mut backend = FakeBackend::new(ExecutionResult::Completed {
+        summary: "must not execute".to_owned(),
+      });
+      backend.prepare_gate = Some(Arc::clone(&gate));
+      let mut configured = orchestrator(
+        state,
+        Arc::new(backend),
+        Arc::new(TestClock(AtomicI64::new(111), 1)),
+        1,
+      );
+      configured.policy.total_timeout = Duration::from_millis(50);
+      configured.policy.prepare_grace = Duration::from_millis(5);
+      let runtime = Arc::new(configured);
+      let caller = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { runtime.run_once().await })
+      };
+      let reached_gate = Arc::clone(&gate);
+      tokio::task::spawn_blocking(move || reached_gate.reached.wait())
+        .await
+        .expect("prepare start barrier");
+      tokio::time::pause();
+      tokio::time::advance(Duration::from_millis(51)).await;
+      tokio::task::yield_now().await;
+      tokio::time::advance(Duration::from_millis(6)).await;
+      assert_eq!(
+        caller.await.expect("caller").expect("tick"),
+        TickOutcome::Failed,
+        "iteration={iteration}"
+      );
+      assert_eq!(runtime.budget.available_permits(), 0);
+      let release_gate = Arc::clone(&gate);
+      tokio::task::spawn_blocking(move || release_gate.release.wait())
+        .await
+        .expect("prepare release barrier");
+      while runtime.budget.available_permits() == 0 {
+        tokio::task::yield_now().await;
+      }
+      assert_eq!(runtime.budget.available_permits(), 1);
+      tokio::time::resume();
+    }
   }
 
   #[tokio::test]
   async fn test_hung_execute_becomes_outcome_unknown_and_guardian_retains_permit() {
-    let (_temp, state) = fixture(&[("hung-execute", 110)]).await;
-    let mut backend = FakeBackend::new(ExecutionResult::Completed {
-      summary: "late completion must not win".to_owned(),
-    });
-    let completion_barrier = Arc::new(Barrier::new(2));
-    backend.completion_barrier = Some(Arc::clone(&completion_barrier));
-    backend.honor_execution_cancellation = false;
-    let mut configured = orchestrator(
-      state.clone(),
-      Arc::new(backend.clone()),
-      Arc::new(TestClock(AtomicI64::new(111), 1)),
-      1,
-    );
-    configured.policy.total_timeout = Duration::from_millis(50);
-    configured.policy.cancellation_grace = Duration::from_millis(5);
-    let runtime = Arc::new(configured);
-    let caller = {
-      let runtime = Arc::clone(&runtime);
-      tokio::spawn(async move { runtime.run_once().await })
-    };
-    tokio::time::timeout(Duration::from_secs(1), async {
-      while backend.active.load(Ordering::Acquire) == 0 {
-        tokio::task::yield_now().await;
-      }
-    })
-    .await
-    .expect("execution start");
-    assert_eq!(
-      caller.await.expect("caller").expect("tick"),
-      TickOutcome::Failed
-    );
-    assert_eq!(runtime.budget.available_permits(), 0);
-    assert!(
-      state
-        .claim_next_scheduled_run("proof", 112, 140)
-        .await
-        .expect("claim proof")
-        .is_none(),
-      "unknown execution must not be retried"
-    );
-    completion_barrier.wait();
-    tokio::time::timeout(Duration::from_secs(1), async {
+    let mut fixtures = Vec::new();
+    for iteration in 0..20 {
+      let job_id = format!("hung-execute-{iteration}");
+      fixtures.push(fixture(&[(&job_id, 110)]).await);
+    }
+    for (iteration, (_temp, state)) in fixtures.into_iter().enumerate() {
+      let completion_barrier = Arc::new(Barrier::new(2));
+      let execution_started = Arc::new(Notify::new());
+      let execution_exited = Arc::new(Notify::new());
+      let mut backend = FakeBackend::new(ExecutionResult::Completed {
+        summary: "late completion must not win".to_owned(),
+      });
+      backend.completion_barrier = Some(Arc::clone(&completion_barrier));
+      backend.honor_execution_cancellation = false;
+      backend.execution_started = Some(Arc::clone(&execution_started));
+      backend.execution_exited = Some(Arc::clone(&execution_exited));
+      let mut configured = orchestrator(
+        state.clone(),
+        Arc::new(backend),
+        Arc::new(TestClock(AtomicI64::new(111), 1)),
+        1,
+      );
+      configured.policy.total_timeout = Duration::from_millis(50);
+      configured.policy.cancellation_grace = Duration::from_millis(5);
+      let runtime = Arc::new(configured);
+      let caller = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { runtime.run_once().await })
+      };
+      execution_started.notified().await;
+      tokio::time::pause();
+      tokio::time::advance(Duration::from_millis(51)).await;
+      tokio::task::yield_now().await;
+      tokio::time::advance(Duration::from_millis(6)).await;
+      assert_eq!(
+        caller.await.expect("caller").expect("tick"),
+        TickOutcome::Failed,
+        "iteration={iteration}"
+      );
+      assert_eq!(runtime.budget.available_permits(), 0);
+      assert!(
+        state
+          .claim_next_scheduled_run("proof", 112, 140)
+          .await
+          .expect("claim proof")
+          .is_none(),
+        "unknown execution must not be retried"
+      );
+      wait_at_test_barrier(Arc::clone(&completion_barrier)).await;
+      execution_exited.notified().await;
       while runtime.budget.available_permits() == 0 {
         tokio::task::yield_now().await;
       }
-    })
-    .await
-    .expect("guardian permit release");
-    assert_eq!(runtime.budget.available_permits(), 1);
+      assert_eq!(runtime.budget.available_permits(), 1);
+      tokio::time::resume();
+    }
   }
 
   #[tokio::test]
   async fn test_heartbeat_stops_and_joins_after_terminal_commit() {
-    let (_temp, state) = fixture(&[("heartbeat-stop", 110)]).await;
-    let mut backend = FakeBackend::new(ExecutionResult::Completed {
-      summary: "done".to_owned(),
-    });
-    backend.execution_delay = Duration::from_millis(10);
-    let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
-    let mut runtime = orchestrator(state, Arc::new(backend), clock.clone(), 1);
-    runtime.policy.heartbeat_interval = Duration::from_millis(1);
-    assert_eq!(
-      runtime.run_once().await.expect("tick"),
-      TickOutcome::Completed
-    );
-    let stopped_at = clock.now();
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    assert_eq!(clock.now(), stopped_at);
+    let mut fixtures = Vec::new();
+    for iteration in 0..20 {
+      let job_id = format!("heartbeat-stop-{iteration}");
+      fixtures.push(fixture(&[(&job_id, 110)]).await);
+    }
+    for (iteration, (_temp, state)) in fixtures.into_iter().enumerate() {
+      let completion_barrier = Arc::new(Barrier::new(2));
+      let execution_started = Arc::new(Notify::new());
+      let mut backend = FakeBackend::new(ExecutionResult::Completed {
+        summary: "done".to_owned(),
+      });
+      backend.completion_barrier = Some(Arc::clone(&completion_barrier));
+      backend.execution_started = Some(Arc::clone(&execution_started));
+      let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
+      let mut runtime = orchestrator(state, Arc::new(backend), clock.clone(), 1);
+      runtime.policy.heartbeat_interval = Duration::from_millis(1);
+      let caller = tokio::spawn(async move { runtime.run_once().await });
+      execution_started.notified().await;
+      wait_at_test_barrier(Arc::clone(&completion_barrier)).await;
+      assert_eq!(
+        caller.await.expect("caller").expect("tick"),
+        TickOutcome::Completed,
+        "iteration={iteration}"
+      );
+      let stopped_at = clock.now();
+      tokio::time::pause();
+      tokio::time::advance(Duration::from_millis(5)).await;
+      assert_eq!(clock.now(), stopped_at);
+      tokio::time::resume();
+    }
   }
 
   #[tokio::test]
   async fn test_terminal_commit_waits_for_cross_pool_lock_released_within_reserve() {
-    let (_temp, state) = fixture(&[("commit-unlocked", 110)]).await;
-    let mut backend = FakeBackend::new(ExecutionResult::Completed {
-      summary: "committed after contention".to_owned(),
-    });
-    backend.execution_delay = Duration::from_millis(30);
-    let backend = Arc::new(backend);
-    let runtime = Arc::new(orchestrator(
-      state.clone(),
-      backend.clone(),
-      Arc::new(TestClock(AtomicI64::new(111), 1)),
-      1,
-    ));
-    let caller = {
-      let runtime = Arc::clone(&runtime);
-      tokio::spawn(async move { runtime.run_once().await })
-    };
-    while backend.active.load(Ordering::Acquire) == 0 {
-      tokio::task::yield_now().await;
+    let mut fixtures = Vec::new();
+    for iteration in 0..20 {
+      let job_id = format!("commit-unlocked-{iteration}");
+      fixtures.push(fixture(&[(&job_id, 110)]).await);
     }
-    let lock = state
-      .acquire_exclusive_storage_lock_for_tests()
-      .await
-      .expect("exclusive lock");
-    while backend.active.load(Ordering::Acquire) != 0 {
-      tokio::task::yield_now().await;
-    }
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    lock.release().await.expect("release lock");
-    assert_eq!(
-      caller.await.expect("caller task").expect("tick"),
-      TickOutcome::Completed
-    );
-    let (run_id, job_id) = {
-      let seen = backend.seen.lock().expect("seen tasks");
-      let InvocationSource::ScheduledRun { run_id, job_id, .. } = &seen[0].source else {
-        panic!("scheduled source");
+    for (iteration, (_temp, state)) in fixtures.into_iter().enumerate() {
+      let completion_barrier = Arc::new(Barrier::new(2));
+      let execution_started = Arc::new(Notify::new());
+      let mut backend = FakeBackend::new(ExecutionResult::Completed {
+        summary: "committed after contention".to_owned(),
+      });
+      backend.completion_barrier = Some(Arc::clone(&completion_barrier));
+      backend.execution_started = Some(Arc::clone(&execution_started));
+      let backend = Arc::new(backend);
+      let terminal_commit_reached = Arc::new(Notify::new());
+      let terminal_commit_release = Arc::new(Notify::new());
+      let mut configured = orchestrator(
+        state.clone(),
+        backend.clone(),
+        Arc::new(TestClock(AtomicI64::new(111), 1)),
+        1,
+      );
+      configured.test_hooks.terminal_commit_reached = Some(Arc::clone(&terminal_commit_reached));
+      configured.test_hooks.terminal_commit_release = Some(Arc::clone(&terminal_commit_release));
+      let runtime = Arc::new(configured);
+      let caller = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { runtime.run_once().await })
       };
-      (run_id.clone(), job_id.clone())
-    };
-    assert_eq!(
-      state
-        .scheduled_execution_authority_counts_for_tests(&run_id, &job_id)
+      execution_started.notified().await;
+      let lock = state
+        .acquire_exclusive_storage_lock_for_tests()
         .await
-        .expect("authority counts"),
-      (1, 1, 1, 0)
-    );
+        .expect("exclusive lock");
+      wait_at_test_barrier(Arc::clone(&completion_barrier)).await;
+      terminal_commit_reached.notified().await;
+      lock.release().await.expect("release lock");
+      terminal_commit_release.notify_one();
+      assert_eq!(
+        caller.await.expect("caller task").expect("tick"),
+        TickOutcome::Completed,
+        "iteration={iteration}"
+      );
+      let (run_id, job_id) = {
+        let seen = backend.seen.lock().expect("seen tasks");
+        let InvocationSource::ScheduledRun { run_id, job_id, .. } = &seen[0].source else {
+          panic!("scheduled source");
+        };
+        (run_id.clone(), job_id.clone())
+      };
+      assert_eq!(
+        state
+          .scheduled_execution_authority_counts_for_tests(&run_id, &job_id)
+          .await
+          .expect("authority counts"),
+        (1, 1, 1, 0)
+      );
+    }
   }
 
   #[tokio::test]
   async fn test_terminal_commit_contention_past_reserve_stops_heartbeat_and_reclaims_unknown() {
-    let (_temp, state) = fixture(&[("commit-blocked", 110)]).await;
-    let mut backend = FakeBackend::new(ExecutionResult::Completed {
-      summary: "must roll back".to_owned(),
-    });
-    let completion_barrier = Arc::new(Barrier::new(2));
-    backend.completion_barrier = Some(Arc::clone(&completion_barrier));
-    let backend = Arc::new(backend);
-    let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
-    let mut configured = orchestrator(state.clone(), backend.clone(), clock.clone(), 1);
-    configured.policy.total_timeout = Duration::from_millis(50);
-    configured.policy.prepare_grace = Duration::from_millis(5);
-    configured.policy.cancellation_grace = Duration::from_millis(5);
-    configured.policy.finalization_grace = Duration::from_millis(20);
-    configured.policy.heartbeat_interval = Duration::from_millis(5);
-    let runtime = Arc::new(configured);
-    let caller = {
-      let runtime = Arc::clone(&runtime);
-      tokio::spawn(async move { runtime.run_once().await })
-    };
-    while backend.active.load(Ordering::Acquire) == 0 {
-      tokio::task::yield_now().await;
+    let mut fixtures = Vec::new();
+    for iteration in 0..20 {
+      let job_id = format!("commit-blocked-{iteration}");
+      let initialized = fixture(&[(&job_id, 110)]).await;
+      fixtures.push((job_id, initialized));
     }
-    let lock = state
-      .acquire_exclusive_storage_lock_for_tests()
-      .await
-      .expect("exclusive lock");
-    completion_barrier.wait();
-    let outcome = tokio::time::timeout(Duration::from_millis(150), caller)
-      .await
-      .expect("supervisor hard stop")
-      .expect("caller task")
-      .expect("tick");
-    assert_eq!(outcome, TickOutcome::LostLease);
-    let heartbeat_stopped_at = clock.now();
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert_eq!(clock.now(), heartbeat_stopped_at);
-    lock.release().await.expect("release lock");
-    assert!(matches!(
-      state
-        .reclaim_next_expired_scheduled_run(200, 3, 210)
-        .await
-        .expect("reclaim"),
-      ExpiredRunReclaimOutcome::OutcomeUnknown { .. }
-    ));
-    let (run_id, job_id) = {
-      let seen = backend.seen.lock().expect("seen tasks");
-      let InvocationSource::ScheduledRun { run_id, job_id, .. } = &seen[0].source else {
-        panic!("scheduled source");
+    for (iteration, (job_id, (_temp, state))) in fixtures.into_iter().enumerate() {
+      let completion_barrier = Arc::new(Barrier::new(2));
+      let execution_started = Arc::new(Notify::new());
+      let mut backend = FakeBackend::new(ExecutionResult::Completed {
+        summary: "must roll back".to_owned(),
+      });
+      backend.completion_barrier = Some(Arc::clone(&completion_barrier));
+      backend.execution_started = Some(Arc::clone(&execution_started));
+      let backend = Arc::new(backend);
+      let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
+      let terminal_commit_reached = Arc::new(Notify::new());
+      let terminal_commit_release = Arc::new(Notify::new());
+      let terminal_fallback_reached = Arc::new(Notify::new());
+      let terminal_fallback_release = Arc::new(Notify::new());
+      let mut configured = orchestrator(state.clone(), backend.clone(), clock.clone(), 1);
+      configured.policy.total_timeout = Duration::from_millis(50);
+      configured.policy.prepare_grace = Duration::from_millis(5);
+      configured.policy.cancellation_grace = Duration::from_millis(5);
+      configured.policy.finalization_grace = Duration::from_millis(20);
+      configured.policy.heartbeat_interval = Duration::from_millis(5);
+      configured.test_hooks = ScheduledExecutionTestHooks {
+        shutdown_cancellation_grace_started: None,
+        terminal_commit_reached: Some(Arc::clone(&terminal_commit_reached)),
+        terminal_commit_release: Some(Arc::clone(&terminal_commit_release)),
+        terminal_fallback_reached: Some(Arc::clone(&terminal_fallback_reached)),
+        terminal_fallback_release: Some(Arc::clone(&terminal_fallback_release)),
       };
-      (run_id.clone(), job_id.clone())
-    };
-    assert_eq!(
-      state
-        .scheduled_execution_authority_counts_for_tests(&run_id, &job_id)
+      let runtime = Arc::new(configured);
+      let caller = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { runtime.run_once().await })
+      };
+      execution_started.notified().await;
+      let lock = state
+        .acquire_exclusive_storage_lock_for_tests()
         .await
-        .expect("authority counts"),
-      (0, 0, 0, 0)
-    );
+        .expect("exclusive lock");
+      tokio::time::pause();
+      wait_at_test_barrier(Arc::clone(&completion_barrier)).await;
+      terminal_commit_reached.notified().await;
+      tokio::time::advance(Duration::from_millis(61)).await;
+      terminal_commit_release.notify_one();
+      terminal_fallback_reached.notified().await;
+      tokio::time::advance(Duration::from_millis(20)).await;
+      terminal_fallback_release.notify_one();
+      let outcome = caller.await.expect("caller task").expect("tick");
+      assert_eq!(outcome, TickOutcome::LostLease, "iteration={iteration}");
+      let heartbeat_stopped_at = clock.now();
+      tokio::time::advance(Duration::from_secs(1)).await;
+      assert_eq!(clock.now(), heartbeat_stopped_at);
+      lock.release().await.expect("release lock");
+      tokio::time::resume();
+      assert!(matches!(
+        state
+          .reclaim_next_expired_scheduled_run(200, 3, 210)
+          .await
+          .expect("reclaim"),
+        ExpiredRunReclaimOutcome::OutcomeUnknown { .. }
+      ));
+      let (run_id, observed_job_id) = {
+        let seen = backend.seen.lock().expect("seen tasks");
+        let InvocationSource::ScheduledRun { run_id, job_id, .. } = &seen[0].source else {
+          panic!("scheduled source");
+        };
+        (run_id.clone(), job_id.clone())
+      };
+      assert_eq!(observed_job_id, job_id);
+      assert_eq!(
+        state
+          .scheduled_execution_authority_counts_for_tests(&run_id, &observed_job_id)
+          .await
+          .expect("authority counts"),
+        (0, 0, 0, 0)
+      );
+    }
   }
 
   #[tokio::test]
   async fn test_shutdown_bounds_terminal_commit_contention_and_stops_heartbeat() {
-    let (_temp, state) = fixture(&[("commit-shutdown", 110)]).await;
-    let mut backend = FakeBackend::new(ExecutionResult::Completed {
-      summary: "must not block shutdown".to_owned(),
-    });
-    backend.execution_delay = Duration::from_millis(200);
-    let backend = Arc::new(backend);
-    let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
-    let mut runtime = orchestrator(state.clone(), backend.clone(), clock.clone(), 1);
-    runtime.policy.total_timeout = Duration::from_secs(2);
-    runtime.policy.finalization_grace = Duration::from_millis(20);
-    runtime.policy.heartbeat_interval = Duration::from_millis(5);
-    let (shutdown, shutdown_rx) = watch::channel(false);
-    let caller = tokio::spawn(runtime.run_supervised(shutdown_rx));
-    while backend.active.load(Ordering::Acquire) == 0 {
-      tokio::task::yield_now().await;
+    let mut fixtures = Vec::new();
+    for iteration in 0..20 {
+      let job_id = format!("commit-shutdown-{iteration}");
+      fixtures.push(fixture(&[(&job_id, 110)]).await);
     }
-    let lock = state
-      .acquire_exclusive_storage_lock_for_tests()
-      .await
-      .expect("exclusive lock");
-    while backend.active.load(Ordering::Acquire) != 0 {
-      tokio::task::yield_now().await;
+    for (iteration, (_temp, state)) in fixtures.into_iter().enumerate() {
+      let completion_barrier = Arc::new(Barrier::new(2));
+      let execution_started = Arc::new(Notify::new());
+      let mut backend = FakeBackend::new(ExecutionResult::Completed {
+        summary: "must not block shutdown".to_owned(),
+      });
+      backend.honor_execution_cancellation = false;
+      backend.completion_barrier = Some(Arc::clone(&completion_barrier));
+      backend.execution_started = Some(Arc::clone(&execution_started));
+      let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
+      let terminal_commit_reached = Arc::new(Notify::new());
+      let terminal_commit_release = Arc::new(Notify::new());
+      let terminal_fallback_reached = Arc::new(Notify::new());
+      let terminal_fallback_release = Arc::new(Notify::new());
+      let shutdown_cancellation_grace_started = Arc::new(Notify::new());
+      let mut runtime = orchestrator(state.clone(), Arc::new(backend), clock.clone(), 1);
+      runtime.policy.total_timeout = Duration::from_secs(2);
+      runtime.policy.cancellation_grace = Duration::from_millis(20);
+      runtime.policy.finalization_grace = Duration::from_millis(20);
+      runtime.policy.heartbeat_interval = Duration::from_millis(5);
+      runtime.test_hooks = ScheduledExecutionTestHooks {
+        shutdown_cancellation_grace_started: Some(Arc::clone(&shutdown_cancellation_grace_started)),
+        terminal_commit_reached: Some(Arc::clone(&terminal_commit_reached)),
+        terminal_commit_release: Some(Arc::clone(&terminal_commit_release)),
+        terminal_fallback_reached: Some(Arc::clone(&terminal_fallback_reached)),
+        terminal_fallback_release: Some(Arc::clone(&terminal_fallback_release)),
+      };
+      let (shutdown, shutdown_rx) = watch::channel(false);
+      let caller = tokio::spawn(runtime.run_supervised(shutdown_rx));
+      execution_started.notified().await;
+      let lock = state
+        .acquire_exclusive_storage_lock_for_tests()
+        .await
+        .expect("exclusive lock");
+      tokio::time::pause();
+      shutdown.send(true).expect("request shutdown");
+      shutdown_cancellation_grace_started.notified().await;
+      tokio::time::advance(Duration::from_millis(21)).await;
+      terminal_commit_reached.notified().await;
+      terminal_commit_release.notify_one();
+      tokio::time::advance(Duration::from_millis(21)).await;
+      terminal_fallback_reached.notified().await;
+      tokio::time::advance(Duration::from_millis(21)).await;
+      terminal_fallback_release.notify_one();
+      let outcome = caller.await.expect("caller task").expect("tick");
+      assert_eq!(outcome, TickOutcome::LostLease, "iteration={iteration}");
+      let heartbeat_stopped_at = clock.now();
+      tokio::time::advance(Duration::from_millis(10)).await;
+      assert_eq!(clock.now(), heartbeat_stopped_at);
+      lock.release().await.expect("release lock");
+      tokio::time::resume();
+      wait_at_test_barrier(Arc::clone(&completion_barrier)).await;
     }
-
-    shutdown.send(true).expect("request shutdown");
-    let outcome = tokio::time::timeout(Duration::from_millis(250), caller)
-      .await
-      .expect("shutdown terminal deadline")
-      .expect("caller task")
-      .expect("tick");
-    assert_eq!(outcome, TickOutcome::LostLease);
-    let heartbeat_stopped_at = clock.now();
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert_eq!(clock.now(), heartbeat_stopped_at);
-    lock.release().await.expect("release lock");
   }
 }

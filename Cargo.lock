@@ -403,10 +403,13 @@ dependencies = [
  "codeoff-config",
  "codeoff-core",
  "codeoff-state",
+ "nix",
+ "rustls",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

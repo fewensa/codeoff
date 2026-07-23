@@ -15,9 +15,12 @@ codeoff-channel-contract = { path = "../channel/contract" }
 codeoff-config = { path = "../config" }
 codeoff-core = { path = "../core" }
 codeoff-state = { path = "../state" }
+nix.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["time"] }
+tokio-rustls.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

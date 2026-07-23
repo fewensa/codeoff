@@ -27,6 +27,7 @@ pub struct RemoteFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteMessage {
+  ReadinessRequest(ReadinessRequestFrame),
   Ready(ReadyFrame),
   Admission(AdmissionFrame),
   Prepare(PrepareFrame),
@@ -39,9 +40,17 @@ pub enum RemoteMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessRequestFrame {
+  pub challenge: String,
+  pub ready_until_unix_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyFrame {
   pub challenge: String,
   pub ready_until_unix_millis: u64,
+  pub attested_profile_json: String,
+  pub attested_profile_digest: String,
   pub deployment_epoch: u64,
   pub profile_digest: String,
   pub gateway_image_digest: String,
@@ -276,6 +285,7 @@ impl RemoteFrame {
 impl RemoteMessage {
   fn validate_at(&self, now: u64) -> Result<(), RemoteProtocolError> {
     match self {
+      Self::ReadinessRequest(request) => request.validate_at(now),
       Self::Ready(ready) => ready.validate_at(now),
       Self::Admission(admission) => admission.validate_at(now),
       Self::Prepare(prepare) => prepare.validate(),
@@ -290,6 +300,7 @@ impl RemoteMessage {
 
   fn to_value(&self) -> Value {
     let (kind, payload) = match self {
+      Self::ReadinessRequest(value) => ("readiness_request", value.to_value()),
       Self::Ready(value) => ("ready", value.to_value()),
       Self::Admission(value) => ("admission", value.to_value()),
       Self::Prepare(value) => ("prepare", value.to_value()),
@@ -308,6 +319,9 @@ impl RemoteMessage {
     let kind = required_str(object, "kind")?;
     let payload = required(object, "payload")?;
     match kind {
+      "readiness_request" => Ok(Self::ReadinessRequest(ReadinessRequestFrame::from_value(
+        payload,
+      )?)),
       "ready" => Ok(Self::Ready(ReadyFrame::from_value(payload)?)),
       "admission" => Ok(Self::Admission(AdmissionFrame::from_value(payload)?)),
       "prepare" => Ok(Self::Prepare(PrepareFrame::from_value(payload)?)),
@@ -322,9 +336,49 @@ impl RemoteMessage {
   }
 }
 
+impl ReadinessRequestFrame {
+  fn validate_at(&self, now: u64) -> Result<(), RemoteProtocolError> {
+    require_hex("readiness_request.challenge", &self.challenge, 64)?;
+    if now != 0
+      && (self.ready_until_unix_millis <= now
+        || self.ready_until_unix_millis.saturating_sub(now) > MAX_READY_TTL_MILLIS)
+    {
+      return Err(RemoteProtocolError::InvalidField(
+        "readiness_request.validity",
+      ));
+    }
+    Ok(())
+  }
+
+  fn to_value(&self) -> Value {
+    json!({
+      "challenge": self.challenge,
+      "ready_until_unix_millis": self.ready_until_unix_millis,
+    })
+  }
+
+  fn from_value(value: &Value) -> Result<Self, RemoteProtocolError> {
+    let object = exact_object(
+      value,
+      &["challenge", "ready_until_unix_millis"],
+      "readiness_request",
+    )?;
+    Ok(Self {
+      challenge: required_string(object, "challenge")?,
+      ready_until_unix_millis: required_u64(object, "ready_until_unix_millis")?,
+    })
+  }
+}
+
 impl ReadyFrame {
   fn validate_at(&self, now: u64) -> Result<(), RemoteProtocolError> {
     require_hex("ready.challenge", &self.challenge, 64)?;
+    require_json_field("ready.attested_profile_json", &self.attested_profile_json)?;
+    require_hex(
+      "ready.attested_profile_digest",
+      &self.attested_profile_digest,
+      64,
+    )?;
     require_hex("ready.profile_digest", &self.profile_digest, 64)?;
     require_image_digest("ready.gateway_image_digest", &self.gateway_image_digest)?;
     require_image_digest("ready.runner_image_digest", &self.runner_image_digest)?;
@@ -350,6 +404,8 @@ impl ReadyFrame {
     json!({
       "challenge": self.challenge,
       "ready_until_unix_millis": self.ready_until_unix_millis,
+      "attested_profile_json": self.attested_profile_json,
+      "attested_profile_digest": self.attested_profile_digest,
       "deployment_epoch": self.deployment_epoch,
       "profile_digest": self.profile_digest,
       "gateway_image_digest": self.gateway_image_digest,
@@ -366,6 +422,8 @@ impl ReadyFrame {
       &[
         "challenge",
         "ready_until_unix_millis",
+        "attested_profile_json",
+        "attested_profile_digest",
         "deployment_epoch",
         "profile_digest",
         "gateway_image_digest",
@@ -379,6 +437,8 @@ impl ReadyFrame {
     Ok(Self {
       challenge: required_string(object, "challenge")?,
       ready_until_unix_millis: required_u64(object, "ready_until_unix_millis")?,
+      attested_profile_json: required_string(object, "attested_profile_json")?,
+      attested_profile_digest: required_string(object, "attested_profile_digest")?,
       deployment_epoch: required_u64(object, "deployment_epoch")?,
       profile_digest: required_string(object, "profile_digest")?,
       gateway_image_digest: required_string(object, "gateway_image_digest")?,
@@ -888,6 +948,8 @@ mod tests {
       message: RemoteMessage::Ready(ReadyFrame {
         challenge: "d".repeat(64),
         ready_until_unix_millis: NOW + 10_000,
+        attested_profile_json: r#"{"schema_version":1}"#.to_owned(),
+        attested_profile_digest: "1".repeat(64),
         deployment_epoch: 9,
         profile_digest: "b".repeat(64),
         gateway_image_digest: format!("sha256:{}", "e".repeat(64)),

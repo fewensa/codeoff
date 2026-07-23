@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use codeoff_agent_contract::{InvocationPrincipalRef, InvocationSource, SessionMode, ToolPolicy};
-use codeoff_core::CredentialRevision;
+use codeoff_core::{AttestedCapabilityProfile, CredentialRevision};
 use codeoff_state::{ScheduledExecutorAdmission, ScheduledPrepareAuthority};
 use rustls::crypto::CryptoProvider;
 use serde_json::Value;
@@ -230,6 +230,21 @@ impl ScheduledRunnerBroker {
       || ready.credential_revision != config.credential_revision
       || authorized_peer.runner_identity.as_str() != config.runner_workload_identity
       || authorized_peer.client_spki_sha256 != config.runner_client_spki_sha256
+    {
+      return Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch);
+    }
+    let attested = AttestedCapabilityProfile::parse_canonical_json(&ready.attested_profile_json)
+      .map_err(|_| ScheduledRunnerBrokerError::ReadyIdentityMismatch)?;
+    let observed_digest = format!(
+      "{:x}",
+      Sha256::digest(ready.attested_profile_json.as_bytes())
+    );
+    if observed_digest != ready.attested_profile_digest
+      || attested.gateway_image_digest != config.gateway_image_digest
+      || attested.runner_image_digest != config.runner_image_digest
+      || attested.runner_workload_identity != config.runner_workload_identity
+      || attested.runner_client_cert_public_key_fingerprint != config.runner_client_spki_sha256
+      || attested.credential_revision != config.credential_revision
     {
       return Err(ScheduledRunnerBrokerError::ReadyIdentityMismatch);
     }
@@ -1077,6 +1092,35 @@ mod tests {
     spki: &str,
   ) -> RemoteFrame {
     let config = config();
+    let mut profile = AttestedCapabilityProfile {
+      codex_version: "test-codex".to_owned(),
+      app_server_schema_sha256: "1".repeat(64),
+      codex_program_sha256: "2".repeat(64),
+      github_mcp_version: "test-mcp".to_owned(),
+      github_mcp_artifact_sha256: "3".repeat(64),
+      github_mcp_endpoint_identity: "test-endpoint".to_owned(),
+      github_tools: ["issue_read", "list_issues", "search_issues", "search_orgs"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+      credential_reference: "test-credential".to_owned(),
+      permission_policy_revision: "test-policy".to_owned(),
+      config_revision: "test-config".to_owned(),
+      config_sha256: "4".repeat(64),
+      gateway_image_digest: config.gateway_image_digest.clone(),
+      runner_image_digest: config.runner_image_digest.clone(),
+      runner_workload_identity: workload_identity.to_owned(),
+      runner_client_cert_public_key_fingerprint: spki.to_owned(),
+      credential_revision: config.credential_revision.clone(),
+      credential_isolation_revision: "test-isolation".to_owned(),
+      credential_deny_policy_revision: "test-deny".to_owned(),
+      negative_test_revision: "test-negative".to_owned(),
+      output_schema_revision: "test-output".to_owned(),
+      attested_at_unix_seconds: 1,
+      profile_sha256: String::new(),
+    };
+    profile.profile_sha256 = profile.computed_profile_sha256();
+    let attested_profile_json = profile.canonical_json();
     RemoteFrame {
       version: REMOTE_PROTOCOL_VERSION,
       session_nonce: session_nonce.to_owned(),
@@ -1084,6 +1128,8 @@ mod tests {
       message: RemoteMessage::Ready(ReadyFrame {
         challenge: challenge.to_owned(),
         ready_until_unix_millis: unix_millis().expect("time") + 4_000,
+        attested_profile_digest: format!("{:x}", Sha256::digest(attested_profile_json.as_bytes())),
+        attested_profile_json,
         deployment_epoch,
         profile_digest: config.profile_digest,
         gateway_image_digest: config.gateway_image_digest,

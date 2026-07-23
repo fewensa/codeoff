@@ -10,7 +10,8 @@ use std::time::Duration;
 use codeoff_agent_contract::{
   AgentTask, InvocationPrincipal, InvocationSource, PreviousSuccessContext, SessionMode, ToolPolicy,
 };
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, OFlag, fcntl, open};
+use nix::sys::stat::Mode;
 use nix::unistd::{Gid, chown, getegid, geteuid};
 use serde_json::{Map, Value};
 use tokio::net::{UnixListener, UnixStream, unix::UCred};
@@ -47,6 +48,7 @@ pub enum ScheduledRunnerExecutorError {
   InsecureParentDirectory,
   ProcessHardening,
   SocketPathExists,
+  LifecycleLocked,
   SocketOwnershipMismatch,
   SocketTypeMismatch,
   CloseOnExecMissing,
@@ -179,6 +181,7 @@ pub struct ScheduledRunnerExecutorConnection {
 pub struct ProtectedScheduledExecutorListener {
   listener: UnixListener,
   socket_path: OwnedSocketPath,
+  _lifecycle_lock: Flock<fs::File>,
   config: ScheduledRunnerExecutorConfig,
 }
 
@@ -257,8 +260,32 @@ impl ProtectedScheduledExecutorListener {
     if parent_metadata.permissions().mode() & 0o022 != 0 && !sticky {
       return Err(ScheduledRunnerExecutorError::InsecureParentDirectory);
     }
-    if fs::symlink_metadata(&config.socket_path).is_ok() {
-      return Err(ScheduledRunnerExecutorError::SocketPathExists);
+    let lock_path = config.socket_path.with_extension("sock.lock");
+    let lock_file = fs::File::from(
+      open(
+        &lock_path,
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+      )
+      .map_err(|error| ScheduledRunnerExecutorError::Io(error.into()))?,
+    );
+    let lock_metadata = lock_file.metadata()?;
+    if lock_metadata.uid() != geteuid().as_raw()
+      || lock_metadata.gid() != getegid().as_raw()
+      || lock_metadata.permissions().mode() & 0o777 != 0o600
+    {
+      return Err(ScheduledRunnerExecutorError::SocketOwnershipMismatch);
+    }
+    let lifecycle_lock = Flock::lock(lock_file, FlockArg::LockExclusiveNonblock)
+      .map_err(|_| ScheduledRunnerExecutorError::LifecycleLocked)?;
+    if let Ok(existing) = fs::symlink_metadata(&config.socket_path) {
+      if !existing.file_type().is_socket() {
+        return Err(ScheduledRunnerExecutorError::SocketTypeMismatch);
+      }
+      if existing.uid() != geteuid().as_raw() || existing.gid() != getegid().as_raw() {
+        return Err(ScheduledRunnerExecutorError::SocketOwnershipMismatch);
+      }
+      fs::remove_file(&config.socket_path)?;
     }
     let listener = UnixListener::bind(&config.socket_path)?;
     require_executor_cloexec(&listener)?;
@@ -280,6 +307,7 @@ impl ProtectedScheduledExecutorListener {
     Ok(Self {
       listener,
       socket_path,
+      _lifecycle_lock: lifecycle_lock,
       config,
     })
   }
@@ -500,15 +528,38 @@ printf normal-child-launch
   }
 
   #[test]
-  fn refuses_to_replace_a_preexisting_socket_path() {
+  fn refuses_to_replace_a_preexisting_non_socket_path() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let path = temp.path().join("control.sock");
     fs::write(&path, b"owned elsewhere").expect("preexisting path");
     assert!(matches!(
       ProtectedScheduledExecutorListener::bind(config(path.clone())),
-      Err(ScheduledRunnerExecutorError::SocketPathExists)
+      Err(ScheduledRunnerExecutorError::SocketTypeMismatch)
     ));
     assert_eq!(fs::read(path).expect("preserved path"), b"owned elsewhere");
+  }
+
+  #[tokio::test]
+  async fn lifecycle_lock_rejects_a_second_executor() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("control.sock");
+    let _first = ProtectedScheduledExecutorListener::bind(config(path.clone())).expect("first");
+    assert!(matches!(
+      ProtectedScheduledExecutorListener::bind(config(path)),
+      Err(ScheduledRunnerExecutorError::LifecycleLocked)
+    ));
+  }
+
+  #[tokio::test]
+  async fn recovers_a_root_owned_stale_socket_only_while_holding_the_lock() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("control.sock");
+    let stale = std::os::unix::net::UnixListener::bind(&path).expect("stale socket");
+    drop(stale);
+    let listener =
+      ProtectedScheduledExecutorListener::bind(config(path.clone())).expect("recover stale socket");
+    drop(listener);
+    assert!(!path.exists());
   }
 
   #[test]

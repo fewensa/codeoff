@@ -37,6 +37,9 @@ const SESSION_NONCE_DOMAIN: &[u8] = b"codeoff-runner-session-nonce-v1";
 const SESSION_CHALLENGE_DOMAIN: &[u8] = b"codeoff-runner-session-challenge-v1";
 const TLS_EXPORTER_BYTES: usize = 32;
 const FRAME_LENGTH_BYTES: usize = 4;
+const MAX_TLS_PEM_BYTES: u64 = 256 * 1024;
+const MAX_TLS_PRIVATE_KEY_BYTES: u64 = 64 * 1024;
+const MAX_TLS_CERTIFICATES: usize = 16;
 const ROOT_FILE_OWNER: ExpectedFileOwner = ExpectedFileOwner { uid: 0, gid: 0 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +235,26 @@ impl ScheduledRunnerTlsClient {
     Self::load_with_owner(paths, server_name, io_policy, ROOT_FILE_OWNER)
   }
 
+  /// Loads client material owned by the dedicated non-root control identity.
+  #[allow(clippy::similar_names)]
+  pub fn load_for_owner(
+    paths: &ScheduledRunnerTlsPaths,
+    server_name: &str,
+    io_policy: ScheduledRunnerIoPolicy,
+    expected_uid: u32,
+    expected_gid: u32,
+  ) -> Result<Self, ScheduledRunnerTlsError> {
+    Self::load_with_owner(
+      paths,
+      server_name,
+      io_policy,
+      ExpectedFileOwner {
+        uid: expected_uid,
+        gid: expected_gid,
+      },
+    )
+  }
+
   fn load_with_owner(
     paths: &ScheduledRunnerTlsPaths,
     server_name: &str,
@@ -413,11 +436,14 @@ fn load_certificates(
   path: &Path,
   expected_owner: ExpectedFileOwner,
 ) -> Result<Vec<CertificateDer<'static>>, ScheduledRunnerTlsError> {
-  let file = open_owned_file(path, expected_owner)?;
+  let file = open_owned_file(path, expected_owner, MAX_TLS_PEM_BYTES)?;
   let certificates = CertificateDer::pem_reader_iter(BufReader::new(file))
     .collect::<Result<Vec<_>, _>>()
     .map_err(|_| ScheduledRunnerTlsError::CertificateRejected)?;
   if certificates.is_empty() {
+    return Err(ScheduledRunnerTlsError::CertificateRejected);
+  }
+  if certificates.len() > MAX_TLS_CERTIFICATES {
     return Err(ScheduledRunnerTlsError::CertificateRejected);
   }
   Ok(certificates)
@@ -427,7 +453,7 @@ fn load_private_key(
   path: &Path,
   expected_owner: ExpectedFileOwner,
 ) -> Result<PrivateKeyDer<'static>, ScheduledRunnerTlsError> {
-  let file = open_owned_file(path, expected_owner)?;
+  let file = open_owned_file(path, expected_owner, MAX_TLS_PRIVATE_KEY_BYTES)?;
   PrivateKeyDer::from_pem_reader(BufReader::new(file))
     .map_err(|_| ScheduledRunnerTlsError::PrivateKeyRejected)
 }
@@ -435,6 +461,7 @@ fn load_private_key(
 fn open_owned_file(
   path: &Path,
   expected_owner: ExpectedFileOwner,
+  max_bytes: u64,
 ) -> Result<File, ScheduledRunnerTlsError> {
   if !path.is_absolute() {
     return Err(ScheduledRunnerTlsError::InvalidPath);
@@ -461,7 +488,13 @@ fn open_owned_file(
     let opened = openat(&current, *component, flags, Mode::empty())
       .map_err(|_| ScheduledRunnerTlsError::FileRejected("open"))?;
     let opened = File::from(opened);
-    verify_owned_component(&opened, component, final_component, expected_owner)?;
+    verify_owned_component(
+      &opened,
+      component,
+      final_component,
+      expected_owner,
+      max_bytes,
+    )?;
     current = opened;
   }
   Ok(current)
@@ -472,9 +505,13 @@ fn verify_owned_component(
   _name: impl AsRef<OsStr>,
   final_component: bool,
   expected_owner: ExpectedFileOwner,
+  max_bytes: u64,
 ) -> Result<(), ScheduledRunnerTlsError> {
   let stat = fstat(file).map_err(|_| ScheduledRunnerTlsError::FileRejected("metadata"))?;
-  if stat.st_uid != expected_owner.uid || stat.st_gid != expected_owner.gid {
+  let expected_component_owner =
+    stat.st_uid == expected_owner.uid && stat.st_gid == expected_owner.gid;
+  let safe_root_ancestor = !final_component && stat.st_uid == 0 && stat.st_gid == 0;
+  if !expected_component_owner && !safe_root_ancestor {
     return Err(ScheduledRunnerTlsError::FileRejected("owner"));
   }
   let file_type = file
@@ -487,7 +524,10 @@ fn verify_owned_component(
   if !final_component && !file_type.is_dir() {
     return Err(ScheduledRunnerTlsError::FileRejected("type"));
   }
-  if final_component && stat.st_mode & 0o077 != 0 {
+  if final_component
+    && (stat.st_mode & 0o777 != 0o400
+      || u64::try_from(stat.st_size).map_or(true, |size| size > max_bytes))
+  {
     return Err(ScheduledRunnerTlsError::FileRejected("permissions"));
   }
   let sticky_directory = !final_component && stat.st_mode & Mode::S_ISVTX.bits() != 0;
@@ -560,6 +600,8 @@ mod tests {
       message: RemoteMessage::Ready(ReadyFrame {
         challenge: "b".repeat(64),
         ready_until_unix_millis: NOW + 5_000,
+        attested_profile_json: r#"{"schema_version":1}"#.to_owned(),
+        attested_profile_digest: "1".repeat(64),
         deployment_epoch: 1,
         profile_digest: "c".repeat(64),
         gateway_image_digest: format!("sha256:{}", "d".repeat(64)),
@@ -672,34 +714,34 @@ mod tests {
     let temp = tempfile::tempdir().expect("temporary directory");
     let path = temp.path().join("tls.pem");
     fs::write(&path, b"test").expect("fixture write");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("fixture permissions");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("fixture permissions");
     let metadata = fs::metadata(temp.path()).expect("fixture metadata");
     let owner = ExpectedFileOwner {
       uid: metadata.uid(),
       gid: metadata.gid(),
     };
-    open_owned_file(&path, owner).expect("matching owner");
+    open_owned_file(&path, owner, MAX_TLS_PEM_BYTES).expect("matching owner");
 
     let wrong_owner = ExpectedFileOwner {
       uid: owner.uid.saturating_add(1),
       gid: owner.gid,
     };
     assert!(matches!(
-      open_owned_file(&path, wrong_owner),
+      open_owned_file(&path, wrong_owner, MAX_TLS_PEM_BYTES),
       Err(ScheduledRunnerTlsError::FileRejected("owner"))
     ));
 
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("loose permissions");
     assert!(matches!(
-      open_owned_file(&path, owner),
+      open_owned_file(&path, owner, MAX_TLS_PEM_BYTES),
       Err(ScheduledRunnerTlsError::FileRejected("permissions"))
     ));
 
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("restore permissions");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("restore permissions");
     let link = temp.path().join("tls-link.pem");
     symlink(&path, &link).expect("fixture symlink");
     assert!(matches!(
-      open_owned_file(&link, owner),
+      open_owned_file(&link, owner, MAX_TLS_PEM_BYTES),
       Err(ScheduledRunnerTlsError::FileRejected("open"))
     ));
   }

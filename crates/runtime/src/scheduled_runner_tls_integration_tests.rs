@@ -185,7 +185,7 @@ impl CertificateFixture {
         .permissions()
         .mode()
         & 0o777,
-      0o600
+      0o400
     );
     assert_eq!(
       fs::metadata(&client_key)
@@ -193,7 +193,7 @@ impl CertificateFixture {
         .permissions()
         .mode()
         & 0o777,
-      0o600
+      0o400
     );
     let client_spki_sha256 = format!(
       "{:x}",
@@ -251,7 +251,7 @@ fn openssl(arguments: &[&str]) {
 }
 
 fn restrict(path: &Path) {
-  fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("restrict TLS fixture");
+  fs::set_permissions(path, fs::Permissions::from_mode(0o400)).expect("restrict TLS fixture");
 }
 
 fn io_policy() -> ScheduledRunnerIoPolicy {
@@ -280,6 +280,8 @@ fn ready(session_nonce: &str, challenge: String, fingerprint: &str, now: u64) ->
     message: RemoteMessage::Ready(ReadyFrame {
       challenge,
       ready_until_unix_millis: now + 5_000,
+      attested_profile_json: r#"{"schema_version":1}"#.to_owned(),
+      attested_profile_digest: "1".repeat(64),
       deployment_epoch: 9,
       profile_digest: "a".repeat(64),
       gateway_image_digest: format!("sha256:{}", "b".repeat(64)),

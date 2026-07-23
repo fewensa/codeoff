@@ -22,7 +22,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use codeoff_agent_contract::{AgentTask, InvocationSource, SessionMode, ToolPolicy};
+use codeoff_agent_contract::{
+  AgentTask, InvocationPrincipal, InvocationSource, SessionMode, ToolPolicy,
+};
 use codeoff_config::{CredentialRevision, RunnerWorkloadIdentity, ScheduledCodexConfig};
 use codeoff_core::AttestedCapabilityProfile;
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -835,6 +837,14 @@ impl Drop for StdioScheduledJsonlTransport {
 pub trait PreparedScheduledCodexExecution: Send {
   fn attested_profile(&self) -> &AttestedCapabilityProfile;
   fn execute(self: Box<Self>) -> ScheduledExecutionResult;
+  /// Shuts down and reaps the prepared no-turn transport.
+  ///
+  /// # Errors
+  /// Returns a typed failure when bounded shutdown cannot prove process-tree cleanup.
+  #[allow(clippy::result_large_err)]
+  fn shutdown_without_execute(
+    self: Box<Self>,
+  ) -> Result<AttestedCapabilityProfile, ScheduledExecutionResult>;
 }
 
 pub trait ScheduledCodexExecution: Send + Sync {
@@ -927,6 +937,92 @@ pub struct BuiltScheduledCodexExecutor {
   pub profile: RequestedCapabilityProfile,
   pub authority: ScheduledDeploymentAuthority,
   pub executor: Arc<dyn ScheduledCodexExecution>,
+}
+
+impl BuiltScheduledCodexExecutor {
+  /// Runs the complete no-turn App Server and MCP readiness protocol and reaps its process tree.
+  ///
+  /// # Errors
+  /// Returns a typed failure when static authority, runtime evidence, App Server negotiation, MCP
+  /// inventory, GitHub authentication status, or bounded cleanup fails.
+  #[allow(clippy::result_large_err)]
+  pub fn probe_readiness(
+    &self,
+    timeout: Duration,
+  ) -> Result<AttestedCapabilityProfile, ScheduledExecutionResult> {
+    if timeout.is_zero() || timeout > MAX_RUN_TIMEOUT {
+      return Err(ScheduledExecutionResult::PreflightRejected(preflight(
+        "scheduled_readiness_timeout_invalid",
+      )));
+    }
+    let identity = ScheduledExecutionIdentity {
+      run_id: "readiness-probe".to_owned(),
+      job_id: "readiness-probe".to_owned(),
+      attempt: 1,
+      fence: 1,
+    };
+    let request = ScheduledCodexRequest {
+      task: AgentTask {
+        task_id: "scheduled:readiness-probe:1:1".to_owned(),
+        instruction: "Verify scheduled runner readiness without starting a turn".to_owned(),
+        source: InvocationSource::ScheduledRun {
+          job_id: identity.job_id.clone(),
+          run_id: identity.run_id.clone(),
+          scheduled_for: "1970-01-01T00:00:00Z".to_owned(),
+        },
+        principal: InvocationPrincipal::service("codeoff-scheduler-readiness"),
+        session: SessionMode::Fresh,
+        channel: None,
+        previous_success: None,
+        tool_policy: ToolPolicy::None,
+        feedback_target: None,
+      },
+      identity: identity.clone(),
+      profile: self.profile.clone(),
+      cancellation: Arc::new(AtomicBool::new(false)),
+      timeout,
+      interrupt_grace: Duration::from_secs(1),
+      terminate_grace: Duration::from_secs(1),
+      kill_grace: Duration::from_secs(1),
+    };
+    let profile_digest = isolation_profile_binding_digest(&self.profile)
+      .map_err(ScheduledExecutionResult::PreflightRejected)?;
+    if profile_digest != self.authority.profile_digest {
+      return Err(ScheduledExecutionResult::PreflightRejected(preflight(
+        "scheduled_readiness_authority_profile_mismatch",
+      )));
+    }
+    let now = now_unix_seconds();
+    let expires_at = now
+      .saturating_add(timeout.as_secs().max(1))
+      .min(self.authority.expires_at_unix_seconds);
+    if expires_at <= now {
+      return Err(ScheduledExecutionResult::PreflightRejected(preflight(
+        "scheduled_readiness_authority_expired",
+      )));
+    }
+    let nonce = sha256_hex(
+      format!(
+        "scheduled-readiness-nonce-v1:{}:{now}",
+        self.authority.attestation_id
+      )
+      .as_bytes(),
+    );
+    let permit = ScheduledIsolationPermit {
+      identity,
+      deployment_epoch: self.authority.deployment_epoch,
+      attestation_id: self.authority.attestation_id.clone(),
+      profile_digest,
+      permit_id: sha256_hex(format!("scheduled-readiness-permit-v1:{nonce}").as_bytes()),
+      nonce,
+      isolation_revision: self.authority.isolation_revision.clone(),
+      expires_at_unix_seconds: expires_at,
+    };
+    self
+      .executor
+      .prepare(request, permit)?
+      .shutdown_without_execute()
+  }
 }
 
 /// Verifies deployment-supplied scheduled execution authority and constructs the production
@@ -1331,6 +1427,16 @@ impl<T: ScheduledJsonlTransport + Send> PreparedScheduledCodexExecution
       Ok(()) => result,
       Err(failure) => ScheduledExecutionResult::TransportLost(failure),
     }
+  }
+
+  #[allow(clippy::result_large_err)]
+  fn shutdown_without_execute(
+    mut self: Box<Self>,
+  ) -> Result<AttestedCapabilityProfile, ScheduledExecutionResult> {
+    let profile = self.attested_profile.clone();
+    bounded_shutdown(&mut self.transport, &self.request)
+      .map(|()| profile)
+      .map_err(ScheduledExecutionResult::TransportLost)
   }
 }
 

@@ -13,7 +13,8 @@ use codeoff_config::{CodeoffConfig, ScheduledRunnerRole, SchedulerRuntimeConfig,
 use codeoff_runtime::scheduled_execution::ScheduledExecutor;
 use codeoff_runtime::scheduled_remote_protocol::{
   AdmissionFrame, ErrorFrame, MAX_READY_TTL_MILLIS, PreparedFrame, REMOTE_PROTOCOL_VERSION,
-  ReadyFrame, RemoteFrame, RemoteMessage, RemoteResultKind, ResultFrame, RunBinding, StartFrame,
+  ReadinessRequestFrame, ReadyFrame, RemoteFrame, RemoteMessage, RemoteResultKind, ResultFrame,
+  RunBinding, StartFrame,
 };
 use codeoff_runtime::scheduled_runner_broker::{
   RemoteScheduledExecutionBackend, ScheduledRunnerBroker, ScheduledRunnerBrokerConfig,
@@ -254,10 +255,7 @@ async fn run_control_session(config: CodeoffConfig) -> Result<(), Box<dyn Error>
     .as_ref()
     .ok_or_else(|| io::Error::other("scheduled runner control configuration missing"))?;
   let frame_timeout = Duration::from_millis(role.frame_timeout_ms);
-  let (profile, authority) =
-    load_trusted_owner_scheduled_deployment_authority(&config.agent.scheduled_codex)
-      .map_err(|failure| io::Error::other(failure.message))?;
-  let client = ScheduledRunnerTlsClient::load(
+  let client = ScheduledRunnerTlsClient::load_for_owner(
     &ScheduledRunnerTlsPaths {
       certificate_chain: role.client_certificate_path.clone(),
       private_key: role.client_private_key_path.clone(),
@@ -269,6 +267,8 @@ async fn run_control_session(config: CodeoffConfig) -> Result<(), Box<dyn Error>
       read_timeout: frame_timeout,
       write_timeout: frame_timeout,
     },
+    role.control_uid,
+    role.control_gid,
   )?;
   let address = tokio::net::lookup_host(&role.gateway_address)
     .await?
@@ -278,35 +278,11 @@ async fn run_control_session(config: CodeoffConfig) -> Result<(), Box<dyn Error>
   let runner_session_nonce = session_nonce(&remote.channel_binding);
   let challenge = session_challenge(&remote.channel_binding);
   let now = unix_millis()?;
-  let configured_ttl = role.readiness_ttl_ms.min(MAX_READY_TTL_MILLIS).min(
-    authority
-      .expires_at_unix_seconds
-      .saturating_mul(1_000)
-      .saturating_sub(now),
-  );
+  let configured_ttl = role.readiness_ttl_ms.min(MAX_READY_TTL_MILLIS);
   if configured_ttl == 0 {
-    return Err(io::Error::other("scheduled runner authority expired before readiness").into());
+    return Err(io::Error::other("scheduled runner readiness TTL is zero").into());
   }
-  remote
-    .framed
-    .write_frame(&RemoteFrame {
-      version: REMOTE_PROTOCOL_VERSION,
-      session_nonce: runner_session_nonce.clone(),
-      sequence: 1,
-      message: RemoteMessage::Ready(ReadyFrame {
-        challenge,
-        ready_until_unix_millis: now.saturating_add(configured_ttl),
-        deployment_epoch: u64::try_from(authority.deployment_epoch)?,
-        profile_digest: authority.profile_digest,
-        gateway_image_digest: profile.gateway_image_digest,
-        runner_image_digest: profile.runner_image_digest,
-        runner_workload_identity: profile.runner_workload_identity,
-        runner_client_cert_public_key_fingerprint: profile
-          .runner_client_cert_public_key_fingerprint,
-        credential_revision: profile.credential_revision,
-      }),
-    })
-    .await?;
+  let ready_until_unix_millis = now.saturating_add(configured_ttl);
   let mut local = ScheduledRunnerControlConnection::connect(&LocalControlConfig {
     socket_path: role.local_socket_path.clone(),
     executor_uid: role.expected_executor_uid,
@@ -317,6 +293,32 @@ async fn run_control_session(config: CodeoffConfig) -> Result<(), Box<dyn Error>
   })
   .await?
   .framed;
+  local
+    .write_frame(&RemoteFrame {
+      version: REMOTE_PROTOCOL_VERSION,
+      session_nonce: runner_session_nonce.clone(),
+      sequence: 1,
+      message: RemoteMessage::ReadinessRequest(ReadinessRequestFrame {
+        challenge: challenge.clone(),
+        ready_until_unix_millis,
+      }),
+    })
+    .await?;
+  let ready_frame = local
+    .read_frame(unix_millis()?)
+    .await?
+    .ok_or_else(|| io::Error::other("scheduled runner executor closed before readiness"))?;
+  let RemoteMessage::Ready(ready) = &ready_frame.message else {
+    return Err(io::Error::other("scheduled runner executor did not provide readiness").into());
+  };
+  if ready_frame.session_nonce != runner_session_nonce
+    || ready_frame.sequence != 1
+    || ready.challenge != challenge
+    || ready.ready_until_unix_millis != ready_until_unix_millis
+  {
+    return Err(io::Error::other("scheduled runner executor readiness binding mismatch").into());
+  }
+  remote.framed.write_frame(&ready_frame).await?;
   relay_runner_frames(&mut remote.framed, &mut local, &runner_session_nonce).await
 }
 
@@ -345,7 +347,9 @@ where
           return Err(io::Error::other("scheduled runner gateway frame rejected").into());
         }
         let terminal = matches!(frame.message, RemoteMessage::Cancel(_));
-        local.write_frame(&frame).await?;
+        let mut local_frame = frame;
+        local_frame.sequence = local_frame.sequence.saturating_add(1);
+        local.write_frame(&local_frame).await?;
         if terminal {
           return Ok(());
         }
@@ -444,14 +448,59 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
   )
   .map_err(|failure| io::Error::other(failure.message))?;
   let now = unix_millis()?;
-  let admission_frame = framed
+  let readiness_frame = framed
     .read_frame(now)
+    .await?
+    .ok_or_else(|| io::Error::other("scheduled runner control closed before readiness request"))?;
+  let RemoteMessage::ReadinessRequest(readiness) = &readiness_frame.message else {
+    return Err(io::Error::other("scheduled runner expected readiness request").into());
+  };
+  if readiness_frame.sequence != 1 {
+    return Err(io::Error::other("scheduled runner readiness sequence mismatch").into());
+  }
+  let remaining = readiness.ready_until_unix_millis.saturating_sub(now);
+  if remaining == 0 || remaining > MAX_READY_TTL_MILLIS {
+    return Err(io::Error::other("scheduled runner readiness deadline invalid").into());
+  }
+  let attested = built
+    .probe_readiness(Duration::from_millis(remaining))
+    .map_err(|result| io::Error::other(format!("scheduled runner readiness failed: {result:?}")))?;
+  let attested_profile_json = attested.canonical_json();
+  framed
+    .write_frame(&RemoteFrame {
+      version: REMOTE_PROTOCOL_VERSION,
+      session_nonce: readiness_frame.session_nonce.clone(),
+      sequence: 1,
+      message: RemoteMessage::Ready(ReadyFrame {
+        challenge: readiness.challenge.clone(),
+        ready_until_unix_millis: readiness.ready_until_unix_millis,
+        attested_profile_digest: sha256_hex(attested_profile_json.as_bytes()),
+        attested_profile_json,
+        deployment_epoch: u64::try_from(built.authority.deployment_epoch)?,
+        profile_digest: built.authority.profile_digest.clone(),
+        gateway_image_digest: attested.gateway_image_digest,
+        runner_image_digest: attested.runner_image_digest,
+        runner_workload_identity: attested.runner_workload_identity,
+        runner_client_cert_public_key_fingerprint: attested
+          .runner_client_cert_public_key_fingerprint,
+        credential_revision: attested.credential_revision,
+      }),
+    })
+    .await?;
+  let admission_frame = framed
+    .read_frame(unix_millis()?)
     .await?
     .ok_or_else(|| io::Error::other("scheduled runner control closed before admission"))?;
   let RemoteMessage::Admission(admission) = &admission_frame.message else {
     return Err(io::Error::other("scheduled runner expected admission").into());
   };
-  validate_admission(&admission_frame, admission, &built.authority, now)?;
+  validate_admission(
+    &admission_frame,
+    admission,
+    &built.authority,
+    &readiness.challenge,
+    unix_millis()?,
+  )?;
   let prepare_frame = framed
     .read_frame(unix_millis()?)
     .await?
@@ -459,7 +508,7 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
   let RemoteMessage::Prepare(prepare) = &prepare_frame.message else {
     return Err(io::Error::other("scheduled runner expected prepare").into());
   };
-  if prepare_frame.session_nonce != admission_frame.session_nonce || prepare_frame.sequence != 2 {
+  if prepare_frame.session_nonce != admission_frame.session_nonce || prepare_frame.sequence != 3 {
     return Err(io::Error::other("scheduled runner prepare sequence mismatch").into());
   }
   validate_binding(
@@ -579,10 +628,12 @@ fn validate_admission(
   frame: &RemoteFrame,
   admission: &AdmissionFrame,
   authority: &codeoff_agent_codex::ScheduledDeploymentAuthority,
+  expected_challenge: &str,
   now: u64,
 ) -> Result<(), Box<dyn Error>> {
   if frame.version != REMOTE_PROTOCOL_VERSION
-    || frame.sequence != 1
+    || frame.sequence != 2
+    || admission.challenge != expected_challenge
     || admission.expires_at_unix_millis <= now
     || admission.deployment_epoch != u64::try_from(authority.deployment_epoch)?
     || admission.profile_digest != authority.profile_digest

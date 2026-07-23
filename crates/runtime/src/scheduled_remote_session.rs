@@ -176,6 +176,9 @@ impl RemoteSessionState {
     now: u64,
   ) -> Result<(), RemoteSessionError> {
     match message {
+      RemoteMessage::ReadinessRequest(_) => {
+        return Err(RemoteSessionError::InvalidPhase);
+      }
       RemoteMessage::Ready(ready) => {
         self.require(
           sender,
@@ -554,6 +557,8 @@ mod tests {
     RemoteMessage::Ready(ReadyFrame {
       challenge: "d".repeat(64),
       ready_until_unix_millis: expiry,
+      attested_profile_json: capability_profile_json(),
+      attested_profile_digest: "a".repeat(64),
       deployment_epoch: 9,
       profile_digest: profile_digest(),
       gateway_image_digest: format!("sha256:{}", "e".repeat(64)),

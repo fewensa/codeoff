@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use codeoff_agent_codex::ScheduledFailure;
 use codeoff_agent_codex::{
   GITHUB_MCP_ACCESS_TOKEN_ENV, RemoteIsolationPermitEnvelope, ScheduledCodexRequest,
   ScheduledExecutionIdentity, ScheduledExecutionResult, ScheduledFailureKind,
@@ -440,7 +442,7 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
   }
   let attested = built
     .probe_readiness(Duration::from_millis(remaining))
-    .map_err(|result| io::Error::other(format!("scheduled runner readiness failed: {result:?}")))?;
+    .map_err(|_| io::Error::other("scheduled runner readiness failed"))?;
   let attested_profile_json = attested.canonical_json();
   let attested_profile_digest = sha256_hex(attested_profile_json.as_bytes());
   let mut ready_message = ReadyFrame {
@@ -744,12 +746,16 @@ fn validate_start(
 fn preparation_error(binding: &RunBinding, result: ScheduledExecutionResult) -> RemoteMessage {
   let (code, message, retryable) = match result {
     ScheduledExecutionResult::PreflightRejected(failure)
-    | ScheduledExecutionResult::Failed(failure) => {
-      ("runner-preflight-rejected", failure.message, false)
-    }
-    ScheduledExecutionResult::TransportLost(failure) => {
-      ("runner-transport-lost", failure.message, true)
-    }
+    | ScheduledExecutionResult::Failed(failure) => (
+      "runner-preflight-rejected",
+      safe_failure_summary(failure.kind).to_owned(),
+      false,
+    ),
+    ScheduledExecutionResult::TransportLost(_) => (
+      "runner-transport-lost",
+      "scheduled runner transport was lost".to_owned(),
+      true,
+    ),
     ScheduledExecutionResult::Interrupted { .. } => (
       "runner-preflight-interrupted",
       "scheduled runner preparation was interrupted".to_owned(),
@@ -798,7 +804,7 @@ fn execution_result(
       RemoteResultKind::Completed,
       json!({
         "failure_kind": failure_kind(failure.kind),
-        "message": failure.message,
+        "message": safe_failure_summary(failure.kind),
         "schema_version": 1,
       })
       .to_string(),
@@ -890,6 +896,22 @@ const fn failure_kind(kind: ScheduledFailureKind) -> &'static str {
     ScheduledFailureKind::TimedOut => "timed_out",
     ScheduledFailureKind::Interrupted => "interrupted",
     ScheduledFailureKind::Transport => "transport",
+  }
+}
+
+const fn safe_failure_summary(kind: ScheduledFailureKind) -> &'static str {
+  match kind {
+    ScheduledFailureKind::InvalidRequest => "scheduled runner request was rejected",
+    ScheduledFailureKind::ProtocolIncompatible => "scheduled runner protocol was rejected",
+    ScheduledFailureKind::CapabilityMismatch => "scheduled runner capability was rejected",
+    ScheduledFailureKind::CredentialIsolationUnproven => {
+      "scheduled runner credential isolation was not proven"
+    }
+    ScheduledFailureKind::OutputSchemaViolation => "scheduled runner output was rejected",
+    ScheduledFailureKind::TurnFailed => "scheduled runner turn failed",
+    ScheduledFailureKind::TimedOut => "scheduled runner timed out",
+    ScheduledFailureKind::Interrupted => "scheduled runner was interrupted",
+    ScheduledFailureKind::Transport => "scheduled runner transport failed",
   }
 }
 
@@ -1096,6 +1118,34 @@ mod tests {
       validate_dedicated_worker_surface_with(&stateful, ScheduledRunnerRole::Control, |_| false)
         .is_err()
     );
+  }
+
+  #[test]
+  fn preparation_error_frames_use_only_fixed_safe_summaries() {
+    const SENTINEL: &str = "rpc-controlled-secret-sentinel";
+    let binding = RunBinding {
+      run_id: "run-1".to_owned(),
+      job_id: "job-1".to_owned(),
+      attempt: 1,
+      fence_token: 1,
+      authority_digest: "a".repeat(64),
+      profile_digest: "b".repeat(64),
+      deployment_epoch: 1,
+      credential_revision: "credential-v1".to_owned(),
+    };
+    let message = preparation_error(
+      &binding,
+      ScheduledExecutionResult::PreflightRejected(ScheduledFailure {
+        kind: ScheduledFailureKind::ProtocolIncompatible,
+        message: SENTINEL.to_owned(),
+      }),
+    );
+    let RemoteMessage::Error(error) = message else {
+      panic!("error frame expected");
+    };
+    assert_eq!(error.code, "runner-preflight-rejected");
+    assert_eq!(error.message, "scheduled runner protocol was rejected");
+    assert!(!error.message.contains(SENTINEL));
   }
 
   #[test]

@@ -1709,13 +1709,10 @@ fn scheduled_request<T: ScheduledJsonlTransport>(
         if response["id"].as_u64() != Some(id) {
           return Err(capability(format!("{method}_response_id_mismatch")));
         }
-        if let Some(error) = response.get("error") {
+        if response.get("error").is_some() {
           return Err(ScheduledFailure::new(
             ScheduledFailureKind::ProtocolIncompatible,
-            format!(
-              "{method}_failed:{}",
-              error["message"].as_str().unwrap_or("unknown")
-            ),
+            format!("{method}_rpc_error"),
           ));
         }
         return Ok(response.get("result").cloned().unwrap_or_else(|| json!({})));
@@ -3965,6 +3962,42 @@ mod tests {
       }))
       .is_err()
     );
+  }
+
+  #[test]
+  fn rpc_error_messages_are_not_reflected_into_failures() {
+    const SENTINEL: &str = "rpc-controlled-secret-sentinel";
+    for method in [
+      "initialize",
+      "thread/start",
+      "mcpServerStatus/list",
+      "mcpServer/tool/call",
+      "turn/start",
+    ] {
+      let actions = Arc::new(Mutex::new(Actions::default()));
+      let mut transport = MockTransport {
+        evidence: evidence(&profile()),
+        reads: VecDeque::from([TimedRead::Message(json!({
+          "error": {"code": -32000, "message": SENTINEL},
+          "id": 1,
+          "jsonrpc": "2.0",
+        }))]),
+        actions,
+      };
+      let cancellation = AtomicBool::new(false);
+      let failure = scheduled_request(
+        &mut transport,
+        1,
+        method,
+        &json!({}),
+        Instant::now() + Duration::from_secs(1),
+        &cancellation,
+      )
+      .expect_err("RPC error must fail");
+      assert_eq!(failure.kind, ScheduledFailureKind::ProtocolIncompatible);
+      assert_eq!(failure.message, format!("{method}_rpc_error"));
+      assert!(!failure.message.contains(SENTINEL));
+    }
   }
 
   #[test]

@@ -61,6 +61,7 @@ pub enum RemoteSessionError {
   HeartbeatPhaseRegression,
   HeartbeatAheadOfSession,
   Terminal,
+  EvidenceReplay,
 }
 
 impl From<RemoteProtocolError> for RemoteSessionError {
@@ -138,6 +139,12 @@ impl RemoteSessionState {
     };
     match next_sequencer.accept(frame.clone(), now_unix_millis)? {
       SequenceAcceptance::ExactDuplicate => {
+        if matches!(
+          frame.message,
+          RemoteMessage::Prepared(_) | RemoteMessage::Result(_)
+        ) {
+          return Err(RemoteSessionError::EvidenceReplay);
+        }
         return Ok(RemoteSessionAcceptance::ExactDuplicate);
       }
       SequenceAcceptance::Accepted => {}
@@ -695,7 +702,7 @@ mod tests {
     );
     assert_eq!(
       session.accept(RemoteSessionRole::Runner, result, NOW),
-      Ok(RemoteSessionAcceptance::ExactDuplicate)
+      Err(RemoteSessionError::EvidenceReplay)
     );
     assert_eq!(
       session.accept(RemoteSessionRole::Runner, frame(4, ready()), NOW),

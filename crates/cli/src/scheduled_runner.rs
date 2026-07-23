@@ -23,7 +23,8 @@ use codeoff_runtime::scheduled_runner_control::{
   ScheduledRunnerControlConfig as LocalControlConfig, ScheduledRunnerControlConnection,
 };
 use codeoff_runtime::scheduled_runner_evidence::{
-  RunnerEvidenceClaims, RunnerEvidenceKind, RunnerEvidenceSigner, evidence_payload_digest,
+  RunnerEvidenceClaims, RunnerEvidenceKind, RunnerEvidenceSigner, prepared_evidence_payload_digest,
+  ready_evidence_payload_digest, result_evidence_payload_digest,
 };
 use codeoff_runtime::scheduled_runner_executor::{
   ProtectedScheduledExecutorListener, ScheduledRunnerExecutorConfig, current_process_credentials,
@@ -485,40 +486,45 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
     .map_err(|result| io::Error::other(format!("scheduled runner readiness failed: {result:?}")))?;
   let attested_profile_json = attested.canonical_json();
   let attested_profile_digest = sha256_hex(attested_profile_json.as_bytes());
-  let ready_evidence = evidence_signer.sign(&runner_evidence_claims(
-    role,
-    RunnerEvidenceKind::Ready,
-    &readiness_frame.session_nonce,
-    &readiness.challenge,
-    1,
-    now,
-    readiness.ready_until_unix_millis,
-    u64::try_from(built.authority.deployment_epoch)?,
-    &built.authority.profile_digest,
-    &attested_profile_digest,
-    &attested.credential_revision,
-    &attested_profile_digest,
-  ))?;
+  let mut ready_message = ReadyFrame {
+    signed_evidence_json: String::new(),
+    challenge: readiness.challenge.clone(),
+    ready_until_unix_millis: readiness.ready_until_unix_millis,
+    attested_profile_digest: attested_profile_digest.clone(),
+    attested_profile_json: attested_profile_json.clone(),
+    deployment_epoch: u64::try_from(built.authority.deployment_epoch)?,
+    profile_digest: built.authority.profile_digest.clone(),
+    gateway_image_digest: attested.gateway_image_digest.clone(),
+    runner_image_digest: attested.runner_image_digest.clone(),
+    runner_workload_identity: attested.runner_workload_identity.clone(),
+    runner_client_cert_public_key_fingerprint: attested
+      .runner_client_cert_public_key_fingerprint
+      .clone(),
+    credential_revision: attested.credential_revision.clone(),
+  };
+  let ready_payload_digest = ready_evidence_payload_digest(&ready_message);
+  ready_message.signed_evidence_json = evidence_signer
+    .sign(&runner_evidence_claims(
+      role,
+      RunnerEvidenceKind::Ready,
+      &readiness_frame.session_nonce,
+      &readiness.challenge,
+      1,
+      now,
+      readiness.ready_until_unix_millis,
+      u64::try_from(built.authority.deployment_epoch)?,
+      &built.authority.profile_digest,
+      &attested_profile_digest,
+      &attested.credential_revision,
+      &ready_payload_digest,
+    ))?
+    .canonical_json();
   framed
     .write_frame(&RemoteFrame {
       version: REMOTE_PROTOCOL_VERSION,
       session_nonce: readiness_frame.session_nonce.clone(),
       sequence: 1,
-      message: RemoteMessage::Ready(ReadyFrame {
-        signed_evidence_json: ready_evidence.canonical_json(),
-        challenge: readiness.challenge.clone(),
-        ready_until_unix_millis: readiness.ready_until_unix_millis,
-        attested_profile_digest,
-        attested_profile_json,
-        deployment_epoch: u64::try_from(built.authority.deployment_epoch)?,
-        profile_digest: built.authority.profile_digest.clone(),
-        gateway_image_digest: attested.gateway_image_digest,
-        runner_image_digest: attested.runner_image_digest,
-        runner_workload_identity: attested.runner_workload_identity,
-        runner_client_cert_public_key_fingerprint: attested
-          .runner_client_cert_public_key_fingerprint,
-        credential_revision: attested.credential_revision,
-      }),
+      message: RemoteMessage::Ready(ready_message),
     })
     .await?;
   let admission_frame = framed
@@ -590,28 +596,30 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
     &prepare_frame.session_nonce,
     &capability_profile,
   );
-  let prepared_message = PreparedFrame {
-    signed_evidence_json: evidence_signer
-      .sign(&runner_evidence_claims(
-        role,
-        RunnerEvidenceKind::Prepared,
-        &prepare_frame.session_nonce,
-        &readiness.challenge,
-        2,
-        unix_millis()?,
-        admission.expires_at_unix_millis,
-        u64::try_from(built.authority.deployment_epoch)?,
-        &built.authority.profile_digest,
-        &capability_profile_digest,
-        &built.profile.credential_revision,
-        &capability_profile_digest,
-      ))?
-      .canonical_json(),
+  let mut prepared_message = PreparedFrame {
+    signed_evidence_json: String::new(),
     binding: prepare.binding.clone(),
     preparation_nonce: preparation_nonce.clone(),
     attested_profile_digest: capability_profile_digest.clone(),
     attested_profile_json: capability_profile,
   };
+  let prepared_payload_digest = prepared_evidence_payload_digest(&prepared_message);
+  prepared_message.signed_evidence_json = evidence_signer
+    .sign(&runner_evidence_claims(
+      role,
+      RunnerEvidenceKind::Prepared,
+      &prepare_frame.session_nonce,
+      &readiness.challenge,
+      2,
+      unix_millis()?,
+      admission.expires_at_unix_millis,
+      u64::try_from(built.authority.deployment_epoch)?,
+      &built.authority.profile_digest,
+      &capability_profile_digest,
+      &built.profile.credential_revision,
+      &prepared_payload_digest,
+    ))?
+    .canonical_json();
   framed
     .write_frame(&runner_frame(
       &prepare_frame,
@@ -839,7 +847,15 @@ fn execution_result(
     ),
   };
   let now = unix_millis()?;
-  let signed_evidence_json = signer
+  let mut result = ResultFrame {
+    signed_evidence_json: String::new(),
+    binding,
+    preparation_nonce,
+    kind,
+    result_json,
+  };
+  let result_payload_digest = result_evidence_payload_digest(&result);
+  result.signed_evidence_json = signer
     .sign(&runner_evidence_claims(
       role,
       RunnerEvidenceKind::Result,
@@ -848,20 +864,14 @@ fn execution_result(
       3,
       now,
       now.saturating_add(MAX_READY_TTL_MILLIS),
-      binding.deployment_epoch,
-      &binding.profile_digest,
+      result.binding.deployment_epoch,
+      &result.binding.profile_digest,
       observed_profile_digest,
-      &binding.credential_revision,
-      &evidence_payload_digest(result_json.as_bytes()),
+      &result.binding.credential_revision,
+      &result_payload_digest,
     ))?
     .canonical_json();
-  Ok(RemoteMessage::Result(ResultFrame {
-    signed_evidence_json,
-    binding,
-    preparation_nonce,
-    kind,
-    result_json,
-  }))
+  Ok(RemoteMessage::Result(result))
 }
 
 #[allow(clippy::too_many_arguments)]

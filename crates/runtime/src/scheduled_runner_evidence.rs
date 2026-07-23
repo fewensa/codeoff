@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+use crate::scheduled_remote_protocol::{
+  PreparedFrame, ReadyFrame, RemoteResultKind, ResultFrame, RunBinding,
+};
 use crate::scheduled_runner_tls::load_root_owned_bounded_file;
 
 const EVIDENCE_SCHEMA_VERSION: u64 = 1;
@@ -15,6 +18,8 @@ const EVIDENCE_ALGORITHM_VERSION: &str = "ed25519-v1";
 const EVIDENCE_DOMAIN: &[u8] = b"codeoff-scheduled-runner-evidence-v1";
 const MAX_EVIDENCE_BYTES: usize = 64 * 1024;
 const MAX_EVIDENCE_KEY_BYTES: u64 = 4 * 1024;
+const ED25519_SIGNATURE_HEX_BYTES: usize = 128;
+const MAX_KEY_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerEvidenceKind {
@@ -61,6 +66,9 @@ impl SignedRunnerEvidence {
     reason = "byte-exact canonical JSON comparison is the contract"
   )]
   pub fn parse_canonical_json(encoded: &str) -> Result<Self, RunnerEvidenceError> {
+    if encoded.len() > MAX_EVIDENCE_BYTES {
+      return Err(RunnerEvidenceError::TooLarge);
+    }
     let value: Value =
       serde_json::from_str(encoded).map_err(|_| RunnerEvidenceError::InvalidClaims)?;
     if value.to_string() != encoded {
@@ -83,11 +91,13 @@ impl SignedRunnerEvidence {
         .map(str::to_owned)
         .ok_or(RunnerEvidenceError::InvalidClaims)
     };
-    Ok(Self {
+    let evidence = Self {
       claims_json: string("claims_json")?,
       key_id: string("key_id")?,
       signature_hex: string("signature_hex")?,
-    })
+    };
+    validate_outer_fields(&evidence)?;
+    Ok(evidence)
   }
 }
 
@@ -112,7 +122,7 @@ impl RunnerEvidenceSigner {
       .map_err(|_| RunnerEvidenceError::InvalidKey)?;
     let key_pair =
       Ed25519KeyPair::from_pkcs8(&bytes).map_err(|_| RunnerEvidenceError::InvalidKey)?;
-    if key_id.is_empty() || key_id.len() > 128 {
+    if !valid_key_id(key_id) {
       return Err(RunnerEvidenceError::InvalidKey);
     }
     Ok(Self {
@@ -138,7 +148,7 @@ impl RunnerEvidenceVerifier {
   pub fn load(path: &Path, key_id: &str) -> Result<Self, RunnerEvidenceError> {
     let public_key =
       load_root_owned_bounded_file(path, 32).map_err(|_| RunnerEvidenceError::InvalidKey)?;
-    if public_key.len() != 32 || key_id.is_empty() || key_id.len() > 128 {
+    if public_key.len() != 32 || !valid_key_id(key_id) {
       return Err(RunnerEvidenceError::InvalidKey);
     }
     Ok(Self {
@@ -211,6 +221,9 @@ fn sign_with_key_pair(
   key_id: &str,
   key_pair: &Ed25519KeyPair,
 ) -> Result<SignedRunnerEvidence, RunnerEvidenceError> {
+  if !valid_key_id(key_id) {
+    return Err(RunnerEvidenceError::InvalidKey);
+  }
   validate_claims(claims, claims.issued_at_unix_millis)?;
   let claims_json = claims.canonical_json();
   if claims_json.len() > MAX_EVIDENCE_BYTES {
@@ -229,7 +242,8 @@ pub fn verify_runner_evidence(
   public_key: &[u8],
   now_unix_millis: u64,
 ) -> Result<RunnerEvidenceClaims, RunnerEvidenceError> {
-  if evidence.claims_json.len() > MAX_EVIDENCE_BYTES || evidence.key_id.is_empty() {
+  validate_outer_fields(evidence)?;
+  if evidence.claims_json.len() > MAX_EVIDENCE_BYTES {
     return Err(RunnerEvidenceError::TooLarge);
   }
   let claims = parse_claims(&evidence.claims_json)?;
@@ -384,7 +398,11 @@ fn hex(bytes: &[u8]) -> String {
   )
 }
 fn decode_hex(value: &str) -> Result<Vec<u8>, RunnerEvidenceError> {
-  if !value.len().is_multiple_of(2) {
+  if value.len() != ED25519_SIGNATURE_HEX_BYTES
+    || !value
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+  {
     return Err(RunnerEvidenceError::InvalidSignature);
   }
   (0..value.len())
@@ -400,6 +418,101 @@ pub fn evidence_payload_digest(bytes: &[u8]) -> String {
   format!("{:x}", Sha256::digest(bytes))
 }
 
+#[must_use]
+pub fn ready_evidence_payload_digest(ready: &ReadyFrame) -> String {
+  evidence_payload_digest(
+    json!({
+      "attested_profile_digest": ready.attested_profile_digest,
+      "attested_profile_json": ready.attested_profile_json,
+      "challenge": ready.challenge,
+      "credential_revision": ready.credential_revision,
+      "deployment_epoch": ready.deployment_epoch,
+      "gateway_image_digest": ready.gateway_image_digest,
+      "kind": "ready",
+      "profile_digest": ready.profile_digest,
+      "ready_until_unix_millis": ready.ready_until_unix_millis,
+      "runner_client_cert_public_key_fingerprint": ready.runner_client_cert_public_key_fingerprint,
+      "runner_image_digest": ready.runner_image_digest,
+      "runner_workload_identity": ready.runner_workload_identity,
+      "schema_version": 1,
+    })
+    .to_string()
+    .as_bytes(),
+  )
+}
+
+#[must_use]
+pub fn prepared_evidence_payload_digest(prepared: &PreparedFrame) -> String {
+  evidence_payload_digest(
+    json!({
+      "attested_profile_digest": prepared.attested_profile_digest,
+      "attested_profile_json": prepared.attested_profile_json,
+      "binding": binding_value(&prepared.binding),
+      "kind": "prepared",
+      "preparation_nonce": prepared.preparation_nonce,
+      "schema_version": 1,
+    })
+    .to_string()
+    .as_bytes(),
+  )
+}
+
+#[must_use]
+pub fn result_evidence_payload_digest(result: &ResultFrame) -> String {
+  let kind = match result.kind {
+    RemoteResultKind::Completed => "completed",
+    RemoteResultKind::FailedBeforeStart => "failed_before_start",
+    RemoteResultKind::OutcomeUnknown => "outcome_unknown",
+  };
+  evidence_payload_digest(
+    json!({
+      "binding": binding_value(&result.binding),
+      "kind": "result",
+      "preparation_nonce": result.preparation_nonce,
+      "result_json": result.result_json,
+      "result_kind": kind,
+      "schema_version": 1,
+    })
+    .to_string()
+    .as_bytes(),
+  )
+}
+
+fn binding_value(binding: &RunBinding) -> Value {
+  json!({
+    "attempt": binding.attempt,
+    "authority_digest": binding.authority_digest,
+    "credential_revision": binding.credential_revision,
+    "deployment_epoch": binding.deployment_epoch,
+    "fence_token": binding.fence_token,
+    "job_id": binding.job_id,
+    "profile_digest": binding.profile_digest,
+    "run_id": binding.run_id,
+  })
+}
+
+fn valid_key_id(value: &str) -> bool {
+  (1..=MAX_KEY_ID_BYTES).contains(&value.len())
+    && value
+      .bytes()
+      .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn validate_outer_fields(evidence: &SignedRunnerEvidence) -> Result<(), RunnerEvidenceError> {
+  if !valid_key_id(&evidence.key_id) {
+    return Err(RunnerEvidenceError::InvalidKey);
+  }
+  if evidence.signature_hex.len() != ED25519_SIGNATURE_HEX_BYTES
+    || !evidence
+      .signature_hex
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+  {
+    return Err(RunnerEvidenceError::InvalidSignature);
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -407,6 +520,7 @@ mod tests {
   use ring::signature::KeyPair;
   use std::fs;
   use std::os::unix::fs::PermissionsExt;
+  use std::os::unix::fs::symlink;
 
   fn claims(kind: RunnerEvidenceKind) -> RunnerEvidenceClaims {
     RunnerEvidenceClaims {
@@ -518,5 +632,191 @@ mod tests {
     assert!(verifier.verify(&evidence, 1_500).is_ok());
     fs::set_permissions(&private_path, fs::Permissions::from_mode(0o600)).expect("loose mode");
     assert!(RunnerEvidenceSigner::load(&private_path, "key-1").is_err());
+  }
+
+  #[test]
+  fn outer_envelope_requires_bounded_key_id_and_exact_lowercase_signature() {
+    let (private, public) = key_pair();
+    let signed =
+      sign_runner_evidence(&claims(RunnerEvidenceKind::Ready), "key-1", &private).expect("sign");
+    for signature in [
+      signed.signature_hex.to_ascii_uppercase(),
+      signed.signature_hex[..126].to_owned(),
+      format!("{}00", signed.signature_hex),
+    ] {
+      let mut candidate = signed.clone();
+      candidate.signature_hex = signature;
+      assert!(matches!(
+        verify_runner_evidence(&candidate, &public, 1_500),
+        Err(RunnerEvidenceError::InvalidSignature)
+      ));
+      assert!(SignedRunnerEvidence::parse_canonical_json(&candidate.canonical_json()).is_err());
+    }
+    for key_id in [
+      String::new(),
+      "a".repeat(MAX_KEY_ID_BYTES + 1),
+      "KEY-1".to_owned(),
+    ] {
+      let mut candidate = signed.clone();
+      candidate.key_id = key_id;
+      assert!(matches!(
+        verify_runner_evidence(&candidate, &public, 1_500),
+        Err(RunnerEvidenceError::InvalidKey)
+      ));
+    }
+  }
+
+  #[test]
+  fn key_loaders_reject_zero_oversize_wrong_length_and_symlink_material() {
+    let temp = tempfile::tempdir().expect("temp");
+    let zero = temp.path().join("zero");
+    let oversized = temp.path().join("oversized");
+    let public_wrong = temp.path().join("public-wrong");
+    let private_boundary = temp.path().join("private-boundary");
+    let linked = temp.path().join("linked");
+    fs::write(&zero, []).expect("zero");
+    fs::write(
+      &oversized,
+      vec![0_u8; usize::try_from(MAX_EVIDENCE_KEY_BYTES + 1).unwrap()],
+    )
+    .expect("oversized");
+    fs::write(&public_wrong, [0_u8; 31]).expect("public wrong");
+    fs::write(
+      &private_boundary,
+      vec![0_u8; usize::try_from(MAX_EVIDENCE_KEY_BYTES).unwrap()],
+    )
+    .expect("private boundary");
+    for path in [&zero, &oversized, &public_wrong, &private_boundary] {
+      fs::set_permissions(path, fs::Permissions::from_mode(0o400)).expect("mode");
+    }
+    symlink(&zero, &linked).expect("symlink");
+    assert!(RunnerEvidenceSigner::load(&zero, "key-1").is_err());
+    assert!(RunnerEvidenceSigner::load(&oversized, "key-1").is_err());
+    assert!(RunnerEvidenceSigner::load(&private_boundary, "key-1").is_err());
+    assert!(RunnerEvidenceVerifier::load(&public_wrong, "key-1").is_err());
+    assert!(RunnerEvidenceSigner::load(&linked, "key-1").is_err());
+    assert!(RunnerEvidenceVerifier::load(&linked, "key-1").is_err());
+  }
+
+  fn binding() -> RunBinding {
+    RunBinding {
+      run_id: "01J00000000000000000000000".to_owned(),
+      job_id: "01J00000000000000000000001".to_owned(),
+      attempt: 1,
+      fence_token: 2,
+      authority_digest: "1".repeat(64),
+      profile_digest: "2".repeat(64),
+      deployment_epoch: 3,
+      credential_revision: "credential-v1".to_owned(),
+    }
+  }
+
+  #[test]
+  fn kind_specific_payload_digests_cover_every_relayed_field() {
+    let ready = ReadyFrame {
+      signed_evidence_json: String::new(),
+      challenge: "1".repeat(64),
+      ready_until_unix_millis: 10,
+      attested_profile_json: "{\"profile\":1}".to_owned(),
+      attested_profile_digest: "2".repeat(64),
+      deployment_epoch: 3,
+      profile_digest: "4".repeat(64),
+      gateway_image_digest: format!("sha256:{}", "5".repeat(64)),
+      runner_image_digest: format!("sha256:{}", "6".repeat(64)),
+      runner_workload_identity: "spiffe://codeoff/runner".to_owned(),
+      runner_client_cert_public_key_fingerprint: "7".repeat(64),
+      credential_revision: "credential-v1".to_owned(),
+    };
+    let ready_digest = ready_evidence_payload_digest(&ready);
+    let mut mutations = Vec::new();
+    let mut value = ready.clone();
+    value.challenge = "8".repeat(64);
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.ready_until_unix_millis += 1;
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.attested_profile_json.push(' ');
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.attested_profile_digest = "8".repeat(64);
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.deployment_epoch += 1;
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.profile_digest = "8".repeat(64);
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.gateway_image_digest.push('x');
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.runner_image_digest.push('x');
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.runner_workload_identity.push('x');
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.runner_client_cert_public_key_fingerprint = "8".repeat(64);
+    mutations.push(value);
+    let mut value = ready.clone();
+    value.credential_revision.push('x');
+    mutations.push(value);
+    assert!(
+      mutations
+        .iter()
+        .all(|value| ready_evidence_payload_digest(value) != ready_digest)
+    );
+
+    let prepared = PreparedFrame {
+      signed_evidence_json: String::new(),
+      binding: binding(),
+      preparation_nonce: "3".repeat(64),
+      attested_profile_json: "{\"profile\":1}".to_owned(),
+      attested_profile_digest: "4".repeat(64),
+    };
+    let prepared_digest = prepared_evidence_payload_digest(&prepared);
+    let mut value = prepared.clone();
+    value.preparation_nonce = "5".repeat(64);
+    assert_ne!(prepared_evidence_payload_digest(&value), prepared_digest);
+    let mut value = prepared.clone();
+    value.attested_profile_json.push(' ');
+    assert_ne!(prepared_evidence_payload_digest(&value), prepared_digest);
+    let mut value = prepared.clone();
+    value.attested_profile_digest = "5".repeat(64);
+    assert_ne!(prepared_evidence_payload_digest(&value), prepared_digest);
+    for index in 0..8 {
+      let mut value = prepared.clone();
+      match index {
+        0 => value.binding.run_id.push('x'),
+        1 => value.binding.job_id.push('x'),
+        2 => value.binding.attempt += 1,
+        3 => value.binding.fence_token += 1,
+        4 => value.binding.authority_digest = "5".repeat(64),
+        5 => value.binding.profile_digest = "5".repeat(64),
+        6 => value.binding.deployment_epoch += 1,
+        7 => value.binding.credential_revision.push('x'),
+        _ => unreachable!(),
+      }
+      assert_ne!(prepared_evidence_payload_digest(&value), prepared_digest);
+    }
+
+    let result = ResultFrame {
+      signed_evidence_json: String::new(),
+      binding: binding(),
+      preparation_nonce: "3".repeat(64),
+      kind: RemoteResultKind::Completed,
+      result_json: "{\"schema_version\":1}".to_owned(),
+    };
+    let result_digest = result_evidence_payload_digest(&result);
+    let mut value = result.clone();
+    value.preparation_nonce = "4".repeat(64);
+    assert_ne!(result_evidence_payload_digest(&value), result_digest);
+    let mut value = result.clone();
+    value.kind = RemoteResultKind::OutcomeUnknown;
+    assert_ne!(result_evidence_payload_digest(&value), result_digest);
+    let mut value = result;
+    value.result_json.push(' ');
+    assert_ne!(result_evidence_payload_digest(&value), result_digest);
   }
 }

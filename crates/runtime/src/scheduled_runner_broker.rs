@@ -3219,6 +3219,27 @@ mod tests {
     assert!(session.slot.lock().expect("signed cleanup slot").is_none());
   }
 
+  #[test]
+  fn started_reservation_without_signed_cleanup_remains_pinned() {
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
+    let session = registered_session(&"e".repeat(64));
+    broker.register(&session).expect("register session");
+    let (_, _, reservation) = broker.state_admission(true).expect("reserve session");
+    let reservation = reservation.expect("reservation guard");
+    session
+      .reserve_grant(unix_millis().expect("time"), &reservation.0.admission_nonce)
+      .expect("issue grant");
+    reservation.validate_and_pin().expect("pin before CAS");
+    reservation
+      .begin_start_attempt()
+      .expect("validate exact reservation at START boundary");
+    reservation
+      .confirm_start_byte()
+      .expect("point of no return before START write attempt");
+    drop(reservation);
+    assert!(session.slot.lock().expect("started slot").is_some());
+  }
+
   #[tokio::test]
   async fn partial_start_frame_write_keeps_started_reservation_pinned() {
     let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");

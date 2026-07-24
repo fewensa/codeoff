@@ -802,6 +802,11 @@ fn preparation_error(binding: &RunBinding, result: ScheduledExecutionResult) -> 
       "scheduled runner transport was lost".to_owned(),
       true,
     ),
+    ScheduledExecutionResult::CleanupUnproven(_) => (
+      "runner-cleanup-unproven",
+      "scheduled runner cleanup was not proven".to_owned(),
+      true,
+    ),
     ScheduledExecutionResult::Interrupted { .. } => (
       "runner-preflight-interrupted",
       "scheduled runner preparation was interrupted".to_owned(),
@@ -836,6 +841,15 @@ fn execution_result(
   challenge: &str,
   observed_profile_digest: &str,
 ) -> Result<RemoteMessage, Box<dyn Error>> {
+  if matches!(result, ScheduledExecutionResult::CleanupUnproven(_)) {
+    return Ok(RemoteMessage::Error(ErrorFrame {
+      binding: Some(binding),
+      preparation_nonce: Some(preparation_nonce),
+      code: "runner-cleanup-unproven".to_owned(),
+      message: "scheduled runner cleanup was not proven".to_owned(),
+      retryable: true,
+    }));
+  }
   let (kind, result_json) = match result {
     ScheduledExecutionResult::Completed { output, .. } => (
       RemoteResultKind::Completed,
@@ -864,6 +878,7 @@ fn execution_result(
       })
       .to_string(),
     ),
+    ScheduledExecutionResult::CleanupUnproven(_) => unreachable!("handled before result signing"),
   };
   let now = unix_millis()?;
   let mut result = ResultFrame {
@@ -1210,6 +1225,69 @@ mod tests {
     assert_eq!(error.code, "runner-preflight-rejected");
     assert_eq!(error.message, "scheduled runner protocol was rejected");
     assert!(!error.message.contains(SENTINEL));
+  }
+
+  #[test]
+  fn cleanup_unproven_execution_result_sends_error_without_cleanup_evidence() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("evidence key");
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse evidence key");
+    let private_key = temp.path().join("executor.pk8");
+    let public_key = temp.path().join("executor.pub");
+    fs::write(&private_key, pkcs8.as_ref()).expect("private key");
+    fs::write(&public_key, key_pair.public_key().as_ref()).expect("public key");
+    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o400)).expect("private mode");
+    fs::set_permissions(&public_key, fs::Permissions::from_mode(0o400)).expect("public mode");
+    let signer = RunnerEvidenceSigner::load(&private_key, "executor-key-1").expect("signer");
+    let binding = RunBinding {
+      run_id: "run-1".to_owned(),
+      job_id: "job-1".to_owned(),
+      attempt: 1,
+      fence_token: 1,
+      authority_digest: "a".repeat(64),
+      profile_digest: "b".repeat(64),
+      deployment_epoch: 1,
+      credential_revision: "credential-v1".to_owned(),
+    };
+    let role = codeoff_config::ScheduledRunnerExecutorConfig {
+      local_socket_path: temp.path().join("executor.sock"),
+      execution_grant_public_key_path: public_key,
+      execution_grant_key_id: "gateway-grant-key-1".to_owned(),
+      execution_grant_key_revision: "gateway-grant-2026-07".to_owned(),
+      execution_grant_signer_identity: "spiffe://codeoff/gateway/production".to_owned(),
+      evidence_private_key_path: private_key,
+      evidence_key_id: "executor-key-1".to_owned(),
+      evidence_key_revision: "executor-evidence-2026-07".to_owned(),
+      evidence_signer_identity: "spiffe://codeoff/executor/production".to_owned(),
+      expected_control_uid: current_process_credentials().uid,
+      expected_control_gid: current_process_credentials().gid,
+      codex_child_uid: 65_534,
+      codex_child_gid: 65_534,
+      accept_timeout_ms: 2_000,
+      frame_timeout_ms: 2_000,
+    };
+    let message = execution_result(
+      binding.clone(),
+      "c".repeat(64),
+      ScheduledExecutionResult::CleanupUnproven(ScheduledFailure {
+        kind: ScheduledFailureKind::Transport,
+        message: "cleanup sentinel".to_owned(),
+      }),
+      &signer,
+      &role,
+      &"d".repeat(64),
+      &"e".repeat(64),
+      &"f".repeat(64),
+    )
+    .expect("cleanup-unproven result");
+    let RemoteMessage::Error(error) = message else {
+      panic!("cleanup-unproven execution must not emit a result frame");
+    };
+    assert_eq!(error.binding, Some(binding));
+    assert_eq!(error.preparation_nonce, Some("c".repeat(64)));
+    assert_eq!(error.code, "runner-cleanup-unproven");
+    assert_eq!(error.message, "scheduled runner cleanup was not proven");
+    assert!(error.retryable);
   }
 
   #[test]

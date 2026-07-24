@@ -9,7 +9,7 @@ use std::fmt;
 use codeoff_core::{CredentialRevision, CriticalId, RunnerWorkloadIdentity};
 use serde_json::{Map, Value, json};
 
-pub const REMOTE_PROTOCOL_VERSION: u64 = 1;
+pub const REMOTE_PROTOCOL_VERSION: u64 = 2;
 pub const MAX_REMOTE_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_READY_TTL_MILLIS: u64 = 30_000;
 pub const MAX_ADMISSION_TTL_MILLIS: u64 = 30_000;
@@ -1171,7 +1171,10 @@ mod tests {
       r#"{{"version":{},"session_nonce":{},"sequence":{},"message":{}}}"#,
       object["version"], object["session_nonce"], object["sequence"], object["message"]
     );
-    let duplicate = format!("{},\"version\":1}}", canonical_text.trim_end_matches('}'));
+    let duplicate = format!(
+      "{},\"version\":{REMOTE_PROTOCOL_VERSION}}}",
+      canonical_text.trim_end_matches('}')
+    );
     let trailing = format!("{canonical_text}\n");
     let leading = format!(" {canonical_text}");
 

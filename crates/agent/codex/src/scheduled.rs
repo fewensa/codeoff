@@ -556,6 +556,7 @@ pub enum ScheduledExecutionResult {
   },
   Failed(ScheduledFailure),
   TransportLost(ScheduledFailure),
+  CleanupUnproven(ScheduledFailure),
   PreflightRejected(ScheduledFailure),
 }
 
@@ -2040,7 +2041,7 @@ impl<T: ScheduledJsonlTransport + Send> PreparedScheduledCodexExecution
     );
     match bounded_shutdown(&mut self.transport, &self.request) {
       Ok(()) => result,
-      Err(failure) => ScheduledExecutionResult::TransportLost(failure),
+      Err(failure) => ScheduledExecutionResult::CleanupUnproven(failure),
     }
   }
 
@@ -5479,6 +5480,30 @@ mod tests {
         "wait_group",
       ]
     );
+  }
+
+  #[test]
+  fn bounded_shutdown_failure_after_success_reports_cleanup_unproven() {
+    let profile = profile();
+    let runtime = evidence(&profile);
+    let actions = Arc::new(Mutex::new(Actions {
+      reap_results: VecDeque::from([ProcessExit::TimedOut, ProcessExit::TimedOut]),
+      ..Actions::default()
+    }));
+    let transport = MockTransport {
+      evidence: runtime,
+      reads: successful_reads(),
+      actions,
+    };
+    let request = request(profile);
+    let executor = executor_for(transport, &request);
+    assert!(matches!(
+      execute_test(&executor, request),
+      ScheduledExecutionResult::CleanupUnproven(ScheduledFailure {
+        kind: ScheduledFailureKind::Transport,
+        ..
+      })
+    ));
   }
 
   #[test]

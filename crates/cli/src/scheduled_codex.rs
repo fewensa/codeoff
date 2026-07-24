@@ -435,7 +435,8 @@ impl PreparedExecution for CodexPreparedExecution {
       ScheduledExecutionResult::Interrupted { .. } => ExecutionResult::Interrupted {
         transport_converged: true,
       },
-      ScheduledExecutionResult::TransportLost(failure) => ExecutionResult::TransportLost {
+      ScheduledExecutionResult::TransportLost(failure)
+      | ScheduledExecutionResult::CleanupUnproven(failure) => ExecutionResult::TransportLost {
         message: failure.message,
       },
       ScheduledExecutionResult::Failed(failure)
@@ -448,6 +449,7 @@ fn prepare_failure(result: ScheduledExecutionResult) -> PrepareFailure {
   let failure = match result {
     ScheduledExecutionResult::Failed(failure)
     | ScheduledExecutionResult::TransportLost(failure)
+    | ScheduledExecutionResult::CleanupUnproven(failure)
     | ScheduledExecutionResult::PreflightRejected(failure) => failure,
     ScheduledExecutionResult::Interrupted { .. } => {
       return PrepareFailure::fatal("scheduled_prepare_interrupted");

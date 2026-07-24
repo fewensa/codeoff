@@ -2,16 +2,19 @@
 
 use std::fmt;
 use std::fs;
-use std::os::fd::AsFd;
+use std::io::ErrorKind;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use codeoff_agent_contract::{
   AgentTask, InvocationPrincipal, InvocationSource, PreviousSuccessContext, SessionMode, ToolPolicy,
 };
-use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, OFlag, fcntl, open};
-use nix::sys::stat::Mode;
+use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, OFlag, fcntl, openat};
+use nix::libc;
+use nix::sys::stat::{Mode, fstat};
 use nix::unistd::{Gid, chown, getegid, geteuid};
 use serde_json::{Map, Value};
 use tokio::net::{UnixListener, UnixStream, unix::UCred};
@@ -187,19 +190,27 @@ pub struct ProtectedScheduledExecutorListener {
 
 struct OwnedSocketPath {
   path: PathBuf,
+  name: PathBuf,
+  parent_dir: fs::File,
   device: u64,
   inode: u64,
   unlink_armed: bool,
 }
 
 impl OwnedSocketPath {
-  fn capture(path: PathBuf) -> Result<Self, ScheduledRunnerExecutorError> {
+  fn capture(
+    path: PathBuf,
+    name: PathBuf,
+    parent_dir: fs::File,
+  ) -> Result<Self, ScheduledRunnerExecutorError> {
     let metadata = fs::symlink_metadata(&path)?;
     if !metadata.file_type().is_socket() {
       return Err(ScheduledRunnerExecutorError::SocketTypeMismatch);
     }
     Ok(Self {
       path,
+      name,
+      parent_dir,
       device: metadata.dev(),
       inode: metadata.ino(),
       unlink_armed: true,
@@ -217,7 +228,12 @@ impl OwnedSocketPath {
     if metadata.dev() != self.device || metadata.ino() != self.inode {
       return Err(ScheduledRunnerExecutorError::SocketOwnershipMismatch);
     }
-    fs::remove_file(&self.path)?;
+    nix::unistd::unlinkat(
+      &self.parent_dir,
+      &self.name,
+      nix::unistd::UnlinkatFlags::NoRemoveDir,
+    )
+    .map_err(|error| ScheduledRunnerExecutorError::Io(error.into()))?;
     self.unlink_armed = false;
     Ok(())
   }
@@ -248,22 +264,27 @@ pub fn current_process_credentials() -> ScheduledRunnerControlPeer {
 impl ProtectedScheduledExecutorListener {
   pub fn bind(config: ScheduledRunnerExecutorConfig) -> Result<Self, ScheduledRunnerExecutorError> {
     config.validate()?;
-    let parent = config
-      .socket_path
-      .parent()
-      .ok_or(ScheduledRunnerExecutorError::InvalidConfiguration)?;
-    let parent_metadata = fs::metadata(parent)?;
-    if !parent_metadata.is_dir() {
-      return Err(ScheduledRunnerExecutorError::InvalidConfiguration);
-    }
-    let sticky = parent_metadata.permissions().mode() & 0o1000 != 0;
-    if parent_metadata.permissions().mode() & 0o022 != 0 && !sticky {
+    let parent_dir = open_socket_parent_directory(&config.socket_path)?;
+    let parent_metadata = parent_dir.metadata()?;
+    if parent_metadata.permissions().mode() & 0o022 != 0 {
       return Err(ScheduledRunnerExecutorError::InsecureParentDirectory);
     }
-    let lock_path = config.socket_path.with_extension("sock.lock");
+    let socket_name = config
+      .socket_path
+      .file_name()
+      .ok_or(ScheduledRunnerExecutorError::InvalidConfiguration)?;
+    let socket_name = PathBuf::from(socket_name);
+    let socket_path = anchored_child_path(&parent_dir, &socket_name);
+    let lock_name = config
+      .socket_path
+      .with_extension("sock.lock")
+      .file_name()
+      .map(PathBuf::from)
+      .ok_or(ScheduledRunnerExecutorError::InvalidConfiguration)?;
     let lock_file = fs::File::from(
-      open(
-        &lock_path,
+      openat(
+        &parent_dir,
+        &lock_name,
         OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         Mode::from_bits_truncate(0o600),
       )
@@ -278,35 +299,39 @@ impl ProtectedScheduledExecutorListener {
     }
     let lifecycle_lock = Flock::lock(lock_file, FlockArg::LockExclusiveNonblock)
       .map_err(|_| ScheduledRunnerExecutorError::LifecycleLocked)?;
-    if let Ok(existing) = fs::symlink_metadata(&config.socket_path) {
+    if let Ok(existing) = fs::symlink_metadata(&socket_path) {
       if !existing.file_type().is_socket() {
         return Err(ScheduledRunnerExecutorError::SocketTypeMismatch);
       }
       if existing.uid() != geteuid().as_raw() || existing.gid() != getegid().as_raw() {
         return Err(ScheduledRunnerExecutorError::SocketOwnershipMismatch);
       }
-      fs::remove_file(&config.socket_path)?;
-    }
-    let listener = UnixListener::bind(&config.socket_path)?;
-    require_executor_cloexec(&listener)?;
-    let socket_path = OwnedSocketPath::capture(config.socket_path.clone())?;
-    let mut metadata = fs::symlink_metadata(&config.socket_path)?;
-    if metadata.gid() != config.control_gid {
-      chown(
-        &config.socket_path,
-        None,
-        Some(Gid::from_raw(config.control_gid)),
+      if socket_path_has_active_listener(&socket_path)? {
+        return Err(ScheduledRunnerExecutorError::SocketPathExists);
+      }
+      nix::unistd::unlinkat(
+        &parent_dir,
+        &socket_name,
+        nix::unistd::UnlinkatFlags::NoRemoveDir,
       )
       .map_err(|error| ScheduledRunnerExecutorError::Io(error.into()))?;
     }
-    fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o620))?;
-    metadata = fs::symlink_metadata(&config.socket_path)?;
-    if metadata.dev() != socket_path.device || metadata.ino() != socket_path.inode {
+    let listener = UnixListener::bind(&socket_path)?;
+    require_executor_cloexec(&listener)?;
+    let owned_socket_path = OwnedSocketPath::capture(socket_path.clone(), socket_name, parent_dir)?;
+    let mut metadata = fs::symlink_metadata(&socket_path)?;
+    if metadata.gid() != config.control_gid {
+      chown(&socket_path, None, Some(Gid::from_raw(config.control_gid)))
+        .map_err(|error| ScheduledRunnerExecutorError::Io(error.into()))?;
+    }
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o620))?;
+    metadata = fs::symlink_metadata(&socket_path)?;
+    if metadata.dev() != owned_socket_path.device || metadata.ino() != owned_socket_path.inode {
       return Err(ScheduledRunnerExecutorError::SocketOwnershipMismatch);
     }
     Ok(Self {
       listener,
-      socket_path,
+      socket_path: owned_socket_path,
       _lifecycle_lock: lifecycle_lock,
       config,
     })
@@ -348,6 +373,50 @@ impl ScheduledRunnerExecutorConnection {
       control_peer,
       framed: ScheduledRunnerFramed::new(stream, read_timeout, write_timeout),
     }
+  }
+}
+
+fn open_socket_parent_directory(
+  socket_path: &Path,
+) -> Result<fs::File, ScheduledRunnerExecutorError> {
+  let mut current = fs::File::open("/")?;
+  let mut components = socket_path.components().peekable();
+  if !matches!(components.next(), Some(Component::RootDir)) {
+    return Err(ScheduledRunnerExecutorError::InvalidConfiguration);
+  }
+  while let Some(component) = components.next() {
+    let Component::Normal(name) = component else {
+      return Err(ScheduledRunnerExecutorError::InvalidConfiguration);
+    };
+    if components.peek().is_none() {
+      break;
+    }
+    let opened = openat(
+      &current,
+      name,
+      OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+      Mode::empty(),
+    )
+    .map_err(|error| ScheduledRunnerExecutorError::Io(error.into()))?;
+    current = fs::File::from(opened);
+  }
+  let stat = fstat(&current).map_err(|error| ScheduledRunnerExecutorError::Io(error.into()))?;
+  if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+    return Err(ScheduledRunnerExecutorError::InvalidConfiguration);
+  }
+  Ok(current)
+}
+
+fn anchored_child_path(parent_dir: &fs::File, child: &Path) -> PathBuf {
+  PathBuf::from(format!("/proc/self/fd/{}", parent_dir.as_raw_fd())).join(child)
+}
+
+fn socket_path_has_active_listener(path: &Path) -> Result<bool, ScheduledRunnerExecutorError> {
+  match StdUnixStream::connect(path) {
+    Ok(_) => Ok(true),
+    Err(error) if error.kind() == ErrorKind::ConnectionRefused => Ok(false),
+    Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+    Err(error) => Err(ScheduledRunnerExecutorError::Io(error)),
   }
 }
 
@@ -560,6 +629,47 @@ printf normal-child-launch
       ProtectedScheduledExecutorListener::bind(config(path.clone())).expect("recover stale socket");
     drop(listener);
     assert!(!path.exists());
+  }
+
+  #[test]
+  fn refuses_to_replace_an_active_socket_listener() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("control.sock");
+    let active = std::os::unix::net::UnixListener::bind(&path).expect("active socket");
+    assert!(matches!(
+      ProtectedScheduledExecutorListener::bind(config(path.clone())),
+      Err(ScheduledRunnerExecutorError::SocketPathExists)
+    ));
+    let _connection = StdUnixStream::connect(&path).expect("active socket remains reachable");
+    drop(active);
+  }
+
+  #[tokio::test]
+  async fn drop_cleanup_unlinks_only_the_fd_anchored_socket_parent() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let parent = temp.path().join("runner");
+    fs::create_dir(&parent).expect("create runner dir");
+    let path = parent.join("control.sock");
+    let listener =
+      ProtectedScheduledExecutorListener::bind(config(path.clone())).expect("listener");
+    let original = fs::symlink_metadata(&path).expect("original socket metadata");
+
+    let replaced_parent = temp.path().join("runner-replaced");
+    fs::rename(&parent, &replaced_parent).expect("move original parent");
+    fs::create_dir(&parent).expect("create replacement parent");
+    let replacement =
+      std::os::unix::net::UnixListener::bind(&path).expect("replacement active socket");
+    let replacement_metadata = fs::symlink_metadata(&path).expect("replacement socket metadata");
+    assert_ne!(
+      (original.dev(), original.ino()),
+      (replacement_metadata.dev(), replacement_metadata.ino())
+    );
+
+    drop(listener);
+
+    assert!(!replaced_parent.join("control.sock").exists());
+    let _connection = StdUnixStream::connect(&path).expect("replacement socket remains reachable");
+    drop(replacement);
   }
 
   #[test]

@@ -5945,6 +5945,9 @@ mod tests {
   #[cfg(unix)]
   #[test]
   fn direct_transport_drop_kills_and_reaps_its_process_group() {
+    if geteuid().as_raw() != 0 {
+      return;
+    }
     let unique = format!(
       "codeoff-scheduled-process-test-{}-{}",
       std::process::id(),

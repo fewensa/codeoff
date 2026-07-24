@@ -482,6 +482,29 @@ pub fn result_evidence_payload_digest(result: &ResultFrame) -> String {
   )
 }
 
+#[must_use]
+pub fn cleanup_evidence_payload_digest(result: &ResultFrame) -> String {
+  let kind = match result.kind {
+    RemoteResultKind::Completed => "completed",
+    RemoteResultKind::FailedBeforeStart => "failed_before_start",
+    RemoteResultKind::OutcomeUnknown => "outcome_unknown",
+  };
+  evidence_payload_digest(
+    json!({
+      "binding": binding_value(&result.binding),
+      "kind": "cleanup",
+      "preparation_nonce": result.preparation_nonce,
+      "result_json": result.result_json,
+      "result_kind": kind,
+      "result_payload_digest": result_evidence_payload_digest(result),
+      "schema_version": 1,
+      "signed_result_evidence_json": result.signed_evidence_json,
+    })
+    .to_string()
+    .as_bytes(),
+  )
+}
+
 fn binding_value(binding: &RunBinding) -> Value {
   json!({
     "attempt": binding.attempt,
@@ -816,20 +839,29 @@ mod tests {
 
     let result = ResultFrame {
       signed_evidence_json: String::new(),
+      signed_cleanup_evidence_json: String::new(),
       binding: binding(),
       preparation_nonce: "3".repeat(64),
       kind: RemoteResultKind::Completed,
       result_json: "{\"schema_version\":1}".to_owned(),
     };
     let result_digest = result_evidence_payload_digest(&result);
+    let cleanup_digest = cleanup_evidence_payload_digest(&result);
     let mut value = result.clone();
     value.preparation_nonce = "4".repeat(64);
     assert_ne!(result_evidence_payload_digest(&value), result_digest);
+    assert_ne!(cleanup_evidence_payload_digest(&value), cleanup_digest);
     let mut value = result.clone();
     value.kind = RemoteResultKind::OutcomeUnknown;
     assert_ne!(result_evidence_payload_digest(&value), result_digest);
-    let mut value = result;
+    assert_ne!(cleanup_evidence_payload_digest(&value), cleanup_digest);
+    let mut value = result.clone();
     value.result_json.push(' ');
     assert_ne!(result_evidence_payload_digest(&value), result_digest);
+    assert_ne!(cleanup_evidence_payload_digest(&value), cleanup_digest);
+    let mut value = result;
+    value.signed_evidence_json = "{}".to_owned();
+    assert_eq!(result_evidence_payload_digest(&value), result_digest);
+    assert_ne!(cleanup_evidence_payload_digest(&value), cleanup_digest);
   }
 }

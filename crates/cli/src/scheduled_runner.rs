@@ -30,8 +30,8 @@ use codeoff_runtime::scheduled_runner_control::{
   relay_runner_frames,
 };
 use codeoff_runtime::scheduled_runner_evidence::{
-  RunnerEvidenceClaims, RunnerEvidenceKind, RunnerEvidenceSigner, prepared_evidence_payload_digest,
-  ready_evidence_payload_digest, result_evidence_payload_digest,
+  RunnerEvidenceClaims, RunnerEvidenceKind, RunnerEvidenceSigner, cleanup_evidence_payload_digest,
+  prepared_evidence_payload_digest, ready_evidence_payload_digest, result_evidence_payload_digest,
 };
 #[cfg(test)]
 use codeoff_runtime::scheduled_runner_evidence::{RunnerEvidenceVerifier, SignedRunnerEvidence};
@@ -868,6 +868,7 @@ fn execution_result(
   let now = unix_millis()?;
   let mut result = ResultFrame {
     signed_evidence_json: String::new(),
+    signed_cleanup_evidence_json: String::new(),
     binding,
     preparation_nonce,
     kind,
@@ -888,6 +889,23 @@ fn execution_result(
       observed_profile_digest,
       &result.binding.credential_revision,
       &result_payload_digest,
+    ))?
+    .canonical_json();
+  let cleanup_payload_digest = cleanup_evidence_payload_digest(&result);
+  result.signed_cleanup_evidence_json = signer
+    .sign(&runner_evidence_claims(
+      role,
+      RunnerEvidenceKind::Cleanup,
+      session_nonce,
+      challenge,
+      3,
+      now,
+      now.saturating_add(MAX_READY_TTL_MILLIS),
+      result.binding.deployment_epoch,
+      &result.binding.profile_digest,
+      observed_profile_digest,
+      &result.binding.credential_revision,
+      &cleanup_payload_digest,
     ))?
     .canonical_json();
   Ok(RemoteMessage::Result(result))
@@ -1396,6 +1414,17 @@ mod tests {
         claims.payload_digest,
         result_evidence_payload_digest(result_payload)
       );
+      let cleanup_evidence =
+        SignedRunnerEvidence::parse_canonical_json(&result_payload.signed_cleanup_evidence_json)
+          .expect("opaque cleanup evidence");
+      let cleanup_claims = verifier
+        .verify(&cleanup_evidence, unix_millis().expect("time"))
+        .expect("cleanup verify");
+      assert_eq!(cleanup_claims.kind, RunnerEvidenceKind::Cleanup);
+      assert_eq!(
+        cleanup_claims.payload_digest,
+        cleanup_evidence_payload_digest(result_payload)
+      );
     };
     let executor = async {
       for expected in ["admission", "prepare"] {
@@ -1458,6 +1487,7 @@ mod tests {
       assert!(matches!(start.message, RemoteMessage::Start(_)));
       let mut result = ResultFrame {
         signed_evidence_json: String::new(),
+        signed_cleanup_evidence_json: String::new(),
         binding: executor_binding,
         preparation_nonce: executor_preparation_nonce,
         kind: RemoteResultKind::Completed,
@@ -1480,6 +1510,24 @@ mod tests {
           &payload_digest,
         ))
         .expect("result sign")
+        .canonical_json();
+      let cleanup_payload_digest = cleanup_evidence_payload_digest(&result);
+      result.signed_cleanup_evidence_json = signer
+        .sign(&runner_evidence_claims(
+          &evidence_role,
+          RunnerEvidenceKind::Cleanup,
+          &nonce,
+          &"e".repeat(64),
+          3,
+          now,
+          now + 5_000,
+          result.binding.deployment_epoch,
+          &result.binding.profile_digest,
+          &"1".repeat(64),
+          &result.binding.credential_revision,
+          &cleanup_payload_digest,
+        ))
+        .expect("cleanup sign")
         .canonical_json();
       local_executor
         .write_frame(&test_remote_frame(&nonce, 3, RemoteMessage::Result(result)))

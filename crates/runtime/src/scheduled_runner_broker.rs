@@ -33,8 +33,9 @@ use crate::scheduled_remote_session::{
   RemoteDisconnectOutcome, RemoteSessionRole, RemoteSessionState, RemoteTerminalDisposition,
 };
 use crate::scheduled_runner_evidence::{
-  RunnerEvidenceKind, SignedRunnerEvidence, prepared_evidence_payload_digest,
-  ready_evidence_payload_digest, result_evidence_payload_digest, verify_runner_evidence,
+  RunnerEvidenceKind, SignedRunnerEvidence, cleanup_evidence_payload_digest,
+  prepared_evidence_payload_digest, ready_evidence_payload_digest, result_evidence_payload_digest,
+  verify_runner_evidence,
 };
 use crate::scheduled_runner_grant::{RemoteExecutionGrantClaims, RemoteExecutionGrantSigner};
 use crate::scheduled_runner_tls::{
@@ -682,6 +683,7 @@ fn accept_authenticated_result(
     return Err(ScheduledRunnerBrokerError::ProtocolRejected);
   };
   let payload_digest = result_evidence_payload_digest(result);
+  let cleanup_payload_digest = cleanup_evidence_payload_digest(result);
   validate_executor_evidence(
     config,
     &RemoteFrame {
@@ -697,6 +699,23 @@ fn accept_authenticated_result(
       payload_digest: &payload_digest,
     },
     &result.signed_evidence_json,
+    now,
+  )?;
+  validate_executor_evidence(
+    config,
+    &RemoteFrame {
+      version: REMOTE_PROTOCOL_VERSION,
+      session_nonce: frame.session_nonce.clone(),
+      sequence: 1,
+      message: RemoteMessage::Ready(ready.clone()),
+    },
+    ExpectedRunnerEvidence {
+      kind: RunnerEvidenceKind::Cleanup,
+      sequence: frame.sequence,
+      observed_profile_digest: executor_observed_profile_digest,
+      payload_digest: &cleanup_payload_digest,
+    },
+    &result.signed_cleanup_evidence_json,
     now,
   )?;
   session
@@ -787,7 +806,7 @@ impl ReservationLease {
     self.0.broker.release_reservation(&self.0, true, false);
   }
 
-  fn release_after_signed_result(&self) {
+  fn release_after_signed_cleanup(&self) {
     self.0.broker.release_reservation(&self.0, true, true);
   }
 }
@@ -1539,7 +1558,7 @@ impl PreparedExecution for RemotePreparedExecution {
     ));
     match result {
       Ok(RemoteExecutionTerminal::Result(result)) => {
-        this.reservation.release_after_signed_result();
+        this.reservation.release_after_signed_cleanup();
         remote_execution_result(result)
       }
       Ok(RemoteExecutionTerminal::FailedBeforeStart) => ExecutionResult::TransportLost {
@@ -2194,6 +2213,73 @@ mod tests {
     }
   }
 
+  #[allow(clippy::too_many_arguments)]
+  fn sign_test_evidence(
+    config: &ScheduledRunnerBrokerConfig,
+    kind: RunnerEvidenceKind,
+    session_nonce: &str,
+    challenge: &str,
+    sequence: u64,
+    now: u64,
+    observed_profile_digest: &str,
+    payload_digest: String,
+  ) -> String {
+    sign_runner_evidence(
+      &RunnerEvidenceClaims {
+        kind,
+        algorithm_version: "ed25519-v1".to_owned(),
+        signer_identity: config.executor_evidence_signer_identity.clone(),
+        key_revision: config.executor_evidence_key_revision.clone(),
+        session_nonce: session_nonce.to_owned(),
+        challenge: challenge.to_owned(),
+        sequence,
+        issued_at_unix_millis: now,
+        expires_at_unix_millis: now + 4_000,
+        deployment_epoch: config.deployment_epoch,
+        deployment_profile_digest: config.profile_digest.clone(),
+        observed_profile_digest: observed_profile_digest.to_owned(),
+        executor_identity: config.executor_identity.clone(),
+        credential_revision: config.credential_revision.clone(),
+        payload_digest,
+      },
+      &config.executor_evidence_key_id,
+      &evidence_keys().0,
+    )
+    .expect("signed evidence")
+    .canonical_json()
+  }
+
+  fn sign_test_result_and_cleanup(
+    config: &ScheduledRunnerBrokerConfig,
+    result: &mut ResultFrame,
+    session_nonce: &str,
+    challenge: &str,
+    sequence: u64,
+    now: u64,
+    observed_profile_digest: &str,
+  ) {
+    result.signed_evidence_json = sign_test_evidence(
+      config,
+      RunnerEvidenceKind::Result,
+      session_nonce,
+      challenge,
+      sequence,
+      now,
+      observed_profile_digest,
+      result_evidence_payload_digest(result),
+    );
+    result.signed_cleanup_evidence_json = sign_test_evidence(
+      config,
+      RunnerEvidenceKind::Cleanup,
+      session_nonce,
+      challenge,
+      sequence,
+      now,
+      observed_profile_digest,
+      cleanup_evidence_payload_digest(result),
+    );
+  }
+
   #[test]
   fn prepared_and_result_evidence_reject_tamper_replay_and_wrong_kind() {
     let config = config();
@@ -2210,6 +2296,7 @@ mod tests {
     for (kind, sequence, payload) in [
       (RunnerEvidenceKind::Prepared, 2, "6".repeat(64)),
       (RunnerEvidenceKind::Result, 3, "7".repeat(64)),
+      (RunnerEvidenceKind::Cleanup, 3, "8".repeat(64)),
     ] {
       let claims = RunnerEvidenceClaims {
         kind,
@@ -2358,35 +2445,21 @@ mod tests {
 
     let mut result = ResultFrame {
       signed_evidence_json: String::new(),
+      signed_cleanup_evidence_json: String::new(),
       binding,
       preparation_nonce: "3".repeat(64),
       kind: RemoteResultKind::Completed,
       result_json: "{\"schema_version\":1,\"summary\":\"done\"}".to_owned(),
     };
-    let payload_digest = result_evidence_payload_digest(&result);
-    result.signed_evidence_json = sign_runner_evidence(
-      &RunnerEvidenceClaims {
-        kind: RunnerEvidenceKind::Result,
-        algorithm_version: "ed25519-v1".to_owned(),
-        signer_identity: config.executor_evidence_signer_identity.clone(),
-        key_revision: config.executor_evidence_key_revision.clone(),
-        session_nonce: nonce,
-        challenge,
-        sequence: 3,
-        issued_at_unix_millis: now,
-        expires_at_unix_millis: now + 4_000,
-        deployment_epoch: config.deployment_epoch,
-        deployment_profile_digest: config.profile_digest.clone(),
-        observed_profile_digest: "4".repeat(64),
-        executor_identity: config.executor_identity.clone(),
-        credential_revision: config.credential_revision.clone(),
-        payload_digest,
-      },
-      &config.executor_evidence_key_id,
-      &evidence_keys().0,
-    )
-    .expect("result signature")
-    .canonical_json();
+    sign_test_result_and_cleanup(
+      &config,
+      &mut result,
+      &nonce,
+      &challenge,
+      3,
+      now,
+      &"4".repeat(64),
+    );
     result.kind = RemoteResultKind::OutcomeUnknown;
     assert!(
       validate_executor_evidence(
@@ -2568,42 +2641,28 @@ mod tests {
 
     let mut result = ResultFrame {
       signed_evidence_json: String::new(),
+      signed_cleanup_evidence_json: String::new(),
       binding,
       preparation_nonce: "6".repeat(64),
       kind: RemoteResultKind::Completed,
       result_json: "{\"schema_version\":1,\"summary\":\"done\"}".to_owned(),
     };
-    let result_payload = result_evidence_payload_digest(&result);
-    result.signed_evidence_json = sign_runner_evidence(
-      &RunnerEvidenceClaims {
-        kind: RunnerEvidenceKind::Result,
-        algorithm_version: "ed25519-v1".to_owned(),
-        signer_identity: config.executor_evidence_signer_identity.clone(),
-        key_revision: config.executor_evidence_key_revision.clone(),
-        session_nonce: nonce.clone(),
-        challenge,
-        sequence: 3,
-        issued_at_unix_millis: now,
-        expires_at_unix_millis: now + 4_000,
-        deployment_epoch: config.deployment_epoch,
-        deployment_profile_digest: config.profile_digest.clone(),
-        observed_profile_digest: profile_digest.clone(),
-        executor_identity: config.executor_identity.clone(),
-        credential_revision: config.credential_revision.clone(),
-        payload_digest: result_payload,
-      },
-      &config.executor_evidence_key_id,
-      &evidence_keys().0,
-    )
-    .expect("result signature")
-    .canonical_json();
+    sign_test_result_and_cleanup(
+      &config,
+      &mut result,
+      &nonce,
+      &challenge,
+      3,
+      now,
+      &profile_digest,
+    );
     let result_frame = RemoteFrame {
       version: REMOTE_PROTOCOL_VERSION,
       session_nonce: nonce,
       sequence: 3,
       message: RemoteMessage::Result(result),
     };
-    for mutation in 0..11 {
+    for mutation in 0..15 {
       let mut translated = result_frame.clone();
       let RemoteMessage::Result(translated_payload) = &mut translated.message else {
         unreachable!()
@@ -2620,6 +2679,43 @@ mod tests {
         8 => translated_payload.preparation_nonce = "5".repeat(64),
         9 => translated_payload.kind = RemoteResultKind::OutcomeUnknown,
         10 => translated_payload.result_json.push(' '),
+        11 => translated_payload.signed_cleanup_evidence_json.push(' '),
+        12 => {
+          translated_payload.signed_cleanup_evidence_json = sign_test_evidence(
+            &config,
+            RunnerEvidenceKind::Result,
+            &translated.session_nonce,
+            &challenge,
+            translated.sequence,
+            now,
+            &profile_digest,
+            cleanup_evidence_payload_digest(translated_payload),
+          );
+        }
+        13 => {
+          translated_payload.signed_cleanup_evidence_json = sign_test_evidence(
+            &config,
+            RunnerEvidenceKind::Cleanup,
+            &translated.session_nonce,
+            &challenge,
+            translated.sequence,
+            now,
+            &"0".repeat(64),
+            cleanup_evidence_payload_digest(translated_payload),
+          );
+        }
+        14 => {
+          translated_payload.signed_cleanup_evidence_json = sign_test_evidence(
+            &config,
+            RunnerEvidenceKind::Cleanup,
+            &translated.session_nonce,
+            &challenge,
+            translated.sequence,
+            now,
+            &profile_digest,
+            "0".repeat(64),
+          );
+        }
         _ => unreachable!(),
       }
       assert!(
@@ -2692,6 +2788,22 @@ mod tests {
       )
       .is_err(),
       "evidence from an old connection must not replay after reconnect"
+    );
+    assert!(
+      validate_executor_evidence(
+        &config,
+        &reconnect_ready,
+        ExpectedRunnerEvidence {
+          kind: RunnerEvidenceKind::Cleanup,
+          sequence: result_frame.sequence,
+          observed_profile_digest: &profile_digest,
+          payload_digest: &cleanup_evidence_payload_digest(result),
+        },
+        &result.signed_cleanup_evidence_json,
+        now,
+      )
+      .is_err(),
+      "cleanup evidence from an old connection must not replay after reconnect"
     );
   }
 
@@ -3075,7 +3187,7 @@ mod tests {
     let guardian = reservation.clone();
     drop(reservation);
     assert!(session.slot.lock().expect("unknown slot").is_some());
-    guardian.release_after_signed_result();
+    guardian.release_after_signed_cleanup();
   }
 
   #[test]
@@ -3103,7 +3215,7 @@ mod tests {
       broker.register(&registered_session(&"6".repeat(64))),
       Err(ScheduledRunnerBrokerError::DuplicateSession)
     ));
-    guardian.release_after_signed_result();
+    guardian.release_after_signed_cleanup();
     assert!(session.slot.lock().expect("signed cleanup slot").is_none());
   }
 
@@ -3146,7 +3258,7 @@ mod tests {
     let guardian = reservation.clone();
     drop(reservation);
     assert!(session.slot.lock().expect("partial START slot").is_some());
-    guardian.release_after_signed_result();
+    guardian.release_after_signed_cleanup();
   }
 
   #[test]
@@ -3490,6 +3602,7 @@ mod tests {
       };
       let mut result = ResultFrame {
         signed_evidence_json: String::new(),
+        signed_cleanup_evidence_json: String::new(),
         binding,
         preparation_nonce: start.preparation_nonce,
         kind: RemoteResultKind::Completed,
@@ -3507,6 +3620,19 @@ mod tests {
           result_evidence_payload_digest(&result),
         ))
         .expect("sign result")
+        .canonical_json();
+      result.signed_cleanup_evidence_json = executor_signer
+        .sign(&production_claims(
+          &executor_config,
+          RunnerEvidenceKind::Cleanup,
+          &readiness_request.session_nonce,
+          &executor_ready.challenge,
+          3,
+          executor_ready.ready_until_unix_millis,
+          &executor_profile_digest,
+          cleanup_evidence_payload_digest(&result),
+        ))
+        .expect("sign cleanup")
         .canonical_json();
       local
         .write_frame(&RemoteFrame {
@@ -3655,6 +3781,7 @@ mod tests {
     let result = |result_json: &str| {
       remote_execution_result(ResultFrame {
         signed_evidence_json: "{}".to_owned(),
+        signed_cleanup_evidence_json: "{}".to_owned(),
         binding: RunBinding {
           run_id: "run-1".to_owned(),
           job_id: "job-1".to_owned(),

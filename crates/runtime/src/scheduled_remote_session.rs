@@ -705,6 +705,7 @@ mod tests {
       3,
       RemoteMessage::Result(ResultFrame {
         signed_evidence_json: "{}".to_owned(),
+        signed_cleanup_evidence_json: "{}".to_owned(),
         binding: binding(),
         preparation_nonce: "3".repeat(64),
         kind: RemoteResultKind::Completed,
@@ -1012,6 +1013,7 @@ mod tests {
             3,
             RemoteMessage::Result(ResultFrame {
               signed_evidence_json: "{}".to_owned(),
+              signed_cleanup_evidence_json: "{}".to_owned(),
               binding: binding(),
               preparation_nonce: "3".repeat(64),
               kind,
@@ -1154,6 +1156,7 @@ mod tests {
           3,
           RemoteMessage::Result(ResultFrame {
             signed_evidence_json: "{}".to_owned(),
+            signed_cleanup_evidence_json: "{}".to_owned(),
             binding: binding(),
             preparation_nonce: "3".repeat(64),
             kind: RemoteResultKind::Completed,

@@ -122,6 +122,7 @@ pub enum RemoteResultKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultFrame {
   pub signed_evidence_json: String,
+  pub signed_cleanup_evidence_json: String,
   pub binding: RunBinding,
   pub preparation_nonce: String,
   pub kind: RemoteResultKind,
@@ -723,7 +724,11 @@ impl ResultFrame {
     if self.result_json.len() > MAX_JSON_FIELD_BYTES {
       return Err(RemoteProtocolError::InvalidField("result.result_json"));
     }
-    require_json_field("result.signed_evidence_json", &self.signed_evidence_json)
+    require_json_field("result.signed_evidence_json", &self.signed_evidence_json)?;
+    require_json_field(
+      "result.signed_cleanup_evidence_json",
+      &self.signed_cleanup_evidence_json,
+    )
   }
 
   fn to_value(&self) -> Value {
@@ -737,6 +742,7 @@ impl ResultFrame {
       "preparation_nonce": self.preparation_nonce,
       "kind": kind,
       "result_json": self.result_json,
+      "signed_cleanup_evidence_json": self.signed_cleanup_evidence_json,
       "signed_evidence_json": self.signed_evidence_json,
     })
   }
@@ -749,6 +755,7 @@ impl ResultFrame {
         "preparation_nonce",
         "kind",
         "result_json",
+        "signed_cleanup_evidence_json",
         "signed_evidence_json",
       ],
       "result",
@@ -764,6 +771,7 @@ impl ResultFrame {
       preparation_nonce: required_string(object, "preparation_nonce")?,
       kind,
       result_json: required_string(object, "result_json")?,
+      signed_cleanup_evidence_json: required_string(object, "signed_cleanup_evidence_json")?,
       signed_evidence_json: required_string(object, "signed_evidence_json")?,
     })
   }
@@ -1102,6 +1110,7 @@ mod tests {
         sequence: 7,
         message: RemoteMessage::Result(ResultFrame {
           signed_evidence_json: "{}".to_owned(),
+          signed_cleanup_evidence_json: "{}".to_owned(),
           binding: binding(),
           preparation_nonce: "3".repeat(64),
           kind: RemoteResultKind::OutcomeUnknown,

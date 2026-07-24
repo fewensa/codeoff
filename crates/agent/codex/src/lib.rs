@@ -1,10 +1,35 @@
 //! Codex App Server backend wiring for Codeoff.
 
-use std::collections::HashMap;
+mod scheduled;
+#[cfg(unix)]
+mod scheduled_artifacts;
+mod scheduled_mcp;
+
+pub use codeoff_core::AttestedCapabilityProfile;
+#[cfg(unix)]
+pub use scheduled::enable_scheduled_executor_subreaper;
+pub use scheduled::{
+  BuiltScheduledCodexExecutor, CODEX_APP_SERVER_SCHEMA_SHA256, CODEX_CLI_VERSION,
+  GITHUB_MCP_ACCESS_TOKEN_ENV, GITHUB_MCP_ARTIFACT_SHA256_ARM64, GITHUB_MCP_ARTIFACT_SHA256_X86_64,
+  GITHUB_MCP_SERVER_VERSION, PreparedScheduledCodexExecution, ProcessExit,
+  RemoteIsolationPermitEnvelope, RequestedCapabilityProfile, ScheduledCodexExecution,
+  ScheduledCodexExecutor, ScheduledCodexRequest, ScheduledDeploymentAuthority,
+  ScheduledExecutionIdentity, ScheduledExecutionResult, ScheduledFailure, ScheduledFailureKind,
+  ScheduledFinalOutput, ScheduledIsolationPermit, ScheduledJsonlTransport,
+  ScheduledRuntimeEvidence, ScheduledUsage, TimedRead, build_production_scheduled_codex_executor,
+  build_supervised_scheduled_codex_executor, load_current_scheduled_deployment_authority,
+  load_trusted_owner_scheduled_deployment_authority, prepare_scheduled_codex_home,
+};
+
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use codeoff_agent_contract::{AgentBackend, AgentTask, AgentTaskResult};
+use codeoff_agent_contract::{
+  AgentBackend, AgentTask, AgentTaskResult, ChannelReplyStrategy, ChannelTaskContext,
+  InvocationPrincipal, InvocationSource, SessionMode, ToolPolicy,
+};
 use codeoff_config::CodeoffConfig;
 use serde_json::{Value, json};
 
@@ -13,7 +38,20 @@ pub struct CodexAppServerRequest {
   pub conversation_id: String,
   pub resume_thread_id: Option<String>,
   pub prompt: String,
+  pub tool_policy: ToolPolicy,
+  pub dynamic_tool_context: CodexDynamicToolContext,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexDynamicToolContext {
+  pub source: InvocationSource,
+  pub principal: InvocationPrincipal,
+  pub channel: Option<ChannelTaskContext>,
+}
+
+const DEFAULT_MAX_PROMPT_BYTES: usize = 64 * 1024;
+const DEFAULT_PREVIOUS_SUCCESS_CONTEXT_MAX_BYTES: usize = 8 * 1024;
+const TRUNCATION_MARKER: &str = "\n[truncated]";
 
 /// Transport seam for the Codex App Server JSON-RPC client.
 ///
@@ -62,13 +100,17 @@ where
     return Err("codex app server command must not be empty".to_owned());
   }
 
-  Ok(CodexAppServerBackend::new(
-    StdioCodexAppServerClient::with_dynamic_tool_handler(
+  Ok(
+    CodexAppServerBackend::new(StdioCodexAppServerClient::with_dynamic_tool_handler(
       codex.command.clone(),
       codex.ephemeral_threads,
       dynamic_tool_handler,
+    ))
+    .with_prompt_limits(
+      codex.max_prompt_bytes,
+      codex.previous_success_context_max_bytes,
     ),
-  ))
+  )
 }
 
 pub trait JsonlTransport {
@@ -88,9 +130,14 @@ pub trait JsonlTransport {
 }
 
 pub trait CodexDynamicToolHandler {
-  fn tool_specs(&self) -> Vec<Value>;
+  fn tool_specs(&self, context: &CodexDynamicToolContext) -> Vec<Value>;
 
-  fn handle_tool_call(&self, tool: &str, arguments: Value) -> Value;
+  fn handle_tool_call(
+    &self,
+    context: &CodexDynamicToolContext,
+    tool: &str,
+    arguments: Value,
+  ) -> Value;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,11 +178,16 @@ impl CodexTurnEventObserver for NoopCodexTurnEventObserver {
 pub struct NoopCodexDynamicToolHandler;
 
 impl CodexDynamicToolHandler for NoopCodexDynamicToolHandler {
-  fn tool_specs(&self) -> Vec<Value> {
+  fn tool_specs(&self, _context: &CodexDynamicToolContext) -> Vec<Value> {
     Vec::new()
   }
 
-  fn handle_tool_call(&self, tool: &str, _arguments: Value) -> Value {
+  fn handle_tool_call(
+    &self,
+    _context: &CodexDynamicToolContext,
+    tool: &str,
+    _arguments: Value,
+  ) -> Value {
     dynamic_tool_failure(format!("unsupported dynamic tool: {tool}"))
   }
 }
@@ -394,8 +446,11 @@ where
   H: CodexDynamicToolHandler,
   O: CodexTurnEventObserver,
 {
+  let (dynamic_tools, allowed_dynamic_tools) = resolve_dynamic_tools(
+    dynamic_tool_handler.tool_specs(&request.dynamic_tool_context),
+    &request.tool_policy,
+  )?;
   let mut transport = (transport_factory)()?;
-  let dynamic_tools = dynamic_tool_handler.tool_specs();
   let mut initialize_params = json!({
     "clientInfo": {
       "name": "codeoff",
@@ -475,9 +530,47 @@ where
     &thread_id,
     turn_id,
     dynamic_tool_handler,
+    &allowed_dynamic_tools,
+    &request.dynamic_tool_context,
     event_observer,
   )
   .map(|result| result.with_codex_thread_id(thread_id))
+}
+
+fn resolve_dynamic_tools(
+  registered: Vec<Value>,
+  policy: &ToolPolicy,
+) -> Result<(Vec<Value>, HashSet<String>), String> {
+  let registered_by_name: HashMap<_, _> = registered
+    .into_iter()
+    .filter_map(|spec| {
+      spec["name"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .map(|name| (name, spec))
+    })
+    .collect();
+  let ToolPolicy::NamedSet(requested) = policy else {
+    return Ok((Vec::new(), HashSet::new()));
+  };
+  if requested.is_empty() {
+    return Err("dynamic tool policy named set must not be empty".to_owned());
+  }
+  let mut allowed = HashSet::new();
+  let mut selected = Vec::with_capacity(requested.len());
+  for name in requested {
+    if name.trim().is_empty() || name != name.trim() {
+      return Err(format!("invalid dynamic tool name in policy: {name:?}"));
+    }
+    if !allowed.insert(name.clone()) {
+      return Err(format!("duplicate dynamic tool in policy: {name}"));
+    }
+    let Some(spec) = registered_by_name.get(name) else {
+      return Err(format!("unknown dynamic tool in policy: {name}"));
+    };
+    selected.push(spec.clone());
+  }
+  Ok((selected, allowed))
 }
 
 fn thread_start_params(ephemeral_threads: bool, dynamic_tools: Vec<Value>) -> Value {
@@ -541,6 +634,8 @@ fn wait_for_terminal_turn<T, H, O>(
   thread_id: &str,
   turn_id: &str,
   dynamic_tool_handler: &H,
+  allowed_dynamic_tools: &HashSet<String>,
+  dynamic_tool_context: &CodexDynamicToolContext,
   event_observer: &O,
 ) -> Result<AgentTaskResult, String>
 where
@@ -566,6 +661,8 @@ where
           thread_id,
           turn_id,
           dynamic_tool_handler,
+          allowed_dynamic_tools,
+          dynamic_tool_context,
         )?;
       }
       Some(method) if is_unsupported_interaction_request(method) => {
@@ -682,6 +779,8 @@ fn respond_to_tool_call<T, H>(
   thread_id: &str,
   turn_id: &str,
   dynamic_tool_handler: &H,
+  allowed_dynamic_tools: &HashSet<String>,
+  dynamic_tool_context: &CodexDynamicToolContext,
 ) -> Result<(), String>
 where
   T: JsonlTransport,
@@ -698,8 +797,10 @@ where
       .unwrap_or("");
     if tool.is_empty() {
       dynamic_tool_failure("tool call missing tool name")
+    } else if !allowed_dynamic_tools.contains(tool) {
+      dynamic_tool_failure(format!("dynamic tool denied by task policy: {tool}"))
     } else {
-      dynamic_tool_handler.handle_tool_call(tool, params["arguments"].clone())
+      dynamic_tool_handler.handle_tool_call(dynamic_tool_context, tool, params["arguments"].clone())
     }
   } else {
     dynamic_tool_failure("tool call thread or turn did not match active turn")
@@ -801,11 +902,28 @@ fn final_agent_text(item: &Value) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct CodexAppServerBackend<C> {
   client: C,
+  max_prompt_bytes: usize,
+  previous_success_context_max_bytes: usize,
 }
 
 impl<C> CodexAppServerBackend<C> {
   pub fn new(client: C) -> Self {
-    Self { client }
+    Self {
+      client,
+      max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
+      previous_success_context_max_bytes: DEFAULT_PREVIOUS_SUCCESS_CONTEXT_MAX_BYTES,
+    }
+  }
+
+  #[must_use]
+  pub const fn with_prompt_limits(
+    mut self,
+    max_prompt_bytes: usize,
+    previous_success_context_max_bytes: usize,
+  ) -> Self {
+    self.max_prompt_bytes = max_prompt_bytes;
+    self.previous_success_context_max_bytes = previous_success_context_max_bytes;
+    self
   }
 }
 
@@ -815,63 +933,214 @@ impl<C: CodexAppServerClient> AgentBackend for CodexAppServerBackend<C> {
   }
 
   fn run(&self, task: AgentTask) -> Result<AgentTaskResult, String> {
-    let message_text = task
-      .context
-      .message_text
-      .as_deref()
-      .map(|text| format!("\n\nIncoming Slack message text:\n{text}"))
-      .unwrap_or_default();
-    let channel_context = task
-      .context
-      .channel_context
-      .as_deref()
-      .map(|context| format!("\n\nRecent Slack conversation context:\n{context}"))
-      .unwrap_or_default();
-    let conversation_summary = task
-      .context
-      .conversation_summary
-      .as_deref()
-      .map(|summary| format!("\n\nConversation summary:\n{summary}"))
-      .unwrap_or_default();
-    let reply_instruction = if task
-      .context
-      .channel_id
-      .as_deref()
-      .is_some_and(|channel_id| channel_id.starts_with('D'))
-    {
-      "For Slack direct messages, return the reply as your final answer; Codeoff will deliver it to Slack."
-    } else {
-      "If a reply is needed, call the channel_reply_to_event dynamic tool."
-    };
-    let prompt = format!(
-      "You are handling a live channel event through Codeoff.\n{reply_instruction}\n\nAnswer Quality Contract:\n- Classify the incoming message as standalone or context-dependent before answering.\n- context-dependent indicators include follow-ups, pronouns, omitted subjects, references such as this/that/above/previous, and requests to inspect code, files, links, screenshots, or implementation details.\n- If the message is context-dependent, use the available channel context or tools before answering.\n- Prefer exact source message data, then thread or direct-message history, then the conversation summary.\n- Use channel_get_message to inspect the exact source message when text, blocks, attachments, or file references matter.\n- Use channel_get_thread_context or channel_get_recent_messages when the recent context is insufficient or has a next_cursor.\n- Use channel_get_resource_info first for files, channel_read_resource_text for text-like files, and channel_download_resource only when a local artifact is necessary.\n- Do not ask the user to resend Slack context before trying the available channel tools.\n- If context remains incomplete after tool use, state the missing context and answer from explicit assumptions.\n\nObjective: {}{}{}{}\n\nSource references:\n- conversation_key: {}\n- channel_id: {}\n- thread_id: {}\n- message_ts: {}\n- user_id: {}\n- event_id: {}\n- dedupe_key: {}\n- source_reference: {}",
-      task.objective,
-      message_text,
-      channel_context,
-      conversation_summary,
-      task.context.conversation_key,
-      task.context.channel_id.as_deref().unwrap_or("none"),
-      task.context.thread_id.as_deref().unwrap_or("none"),
-      task.context.message_ts.as_deref().unwrap_or("none"),
-      task.context.user_id.as_deref().unwrap_or("none"),
-      task.context.event_id,
-      task.context.dedupe_key,
-      task.context.source_reference.as_deref().unwrap_or("none"),
+    task.validate().map_err(str::to_owned)?;
+    let prompt = render_prompt(
+      &task,
+      self.max_prompt_bytes,
+      self.previous_success_context_max_bytes,
+    )?;
+    let conversation_id = task.channel.as_ref().map_or_else(
+      || task.task_id.clone(),
+      |channel| channel.conversation_key.clone(),
     );
+    let resume_thread_id = match &task.session {
+      SessionMode::Fresh => None,
+      SessionMode::Resume { thread_id } => Some(thread_id.clone()),
+    };
     self.client.start_turn(&CodexAppServerRequest {
-      conversation_id: task.context.conversation_key,
-      resume_thread_id: task.context.resume_thread_id.clone(),
+      conversation_id,
+      resume_thread_id,
       prompt,
+      tool_policy: task.tool_policy,
+      dynamic_tool_context: CodexDynamicToolContext {
+        source: task.source,
+        principal: task.principal,
+        channel: task.channel,
+      },
     })
   }
+}
+
+fn render_prompt(
+  task: &AgentTask,
+  max_prompt_bytes: usize,
+  previous_success_context_max_bytes: usize,
+) -> Result<String, String> {
+  if task.instruction.trim().is_empty() {
+    return Err("agent task instruction must not be empty".to_owned());
+  }
+  let mut required = format!(
+    "You are executing a bounded task through Codeoff.\nReturn a concise final result or use only the dynamic tools allowed for this task.\n\nObjective: {}",
+    task.instruction
+  );
+  match &task.tool_policy {
+    ToolPolicy::None => required.push_str("\n\nAllowed Codeoff dynamic tools: none."),
+    ToolPolicy::NamedSet(names) => {
+      let _ = write!(
+        required,
+        "\n\nAllowed Codeoff dynamic tools: {}.",
+        names.join(", ")
+      );
+    }
+  }
+  let mut optional_sections = Vec::new();
+  if let Some(channel) = &task.channel {
+    append_channel_prompt(&mut required, &mut optional_sections, channel);
+  }
+  append_invocation_source(&mut required, &task.source);
+  if required.len() > max_prompt_bytes {
+    return Err("codex prompt required content exceeds max_prompt_bytes".to_owned());
+  }
+  if let Some(previous) = &task.previous_success {
+    let source = if previous.was_truncated && !previous.content.ends_with(TRUNCATION_MARKER) {
+      format!("{}{}", previous.content, TRUNCATION_MARKER)
+    } else {
+      previous.content.clone()
+    };
+    let (content, truncated_now) =
+      truncate_utf8_with_marker(&source, previous_success_context_max_bytes);
+    let label = if previous.was_truncated || truncated_now {
+      "Previous successful result (bounded snapshot)"
+    } else {
+      "Previous successful result"
+    };
+    optional_sections.push((label, content));
+  }
+  let mut prompt = required;
+  for (label, content) in optional_sections {
+    append_bounded_section(&mut prompt, label, &content, max_prompt_bytes);
+  }
+  Ok(prompt)
+}
+
+fn append_channel_prompt(
+  required: &mut String,
+  optional_sections: &mut Vec<(&'static str, String)>,
+  channel: &ChannelTaskContext,
+) {
+  let reply_instruction = match channel.reply_strategy {
+    ChannelReplyStrategy::FinalAnswer => {
+      "For direct messages, return the reply as your final answer; Codeoff will deliver it to the channel."
+    }
+    ChannelReplyStrategy::DynamicTool => {
+      "If a reply is needed, call the channel_reply_to_event dynamic tool."
+    }
+  };
+  let _ = write!(
+    required,
+    "\n\nYou are handling a live channel event through Codeoff.\n{reply_instruction}\n\nAnswer Quality Contract:\n- Classify the incoming message as standalone or context-dependent before answering.\n- context-dependent indicators include follow-ups, pronouns, omitted subjects, references such as this/that/above/previous, and requests to inspect code, files, links, screenshots, or implementation details.\n- If the message is context-dependent, use the available channel context or tools before answering.\n- Prefer exact source message data, then thread or direct-message history, then the conversation summary.\n- Use channel_get_message to inspect the exact source message when text, blocks, attachments, or file references matter.\n- Use channel_get_thread_context or channel_get_recent_messages when the recent context is insufficient or has a next_cursor.\n- Use channel_get_resource_info first for files, channel_read_resource_text for text-like files, and channel_download_resource only when a local artifact is necessary.\n- Do not ask the user to resend channel context before trying the available channel tools.\n- If context remains incomplete after tool use, state the missing context and answer from explicit assumptions.\n\nSource references:\n- provider: {}\n- workspace_id: {}\n- conversation_key: {}\n- conversation_kind: {:?}\n- channel_id: {}\n- thread_id: {}\n- message_ts: {}\n- user_id: {}",
+    channel.provider,
+    channel.workspace_id,
+    channel.conversation_key,
+    channel.conversation_kind,
+    channel.channel_id.as_deref().unwrap_or("none"),
+    channel.thread_id.as_deref().unwrap_or("none"),
+    channel.message_ts.as_deref().unwrap_or("none"),
+    channel.user_id.as_deref().unwrap_or("none"),
+  );
+  if let Some(message) = channel.message_text.as_deref() {
+    optional_sections.push(("Incoming channel message text", message.to_owned()));
+  }
+  if let Some(context) = channel.recent_context.as_deref() {
+    optional_sections.push(("Recent channel conversation context", context.to_owned()));
+  }
+  if let Some(summary) = channel.conversation_summary.as_deref() {
+    optional_sections.push(("Conversation summary", summary.to_owned()));
+  }
+}
+
+fn append_invocation_source(required: &mut String, source: &InvocationSource) {
+  match source {
+    InvocationSource::ChannelEvent {
+      event_id,
+      dedupe_key,
+      source_reference,
+      ..
+    } => {
+      let _ = write!(
+        *required,
+        "\n- event_id: {event_id}\n- dedupe_key: {dedupe_key}\n- source_reference: {}",
+        source_reference.as_deref().unwrap_or("none")
+      );
+    }
+    InvocationSource::ScheduledRun {
+      job_id,
+      run_id,
+      scheduled_for,
+    } => {
+      let _ = write!(
+        *required,
+        "\n\nExecution context: independent scheduled run. This run has no live channel and must return a non-empty final result.\n- job_id: {job_id}\n- run_id: {run_id}\n- scheduled_for: {scheduled_for}"
+      );
+    }
+    InvocationSource::TrustedOperator { request_id } => {
+      let _ = write!(
+        *required,
+        "\n\nExecution source: trusted operator request {request_id}."
+      );
+    }
+    InvocationSource::InternalService {
+      service,
+      request_id,
+    } => {
+      let _ = write!(
+        *required,
+        "\n\nExecution source: internal service {service}, request {request_id}."
+      );
+    }
+  }
+}
+
+fn append_bounded_section(prompt: &mut String, label: &str, content: &str, max_bytes: usize) {
+  let prefix = format!("\n\n{label}:\n");
+  let available = max_bytes.saturating_sub(prompt.len());
+  if available <= prefix.len() {
+    return;
+  }
+  let (content, _) = truncate_utf8_with_marker(content, available - prefix.len());
+  prompt.push_str(&prefix);
+  prompt.push_str(&content);
+}
+
+fn truncate_utf8_with_marker(content: &str, max_bytes: usize) -> (String, bool) {
+  if content.len() <= max_bytes {
+    return (content.to_owned(), false);
+  }
+  if max_bytes < TRUNCATION_MARKER.len() {
+    return (String::new(), true);
+  }
+  let mut boundary = max_bytes - TRUNCATION_MARKER.len();
+  while !content.is_char_boundary(boundary) {
+    boundary -= 1;
+  }
+  let mut truncated = content[..boundary].to_owned();
+  truncated.push_str(TRUNCATION_MARKER);
+  (truncated, true)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use codeoff_agent_contract::AgentTaskContext;
+  use codeoff_agent_contract::{
+    ChannelTaskContext, ConversationKind, FeedbackTarget, InvocationPrincipal,
+    PreviousSuccessContext,
+  };
   use std::cell::RefCell;
   use std::rc::Rc;
+
+  fn test_dynamic_tool_context() -> CodexDynamicToolContext {
+    CodexDynamicToolContext {
+      source: InvocationSource::ChannelEvent {
+        provider: "slack".to_owned(),
+        workspace_id: "W1".to_owned(),
+        event_id: "E1".to_owned(),
+        dedupe_key: "d1".to_owned(),
+        source_reference: None,
+      },
+      principal: InvocationPrincipal::channel_actor("slack", "W1", "U1"),
+      channel: None,
+    }
+  }
 
   #[derive(Debug, Clone)]
   struct FakeJsonlTransport {
@@ -965,32 +1234,162 @@ mod tests {
     }
   }
 
+  fn slack_task() -> AgentTask {
+    AgentTask {
+      task_id: "slack:W1:d1".to_owned(),
+      instruction: "Handle the mention".to_owned(),
+      source: InvocationSource::ChannelEvent {
+        provider: "slack".to_owned(),
+        workspace_id: "W1".to_owned(),
+        event_id: "E1".to_owned(),
+        dedupe_key: "d1".to_owned(),
+        source_reference: Some("slack://W1/C1/100.0".to_owned()),
+      },
+      principal: InvocationPrincipal::channel_actor("slack", "W1", "U1"),
+      session: SessionMode::Fresh,
+      channel: Some(ChannelTaskContext {
+        provider: "slack".to_owned(),
+        workspace_id: "W1".to_owned(),
+        conversation_key: "slack:W1:thread:C1:99.0".to_owned(),
+        conversation_kind: ConversationKind::Thread,
+        reply_strategy: ChannelReplyStrategy::DynamicTool,
+        message_text: Some("please restart the failed worker".to_owned()),
+        channel_id: Some("C1".to_owned()),
+        thread_id: Some("99.0".to_owned()),
+        message_ts: Some("100.0".to_owned()),
+        user_id: Some("U1".to_owned()),
+        recent_context: None,
+        conversation_summary: Some("User previously reported a failed worker.".to_owned()),
+      }),
+      previous_success: None,
+      tool_policy: ToolPolicy::NamedSet(vec!["channel_reply_to_event".to_owned()]),
+      feedback_target: Some(FeedbackTarget::Channel {
+        conversation_kind: ConversationKind::Thread,
+        channel_id: "C1".to_owned(),
+        thread_id: Some("99.0".to_owned()),
+        message_ts: Some("100.0".to_owned()),
+      }),
+    }
+  }
+
+  fn scheduled_task() -> AgentTask {
+    AgentTask {
+      task_id: "run-1".to_owned(),
+      instruction: "Inspect the configured repository issues".to_owned(),
+      source: InvocationSource::ScheduledRun {
+        job_id: "job-1".to_owned(),
+        run_id: "run-1".to_owned(),
+        scheduled_for: "2026-07-21T12:00:00Z".to_owned(),
+      },
+      principal: InvocationPrincipal::service("scheduler"),
+      session: SessionMode::Fresh,
+      channel: None,
+      previous_success: None,
+      tool_policy: ToolPolicy::None,
+      feedback_target: None,
+    }
+  }
+
+  #[test]
+  fn scheduled_task_starts_fresh_without_channel_language() {
+    let client = FakeClient::default();
+    let backend = CodexAppServerBackend::new(&client);
+
+    backend.run(scheduled_task()).expect("scheduled turn");
+
+    let requests = client.0.borrow();
+    assert_eq!(requests[0].conversation_id, "run-1");
+    assert_eq!(requests[0].resume_thread_id, None);
+    assert!(requests[0].prompt.contains("independent scheduled run"));
+    for forbidden in ["Slack", "live channel event", "channel_reply_to_event"] {
+      assert!(
+        !requests[0].prompt.contains(forbidden),
+        "unexpected channel wording: {forbidden}"
+      );
+    }
+  }
+
+  #[test]
+  fn renderer_does_not_expose_or_replace_trusted_principal() {
+    let client = FakeClient::default();
+    let backend = CodexAppServerBackend::new(&client);
+    let mut task = scheduled_task();
+    task.principal = InvocationPrincipal::service("scheduler-principal-sentinel");
+    let principal = task.principal.clone();
+    task.source = InvocationSource::TrustedOperator {
+      request_id: "claims-admin-but-is-only-provenance".to_owned(),
+    };
+
+    backend.run(task.clone()).expect("operator provenance turn");
+
+    assert_eq!(task.principal, principal);
+    let requests = client.0.borrow();
+    assert!(
+      requests[0]
+        .prompt
+        .contains("claims-admin-but-is-only-provenance")
+    );
+    assert!(!requests[0].prompt.contains("scheduler-principal-sentinel"));
+  }
+
+  #[test]
+  fn invalid_scheduled_session_is_rejected_before_client_start() {
+    let client = FakeClient::default();
+    let backend = CodexAppServerBackend::new(&client);
+    let mut task = scheduled_task();
+    task.session = SessionMode::Resume {
+      thread_id: "old-slack-thread".to_owned(),
+    };
+
+    let error = backend.run(task).expect_err("invalid scheduled task");
+
+    assert_eq!(error, "scheduled_run_requires_fresh_session");
+    assert!(client.0.borrow().is_empty());
+  }
+
+  #[test]
+  fn prompt_budget_truncates_previous_context_at_utf8_boundary() {
+    let client = FakeClient::default();
+    let backend = CodexAppServerBackend::new(&client).with_prompt_limits(700, 20);
+    let mut task = scheduled_task();
+    task.previous_success = Some(PreviousSuccessContext {
+      content: "火星火星火星火星火星火星".to_owned(),
+      was_truncated: false,
+    });
+
+    backend.run(task).expect("scheduled turn");
+
+    let requests = client.0.borrow();
+    assert!(requests[0].prompt.len() <= 700);
+    assert!(requests[0].prompt.contains(TRUNCATION_MARKER));
+    assert!(
+      requests[0]
+        .prompt
+        .is_char_boundary(requests[0].prompt.len())
+    );
+  }
+
+  #[test]
+  fn prompt_budget_rejects_required_content_before_starting_client() {
+    let client = FakeClient::default();
+    let backend = CodexAppServerBackend::new(&client).with_prompt_limits(20, 20);
+
+    let error = backend
+      .run(scheduled_task())
+      .expect_err("required prompt must exceed budget");
+
+    assert_eq!(
+      error,
+      "codex prompt required content exceeds max_prompt_bytes"
+    );
+    assert!(client.0.borrow().is_empty());
+  }
+
   #[test]
   fn turns_a_slack_task_into_an_interactive_codex_turn_with_source_references() {
     let client = FakeClient::default();
     let backend = CodexAppServerBackend::new(&client);
-    let result = backend
-      .run(AgentTask {
-        task_id: "slack:W1:d1".to_owned(),
-        objective: "Handle the mention".to_owned(),
-        context: AgentTaskContext {
-          provider: "slack".to_owned(),
-          workspace_id: "W1".to_owned(),
-          conversation_key: "slack:W1:thread:C1:99.0".to_owned(),
-          resume_thread_id: None,
-          message_text: Some("please restart the failed worker".to_owned()),
-          channel_id: Some("C1".to_owned()),
-          thread_id: Some("99.0".to_owned()),
-          message_ts: Some("100.0".to_owned()),
-          user_id: Some("U1".to_owned()),
-          channel_context: None,
-          conversation_summary: Some("User previously reported a failed worker.".to_owned()),
-          event_id: "E1".to_owned(),
-          dedupe_key: "d1".to_owned(),
-          source_reference: Some("slack://W1/C1/100.0".to_owned()),
-        },
-      })
-      .expect("turn result");
+    let result = backend.run(slack_task()).expect("turn result");
 
     assert_eq!(result, AgentTaskResult::draft("Private draft"));
     let requests = client.0.borrow();
@@ -1016,7 +1415,7 @@ mod tests {
         .contains("If the message is context-dependent, use the available channel context or tools before answering.")
     );
     assert!(requests[0].prompt.contains(
-      "Do not ask the user to resend Slack context before trying the available channel tools."
+      "Do not ask the user to resend channel context before trying the available channel tools."
     ));
     assert!(
       requests[0]
@@ -1041,7 +1440,7 @@ mod tests {
     assert!(
       requests[0]
         .prompt
-        .contains("Incoming Slack message text:\nplease restart the failed worker")
+        .contains("Incoming channel message text:\nplease restart the failed worker")
     );
     assert!(
       requests[0]
@@ -1068,32 +1467,23 @@ mod tests {
     let client = FakeClient::default();
     let backend = CodexAppServerBackend::new(&client);
 
-    backend
-      .run(AgentTask {
-        task_id: "slack:W1:dm-d1".to_owned(),
-        objective: "Handle the direct message".to_owned(),
-        context: AgentTaskContext {
-          provider: "slack".to_owned(),
-          workspace_id: "W1".to_owned(),
-          conversation_key: "slack:W1:dm:D1".to_owned(),
-          resume_thread_id: None,
-          message_text: Some("那火星呢？".to_owned()),
-          channel_id: Some("D1".to_owned()),
-          thread_id: Some("200.0".to_owned()),
-          message_ts: Some("201.0".to_owned()),
-          user_id: Some("U1".to_owned()),
-          channel_context: Some(r#"{"events":[{"text":"月球上都有什么"}]}"#.to_owned()),
-          conversation_summary: None,
-          event_id: "E-DM".to_owned(),
-          dedupe_key: "dm-d1".to_owned(),
-          source_reference: Some("slack://W1/D1/201.0".to_owned()),
-        },
-      })
-      .expect("turn result");
+    let mut task = slack_task();
+    task.instruction = "Handle the direct message".to_owned();
+    let channel = task.channel.as_mut().expect("channel");
+    channel.conversation_key = "slack:W1:dm:D1".to_owned();
+    channel.conversation_kind = ConversationKind::DirectMessage;
+    channel.reply_strategy = ChannelReplyStrategy::FinalAnswer;
+    channel.message_text = Some("那火星呢？".to_owned());
+    channel.channel_id = Some("not-prefixed-as-dm".to_owned());
+    channel.thread_id = Some("200.0".to_owned());
+    channel.message_ts = Some("201.0".to_owned());
+    channel.recent_context = Some(r#"{"events":[{"text":"月球上都有什么"}]}"#.to_owned());
+    channel.conversation_summary = None;
+    backend.run(task).expect("turn result");
 
     let requests = client.0.borrow();
     assert!(requests[0].prompt.contains(
-      "For Slack direct messages, return the reply as your final answer; Codeoff will deliver it to Slack."
+      "For direct messages, return the reply as your final answer; Codeoff will deliver it to the channel."
     ));
     assert!(
       !requests[0]
@@ -1103,7 +1493,7 @@ mod tests {
     assert!(
       requests[0]
         .prompt
-        .contains("Recent Slack conversation context:")
+        .contains("Recent channel conversation context:")
     );
     assert!(
       requests[0]
@@ -1118,28 +1508,11 @@ mod tests {
     let client = FakeClient::default();
     let backend = CodexAppServerBackend::new(&client);
 
-    backend
-      .run(AgentTask {
-        task_id: "slack:W1:d2".to_owned(),
-        objective: "Handle the follow-up".to_owned(),
-        context: AgentTaskContext {
-          provider: "slack".to_owned(),
-          workspace_id: "W1".to_owned(),
-          conversation_key: "slack:W1:thread:C1:99.0".to_owned(),
-          resume_thread_id: Some("thread-existing".to_owned()),
-          message_text: None,
-          channel_id: Some("C1".to_owned()),
-          thread_id: Some("99.0".to_owned()),
-          message_ts: Some("101.0".to_owned()),
-          user_id: Some("U1".to_owned()),
-          channel_context: None,
-          conversation_summary: None,
-          event_id: "E2".to_owned(),
-          dedupe_key: "d2".to_owned(),
-          source_reference: Some("slack://W1/C1/101.0".to_owned()),
-        },
-      })
-      .expect("turn result");
+    let mut task = slack_task();
+    task.session = SessionMode::Resume {
+      thread_id: "thread-existing".to_owned(),
+    };
+    backend.run(task).expect("turn result");
 
     let requests = client.0.borrow();
     assert_eq!(
@@ -1154,28 +1527,7 @@ mod tests {
       FakeThreadClient::new(AgentTaskResult::accepted_dispatch_with_thread("thread-new"));
     let backend = CodexAppServerBackend::new(&client);
 
-    let result = backend
-      .run(AgentTask {
-        task_id: "slack:W1:d2".to_owned(),
-        objective: "Handle the follow-up".to_owned(),
-        context: AgentTaskContext {
-          provider: "slack".to_owned(),
-          workspace_id: "W1".to_owned(),
-          conversation_key: "slack:W1:thread:C1:99.0".to_owned(),
-          resume_thread_id: None,
-          message_text: None,
-          channel_id: Some("C1".to_owned()),
-          thread_id: Some("99.0".to_owned()),
-          message_ts: Some("101.0".to_owned()),
-          user_id: Some("U1".to_owned()),
-          channel_context: None,
-          conversation_summary: None,
-          event_id: "E2".to_owned(),
-          dedupe_key: "d2".to_owned(),
-          source_reference: Some("slack://W1/C1/101.0".to_owned()),
-        },
-      })
-      .expect("turn result");
+    let result = backend.run(slack_task()).expect("turn result");
 
     assert_eq!(result.codex_thread_id(), Some("thread-new"));
   }
@@ -1195,6 +1547,8 @@ mod tests {
         conversation_id: "slack:W1:d1".to_owned(),
         resume_thread_id: None,
         prompt: "Source references:\n- channel_id: C1\n- event_id: E1\n- dedupe_key: d1".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("accepted turn");
 
@@ -1248,6 +1602,8 @@ mod tests {
         conversation_id: "slack:W1:d1".to_owned(),
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::NamedSet(vec!["channel_reply_to_event".to_owned()]),
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1257,6 +1613,75 @@ mod tests {
       writes[2]["params"]["dynamicTools"][0]["name"],
       "channel_reply_to_event"
     );
+  }
+
+  #[test]
+  fn jsonl_client_does_not_enable_dynamic_tools_for_default_deny_policy() {
+    let transport = FakeJsonlTransport::new([
+      r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+      r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}"#,
+      r#"{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}"#,
+      r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed","items":[]}}}"#,
+    ]);
+    let client = CodexAppServerJsonlClient::new(|| Ok(transport.clone()), true)
+      .with_dynamic_tool_handler(StaticDynamicToolHandler::new(vec![json!({
+        "name": "channel_reply_to_event",
+        "description": "reply",
+        "inputSchema": { "type": "object" }
+      })]));
+
+    client
+      .start_turn(&CodexAppServerRequest {
+        conversation_id: "run-1".to_owned(),
+        resume_thread_id: None,
+        prompt: "Run".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
+      })
+      .expect("completed turn");
+
+    let writes = transport.writes();
+    assert!(writes[0]["params"].get("capabilities").is_none());
+    assert!(writes[2]["params"].get("dynamicTools").is_none());
+  }
+
+  #[test]
+  fn jsonl_client_rejects_empty_unknown_and_duplicate_named_tool_policies() {
+    let client = CodexAppServerJsonlClient::new(
+      || Err::<FakeJsonlTransport, _>("transport must not start".to_owned()),
+      true,
+    )
+    .with_dynamic_tool_handler(StaticDynamicToolHandler::new(vec![json!({
+      "name": "known_tool",
+      "description": "known",
+      "inputSchema": { "type": "object" }
+    })]));
+
+    for (policy, expected) in [
+      (
+        ToolPolicy::NamedSet(Vec::new()),
+        "dynamic tool policy named set must not be empty",
+      ),
+      (
+        ToolPolicy::NamedSet(vec!["unknown_tool".to_owned()]),
+        "unknown dynamic tool in policy: unknown_tool",
+      ),
+      (
+        ToolPolicy::NamedSet(vec!["known_tool".to_owned(), "known_tool".to_owned()]),
+        "duplicate dynamic tool in policy: known_tool",
+      ),
+    ] {
+      let error = client
+        .start_turn(&CodexAppServerRequest {
+          conversation_id: "run-1".to_owned(),
+          resume_thread_id: None,
+          prompt: "Run".to_owned(),
+          tool_policy: policy,
+          dynamic_tool_context: test_dynamic_tool_context(),
+        })
+        .expect_err("invalid policy");
+      assert_eq!(error, expected);
+    }
   }
 
   #[test]
@@ -1285,6 +1710,8 @@ mod tests {
         conversation_id: "slack:W1:d1".to_owned(),
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::NamedSet(vec!["channel_reply_to_event".to_owned()]),
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1295,6 +1722,10 @@ mod tests {
         json!({"text": "hello"})
       )]
     );
+    assert_eq!(
+      handler.contexts.borrow().as_slice(),
+      &[test_dynamic_tool_context()]
+    );
     let writes = transport.writes();
     let response = writes
       .iter()
@@ -1302,6 +1733,44 @@ mod tests {
       .expect("tool call response");
     assert_eq!(response["result"]["success"], true);
     assert_eq!(response["result"]["contentItems"][0]["type"], "inputText");
+  }
+
+  #[test]
+  fn resumed_thread_rejects_tool_allowed_by_previous_task_but_denied_now() {
+    let transport = FakeJsonlTransport::new([
+      r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+      r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-existing"}}}"#,
+      r#"{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}"#,
+      r#"{"jsonrpc":"2.0","id":10,"method":"item/tool/call","params":{"threadId":"thread-existing","turnId":"turn-1","tool":"old_tool","arguments":{}}}"#,
+      r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-existing","turn":{"id":"turn-1","status":"completed","items":[]}}}"#,
+    ]);
+    let handler = RecordingDynamicToolHandler::new(dynamic_tool_success(&json!({"ok": true})));
+    let client = CodexAppServerJsonlClient::new(|| Ok(transport.clone()), true)
+      .with_dynamic_tool_handler(handler.clone());
+
+    client
+      .start_turn(&CodexAppServerRequest {
+        conversation_id: "conversation-2".to_owned(),
+        resume_thread_id: Some("thread-existing".to_owned()),
+        prompt: "Continue".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
+      })
+      .expect("completed turn");
+
+    assert!(handler.calls.borrow().is_empty());
+    let writes = transport.writes();
+    let response = writes
+      .iter()
+      .find(|value| value["id"] == 10)
+      .expect("denied tool response");
+    assert_eq!(response["result"]["success"], false);
+    assert!(
+      response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("failure text")
+        .contains("dynamic tool denied by task policy: old_tool")
+    );
   }
 
   #[test]
@@ -1325,6 +1794,8 @@ mod tests {
         conversation_id: "slack:W1:d1".to_owned(),
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1359,6 +1830,8 @@ mod tests {
         conversation_id: "slack:W1:d2".to_owned(),
         resume_thread_id: Some("thread-existing".to_owned()),
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1397,6 +1870,8 @@ mod tests {
         conversation_id: "slack:W1:d2".to_owned(),
         resume_thread_id: Some("thread-archived".to_owned()),
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1440,6 +1915,8 @@ mod tests {
         conversation_id: "slack:W1:d2".to_owned(),
         resume_thread_id: Some("thread-missing-rollout".to_owned()),
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1482,6 +1959,8 @@ mod tests {
         conversation_id: "slack:W1:d1".to_owned(),
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn after server notification");
 
@@ -1508,6 +1987,8 @@ mod tests {
         conversation_id: "slack:W1:d1".to_owned(),
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1541,6 +2022,8 @@ mod tests {
         conversation_id: "slack:W1:d1".to_owned(),
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1599,6 +2082,8 @@ mod tests {
         conversation_id: "slack:W1:d1".to_owned(),
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1655,6 +2140,8 @@ mod tests {
         conversation_id: "slack:W1:d1".to_owned(),
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect("completed turn");
 
@@ -1678,6 +2165,8 @@ mod tests {
         conversation_id: "slack:W1:d1".to_owned(),
         resume_thread_id: None,
         prompt: "Source references only".to_owned(),
+        tool_policy: ToolPolicy::None,
+        dynamic_tool_context: test_dynamic_tool_context(),
       })
       .expect_err("turn/start error");
 
@@ -1721,11 +2210,16 @@ mod tests {
   }
 
   impl CodexDynamicToolHandler for StaticDynamicToolHandler {
-    fn tool_specs(&self) -> Vec<Value> {
+    fn tool_specs(&self, _context: &CodexDynamicToolContext) -> Vec<Value> {
       self.specs.clone()
     }
 
-    fn handle_tool_call(&self, _tool: &str, _arguments: Value) -> Value {
+    fn handle_tool_call(
+      &self,
+      _context: &CodexDynamicToolContext,
+      _tool: &str,
+      _arguments: Value,
+    ) -> Value {
       json!({
         "success": false,
         "contentItems": [
@@ -1742,6 +2236,7 @@ mod tests {
   struct RecordingDynamicToolHandler {
     result: Value,
     calls: Rc<RefCell<Vec<(String, Value)>>>,
+    contexts: Rc<RefCell<Vec<CodexDynamicToolContext>>>,
   }
 
   impl RecordingDynamicToolHandler {
@@ -1749,16 +2244,32 @@ mod tests {
       Self {
         result,
         calls: Rc::new(RefCell::new(Vec::new())),
+        contexts: Rc::new(RefCell::new(Vec::new())),
       }
     }
   }
 
   impl CodexDynamicToolHandler for RecordingDynamicToolHandler {
-    fn tool_specs(&self) -> Vec<Value> {
-      Vec::new()
+    fn tool_specs(&self, _context: &CodexDynamicToolContext) -> Vec<Value> {
+      ["channel_reply_to_event", "old_tool"]
+        .into_iter()
+        .map(|name| {
+          json!({
+            "name": name,
+            "description": "test tool",
+            "inputSchema": { "type": "object" }
+          })
+        })
+        .collect()
     }
 
-    fn handle_tool_call(&self, tool: &str, arguments: Value) -> Value {
+    fn handle_tool_call(
+      &self,
+      context: &CodexDynamicToolContext,
+      tool: &str,
+      arguments: Value,
+    ) -> Value {
+      self.contexts.borrow_mut().push(context.clone());
       self.calls.borrow_mut().push((tool.to_owned(), arguments));
       self.result.clone()
     }

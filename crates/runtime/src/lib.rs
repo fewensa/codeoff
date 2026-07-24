@@ -10,6 +10,23 @@
 )]
 
 pub mod channel_tools;
+mod schedule_audit;
+mod schedule_authorization;
+mod schedule_contract;
+mod schedule_resolution;
+pub mod schedule_service;
+pub mod schedule_tools;
+pub mod scheduled_delivery;
+pub mod scheduled_execution;
+pub mod scheduled_remote_protocol;
+pub mod scheduled_remote_session;
+pub mod scheduled_runner_broker;
+pub mod scheduled_runner_control;
+pub mod scheduled_runner_evidence;
+pub mod scheduled_runner_executor;
+pub mod scheduled_runner_grant;
+pub mod scheduled_runner_tls;
+pub mod scheduler_observability;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -17,7 +34,10 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use codeoff_agent_contract::{AgentBackend, AgentTask, AgentTaskContext};
+use codeoff_agent_contract::{
+  AgentBackend, AgentTask, ChannelReplyStrategy, ChannelTaskContext, ConversationKind,
+  FeedbackTarget, InvocationPrincipal, InvocationSource, SessionMode, ToolPolicy,
+};
 use codeoff_channel_contract::{ChannelEventKind, ChannelReplyTarget};
 use codeoff_state::{
   AgentDraft, ChannelConversationKey, ContextFetchAttemptRecord, SlackDeliverySender,
@@ -27,9 +47,10 @@ use codeoff_state::{
 use serde_json::{Value, json};
 
 use crate::channel_tools::{
-  ChannelContextProvider, ChannelContextProviderError, ChannelToolError,
-  SlackContextBootstrapRequest, bootstrap_slack_context,
+  CHANNEL_DYNAMIC_TOOL_NAMES, ChannelContextProvider, ChannelContextProviderError,
+  ChannelToolError, SlackContextBootstrapRequest, bootstrap_slack_context,
 };
+use crate::schedule_tools::SCHEDULE_DYNAMIC_TOOL_NAMES;
 
 const CHANNEL_CONVERSATION_SUMMARY_LIMIT: usize = 2_000;
 
@@ -343,27 +364,17 @@ pub async fn dispatch_next_channel_event_with_processing_streams_context_and_loc
     conversation_summary.as_deref(),
   )
   .await?;
-  let task = AgentTask {
-    task_id: format!("slack:{}:{}", event.workspace_id, event.dedupe_key),
-    objective: "Prepare a bounded private draft or action plan for the queued Slack event."
-      .to_owned(),
-    context: AgentTaskContext {
-      provider: event.provider.clone(),
-      workspace_id: event.workspace_id.clone(),
-      conversation_key,
-      resume_thread_id: resume_thread_id.clone(),
-      message_text: event.text.clone(),
-      channel_id: source.channel_id.clone().or(target_channel_id),
-      thread_id: source.thread_id.clone().or(target_thread_id),
-      message_ts: source.message_ts.clone(),
-      user_id: source.user_id.clone(),
-      channel_context,
-      conversation_summary: conversation_summary.clone(),
-      event_id: event.event_id.clone(),
-      dedupe_key: event.dedupe_key.clone(),
-      source_reference: event.source_reference.clone(),
-    },
-  };
+  let task = build_slack_agent_task(
+    &event,
+    &source,
+    conversation_key,
+    &channel_conversation_key,
+    resume_thread_id.clone(),
+    channel_context,
+    conversation_summary.clone(),
+    source.channel_id.clone().or(target_channel_id),
+    source.thread_id.clone().or(target_thread_id),
+  );
   match backend.run(task) {
     Ok(result) => {
       let codex_thread_id = result.codex_thread_id().map(ToOwned::to_owned);
@@ -439,6 +450,87 @@ pub async fn dispatch_next_channel_event_with_processing_streams_context_and_loc
         event_id: event.event_id,
       })
     }
+  }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_slack_agent_task(
+  event: &codeoff_channel_contract::ChannelEvent,
+  source: &SlackSourceReferences,
+  conversation_key: String,
+  conversation: &ChannelConversationKey,
+  resume_thread_id: Option<String>,
+  recent_context: Option<String>,
+  conversation_summary: Option<String>,
+  channel_id: Option<String>,
+  thread_id: Option<String>,
+) -> AgentTask {
+  let conversation_kind = match conversation.conversation_kind.as_str() {
+    "dm" => ConversationKind::DirectMessage,
+    "thread" => ConversationKind::Thread,
+    _ => ConversationKind::Channel,
+  };
+  let reply_strategy = if conversation_kind == ConversationKind::DirectMessage {
+    ChannelReplyStrategy::FinalAnswer
+  } else {
+    ChannelReplyStrategy::DynamicTool
+  };
+  let feedback_target = channel_id
+    .clone()
+    .map(|channel_id| FeedbackTarget::Channel {
+      conversation_kind,
+      channel_id,
+      thread_id: thread_id.clone(),
+      message_ts: source.message_ts.clone(),
+    });
+  let principal = source.user_id.as_ref().map_or_else(
+    || InvocationPrincipal::service("codeoff:slack-ingress"),
+    |user_id| InvocationPrincipal::channel_actor(&event.provider, &event.workspace_id, user_id),
+  );
+  AgentTask {
+    task_id: format!("slack:{}:{}", event.workspace_id, event.dedupe_key),
+    instruction: "Prepare a bounded private draft or action plan for the queued Slack event."
+      .to_owned(),
+    source: InvocationSource::ChannelEvent {
+      provider: event.provider.clone(),
+      workspace_id: event.workspace_id.clone(),
+      event_id: event.event_id.clone(),
+      dedupe_key: event.dedupe_key.clone(),
+      source_reference: event.source_reference.clone(),
+    },
+    principal,
+    session: resume_thread_id.map_or(SessionMode::Fresh, |thread_id| SessionMode::Resume {
+      thread_id,
+    }),
+    channel: Some(ChannelTaskContext {
+      provider: event.provider.clone(),
+      workspace_id: event.workspace_id.clone(),
+      conversation_key,
+      conversation_kind,
+      reply_strategy,
+      message_text: event.text.clone(),
+      channel_id,
+      thread_id,
+      message_ts: source.message_ts.clone(),
+      user_id: source.user_id.clone(),
+      recent_context,
+      conversation_summary,
+    }),
+    previous_success: None,
+    tool_policy: ToolPolicy::NamedSet(
+      CHANNEL_DYNAMIC_TOOL_NAMES
+        .iter()
+        .chain(
+          source
+            .user_id
+            .as_ref()
+            .into_iter()
+            .flat_map(|_| SCHEDULE_DYNAMIC_TOOL_NAMES.iter()),
+        )
+        .map(|name| (*name).to_owned())
+        .collect(),
+    ),
+    feedback_target,
   }
 }
 

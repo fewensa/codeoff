@@ -1,107 +1,95 @@
 # Observability
 
-目的：定義 Codeoff channel gateway 未來、暫緩實作的 observability 方向。
-閱讀時機：設計 operational visibility、readiness checks、metrics 或 production diagnostics 前。
-不涵蓋：已實作 API、CLI surface、dashboard、alert policy 或 deployment manifest。
+目的：說明已實作的 operational HTTP、scheduler telemetry、readiness 與 logging surface。
+閱讀時機：設定 probes、metrics collection 或 production diagnostics 時。
+不涵蓋：user-facing API 或可 mutation 的 remote administration surface。
 
-## 狀態
+## 已實作 Operational HTTP
 
-Observability 目前刻意暫緩。當前優先順序仍是 local channel gateway loop：Slack intake、SQLite queue、Codex App Server dispatch、MCP channel tools、outbound delivery、receipts 與 rate-limit handling。
+`codeoff serve` 一律會在 `[server].bind` 啟動 bounded HTTP/1 operational server。預設為 `127.0.0.1:7788`；除非設定 `[server].allow_non_loopback = true`，否則 non-loopback address 會被拒絕。
 
-未來實作 observability 時，方向應是 cluster-friendly、service-oriented：
+目前只實作以下 read-only `GET` routes：
 
-- HTTP admin/read-only API，用於 health、readiness、queue state、delivery state 與 bounded diagnostics。
-- Prometheus-compatible metrics endpoint。
-- daemon 輸出的 structured logs。
+- `GET /healthz`：process liveness，回傳 `{"status":"alive"}`。
+- `GET /readyz`：SQLite readability 加上 scheduler component、loop、provider 與 snapshot readiness。
+- `GET /metrics`：Prometheus/OpenMetrics scheduler telemetry。
 
-Operational visibility 不應依賴 CLI inspection commands。CLI commands 可以繼續服務 local development 或一次性 maintenance，但不應是 health checks、dashboards、alerts 或 cluster probes 的主要介面。
+其他 path 回傳 `404`，非 `GET` method 回傳 `405`，帶 query string 的 request 會被拒絕。Response 有大小限制、包含 `Cache-Control: no-store`，且不暴露 instruction、payload body、provider receipt、token 或 raw error。
 
-## HTTP Admin And Read-Only API
+以下 admin routes 尚未實作，仍屬未來工作：runtime summary、inbound/outbound queue inspection、event lookup、delivery lookup 與 conversation mapping diagnostics。CLI scheduler diagnostics 是 trusted-local maintenance commands，不是 HTTP admin endpoints。
 
-未來 HTTP surface 預設應是 read-only。任何 mutation 或 replay endpoint 都必須作為獨立、明確受保護的 admin operation 設計。
+在共用 prefix `codeoff [--config PATH] [--state-dir PATH] scheduler` 下，確切的 read-only CLI diagnostic surface 是 `status [--json]`、`runs list [--status STATE] [--limit N] [--json]`、`runs show RUN_ID [--json]`、`deliveries list [--status STATE] [--limit N] [--json]`、`deliveries show DELIVERY_ID [--json]`，以及 `reconcile --dry-run [--limit N] [--json]`。這些 commands 不需要 operator identity，回傳 sanitized projections，也不會 mutation scheduler authority，但仍需要 trusted-local SQLite filesystem access。
 
-建議 endpoints：
+不得將 diagnostic CLI 視為 mutation commands 的 authorization。Owner-scoped `create|get|list|update|pause|resume|delete` commands 需要 `CODEOFF_SCHEDULER_OPERATOR_ID` 與 `CODEOFF_SCHEDULER_OPERATOR_REALM`。`reconcile --apply`、`retry-run`、`retry-delivery` 與 `resolve-delivery-unknown` 需要 expected authority coordinates，以及 non-empty、上限 64 KiB 的 `--authority-file`；retry 與 resolution 另需 [Runtime](runtime.md#scheduler-cli-authority-boundary) 所述的 canonical schema-version-1 reason/evidence JSON。Mutation verifier 會刻意 fail closed，直到 Issue 09 deployment 注入 trusted verifier authority；因此只提供 files 並不會啟用任何 high-risk mutation。
 
-- `GET /healthz`: process liveness，避免昂貴 dependency checks。
-- `GET /readyz`: runtime loops、database access 與必要 provider configuration 的 readiness。
-- `GET /admin/runtime`: sanitized runtime summary，包含 enabled loops、configured transports、build/version information 與 current process role。
-- `GET /admin/queues/inbound`: bounded inbound queue summary，按 status、age、attempts 與 next due time 呈現。
-- `GET /admin/queues/outbound`: bounded outbound delivery summary，按 status、age、attempts、next due time 與 rate-limit cooldown 呈現。
-- `GET /admin/events/{event_id}`: 單一已知 event id 的 sanitized source-backed event diagnostics。
-- `GET /admin/deliveries/{delivery_id}`: 單一已知 delivery id 的 sanitized delivery request 與 receipt diagnostics。
-- `GET /admin/conversations/{conversation_key}`: provider thread/channel scope 到 Codex thread id 的 mapping diagnostics，預設不包含 message bodies。
-- `GET /metrics`: Prometheus metrics。
+## Readiness Contract
 
-Read endpoints 應使用明確 pagination 或小型 hard limits。Responses 預設應避免 raw Slack tokens、signing secrets、user tokens、完整 message bodies、Codex prompts、Codex final answers 與 unbounded raw provider payloads。
+若 SQLite 無法在 250 ms 內完成 bounded read probe，`/readyz` 會 fail closed 並回傳 `503`。Scheduler disabled 時，SQLite probe 通過後回傳 `200` 與 `scheduler_disabled`。
 
-## Prometheus Metrics
+Scheduler enabled 時，readiness 另外要求：
 
-Metrics 應描述 gateway health 與 backlog，不暴露 sensitive content。
+- scheduler execution 與 delivery/preparation loops 已回報 started；
+- required claim-side dependencies 可用；
+- bounded SQLite scheduler snapshot 曾成功；
+- 沒有 snapshot read/timeout error，且 snapshot age 不超過 15 秒。
 
-建議 counters：
+`run_claims_enabled` 與 `delivery_claims_enabled` 是獨立 kill switches。若啟用 claim path 卻缺少必要 executor/provider，readiness 會失敗，不會默默丟棄工作。Provider claims disabled 時，delivery preparation loop 仍可運行。
 
-- `codeoff_slack_events_received_total{workspace, event_type}`
-- `codeoff_slack_events_deduped_total{workspace}`
-- `codeoff_channel_events_enqueued_total{provider, workspace}`
-- `codeoff_dispatch_attempts_total{provider, workspace, result}`
-- `codeoff_outbound_delivery_attempts_total{provider, workspace, result}`
-- `codeoff_mcp_tool_calls_total{tool, result}`
-- `codeoff_rate_limit_events_total{provider, workspace, scope}`
+## 已實作 Scheduler Metrics
 
-建議 gauges：
+Metrics endpoint 提供 low-cardinality scheduler telemetry，包括：
 
-- `codeoff_inbound_queue_depth{provider, workspace, status}`
-- `codeoff_outbound_queue_depth{provider, workspace, status}`
-- `codeoff_oldest_inbound_event_age_seconds{provider, workspace}`
-- `codeoff_oldest_outbound_delivery_age_seconds{provider, workspace}`
-- `codeoff_rate_limit_cooldown_seconds{provider, workspace, scope}`
-- `codeoff_runtime_loop_up{loop}`
+- `codeoff_scheduler_events_total`，使用固定 worker、operation、status 與 stable error kind labels；
+- `codeoff_scheduler_operation_duration_seconds`；
+- `codeoff_scheduler_last_attempt`；
+- `codeoff_scheduler_transitions_total`，使用固定 `kind` vocabulary。這些 totals 會與已接受的
+  state/audit transition 在同一個 SQLite transaction 內遞增，daemon restart 後仍會保留；
+- `codeoff_scheduler_worker_capacity` 與 `codeoff_scheduler_worker_available_slots`，使用固定 worker；
+- due jobs、pending/leased/executing/unknown runs、unprepared/pending/sending/retryable/unknown deliveries 與 oldest work ages 的 bounded gauges；
+- snapshot success、age 與 saturation gauges。
 
-建議 histograms：
+Durable transition kinds 涵蓋 materialization/coalescing/overlap 決策；run claim、terminal、
+recovery、stale-fence 與 policy-limit outcomes；delivery claim、success、retry、failure、unknown、
+skip 與 forced-unknown resend outcomes；彼此獨立的 execution baseline 與 accepted-delivery
+baseline advances；executor validation categories；以及 unauthorized scheduler mutations。
+Counter 只會在 authoritative transaction 接受 outcome 後遞增；rollback 與重複 metrics scrape
+不會重複計數。特別是 `delivery_retry` 為 durable 且不依賴 Agent execution，因此可直接驗證
+no-Agent delivery retry invariant。
 
-- `codeoff_dispatch_latency_seconds{provider, workspace}`
-- `codeoff_outbound_delivery_latency_seconds{provider, workspace}`
-- `codeoff_slack_api_request_duration_seconds{method, result}`
-- `codeoff_mcp_tool_call_duration_seconds{tool, result}`
-- `codeoff_sqlite_operation_duration_seconds{operation, result}`
+Decision counter 使用 durable authority，而不是 poll 次數。`overlap_suppressed` 對每個新的
+`(job generation, scheduled_for)` decision 只遞增一次，restart 後亦同。其 cursor 透過
+cascading foreign key 歸 job 所有，accepted schedule update 會重設 cursor；active 與 paused
+job 的 cursor 會保留，completed 與 deleted job 的 cursor 則由 bounded retention batch 清除。
+Counter exhaustion policy limit 對每個受影響的 run 或 delivery 只遞增一次；request policy
+limit 對每一筆已接受的 typed audit row 遞增一次。真正的 idempotent replay 不會插入新的
+audit row，因此不會遞增 counter；terminal deadline/retry limit 則與已接受的 terminal
+transition 一起遞增一次。
+`stale_fence_rejected` 對每個被拒絕的 authoritative CAS、stale exact reconcile，或只能接受為
+diagnostic evidence 的 late completion/failure 遞增一次。重複送出的 stale attempt 是新的拒絕
+嘗試，因此會再次遞增。
 
-Labels 必須維持 low-cardinality。不要用 Slack channel ids、Slack user ids、event ids、delivery ids、message text、Codex thread ids 或 raw error strings 作為 metric labels。
+Executor validation 由 typed failure source 分類。只有 error kind 精確為
+`profile_validation_failed`、`artifact_validation_failed` 與 `tool_list_validation_failed` 的
+preflight transition 會遞增對應 counter；一般 schedule request validation 不會被重新分類成
+artifact failure。
 
-## Structured Logs
+Worker gauge 反映實際 spawn topology。Scheduler enabled 時有一個 execution worker；provider
+可用時有一個 delivery worker，否則有一個 standalone delivery preparation worker。Worker 的
+available slot 會在 `tick/started` 從 `1` 變成 `0`，並在相對應的 terminal tick status 回到
+`1`；nested attempt 不會改變 slot availability。
 
-Daemon 應輸出適合 local files、container logs 或 centralized collectors 的 structured logs。
+SQLite snapshot 每 5 秒 refresh，count 上限為 100,000、age 上限為 30 天，timeout 為 500 ms。Refresh 失敗時會保留上一份 bounded gauge values，但 readiness 會將 snapshot 視為 unavailable。
 
-建議 fields：
+Labels 不包含 job、run、delivery、owner、channel、user、thread、Slack 或 Codex id；instruction、
+prompt、result、payload、token、secret、receipt 與 raw error string 也全部排除。Metric labels
+只會從固定 enum 中選取。
 
-- `timestamp`
-- `level`
-- `component`
-- `operation`
-- `provider`
-- `workspace_id`
-- `event_id` 或 `delivery_id`，如果可用
-- `dedupe_key`，如果有用且安全
-- `attempt`
-- `status`
-- `duration_ms`
-- `error_kind`
-- `retry_after_ms`
+## Structured Scheduler Tracing
 
-Logs 應優先使用 stable error kinds，而不是 raw provider responses。Sensitive fields、tokens、完整 message bodies、raw Codex prompts、raw Codex answers 與 unbounded Slack payloads 必須省略或 redacted。
+Daemon 會初始化無 ANSI 的 JSON tracing。Scheduler workers 會輸出固定 worker/operation/status/error-kind events 與 monotonic durations。這是已實作的 scheduler tracing path；legacy gateway components 仍可能輸出既有格式，且不一定全部包含在 scheduler metrics 中。
 
-## Security Boundary
+Secret、完整 provider payload、Codex prompt/answer、instruction、rendered delivery body 與 unbounded error 都必須省略或 redacted。
 
-Admin/read-only API 是 operational interface，不是 user-facing product API。
+## Exposure Boundary
 
-必要邊界：
-
-- Local daemon 預設 bind to loopback。
-- 綁定 non-loopback address 前必須有明確 configuration。
-- 暴露到 loopback 以外時必須要求 authentication。
-- Read-only endpoints 與任何未來 mutating admin endpoints 必須分離。
-- 每個 response 都要 redacts secrets 與 sensitive content。
-- 使用 bounded response sizes 與 pagination。
-- Metrics 不包含 high-cardinality identifiers 或 message content。
-- Raw provider payload access 應視為 privileged diagnostics，而不是 default API feature。
-
-Cluster deployments 應把 HTTP admin surface 放在平台既有 service、network policy 與 authentication controls 後面。Health 與 readiness probes 只有在僅能由 trusted local 或 cluster networks 存取時，才可以 unauthenticated。
+Operational server 沒有 application-layer authentication。除非 deployment 明確設定 `allow_non_loopback = true`，並提供 platform network policy、authentication proxy 與 trusted probe access，否則應保留預設 loopback bind。`/healthz` 與 `/readyz` 只有在 trusted local 或 cluster network 內才應 unauthenticated。

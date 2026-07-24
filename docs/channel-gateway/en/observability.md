@@ -1,107 +1,95 @@
 # Observability
 
-Purpose: define the deferred observability direction for the Codeoff channel gateway.
-Read this before designing operational visibility, readiness checks, metrics, or production diagnostics.
-This does not define an implemented API, CLI surface, dashboard, alert policy, or deployment manifest.
+Purpose: describe the implemented operational HTTP, scheduler telemetry, readiness, and logging surface.
+Read this when configuring probes, metrics collection, or production diagnostics.
+This does not define a user-facing API or mutating remote administration surface.
 
-## Status
+## Implemented Operational HTTP
 
-Observability is intentionally deferred. The current priority is the local channel gateway loop: Slack intake, SQLite queueing, Codex App Server dispatch, MCP channel tools, outbound delivery, receipts, and rate-limit handling.
+`codeoff serve` always starts a bounded HTTP/1 operational server on `[server].bind`. The default is `127.0.0.1:7788`; a non-loopback address is rejected unless `[server].allow_non_loopback = true`.
 
-When observability is implemented, it should be cluster-friendly and service-oriented:
+Only these read-only `GET` routes are implemented:
 
-- HTTP admin/read-only API for health, readiness, queue state, delivery state, and bounded diagnostics.
-- Prometheus-compatible metrics endpoint.
-- Structured logs emitted by the daemon.
+- `GET /healthz`: process liveness, returning `{"status":"alive"}`.
+- `GET /readyz`: SQLite readability plus scheduler component, loop, provider, and snapshot readiness.
+- `GET /metrics`: Prometheus/OpenMetrics scheduler telemetry.
 
-Operational visibility should not depend on CLI inspection commands. CLI commands may remain useful for local development or one-shot maintenance, but they should not be the primary interface for health checks, dashboards, alerts, or cluster probes.
+Other paths return `404`; non-`GET` methods return `405`; query strings are rejected. Responses are bounded, carry `Cache-Control: no-store`, and do not expose instructions, payload bodies, provider receipts, tokens, or raw errors.
 
-## HTTP Admin And Read-Only API
+The following admin routes are not implemented and remain future work: runtime summaries, inbound/outbound queue inspection, event lookup, delivery lookup, and conversation mapping diagnostics. CLI scheduler diagnostics are trusted-local maintenance commands, not HTTP admin endpoints.
 
-The future HTTP surface should be read-only by default. Any mutation or replay endpoint must be designed as a separate, explicitly guarded admin operation.
+With the common prefix `codeoff [--config PATH] [--state-dir PATH] scheduler`, the exact read-only CLI diagnostic surface is `status [--json]`, `runs list [--status STATE] [--limit N] [--json]`, `runs show RUN_ID [--json]`, `deliveries list [--status STATE] [--limit N] [--json]`, `deliveries show DELIVERY_ID [--json]`, and `reconcile --dry-run [--limit N] [--json]`. These commands need no operator identity, return sanitized projections, and do not mutate scheduler authority, but they still require trusted-local filesystem access to SQLite.
 
-Recommended endpoints:
+Do not treat the diagnostic CLI as authorization for mutation commands. Owner-scoped `create|get|list|update|pause|resume|delete` commands require `CODEOFF_SCHEDULER_OPERATOR_ID` plus `CODEOFF_SCHEDULER_OPERATOR_REALM`. `reconcile --apply`, `retry-run`, `retry-delivery`, and `resolve-delivery-unknown` require expected authority coordinates and a non-empty, at-most-64-KiB `--authority-file`; retry and resolution also take canonical schema-version-1 reason/evidence JSON as documented in [Runtime](runtime.md#scheduler-cli-authority-boundary). The mutation verifier intentionally fails closed until the Issue 09 deployment injects trusted verifier authority, so no high-risk mutation is currently enabled by merely supplying files.
 
-- `GET /healthz`: process liveness. This should avoid expensive dependency checks.
-- `GET /readyz`: readiness for configured runtime loops, database access, and required provider configuration.
-- `GET /admin/runtime`: sanitized runtime summary, including enabled loops, configured transports, build/version information, and current process role.
-- `GET /admin/queues/inbound`: bounded inbound queue summary by status, age, attempts, and next due time.
-- `GET /admin/queues/outbound`: bounded outbound delivery summary by status, age, attempts, next due time, and rate-limit cooldown.
-- `GET /admin/events/{event_id}`: sanitized source-backed event diagnostics for a single known event id.
-- `GET /admin/deliveries/{delivery_id}`: sanitized delivery request and receipt diagnostics for a single known delivery id.
-- `GET /admin/conversations/{conversation_key}`: mapping diagnostics for provider thread/channel scope to Codex thread id, without message bodies by default.
-- `GET /metrics`: Prometheus metrics.
+## Readiness Contract
 
-Read endpoints should use explicit pagination or small hard limits. Responses should avoid raw Slack tokens, signing secrets, user tokens, full message bodies by default, Codex prompts, Codex final answers, and unbounded raw provider payloads.
+`/readyz` fails closed with `503` when SQLite cannot answer its bounded read probe within 250 ms. With the scheduler disabled it returns `200` and `scheduler_disabled` after SQLite passes.
 
-## Prometheus Metrics
+With the scheduler enabled, readiness additionally requires:
 
-Metrics should describe gateway health and backlog without exposing sensitive content.
+- scheduler execution and delivery/preparation loops to have reported started;
+- required claim-side dependencies to be available;
+- a successful bounded SQLite scheduler snapshot;
+- no snapshot read/timeout error and a snapshot no older than 15 seconds.
 
-Recommended counters:
+`run_claims_enabled` and `delivery_claims_enabled` are independent kill switches. Enabling a claim path without its required executor/provider makes readiness fail rather than silently dropping work. The delivery preparation loop can run while provider claims are disabled.
 
-- `codeoff_slack_events_received_total{workspace, event_type}`
-- `codeoff_slack_events_deduped_total{workspace}`
-- `codeoff_channel_events_enqueued_total{provider, workspace}`
-- `codeoff_dispatch_attempts_total{provider, workspace, result}`
-- `codeoff_outbound_delivery_attempts_total{provider, workspace, result}`
-- `codeoff_mcp_tool_calls_total{tool, result}`
-- `codeoff_rate_limit_events_total{provider, workspace, scope}`
+## Implemented Scheduler Metrics
 
-Recommended gauges:
+The metrics endpoint exposes low-cardinality scheduler telemetry, including:
 
-- `codeoff_inbound_queue_depth{provider, workspace, status}`
-- `codeoff_outbound_queue_depth{provider, workspace, status}`
-- `codeoff_oldest_inbound_event_age_seconds{provider, workspace}`
-- `codeoff_oldest_outbound_delivery_age_seconds{provider, workspace}`
-- `codeoff_rate_limit_cooldown_seconds{provider, workspace, scope}`
-- `codeoff_runtime_loop_up{loop}`
+- `codeoff_scheduler_events_total` by fixed worker, operation, status, and stable error kind;
+- `codeoff_scheduler_operation_duration_seconds`;
+- `codeoff_scheduler_last_attempt`;
+- `codeoff_scheduler_transitions_total` by a fixed `kind` vocabulary. These totals are advanced in
+  the same SQLite transaction as the accepted state/audit transition and survive daemon restarts;
+- `codeoff_scheduler_worker_capacity` and `codeoff_scheduler_worker_available_slots` by fixed worker;
+- bounded gauges for due jobs, pending/leased/executing/unknown runs, unprepared/pending/sending/retryable/unknown deliveries, and oldest work ages;
+- snapshot success, age, and saturation gauges.
 
-Recommended histograms:
+The durable transition kinds cover materialization/coalescing/overlap decisions; run claim,
+terminal, recovery, stale-fence, and policy-limit outcomes; delivery claim, success, retry, failure,
+unknown, skip, and forced-unknown resend outcomes; independent execution and accepted-delivery
+baseline advances; executor validation categories; and unauthorized scheduler mutations. Counters
+advance only after the authoritative transaction accepts the outcome. Rollback and repeated metric
+scrapes do not increment them. In particular, `delivery_retry` is durable and independent of an
+Agent execution, so the no-Agent delivery retry invariant can be checked directly.
 
-- `codeoff_dispatch_latency_seconds{provider, workspace}`
-- `codeoff_outbound_delivery_latency_seconds{provider, workspace}`
-- `codeoff_slack_api_request_duration_seconds{method, result}`
-- `codeoff_mcp_tool_call_duration_seconds{tool, result}`
-- `codeoff_sqlite_operation_duration_seconds{operation, result}`
+Decision counters use durable authority rather than polling frequency. `overlap_suppressed`
+advances once for each new `(job generation, scheduled_for)` decision, even across restart. Its
+cursor is owned by the job through a cascading foreign key, resets on an accepted schedule update,
+and retains active and paused jobs. Cursors for completed and deleted jobs are removed by bounded
+retention batches. Counter-exhaustion policy limits advance once per affected run or delivery;
+request policy limits advance once for each accepted typed audit row. A true idempotent replay does
+not insert another audit row and therefore does not advance the counter. Terminal deadline/retry
+limits advance once with the accepted terminal transition.
+`stale_fence_rejected` advances once for each rejected authoritative CAS, stale exact reconcile, or
+late completion/failure that is accepted only as diagnostic evidence. A repeated stale attempt is a
+new rejected attempt and therefore advances again.
 
-Labels must remain low-cardinality. Do not label metrics with Slack channel ids, Slack user ids, event ids, delivery ids, message text, Codex thread ids, or raw error strings.
+Executor validation is classified at the typed failure source. Only exact
+`profile_validation_failed`, `artifact_validation_failed`, and `tool_list_validation_failed`
+preflight transitions advance those three counters; general schedule request validation is not
+reclassified as an artifact failure.
 
-## Structured Logs
+Worker gauges follow the actual spawned topology. An enabled scheduler has one execution worker;
+it has one delivery worker when a provider is available, otherwise one standalone delivery
+preparation worker. A worker's available slot changes from `1` to `0` at `tick/started` and returns
+to `1` at the matching terminal tick status. Nested attempts do not change slot availability.
 
-The daemon should emit structured logs suitable for local files, container logs, or centralized collectors.
+The SQLite snapshot refreshes every 5 seconds, is capped at 100,000 rows/counts and 30 days of age, and has a 500 ms timeout. A failed refresh preserves the last bounded gauge values but marks the snapshot unavailable for readiness.
 
-Recommended fields:
+Labels never contain job, run, delivery, owner, channel, user, thread, Slack, or Codex ids;
+instructions, prompts, results, payloads, tokens, secrets, receipts, and raw error strings are also
+excluded. Metric labels are selected only from fixed enums.
 
-- `timestamp`
-- `level`
-- `component`
-- `operation`
-- `provider`
-- `workspace_id`
-- `event_id` or `delivery_id` when available
-- `dedupe_key` when useful and safe
-- `attempt`
-- `status`
-- `duration_ms`
-- `error_kind`
-- `retry_after_ms`
+## Structured Scheduler Tracing
 
-Logs should prefer stable error kinds over raw provider responses. Sensitive fields, tokens, full message bodies, raw Codex prompts, raw Codex answers, and unbounded Slack payloads must be omitted or redacted.
+The daemon initializes JSON tracing without ANSI output. Scheduler workers emit fixed worker/operation/status/error-kind events and monotonic durations. This is the implemented scheduler tracing path; legacy gateway components may still emit their existing output and are not all represented by scheduler metrics.
 
-## Security Boundary
+Secrets, full provider payloads, Codex prompts/answers, instructions, rendered delivery bodies, and unbounded errors must remain absent or redacted.
 
-The admin/read-only API is an operational interface, not a user-facing product API.
+## Exposure Boundary
 
-Required boundaries:
-
-- Bind to loopback by default for local daemon use.
-- Require explicit configuration before binding to a non-loopback address.
-- Require authentication when exposed beyond loopback.
-- Keep read-only endpoints separate from any future mutating admin endpoints.
-- Redact secrets and sensitive content in every response.
-- Use bounded response sizes and pagination.
-- Keep metrics free of high-cardinality identifiers and message content.
-- Treat raw provider payload access as privileged diagnostics, not a default API feature.
-
-Cluster deployments should put the HTTP admin surface behind the platform's normal service, network policy, and authentication controls. Health and readiness probes may be unauthenticated only when they are reachable solely from trusted local or cluster networks.
+The operational server has no application-layer authentication. Keep the default loopback bind unless a deployment deliberately sets `allow_non_loopback = true` and supplies platform network policy, authentication proxying, and trusted probe access. `/healthz` and `/readyz` should be unauthenticated only inside a trusted local or cluster network.

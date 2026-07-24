@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use codeoff_config::{
   CodeoffConfig, ConfigError, ConfigLoadOptions, DataRetentionConfig, DatabaseConfig,
-  SlackDirectMessageFeedbackMode, SlackResponseFeedbackMode,
+  ScheduledCodexConfig, ScheduledExecutionBackend, ScheduledRemoteRunnerConfig,
+  ScheduledRunnerControlConfig, ScheduledRunnerExecutorConfig, ScheduledRunnerGatewayConfig,
+  ScheduledRunnerRole, SchedulerRuntimeConfig, SlackDirectMessageFeedbackMode,
+  SlackResponseFeedbackMode,
 };
 use tempfile::tempdir;
 
@@ -81,6 +84,25 @@ url = "sqlite://./.codeoff/codeoff.db"
 }
 
 #[test]
+fn test_server_bind_requires_explicit_non_loopback_exposure() {
+  let mut config = CodeoffConfig::default();
+  config.server.bind = "0.0.0.0:7788".to_owned();
+
+  let error = config
+    .validate()
+    .expect_err("non-loopback server bind must fail closed");
+  assert!(matches!(
+    error,
+    ConfigError::NonLoopbackServerBind { value } if value == "0.0.0.0:7788"
+  ));
+
+  config.server.allow_non_loopback = true;
+  config
+    .validate()
+    .expect("explicit non-loopback exposure is valid");
+}
+
+#[test]
 fn test_database_driver_defaults_to_sqlite_and_loads_from_toml() {
   let defaults_dir = tempdir().expect("create tempdir");
   let defaults = CodeoffConfig::load(
@@ -127,6 +149,9 @@ fn test_data_retention_defaults_and_toml_overrides() {
       context_attempt_days: 14,
       conversation_summary_days: 90,
       artifact_days: 7,
+      scheduled_run_days: 30,
+      scheduled_delivery_days: 30,
+      scheduled_retention_batch_limit: 100,
     }
   );
 
@@ -142,6 +167,9 @@ delivery_days = 60
 context_attempt_days = 21
 conversation_summary_days = 120
 artifact_days = 10
+scheduled_run_days = 75
+scheduled_delivery_days = 80
+scheduled_retention_batch_limit = 125
 ",
   )
   .expect("write config");
@@ -158,8 +186,597 @@ artifact_days = 10
       context_attempt_days: 21,
       conversation_summary_days: 120,
       artifact_days: 10,
+      scheduled_run_days: 75,
+      scheduled_delivery_days: 80,
+      scheduled_retention_batch_limit: 125,
     }
   );
+}
+
+#[test]
+fn test_data_retention_rejects_zero_and_unsafe_scheduler_limits() {
+  let mut config = CodeoffConfig::default();
+  config.data_retention.scheduled_run_days = 0;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidDataRetention {
+      field: "scheduled_run_days",
+      ..
+    })
+  ));
+
+  config.data_retention.scheduled_run_days = 30;
+  config.data_retention.scheduled_delivery_days = 3_651;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidDataRetention {
+      field: "scheduled_delivery_days",
+      ..
+    })
+  ));
+
+  config.data_retention.scheduled_delivery_days = 30;
+  config.data_retention.scheduled_retention_batch_limit = 0;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidDataRetention {
+      field: "scheduled_retention_batch_limit",
+      ..
+    })
+  ));
+}
+
+#[test]
+fn test_scheduler_run_claims_default_off_and_loads_explicit_opt_in() {
+  let defaults = SchedulerRuntimeConfig::default();
+  assert!(!defaults.enabled);
+  assert!(!defaults.run_claims_enabled);
+  assert!(!defaults.delivery_claims_enabled);
+
+  let dir = tempdir().expect("create tempdir");
+  let config_path = dir.path().join("codeoff.toml");
+  fs::write(
+    &config_path,
+    r#"
+[scheduler]
+enabled = true
+run_claims_enabled = true
+delivery_claims_enabled = true
+recovery_batch_limit = 64
+run_retry_base_seconds = 60
+run_max_attempts = 5
+
+[agent.scheduled_codex]
+codex_program = "/opt/codeoff/bin/codex"
+codex_program_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+codex_home = "/var/lib/codeoff/scheduled-codex"
+cwd = "/work/codeoff-scheduled"
+github_mcp_url = "http://127.0.0.1:8090/mcp"
+github_mcp_artifact_path = "/opt/codeoff/bin/github-mcp-server"
+github_mcp_artifact_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+github_mcp_endpoint_identity = "github-mcp-scheduled-v1"
+github_mcp_access_auth_mode = "supervisor-dynamic-tools-v1"
+github_mcp_access_token_revision = "mcp-channel-v1"
+credential_reference = "kubernetes:codeoff/github-mcp"
+permission_policy_revision = "scheduled-read-only-v1"
+config_revision = "scheduled-codex-v1"
+config_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+gateway_image_digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+runner_image_digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+runner_workload_identity = "spiffe://codeoff/runner/production"
+runner_client_cert_public_key_fingerprint = "1111111111111111111111111111111111111111111111111111111111111111"
+credential_revision = "github-readonly-2026-07"
+isolation_attestation_path = "/var/run/codeoff/isolation-attestation.json"
+isolation_trust_bundle_path = "/opt/codeoff/attestation/isolation-trust-bundle.json"
+trusted_owner_uid = 0
+trusted_owner_gid = 0
+runtime_uid = 65534
+runtime_gid = 65534
+"#,
+  )
+  .expect("write config");
+
+  let loaded =
+    CodeoffConfig::load(ConfigLoadOptions::new().config_path(config_path)).expect("load config");
+
+  assert!(loaded.scheduler.enabled);
+  assert!(loaded.scheduler.run_claims_enabled);
+  assert!(loaded.scheduler.delivery_claims_enabled);
+  assert_eq!(loaded.scheduler.recovery_batch_limit, 64);
+  assert_eq!(loaded.scheduler.run_retry_base_seconds, 60);
+  assert_eq!(loaded.scheduler.run_max_attempts, 5);
+  loaded.validate().expect("scheduler config");
+}
+
+#[test]
+fn test_scheduler_config_rejects_claims_without_lifecycle_and_unsafe_limits() {
+  let mut config = CodeoffConfig::default();
+  config.scheduler.run_claims_enabled = true;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "enabled",
+      ..
+    })
+  ));
+
+  config.scheduler.enabled = true;
+  config.scheduler.run_claims_enabled = false;
+  config.scheduler.run_heartbeat_interval_ms =
+    u64::from(config.scheduler.run_lease_seconds) * 1_000;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "run_heartbeat_interval_ms",
+      ..
+    })
+  ));
+
+  config.scheduler.run_heartbeat_interval_ms = 1_000;
+  config.scheduler.run_max_attempts = 0;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "run_max_attempts",
+      ..
+    })
+  ));
+}
+
+#[test]
+fn test_scheduler_policy_rejects_strict_heartbeat_and_incoherent_deadlines() {
+  let mut config = CodeoffConfig::default();
+  config.scheduler.run_heartbeat_interval_ms =
+    u64::from(config.scheduler.run_lease_seconds) * 1_000 / 3;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "run_heartbeat_interval_ms",
+      ..
+    })
+  ));
+
+  config.scheduler.run_heartbeat_interval_ms = u64::MAX;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "run_heartbeat_interval_ms",
+      ..
+    })
+  ));
+
+  config.scheduler.run_heartbeat_interval_ms = 1_000;
+  config.scheduler.run_deadline_seconds = config.scheduler.run_timeout_seconds;
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "run_deadline_seconds",
+      ..
+    })
+  ));
+
+  config.scheduler.run_deadline_seconds = SchedulerRuntimeConfig::default().run_deadline_seconds;
+  config.scheduler.delivery_deadline_seconds = u32::from(
+    config.scheduler.delivery_send_timeout_seconds
+      + config.scheduler.delivery_finalization_timeout_seconds
+      - 1,
+  );
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "delivery_retry_after_max_seconds" | "delivery_deadline_seconds",
+      ..
+    })
+  ));
+}
+
+fn valid_scheduled_codex_config() -> ScheduledCodexConfig {
+  ScheduledCodexConfig {
+    execution_backend: ScheduledExecutionBackend::Local,
+    remote_runner: ScheduledRemoteRunnerConfig::default(),
+    codex_program: "/opt/codeoff/bin/codex".into(),
+    codex_program_sha256: "a".repeat(64),
+    codex_home: "/var/lib/codeoff/scheduled-codex".into(),
+    cwd: "/work/codeoff-scheduled".into(),
+    github_mcp_url: "http://127.0.0.1:8090/mcp".to_owned(),
+    github_mcp_artifact_path: "/opt/codeoff/bin/github-mcp-server".into(),
+    github_mcp_artifact_sha256: "b".repeat(64),
+    github_mcp_endpoint_identity: "github-mcp-scheduled-v1".to_owned(),
+    github_mcp_access_auth_mode: "supervisor-dynamic-tools-v1".to_owned(),
+    github_mcp_access_token_revision: "mcp-channel-v1".to_owned(),
+    credential_reference: "kubernetes:codeoff/github-mcp".to_owned(),
+    permission_policy_revision: "scheduled-read-only-v1".to_owned(),
+    config_revision: "scheduled-codex-v1".to_owned(),
+    config_sha256: "c".repeat(64),
+    gateway_image_digest: format!("sha256:{}", "e".repeat(64)),
+    runner_image_digest: format!("sha256:{}", "f".repeat(64)),
+    runner_workload_identity: "spiffe://codeoff/runner/production".to_owned(),
+    runner_client_cert_public_key_fingerprint: "1".repeat(64),
+    credential_revision: "github-readonly-2026-07".to_owned(),
+    isolation_attestation_path: "/var/run/codeoff/isolation-attestation.json".into(),
+    isolation_trust_bundle_path: "/opt/codeoff/attestation/isolation-trust-bundle.json".into(),
+    trusted_owner_uid: 0,
+    trusted_owner_gid: 0,
+    runtime_uid: 65_534,
+    runtime_gid: 65_534,
+  }
+}
+
+fn scheduler_with_valid_scheduled_codex() -> CodeoffConfig {
+  let mut config = CodeoffConfig::default();
+  config.scheduler.enabled = true;
+  config.scheduler.run_claims_enabled = true;
+  config.agent.scheduled_codex = valid_scheduled_codex_config();
+  config
+}
+
+fn gateway_config() -> ScheduledRunnerGatewayConfig {
+  ScheduledRunnerGatewayConfig {
+    bind: "0.0.0.0:7443".to_owned(),
+    server_certificate_path: "/run/codeoff/tls/server.crt".into(),
+    server_private_key_path: "/run/codeoff/tls/server.key".into(),
+    client_ca_bundle_path: "/run/codeoff/tls/client-ca.crt".into(),
+    execution_grant_private_key_path: "/run/codeoff/grant/gateway.pk8".into(),
+    execution_grant_key_id: "gateway-grant-key-1".to_owned(),
+    execution_grant_key_revision: "gateway-grant-2026-07".to_owned(),
+    execution_grant_signer_identity: "spiffe://codeoff/gateway/production".to_owned(),
+    executor_evidence_public_key_path: "/run/codeoff/evidence/executor.pub".into(),
+    executor_evidence_key_id: "executor-key-1".to_owned(),
+    executor_evidence_key_revision: "executor-evidence-2026-07".to_owned(),
+    executor_evidence_signer_identity: "spiffe://codeoff/executor/production".to_owned(),
+    handshake_timeout_ms: 5_000,
+    frame_timeout_ms: 30_000,
+    readiness_ttl_ms: 30_000,
+    max_connections: 2,
+  }
+}
+
+fn control_config() -> ScheduledRunnerControlConfig {
+  ScheduledRunnerControlConfig {
+    gateway_address: "codeoff-gateway.codeoff.svc:7443".to_owned(),
+    gateway_server_name: "codeoff-gateway.codeoff.svc".to_owned(),
+    client_certificate_path: "/run/codeoff/tls/client.crt".into(),
+    client_private_key_path: "/run/codeoff/tls/client.key".into(),
+    server_ca_bundle_path: "/run/codeoff/tls/server-ca.crt".into(),
+    local_socket_path: "/run/codeoff/runner/executor.sock".into(),
+    control_uid: 10_001,
+    control_gid: 10_001,
+    expected_executor_uid: 0,
+    expected_executor_gid: 0,
+    connect_timeout_ms: 5_000,
+    frame_timeout_ms: 30_000,
+    readiness_ttl_ms: 30_000,
+  }
+}
+
+fn executor_config() -> ScheduledRunnerExecutorConfig {
+  ScheduledRunnerExecutorConfig {
+    local_socket_path: "/run/codeoff/runner/executor.sock".into(),
+    execution_grant_public_key_path: "/run/codeoff/grant/gateway.pub".into(),
+    execution_grant_key_id: "gateway-grant-key-1".to_owned(),
+    execution_grant_key_revision: "gateway-grant-2026-07".to_owned(),
+    execution_grant_signer_identity: "spiffe://codeoff/gateway/production".to_owned(),
+    evidence_private_key_path: "/run/codeoff/evidence/executor.pk8".into(),
+    evidence_key_id: "executor-key-1".to_owned(),
+    evidence_key_revision: "executor-evidence-2026-07".to_owned(),
+    evidence_signer_identity: "spiffe://codeoff/executor/production".to_owned(),
+    expected_control_uid: 10_001,
+    expected_control_gid: 10_001,
+    codex_child_uid: 65_534,
+    codex_child_gid: 65_534,
+    accept_timeout_ms: 5_000,
+    frame_timeout_ms: 30_000,
+  }
+}
+
+#[test]
+fn test_remote_runner_roles_require_exactly_one_strict_role_table() {
+  let mut scheduled = valid_scheduled_codex_config();
+  scheduled.execution_backend = ScheduledExecutionBackend::RemoteRunner;
+  scheduled.remote_runner.gateway = Some(gateway_config());
+  scheduled
+    .validate_remote_runner_role(ScheduledRunnerRole::Gateway)
+    .expect("gateway role");
+
+  scheduled.remote_runner.control = Some(control_config());
+  assert!(matches!(
+    scheduled.validate_remote_runner_role(ScheduledRunnerRole::Gateway),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.remote_runner",
+      ..
+    })
+  ));
+
+  scheduled.remote_runner.gateway = None;
+  scheduled
+    .validate_remote_runner_role(ScheduledRunnerRole::Control)
+    .expect("control role");
+
+  scheduled.remote_runner.control = None;
+  scheduled.remote_runner.executor = Some(executor_config());
+  scheduled
+    .validate_remote_runner_role(ScheduledRunnerRole::Executor)
+    .expect("executor role");
+}
+
+#[test]
+fn test_remote_runner_roles_reject_unsafe_addresses_paths_identities_and_bounds() {
+  let mut scheduled = valid_scheduled_codex_config();
+  scheduled.execution_backend = ScheduledExecutionBackend::RemoteRunner;
+  let mut gateway = gateway_config();
+  gateway.bind = "0.0.0.0:0".to_owned();
+  scheduled.remote_runner.gateway = Some(gateway);
+  assert!(
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Gateway)
+      .is_err()
+  );
+
+  scheduled.remote_runner.gateway = None;
+  let mut control = control_config();
+  control.gateway_server_name = "Codeoff.Example".to_owned();
+  scheduled.remote_runner.control = Some(control);
+  assert!(
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Control)
+      .is_err()
+  );
+
+  scheduled.remote_runner.control = None;
+  let mut executor = executor_config();
+  executor.local_socket_path = "relative.sock".into();
+  scheduled.remote_runner.executor = Some(executor);
+  assert!(
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Executor)
+      .is_err()
+  );
+}
+
+#[test]
+fn test_remote_runner_evidence_key_ids_use_the_core_canonical_contract() {
+  let valid_at_limit = "a".repeat(codeoff_core::MAX_EVIDENCE_KEY_ID_BYTES);
+  for key_id in ["a", "executor-key-1", valid_at_limit.as_str()] {
+    let mut scheduled = valid_scheduled_codex_config();
+    scheduled.execution_backend = ScheduledExecutionBackend::RemoteRunner;
+    let mut gateway = gateway_config();
+    gateway.executor_evidence_key_id = key_id.to_owned();
+    scheduled.remote_runner.gateway = Some(gateway);
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Gateway)
+      .expect("canonical gateway evidence key ID");
+
+    scheduled.remote_runner.gateway = None;
+    let mut executor = executor_config();
+    executor.evidence_key_id = key_id.to_owned();
+    scheduled.remote_runner.executor = Some(executor);
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Executor)
+      .expect("canonical executor evidence key ID");
+  }
+
+  let oversized = "a".repeat(codeoff_core::MAX_EVIDENCE_KEY_ID_BYTES + 1);
+  for key_id in [
+    "",
+    "KEY-1",
+    "key_1",
+    "key/1",
+    " key-1",
+    "key-1 ",
+    oversized.as_str(),
+  ] {
+    let mut scheduled = valid_scheduled_codex_config();
+    scheduled.execution_backend = ScheduledExecutionBackend::RemoteRunner;
+    let mut gateway = gateway_config();
+    gateway.executor_evidence_key_id = key_id.to_owned();
+    scheduled.remote_runner.gateway = Some(gateway);
+    assert!(matches!(
+      scheduled.validate_remote_runner_role(ScheduledRunnerRole::Gateway),
+      Err(ConfigError::InvalidScheduler {
+        field: "scheduled_codex.remote_runner.gateway.executor_evidence_key_id",
+        ..
+      })
+    ));
+
+    scheduled.remote_runner.gateway = None;
+    let mut executor = executor_config();
+    executor.evidence_key_id = key_id.to_owned();
+    scheduled.remote_runner.executor = Some(executor);
+    assert!(matches!(
+      scheduled.validate_remote_runner_role(ScheduledRunnerRole::Executor),
+      Err(ConfigError::InvalidScheduler {
+        field: "scheduled_codex.remote_runner.executor.evidence_key_id",
+        ..
+      })
+    ));
+  }
+}
+
+#[test]
+fn test_remote_runner_execution_grant_key_ids_use_the_core_canonical_contract() {
+  let valid_at_limit = "a".repeat(codeoff_core::MAX_EVIDENCE_KEY_ID_BYTES);
+  for key_id in ["a", "gateway-grant-key-1", valid_at_limit.as_str()] {
+    let mut scheduled = valid_scheduled_codex_config();
+    scheduled.execution_backend = ScheduledExecutionBackend::RemoteRunner;
+    let mut gateway = gateway_config();
+    gateway.execution_grant_key_id = key_id.to_owned();
+    scheduled.remote_runner.gateway = Some(gateway);
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Gateway)
+      .expect("canonical gateway grant key ID");
+
+    scheduled.remote_runner.gateway = None;
+    let mut executor = executor_config();
+    executor.execution_grant_key_id = key_id.to_owned();
+    scheduled.remote_runner.executor = Some(executor);
+    scheduled
+      .validate_remote_runner_role(ScheduledRunnerRole::Executor)
+      .expect("canonical executor grant key ID");
+  }
+
+  let oversized = "a".repeat(codeoff_core::MAX_EVIDENCE_KEY_ID_BYTES + 1);
+  for key_id in ["", "KEY-1", "key_1", "key/1", oversized.as_str()] {
+    let mut scheduled = valid_scheduled_codex_config();
+    scheduled.execution_backend = ScheduledExecutionBackend::RemoteRunner;
+    let mut gateway = gateway_config();
+    gateway.execution_grant_key_id = key_id.to_owned();
+    scheduled.remote_runner.gateway = Some(gateway);
+    assert!(matches!(
+      scheduled.validate_remote_runner_role(ScheduledRunnerRole::Gateway),
+      Err(ConfigError::InvalidScheduler {
+        field: "scheduled_codex.remote_runner.gateway.execution_grant_key_id",
+        ..
+      })
+    ));
+
+    scheduled.remote_runner.gateway = None;
+    let mut executor = executor_config();
+    executor.execution_grant_key_id = key_id.to_owned();
+    scheduled.remote_runner.executor = Some(executor);
+    assert!(matches!(
+      scheduled.validate_remote_runner_role(ScheduledRunnerRole::Executor),
+      Err(ConfigError::InvalidScheduler {
+        field: "scheduled_codex.remote_runner.executor.execution_grant_key_id",
+        ..
+      })
+    ));
+  }
+}
+
+#[test]
+fn test_remote_runner_tables_deny_unknown_fields_and_backend_aliases() {
+  let dir = tempdir().expect("create tempdir");
+  for body in [
+    r#"
+[agent.scheduled_codex]
+execution_backend = "remote"
+"#,
+    r#"
+[agent.scheduled_codex]
+execution_backend = "remote-runner"
+
+[agent.scheduled_codex.remote_runner.gateway]
+bind = "0.0.0.0:7443"
+server_certificate_path = "/run/server.crt"
+server_private_key_path = "/run/server.key"
+client_ca_bundle_path = "/run/client-ca.crt"
+handshake_timeout_ms = 5000
+frame_timeout_ms = 30000
+readiness_ttl_ms = 60000
+max_connections = 2
+connection_limit = 2
+"#,
+  ] {
+    let config_path = dir.path().join("codeoff.toml");
+    fs::write(&config_path, body).expect("write config");
+    assert!(matches!(
+      CodeoffConfig::load(ConfigLoadOptions::new().config_path(config_path)),
+      Err(ConfigError::Parse { .. })
+    ));
+  }
+}
+
+#[test]
+fn test_scheduled_codex_rejects_unsafe_paths_digests_keys_and_urls() {
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.codex_program = "relative/codex".into();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.codex_program",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.isolation_trust_bundle_path = "relative/trust-bundle.json".into();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.isolation_trust_bundle_path",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.cwd = config.agent.scheduled_codex.codex_home.join("workspace");
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.cwd",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.config_sha256 = "A".repeat(64);
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.config_sha256",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.runner_image_digest = "sha-f375909".to_owned();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.runner_image_digest",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.runner_workload_identity =
+    "spiffe://Codeoff/runner/production".to_owned();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.runner_workload_identity",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.credential_revision = "GitHub-Readonly".to_owned();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.credential_revision",
+      ..
+    })
+  ));
+
+  let mut config = scheduler_with_valid_scheduled_codex();
+  config.agent.scheduled_codex.github_mcp_url = "http://token@127.0.0.1:8090/mcp".to_owned();
+  assert!(matches!(
+    config.validate(),
+    Err(ConfigError::InvalidScheduler {
+      field: "scheduled_codex.github_mcp_url",
+      ..
+    })
+  ));
+}
+
+#[test]
+fn test_scheduler_config_rejects_retired_delivery_enabled_name() {
+  let dir = tempdir().expect("create tempdir");
+  let config_path = dir.path().join("codeoff.toml");
+  fs::write(
+    &config_path,
+    r"
+[scheduler]
+enabled = true
+delivery_enabled = true
+",
+  )
+  .expect("write config");
+  assert!(matches!(
+    CodeoffConfig::load(ConfigLoadOptions::new().config_path(config_path)),
+    Err(ConfigError::Parse { .. })
+  ));
 }
 
 #[test]
@@ -379,6 +996,8 @@ fn test_codex_app_server_config_loads_from_toml() {
 command = "codex app-server --sandbox workspace-write"
 transport = "stdio"
 ephemeral_threads = false
+max_prompt_bytes = 32768
+previous_success_context_max_bytes = 4096
 "#,
   )
   .expect("write config");
@@ -392,6 +1011,14 @@ ephemeral_threads = false
   );
   assert_eq!(loaded.agent.codex_app_server.transport, "stdio");
   assert!(!loaded.agent.codex_app_server.ephemeral_threads);
+  assert_eq!(loaded.agent.codex_app_server.max_prompt_bytes, 32_768);
+  assert_eq!(
+    loaded
+      .agent
+      .codex_app_server
+      .previous_success_context_max_bytes,
+    4_096
+  );
 }
 
 #[test]

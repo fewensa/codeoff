@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 
 struct TestStore {
   _temp: TempDir,
@@ -293,6 +294,44 @@ async fn read_json_line(reader: &mut BufReader<TcpStream>) -> Value {
   let mut line = String::new();
   reader.read_line(&mut line).await.expect("read response");
   serde_json::from_str(&line).expect("json response")
+}
+
+#[tokio::test]
+async fn test_tcp_server_shutdown_closes_and_joins_active_connections() {
+  let state = store().await;
+  let server = McpTcpServer::bind("127.0.0.1:0", state.store, FakeContextProvider::default())
+    .await
+    .expect("bind server");
+  let address = server.local_addr().expect("local address");
+  let (shutdown, shutdown_rx) = watch::channel(false);
+  let server_task = tokio::spawn(server.run_until(shutdown_rx));
+  let mut stream = TcpStream::connect(address).await.expect("connect server");
+  write_json_line(
+    &mut stream,
+    json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+  )
+  .await;
+  let mut reader = BufReader::new(stream);
+  let response = read_json_line(&mut reader).await;
+  assert_eq!(response["id"], 1);
+
+  shutdown.send(true).expect("request shutdown");
+  tokio::time::timeout(std::time::Duration::from_secs(1), server_task)
+    .await
+    .expect("server shutdown deadline")
+    .expect("server join")
+    .expect("server shutdown");
+  let mut trailing = String::new();
+  assert_eq!(
+    tokio::time::timeout(
+      std::time::Duration::from_secs(1),
+      reader.read_line(&mut trailing),
+    )
+    .await
+    .expect("connection close deadline")
+    .expect("connection close"),
+    0
+  );
 }
 
 #[tokio::test]

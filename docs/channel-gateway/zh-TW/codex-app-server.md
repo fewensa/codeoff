@@ -14,6 +14,8 @@ command = "codex app-server --listen stdio://"
 transport = "stdio"
 ephemeral_threads = true
 max_parallel_turns = 10
+max_prompt_bytes = 65536
+previous_success_context_max_bytes = 8192
 ```
 
 目前 client 使用 stdio JSONL。Dispatch 會等待 Codex turn completed，並只在 Codex 回傳 final agent text 時保存 final draft text。
@@ -51,9 +53,16 @@ Payload 以 identifiers 為主：
 
 Active event 可以附帶 compact message text 與 context hints，但 Slack history 與 files 應透過 bounded channel tools 取得。
 
+Invocation provenance 與 trusted principal 是不同的 runtime values。Principal 由 authenticated
+adapter 建立，且絕不會 render 到 Codex prompt。Scheduled invocation 必須使用 fresh session，
+並且不能包含 channel context 或 interactive feedback；feedback wrapper 與 Codex backend 都會在
+任何 side effect 開始前拒絕非法組合。
+
 ## Dynamic Tools
 
-Turn 執行期間，Codex 可呼叫 Codeoff channel tools：
+每個 task 都帶有 default-deny dynamic-tool policy。Interactive channel turn 只會宣告該 task
+allowlist 內的 channel tools，而且每次 tool call 都會再次檢查同一份 policy。Codex 可使用這些
+允許的 tools：
 
 - reply to current event or known thread。
 - 以 bot 或 configured user token send message。

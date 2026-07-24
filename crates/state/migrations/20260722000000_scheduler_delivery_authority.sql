@@ -1,0 +1,917 @@
+create table _scheduled_delivery_baselines_220000 as
+select * from scheduled_delivery_baselines;
+
+drop table scheduled_delivery_baselines;
+
+create table _scheduled_run_deliveries_220000 as
+select * from scheduled_run_deliveries;
+
+drop table scheduled_run_deliveries;
+
+create table scheduled_run_deliveries (
+  delivery_id text primary key,
+  run_id text not null,
+  job_id text not null,
+  target_identity_digest text not null,
+  target_json text not null,
+  state text not null default 'pending',
+  attempt integer not null default 0,
+  next_attempt_at integer,
+  lease_owner text,
+  lease_expires_at integer,
+  fence integer not null default 0,
+  idempotency_key text,
+  provider_receipt text,
+  provider_outcome text,
+  error_kind text,
+  error_message text,
+  delivery_policy_version integer not null,
+  render_version integer,
+  payload_schema_version integer,
+  content_type text,
+  hash_algorithm text,
+  payload_digest text,
+  payload_snapshot blob,
+  payload_created_at integer,
+  expected_baseline_version integer,
+  claimed_baseline_version integer,
+  result_artifact_id text,
+  result_attempt integer,
+  result_fence integer,
+  target_snapshot_digest_algorithm text,
+  target_snapshot_digest text,
+  target_snapshot_version integer,
+  intent_key text,
+  authority_kind text not null default 'legacy',
+  created_at integer not null,
+  updated_at integer not null,
+  unique (
+    run_id,
+    target_identity_digest,
+    delivery_policy_version,
+    render_version,
+    hash_algorithm
+  ),
+  unique (delivery_id, run_id, job_id),
+  foreign key (run_id, job_id)
+    references scheduled_runs(run_id, job_id) on delete restrict,
+  foreign key (
+    result_artifact_id,
+    run_id,
+    job_id,
+    result_attempt,
+    result_fence
+  ) references scheduled_run_result_artifacts (
+    artifact_id,
+    run_id,
+    job_id,
+    accepted_attempt,
+    accepted_fence
+  ) on delete restrict,
+  check (json_valid(target_json) and json_type(target_json) = 'object'),
+  check (state in (
+    'pending',
+    'sending',
+    'delivered',
+    'failed_retryable',
+    'failed_terminal',
+    'delivery_unknown',
+    'skipped_none',
+    'skipped_unchanged'
+  )),
+  check (
+    attempt >= 0
+    and fence >= 0
+    and delivery_policy_version > 0
+    and updated_at >= created_at
+  ),
+  check (
+    (payload_snapshot is null
+      and render_version is null
+      and payload_schema_version is null
+      and content_type is null
+      and hash_algorithm is null
+      and payload_digest is null
+      and payload_created_at is null
+      and expected_baseline_version is null
+      and target_snapshot_version is null)
+    or
+    (length(payload_snapshot) > 0
+      and render_version > 0
+      and payload_schema_version = 1
+      and length(content_type) > 0
+      and hash_algorithm = 'sha256-utf8-exact-v1'
+      and length(payload_digest) = 64
+      and payload_digest not glob '*[^0-9a-f]*'
+      and payload_created_at >= created_at
+      and expected_baseline_version >= 0
+      and target_snapshot_version > 0)
+  ),
+  check (
+    authority_kind != 'intent_v1'
+    or (
+      result_artifact_id is not null
+      and length(result_artifact_id) > 0
+      and result_attempt is not null
+      and result_attempt > 0
+      and result_fence is not null
+      and result_fence > 0
+      and delivery_policy_version = 1
+      and target_snapshot_digest_algorithm is not null
+      and target_snapshot_digest_algorithm = 'sha256-v1'
+      and target_snapshot_digest is not null
+      and length(target_snapshot_digest) = 64
+      and target_snapshot_digest not glob '*[^0-9a-f]*'
+      and length(target_identity_digest) = 64
+      and target_identity_digest not glob '*[^0-9a-f]*'
+      and intent_key is not null
+      and length(intent_key) between 72 and 2170
+      and intent_key = 'v1:' || lower(hex(cast(run_id as blob))) || ':' || target_identity_digest || ':1'
+      and delivery_id = 'intent:' || intent_key
+      and (
+        (state = 'pending' and payload_snapshot is null)
+        or (state = 'failed_terminal' and payload_snapshot is null)
+        or payload_snapshot is not null
+      )
+    )
+  ),
+  check (
+    (state = 'sending'
+      and lease_owner is not null
+      and length(lease_owner) > 0
+      and lease_expires_at is not null
+      and idempotency_key is not null
+      and length(idempotency_key) > 0)
+    or
+    (state != 'sending'
+      and lease_owner is null
+      and lease_expires_at is null)
+  ),
+  check (next_attempt_at is null or state = 'failed_retryable'),
+  check (claimed_baseline_version is null or claimed_baseline_version >= 0),
+  check (
+    authority_kind != 'intent_v1'
+    or state not in (
+      'sending',
+      'delivered',
+      'failed_retryable',
+      'delivery_unknown',
+      'skipped_unchanged'
+    )
+    or claimed_baseline_version is not null
+  ),
+  check (provider_receipt is null or state = 'delivered'),
+  check (
+    (state in ('pending', 'sending') and provider_outcome is null)
+    or (state = 'delivered' and provider_outcome = 'confirmed_success')
+    or (state = 'failed_retryable' and provider_outcome = 'confirmed_no_write_retryable')
+    or (state = 'failed_terminal' and provider_outcome = 'confirmed_no_write_terminal')
+    or (state = 'delivery_unknown' and provider_outcome = 'ambiguous_post_write')
+    or (state = 'skipped_none' and provider_outcome = 'skipped_none')
+    or (state = 'skipped_unchanged' and provider_outcome = 'skipped_unchanged')
+  ),
+  check (
+    (state in ('failed_retryable', 'failed_terminal', 'delivery_unknown')
+      and error_kind is not null
+      and length(error_kind) > 0)
+    or
+    (state not in ('failed_retryable', 'failed_terminal', 'delivery_unknown')
+      and error_kind is null
+      and error_message is null)
+  ),
+  check (
+    state not in (
+      'sending',
+      'delivered',
+      'failed_retryable',
+      'delivery_unknown',
+      'skipped_unchanged'
+    )
+    or authority_kind != 'intent_v1'
+    or payload_snapshot is not null
+  )
+);
+
+insert into scheduled_run_deliveries (
+  delivery_id,
+  run_id,
+  job_id,
+  target_identity_digest,
+  target_json,
+  state,
+  attempt,
+  next_attempt_at,
+  lease_owner,
+  lease_expires_at,
+  fence,
+  idempotency_key,
+  provider_receipt,
+  provider_outcome,
+  error_kind,
+  error_message,
+  delivery_policy_version,
+  render_version,
+  payload_schema_version,
+  content_type,
+  hash_algorithm,
+  payload_digest,
+  payload_snapshot,
+  payload_created_at,
+  expected_baseline_version,
+  claimed_baseline_version,
+  result_artifact_id,
+  result_attempt,
+  result_fence,
+  target_snapshot_digest_algorithm,
+  target_snapshot_digest,
+  target_snapshot_version,
+  intent_key,
+  authority_kind,
+  created_at,
+  updated_at
+)
+select
+  delivery_id,
+  run_id,
+  job_id,
+  target_identity_digest,
+  target_json,
+  case
+    when authority_kind = 'intent_v1'
+      and state in ('intent', 'pending')
+      and payload_snapshot is null then 'pending'
+    when authority_kind = 'intent_v1' and payload_snapshot is not null then 'failed_terminal'
+    when state in ('sending', 'failed', 'delivery_unknown') then 'delivery_unknown'
+    when state = 'delivered' then 'delivered'
+    when state = 'skipped' and json_extract(target_json, '$.kind') = 'none' then 'skipped_none'
+    else 'failed_terminal'
+  end,
+  attempt,
+  null,
+  null,
+  null,
+  fence,
+  null,
+  case when state = 'delivered' then provider_receipt end,
+  case
+    when state = 'delivered' then 'confirmed_success'
+    when state in ('sending', 'failed', 'delivery_unknown') then 'ambiguous_post_write'
+    when state = 'skipped' and json_extract(target_json, '$.kind') = 'none' then 'skipped_none'
+    when authority_kind = 'intent_v1' and payload_snapshot is not null
+      then 'confirmed_no_write_terminal'
+    when state in ('pending', 'leased', 'skipped') and authority_kind != 'intent_v1'
+      then 'confirmed_no_write_terminal'
+  end,
+  case
+    when payload_snapshot is not null and state != 'delivered'
+      then 'legacy_payload_digest_unverified'
+    when state = 'sending' then 'legacy_sending_recovered_unknown'
+    when state = 'failed' then 'legacy_failure_recovered_unknown'
+    when state = 'delivery_unknown' then coalesce(nullif(error_message, ''), 'legacy_delivery_unknown')
+    when state = 'leased' then 'legacy_lease_missing_payload'
+    when state = 'pending' and authority_kind != 'intent_v1' then 'legacy_pending_missing_payload'
+    when state = 'skipped' and json_extract(target_json, '$.kind') is not 'none'
+      then 'legacy_skipped_target_not_none'
+  end,
+  case
+    when state in ('sending', 'failed', 'delivery_unknown', 'leased')
+      or (state = 'pending' and authority_kind != 'intent_v1')
+      or (authority_kind = 'intent_v1' and payload_snapshot is not null)
+      or (state = 'skipped' and json_extract(target_json, '$.kind') is not 'none')
+      then coalesce(nullif(error_message, ''), 'legacy delivery requires operator review')
+  end,
+  delivery_policy_version,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  result_artifact_id,
+  result_attempt,
+  result_fence,
+  target_snapshot_digest_algorithm,
+  target_snapshot_digest,
+  null,
+  intent_key,
+  authority_kind,
+  created_at,
+  updated_at
+from _scheduled_run_deliveries_220000;
+
+drop table _scheduled_run_deliveries_220000;
+
+create index idx_scheduled_deliveries_claim
+  on scheduled_run_deliveries (state, next_attempt_at, created_at, delivery_id);
+create index idx_scheduled_deliveries_retry
+  on scheduled_run_deliveries (state, next_attempt_at, delivery_id);
+create index idx_scheduled_deliveries_recovery
+  on scheduled_run_deliveries (state, lease_expires_at, delivery_id);
+create unique index idx_scheduled_delivery_intent_identity
+  on scheduled_run_deliveries (run_id, target_identity_digest, delivery_policy_version)
+  where intent_key is not null;
+create unique index idx_scheduled_delivery_intent_key
+  on scheduled_run_deliveries (intent_key)
+  where intent_key is not null;
+create unique index idx_scheduled_delivery_active_baseline_identity
+  on scheduled_run_deliveries (
+    job_id,
+    target_identity_digest,
+    target_snapshot_digest,
+    delivery_policy_version,
+    render_version,
+    hash_algorithm
+  ) where state = 'sending';
+
+create table scheduled_delivery_attempts (
+  delivery_id text not null,
+  attempt integer not null,
+  fence integer not null,
+  lease_owner text not null,
+  lease_expires_at integer not null,
+  idempotency_key text not null,
+  claimed_baseline_version integer not null,
+  state text not null,
+  provider_receipt text,
+  provider_outcome text,
+  error_kind text,
+  error_message text,
+  started_at integer not null,
+  completed_at integer,
+  primary key (delivery_id, attempt),
+  unique (delivery_id, fence),
+  foreign key (delivery_id) references scheduled_run_deliveries(delivery_id) on delete restrict,
+  check (attempt > 0 and fence > 0 and claimed_baseline_version >= 0),
+  check (length(lease_owner) > 0 and lease_expires_at > started_at),
+  check (length(idempotency_key) > 0),
+  check (state in (
+    'sending',
+    'delivered',
+    'failed_retryable',
+    'failed_terminal',
+    'delivery_unknown'
+  )),
+  check ((state = 'sending' and completed_at is null)
+    or (state != 'sending' and completed_at is not null)),
+  check (completed_at is null or completed_at >= started_at),
+  check (provider_receipt is null or state = 'delivered'),
+  check (
+    (state = 'sending' and provider_outcome is null)
+    or (state = 'delivered' and provider_outcome = 'confirmed_success')
+    or (state = 'failed_retryable' and provider_outcome = 'confirmed_no_write_retryable')
+    or (state = 'failed_terminal' and provider_outcome = 'confirmed_no_write_terminal')
+    or (state = 'delivery_unknown' and provider_outcome = 'ambiguous_post_write')
+  )
+);
+
+create index idx_scheduled_delivery_attempts_recovery
+  on scheduled_delivery_attempts (state, lease_expires_at, delivery_id, attempt);
+
+create trigger trg_scheduled_delivery_attempt_claim_authority
+before update of claimed_baseline_version on scheduled_delivery_attempts
+when new.claimed_baseline_version is not old.claimed_baseline_version
+begin
+  select raise(abort, 'scheduled delivery attempt claim authority is immutable');
+end;
+
+create table scheduled_delivery_legacy_baseline_audit (
+  job_id text not null references scheduled_jobs(job_id) on delete restrict,
+  target_identity_digest text not null,
+  delivery_policy_version integer not null,
+  render_version integer not null,
+  claimed_hash_algorithm text not null,
+  claimed_payload_digest text not null,
+  source_delivery_id text not null,
+  source_run_id text not null,
+  source_result_hash text not null,
+  accepted_at integer not null,
+  claimed_baseline_version integer not null,
+  quarantine_reason text not null,
+  primary key (
+    job_id,
+    target_identity_digest,
+    delivery_policy_version,
+    render_version,
+    claimed_hash_algorithm
+  ),
+  check (
+    delivery_policy_version > 0
+    and render_version > 0
+    and claimed_baseline_version > 0
+  ),
+  check (
+    length(target_identity_digest) > 0
+    and length(claimed_hash_algorithm) > 0
+    and length(claimed_payload_digest) > 0
+    and length(source_delivery_id) > 0
+    and length(source_run_id) > 0
+    and length(source_result_hash) > 0
+    and quarantine_reason = 'pre_authority_baseline_unverified'
+  )
+);
+
+insert into scheduled_delivery_legacy_baseline_audit (
+  job_id,
+  target_identity_digest,
+  delivery_policy_version,
+  render_version,
+  claimed_hash_algorithm,
+  claimed_payload_digest,
+  source_delivery_id,
+  source_run_id,
+  source_result_hash,
+  accepted_at,
+  claimed_baseline_version,
+  quarantine_reason
+)
+select
+  job_id,
+  target_identity_digest,
+  delivery_policy_version,
+  render_version,
+  hash_algorithm,
+  accepted_payload_digest,
+  source_delivery_id,
+  source_run_id,
+  source_result_hash,
+  accepted_at,
+  baseline_version,
+  'pre_authority_baseline_unverified'
+from _scheduled_delivery_baselines_220000;
+
+create trigger trg_scheduled_delivery_legacy_baseline_insert
+before insert on scheduled_delivery_legacy_baseline_audit
+begin
+  select raise(abort, 'legacy delivery baseline quarantine is migration-owned');
+end;
+
+create trigger trg_scheduled_delivery_legacy_baseline_update
+before update on scheduled_delivery_legacy_baseline_audit
+begin
+  select raise(abort, 'legacy delivery baseline quarantine is immutable');
+end;
+
+create trigger trg_scheduled_delivery_legacy_baseline_delete
+before delete on scheduled_delivery_legacy_baseline_audit
+begin
+  select raise(abort, 'legacy delivery baseline quarantine cannot be deleted');
+end;
+
+create table scheduled_delivery_baselines (
+  job_id text not null references scheduled_jobs(job_id) on delete restrict,
+  target_identity_digest text not null,
+  target_snapshot_digest_algorithm text not null,
+  target_snapshot_digest text not null,
+  delivery_policy_version integer not null,
+  render_version integer not null,
+  hash_algorithm text not null,
+  accepted_payload_digest text not null,
+  source_delivery_id text not null,
+  source_run_id text not null,
+  source_result_id text,
+  source_result_hash text not null,
+  accepted_at integer not null,
+  baseline_version integer not null,
+  primary key (
+    job_id,
+    target_identity_digest,
+    target_snapshot_digest_algorithm,
+    target_snapshot_digest,
+    delivery_policy_version,
+    render_version,
+    hash_algorithm
+  ),
+  check (
+    delivery_policy_version > 0
+    and render_version > 0
+    and typeof(baseline_version) = 'integer'
+    and baseline_version between 1 and 9223372036854775807
+    and accepted_at >= 0
+  ),
+  check (
+    length(target_identity_digest) > 0
+    and length(target_snapshot_digest_algorithm) > 0
+    and length(target_snapshot_digest) > 0
+    and length(hash_algorithm) > 0
+    and length(accepted_payload_digest) > 0
+    and length(source_delivery_id) > 0
+    and length(source_run_id) > 0
+    and length(source_result_hash) > 0
+  )
+);
+
+drop table _scheduled_delivery_baselines_220000;
+
+create table scheduled_delivery_retention_audit (
+  operation_id text not null,
+  delivery_id text not null,
+  run_id text not null,
+  job_id text not null references scheduled_jobs(job_id) on delete restrict,
+  delivery_state text not null,
+  payload_digest text not null,
+  authorized_at integer not null,
+  attempts_deleted integer not null default 0,
+  completed_at integer,
+  primary key (operation_id, delivery_id),
+  check (length(operation_id) > 0 and length(delivery_id) > 0 and length(run_id) > 0),
+  check (delivery_state in ('delivered', 'failed_terminal', 'skipped_none', 'skipped_unchanged')),
+  check (length(payload_digest) = 64 and payload_digest not glob '*[^0-9a-f]*'),
+  check (authorized_at >= 0 and attempts_deleted >= 0),
+  check (completed_at is null or completed_at >= authorized_at)
+);
+
+create trigger trg_scheduled_delivery_retention_audit_acceptance
+before insert on scheduled_delivery_retention_audit
+when new.completed_at is not null
+  or new.attempts_deleted != 0
+  or not exists (
+  select 1
+  from scheduled_run_deliveries delivery
+  join scheduled_runs run
+    on run.run_id = delivery.run_id and run.job_id = delivery.job_id
+  where delivery.delivery_id = new.delivery_id
+    and delivery.run_id = new.run_id
+    and delivery.job_id = new.job_id
+    and delivery.state = new.delivery_state
+    and delivery.payload_digest = new.payload_digest
+    and delivery.authority_kind = 'intent_v1'
+    and delivery.payload_snapshot is not null
+    and delivery.state in ('delivered', 'failed_terminal', 'skipped_none', 'skipped_unchanged')
+    and run.state = 'succeeded'
+    and delivery.updated_at <= new.authorized_at
+    and run.updated_at <= new.authorized_at
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = run.run_id
+        and baseline.job_id = run.job_id
+    )
+)
+begin
+  select raise(abort, 'scheduled delivery retention authority mismatch');
+end;
+
+create trigger trg_scheduled_delivery_retention_audit_update
+before update on scheduled_delivery_retention_audit
+when not (
+  old.completed_at is null
+  and new.completed_at is not null
+  and new.completed_at >= old.authorized_at
+  and new.operation_id is old.operation_id
+  and new.delivery_id is old.delivery_id
+  and new.run_id is old.run_id
+  and new.job_id is old.job_id
+  and new.delivery_state is old.delivery_state
+  and new.payload_digest is old.payload_digest
+  and new.authorized_at is old.authorized_at
+  and new.attempts_deleted >= 0
+)
+begin
+  select raise(abort, 'scheduled delivery retention audit is immutable');
+end;
+
+create trigger trg_scheduled_delivery_retention_audit_delete
+before delete on scheduled_delivery_retention_audit
+begin
+  select raise(abort, 'scheduled delivery retention audit cannot be deleted');
+end;
+
+create trigger trg_scheduled_delivery_intent_acceptance
+before insert on scheduled_run_deliveries
+when new.authority_kind = 'intent_v1' or new.intent_key is not null
+begin
+  select case when not (
+    new.state = 'pending'
+    and new.attempt = 0
+    and new.fence = 0
+    and new.payload_snapshot is null
+    and new.idempotency_key is null
+  ) then raise(abort, 'scheduled delivery intent must start pending and unrendered') end;
+  select case when not exists (
+    select 1
+    from scheduled_run_result_artifacts artifact
+    join scheduled_runs run
+      on run.run_id = artifact.run_id and run.job_id = artifact.job_id
+    where artifact.artifact_id = new.result_artifact_id
+      and artifact.run_id = new.run_id
+      and artifact.job_id = new.job_id
+      and artifact.accepted_attempt = new.result_attempt
+      and artifact.accepted_fence = new.result_fence
+      and artifact.schema_version = 1
+      and artifact.provenance = 'native'
+      and artifact.provenance_version = 1
+      and new.target_json = json(new.target_json)
+      and json_extract(new.target_json, '$.identity_digest') = new.target_identity_digest
+      and exists (
+        select 1
+        from json_each(run.targets_json) target
+        where json(target.value) = new.target_json
+      )
+  ) then raise(abort, 'scheduled delivery intent result authority mismatch') end;
+end;
+
+create trigger trg_scheduled_delivery_intent_insert_collision
+before insert on scheduled_run_deliveries
+when exists (
+  select 1
+  from scheduled_run_deliveries existing
+  where existing.authority_kind = 'intent_v1'
+    and (
+      existing.delivery_id = new.delivery_id
+      or (new.intent_key is not null and existing.intent_key = new.intent_key)
+      or (
+        existing.run_id = new.run_id
+        and existing.target_identity_digest = new.target_identity_digest
+        and existing.delivery_policy_version = new.delivery_policy_version
+      )
+    )
+)
+begin
+  select raise(abort, 'scheduled delivery authority cannot be replaced');
+end;
+
+create trigger trg_scheduled_delivery_intent_update_collision
+before update on scheduled_run_deliveries
+when exists (
+  select 1
+  from scheduled_run_deliveries existing
+  where existing.authority_kind = 'intent_v1'
+    and existing.rowid != old.rowid
+    and (
+      existing.delivery_id = new.delivery_id
+      or (new.intent_key is not null and existing.intent_key = new.intent_key)
+      or (
+        existing.run_id = new.run_id
+        and existing.target_identity_digest = new.target_identity_digest
+        and existing.delivery_policy_version = new.delivery_policy_version
+      )
+    )
+)
+begin
+  select raise(abort, 'scheduled delivery update conflicts with authority');
+end;
+
+create trigger trg_scheduled_delivery_identity_immutable
+before update on scheduled_run_deliveries
+when old.authority_kind = 'intent_v1' and (
+  new.delivery_id is not old.delivery_id
+  or new.run_id is not old.run_id
+  or new.job_id is not old.job_id
+  or new.target_identity_digest is not old.target_identity_digest
+  or new.target_json is not old.target_json
+  or new.delivery_policy_version is not old.delivery_policy_version
+  or new.result_artifact_id is not old.result_artifact_id
+  or new.result_attempt is not old.result_attempt
+  or new.result_fence is not old.result_fence
+  or new.target_snapshot_digest_algorithm is not old.target_snapshot_digest_algorithm
+  or new.target_snapshot_digest is not old.target_snapshot_digest
+  or new.intent_key is not old.intent_key
+  or new.authority_kind is not old.authority_kind
+  or new.created_at is not old.created_at
+)
+begin
+  select raise(abort, 'scheduled delivery authority identity is immutable');
+end;
+
+create trigger trg_scheduled_delivery_claimed_baseline_authority
+before update of claimed_baseline_version on scheduled_run_deliveries
+when old.authority_kind = 'intent_v1' and not (
+  (old.state = 'pending'
+    and new.state in ('sending', 'skipped_unchanged')
+    and old.claimed_baseline_version is null
+    and new.claimed_baseline_version >= 0)
+  or (old.state = 'failed_retryable'
+    and new.state = 'pending'
+    and old.claimed_baseline_version is not null
+    and new.claimed_baseline_version is null)
+)
+begin
+  select raise(abort, 'scheduled delivery claim baseline authority is immutable');
+end;
+
+create trigger trg_scheduled_delivery_payload_immutable
+before update on scheduled_run_deliveries
+when old.authority_kind = 'intent_v1'
+  and old.payload_snapshot is not null
+  and (
+    new.render_version is not old.render_version
+    or new.payload_schema_version is not old.payload_schema_version
+    or new.content_type is not old.content_type
+    or new.hash_algorithm is not old.hash_algorithm
+    or new.payload_digest is not old.payload_digest
+    or new.payload_snapshot is not old.payload_snapshot
+    or new.payload_created_at is not old.payload_created_at
+    or new.expected_baseline_version is not old.expected_baseline_version
+    or new.target_snapshot_version is not old.target_snapshot_version
+  )
+begin
+  select raise(abort, 'scheduled delivery payload is immutable');
+end;
+
+create trigger trg_scheduled_delivery_skipped_unchanged_acceptance
+before update of state on scheduled_run_deliveries
+when new.state = 'skipped_unchanged' and not exists (
+  select 1
+  from scheduled_delivery_baselines baseline
+  where old.state = 'pending'
+    and old.payload_snapshot is not null
+    and new.authority_kind = 'intent_v1'
+    and new.payload_snapshot is not null
+    and new.provider_outcome = 'skipped_unchanged'
+    and new.hash_algorithm = 'sha256-utf8-exact-v1'
+    and baseline.job_id = new.job_id
+    and baseline.target_identity_digest = new.target_identity_digest
+    and baseline.target_snapshot_digest_algorithm = new.target_snapshot_digest_algorithm
+    and baseline.target_snapshot_digest = new.target_snapshot_digest
+    and baseline.delivery_policy_version = new.delivery_policy_version
+    and baseline.render_version = new.render_version
+    and baseline.hash_algorithm = new.hash_algorithm
+    and baseline.accepted_payload_digest = new.payload_digest
+    and baseline.baseline_version = new.claimed_baseline_version
+)
+begin
+  select raise(abort, 'unchanged delivery requires exact accepted baseline authority');
+end;
+
+create trigger trg_scheduled_delivery_state_transition
+before update of state on scheduled_run_deliveries
+when old.state != new.state and not (
+  (old.state = 'pending' and new.state in ('sending', 'skipped_none', 'skipped_unchanged'))
+  or (old.state = 'sending' and new.state in (
+    'delivered',
+    'failed_retryable',
+    'failed_terminal',
+    'delivery_unknown'
+  ))
+  or (old.state = 'failed_retryable' and new.state = 'pending')
+)
+begin
+  select raise(abort, 'invalid scheduled delivery state transition');
+end;
+
+create trigger trg_scheduled_delivery_intent_promotion_forbidden
+before update on scheduled_run_deliveries
+when old.authority_kind != 'intent_v1'
+  and (new.authority_kind = 'intent_v1' or new.intent_key is not null)
+begin
+  select raise(abort, 'legacy delivery cannot become intent authority');
+end;
+
+create trigger trg_scheduled_delivery_retention_delete_guard
+before delete on scheduled_run_deliveries
+when not exists (
+  select 1
+  from scheduled_delivery_retention_audit audit
+  where audit.delivery_id = old.delivery_id
+    and audit.run_id = old.run_id
+    and audit.job_id = old.job_id
+    and audit.delivery_state = old.state
+    and audit.payload_digest = old.payload_digest
+    and audit.completed_at is null
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id
+        and baseline.job_id = old.job_id
+    )
+)
+begin
+  select raise(abort, 'scheduled delivery deletion requires retention authority');
+end;
+
+create trigger trg_scheduled_delivery_attempt_retention_delete_guard
+before delete on scheduled_delivery_attempts
+when not exists (
+  select 1
+  from scheduled_run_deliveries delivery
+  join scheduled_delivery_retention_audit audit
+    on audit.delivery_id = delivery.delivery_id
+    and audit.run_id = delivery.run_id
+    and audit.job_id = delivery.job_id
+    and audit.delivery_state = delivery.state
+    and audit.payload_digest = delivery.payload_digest
+  where delivery.delivery_id = old.delivery_id
+    and audit.completed_at is null
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = delivery.run_id
+        and baseline.job_id = delivery.job_id
+    )
+)
+begin
+  select raise(abort, 'scheduled delivery attempt deletion requires retention authority');
+end;
+
+drop trigger trg_scheduled_run_result_artifacts_delete_guard;
+
+create trigger trg_scheduled_run_result_artifacts_retention_delete_guard
+before delete on scheduled_run_result_artifacts
+when not exists (
+  select 1
+  from scheduled_delivery_retention_audit audit
+  join scheduled_runs run
+    on run.run_id = audit.run_id and run.job_id = audit.job_id
+  where audit.run_id = old.run_id
+    and audit.job_id = old.job_id
+    and audit.completed_at is null
+    and run.state = 'succeeded'
+    and run.result_artifact_id = old.artifact_id
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id
+        and baseline.job_id = old.job_id
+    )
+    and not exists (
+      select 1
+      from scheduled_run_deliveries delivery
+      where delivery.run_id = old.run_id
+        and not exists (
+          select 1
+          from scheduled_delivery_retention_audit item
+          where item.delivery_id = delivery.delivery_id
+            and item.run_id = delivery.run_id
+            and item.job_id = delivery.job_id
+            and item.delivery_state = delivery.state
+            and item.payload_digest = delivery.payload_digest
+            and item.completed_at is null
+        )
+    )
+)
+begin
+  select raise(abort, 'scheduled result deletion requires retention authority');
+end;
+
+create trigger trg_scheduled_run_late_evidence_retention_delete_guard
+before delete on scheduled_run_late_evidence
+when not exists (
+  select 1
+  from scheduled_run_attempts attempt
+  join scheduled_delivery_retention_audit audit
+    on audit.run_id = attempt.run_id and audit.job_id = attempt.job_id
+  where attempt.run_id = old.run_id
+    and attempt.attempt = old.attempt
+    and attempt.fence = old.fence
+    and audit.completed_at is null
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = attempt.run_id
+        and baseline.job_id = attempt.job_id
+    )
+)
+begin
+  select raise(abort, 'scheduled late evidence deletion requires retention authority');
+end;
+
+create trigger trg_scheduled_run_attempt_retention_delete_guard
+before delete on scheduled_run_attempts
+when not exists (
+  select 1
+  from scheduled_delivery_retention_audit audit
+  where audit.run_id = old.run_id
+    and audit.job_id = old.job_id
+    and audit.completed_at is null
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id
+        and baseline.job_id = old.job_id
+    )
+)
+begin
+  select raise(abort, 'scheduled run attempt deletion requires retention authority');
+end;
+
+create trigger trg_scheduled_run_retention_delete_guard
+before delete on scheduled_runs
+when not exists (
+  select 1
+  from scheduled_delivery_retention_audit audit
+  where audit.run_id = old.run_id
+    and audit.job_id = old.job_id
+    and audit.completed_at is null
+    and old.state = 'succeeded'
+    and not exists (
+      select 1
+      from scheduled_execution_baselines baseline
+      where baseline.source_run_id = old.run_id
+        and baseline.job_id = old.job_id
+    )
+)
+begin
+  select raise(abort, 'scheduled run deletion requires retention authority');
+end;
+
+create table _scheduler_delivery_authority_guard_220000 (
+  invalid_count integer not null check (invalid_count = 0)
+);
+
+insert into _scheduler_delivery_authority_guard_220000 (invalid_count)
+select count(*) from pragma_foreign_key_check;
+
+drop table _scheduler_delivery_authority_guard_220000;

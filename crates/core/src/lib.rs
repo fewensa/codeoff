@@ -1,1 +1,15 @@
 //! Core domain types for Codeoff.
+
+mod attested_capability;
+mod scheduled_identity;
+mod scheduler_policy;
+
+pub use attested_capability::{AttestedCapabilityProfile, AttestedCapabilityProfileError};
+pub use scheduled_identity::{
+  CredentialRevision, CriticalId, EvidenceKeyId, MAX_CREDENTIAL_REVISION_BYTES,
+  MAX_CRITICAL_ID_BYTES, MAX_EVIDENCE_KEY_ID_BYTES, MAX_RUNNER_WORKLOAD_IDENTITY_BYTES,
+  RunnerWorkloadIdentity, ScheduledIdentityError,
+};
+pub use scheduler_policy::{
+  SCHEDULER_OPERATIONAL_POLICY_VERSION, SchedulerOperationalPolicy, SchedulerPolicyValidationError,
+};

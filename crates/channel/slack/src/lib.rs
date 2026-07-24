@@ -14,6 +14,8 @@ mod error;
 mod intake;
 mod mention_filter;
 mod normalize;
+mod schedule_target;
+mod scheduled_delivery;
 mod socket_mode;
 mod web_api;
 mod worker;
@@ -28,11 +30,13 @@ pub use normalize::{
   NormalizedSlackEvent, SlackNormalizeError, normalize_socket_mode_envelope,
   normalize_socket_mode_envelope_with_mention_filter,
 };
+pub use schedule_target::SlackScheduleTargetVerifier;
+pub use scheduled_delivery::SlackScheduledDeliveryProvider;
 pub use socket_mode::{SlackSocketTransport, SocketModeEnvelope, TransportReceive};
 pub use web_api::{
-  SlackChannelAddress, SlackConfiguredSender, SlackConnectorStatus, SlackHttpClient,
-  SlackHttpDownloadRequest, SlackHttpRequest, SlackHttpResponse, SlackPostedMessage,
-  SlackReqwestWebApiClient, SlackStreamMessage, SlackStreamStatus, SlackUserAddress,
-  SlackWebApiClient, SlackWebApiError,
+  SlackApiErrorClass, SlackApiErrorScope, SlackAuthIdentity, SlackChannelAddress,
+  SlackConfiguredSender, SlackConnectorStatus, SlackHttpClient, SlackHttpDownloadRequest,
+  SlackHttpRequest, SlackHttpResponse, SlackPostedMessage, SlackReqwestWebApiClient,
+  SlackStreamMessage, SlackStreamStatus, SlackUserAddress, SlackWebApiClient, SlackWebApiError,
 };
 pub use worker::{SocketWorkerAction, SocketWorkerOptions, check_slack_worker, run_socket_worker};

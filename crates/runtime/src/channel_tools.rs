@@ -24,6 +24,31 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const CHANNEL_DYNAMIC_TOOL_NAMES: &[&str] = &[
+  "channel_reply_to_event",
+  "channel_send_message",
+  "channel_get_thread_context",
+  "channel_get_recent_messages",
+  "channel_get_current_event",
+  "channel_get_current_conversation",
+  "channel_get_context_pack",
+  "channel_get_delivery_status",
+  "channel_get_message",
+  "channel_get_resource_info",
+  "channel_read_resource_text",
+  "channel_download_resource",
+  "channel_search_users",
+  "channel_get_user",
+  "channel_resolve_user",
+  "channel_search_channels",
+  "channel_get_channel",
+  "channel_resolve_channel",
+  "channel_list_senders",
+  "channel_list_workspaces",
+  "channel_get_connector_status",
+  "channel_reply_to_thread",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyToEventRequest {
   pub connector_id: String,

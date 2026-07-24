@@ -1,11 +1,12 @@
 use std::fs;
 
 use assert_cmd::Command;
-use clap::CommandFactory;
+use clap::{CommandFactory, Parser};
 use codeoff_channel_contract::{ChannelEvent, ChannelEventKind, ChannelReplyTarget};
 use codeoff_cli::Cli;
 use codeoff_config::{CodeoffConfig, ConfigLoadOptions};
 use codeoff_state::{SlackSourceEvent, StateStore};
+use predicates::prelude::PredicateBooleanExt;
 use tempfile::tempdir;
 
 #[test]
@@ -26,12 +27,362 @@ fn test_cli_exposes_expected_subcommands() {
   assert!(worker.find_subcommand("slack").is_some());
   assert!(worker.find_subcommand("channel-events").is_some());
   assert!(worker.find_subcommand("temporal").is_none());
-  assert!(command.find_subcommand("schedule").is_none());
+
+  let mut scheduler = command
+    .find_subcommand("scheduler")
+    .expect("scheduler subcommand")
+    .clone();
+  for operation in [
+    "status",
+    "runs",
+    "deliveries",
+    "reconcile",
+    "retry-run",
+    "retry-delivery",
+    "resolve-delivery-unknown",
+    "create",
+    "get",
+    "list",
+    "update",
+    "pause",
+    "resume",
+    "delete",
+  ] {
+    assert!(
+      scheduler.find_subcommand(operation).is_some(),
+      "{operation}"
+    );
+  }
+  assert!(
+    !scheduler
+      .render_long_help()
+      .to_string()
+      .contains("--as-user")
+  );
+  let scheduler_help = scheduler.render_long_help().to_string();
+  for claim in [
+    "Sanitized read-only diagnostics",
+    "do not require operator identity",
+    "CODEOFF_SCHEDULER_OPERATOR_ID",
+    "CODEOFF_SCHEDULER_OPERATOR_REALM",
+    "reconcile --apply",
+    "--authority-file",
+    "current verifier fails closed",
+  ] {
+    assert!(
+      scheduler_help.contains(claim),
+      "missing scheduler help {claim}"
+    );
+  }
+  let status_help = scheduler
+    .find_subcommand("status")
+    .expect("scheduler status")
+    .clone()
+    .render_long_help()
+    .to_string();
+  for claim in [
+    "enablement",
+    "claim switches",
+    "/healthz",
+    "/readyz",
+    "/metrics",
+  ] {
+    assert!(status_help.contains(claim), "missing status help {claim}");
+  }
 
   let config = command
     .find_subcommand("config")
     .expect("config subcommand");
   assert!(config.find_subcommand("check").is_some());
+}
+
+#[test]
+fn test_scheduler_diagnostics_and_dry_run_do_not_require_operator_identity() {
+  let dir = tempdir().expect("create tempdir");
+  let state_dir = dir.path().join("state");
+  for arguments in [
+    vec!["scheduler", "status", "--json"],
+    vec!["scheduler", "runs", "list", "--limit", "10", "--json"],
+    vec!["scheduler", "deliveries", "list", "--limit", "10", "--json"],
+    vec![
+      "scheduler",
+      "reconcile",
+      "--dry-run",
+      "--limit",
+      "10",
+      "--json",
+    ],
+  ] {
+    let output = Command::cargo_bin("codeoff")
+      .expect("codeoff binary")
+      .env_remove("CODEOFF_SCHEDULER_OPERATOR_ID")
+      .env_remove("CODEOFF_SCHEDULER_OPERATOR_REALM")
+      .arg("--state-dir")
+      .arg(&state_dir)
+      .args(arguments)
+      .assert()
+      .success()
+      .get_output()
+      .stdout
+      .clone();
+    let output: serde_json::Value = serde_json::from_slice(&output).expect("sanitized JSON");
+    assert_eq!(output["schema_version"], 1);
+    assert_eq!(output["ok"], true);
+  }
+}
+
+#[test]
+fn test_scheduler_diagnostics_default_to_sanitized_human_output() {
+  let dir = tempdir().expect("create tempdir");
+  let state_dir = dir.path().join("state");
+  for arguments in [
+    vec!["scheduler", "status"],
+    vec!["scheduler", "runs", "list", "--limit", "10"],
+    vec!["scheduler", "deliveries", "list", "--limit", "10"],
+    vec!["scheduler", "reconcile", "--dry-run", "--limit", "10"],
+  ] {
+    let output = Command::cargo_bin("codeoff")
+      .expect("codeoff binary")
+      .env_remove("CODEOFF_SCHEDULER_OPERATOR_ID")
+      .env_remove("CODEOFF_SCHEDULER_OPERATOR_REALM")
+      .arg("--state-dir")
+      .arg(&state_dir)
+      .args(arguments)
+      .assert()
+      .success()
+      .get_output()
+      .stdout
+      .clone();
+    let output = String::from_utf8(output).expect("human output");
+    assert!(output.starts_with("status: ok\n"));
+    assert!(serde_json::from_str::<serde_json::Value>(&output).is_err());
+    for forbidden in [
+      "reason-sentinel",
+      "evidence-sentinel",
+      "receipt-sentinel",
+      "authority-sentinel",
+    ] {
+      assert!(!output.contains(forbidden));
+    }
+  }
+}
+
+#[test]
+fn test_scheduler_reconcile_requires_exactly_one_mode() {
+  assert!(
+    Cli::try_parse_from(["codeoff", "scheduler", "reconcile"])
+      .expect_err("missing mode must fail")
+      .to_string()
+      .contains("--dry-run")
+  );
+  assert!(
+    Cli::try_parse_from(["codeoff", "scheduler", "reconcile", "--dry-run", "--apply",]).is_err()
+  );
+  assert!(Cli::try_parse_from(["codeoff", "scheduler", "reconcile", "--dry-run"]).is_ok());
+  assert!(Cli::try_parse_from(["codeoff", "scheduler", "reconcile", "--apply"]).is_ok());
+}
+
+#[test]
+fn test_scheduler_force_resend_requires_reason_and_duplicate_risk_acknowledgement() {
+  let prefix = [
+    "codeoff",
+    "scheduler",
+    "resolve-delivery-unknown",
+    "delivery",
+    "--disposition",
+    "force-resend",
+    "--request-id",
+    "request",
+    "--expected-attempt",
+    "1",
+    "--expected-fence",
+    "1",
+    "--evidence-file",
+    "evidence.json",
+    "--authority-file",
+    "authority.bin",
+  ];
+  assert!(Cli::try_parse_from(prefix).is_err());
+  assert!(Cli::try_parse_from(prefix.into_iter().chain(["--reason-file", "reason.json"])).is_err());
+  assert!(
+    Cli::try_parse_from(prefix.into_iter().chain([
+      "--reason-file",
+      "reason.json",
+      "--acknowledge-duplicate-risk",
+    ]))
+    .is_ok()
+  );
+}
+
+#[test]
+fn test_scheduler_mutation_fails_closed_when_authority_verifier_is_unavailable() {
+  let dir = tempdir().expect("create tempdir");
+  let state_dir = dir.path().join("state");
+  let reason = dir.path().join("reason.json");
+  let authority = dir.path().join("authority.bin");
+  fs::write(
+    &reason,
+    r#"{"reason":"provider recovered","reason_code":"provider_recovered","schema_version":1}"#,
+  )
+  .expect("write reason");
+  fs::write(&authority, b"opaque-authority").expect("write authority");
+  let stderr = Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env_remove("CODEOFF_SCHEDULER_OPERATOR_ID")
+    .env_remove("CODEOFF_SCHEDULER_OPERATOR_REALM")
+    .arg("--state-dir")
+    .arg(&state_dir)
+    .args([
+      "scheduler",
+      "retry-delivery",
+      "delivery-id",
+      "--request-id",
+      "request-1",
+      "--expected-attempt",
+      "1",
+      "--expected-fence",
+      "1",
+      "--reason-file",
+      reason.to_str().expect("reason path"),
+      "--authority-file",
+      authority.to_str().expect("authority path"),
+    ])
+    .assert()
+    .failure()
+    .get_output()
+    .stderr
+    .clone();
+  let error: serde_json::Value = serde_json::from_slice(&stderr).expect("structured error");
+  assert_eq!(error["error"]["code"], "authority_verifier_unavailable");
+  assert!(!String::from_utf8_lossy(&stderr).contains("opaque-authority"));
+  assert!(!String::from_utf8_lossy(&stderr).contains("provider recovered"));
+}
+
+#[test]
+fn test_scheduler_stdin_create_and_get_are_no_slack_sanitized_json() {
+  let dir = tempdir().expect("create tempdir");
+  let state_dir = dir.path().join("state");
+  let prompt = "private prompt sentinel Authorization: Bearer hidden";
+  let input = format!(
+    r#"{{
+      "schema_version": 1,
+      "request_id": "stdin-create",
+      "instruction": "{prompt}",
+      "schedule": {{"kind": "once", "at": "2030-01-01T00:00:00Z"}},
+      "capability": "none",
+      "previous_success": {{"kind": "none"}},
+      "delivery": {{"kind": "none"}}
+    }}"#
+  );
+  let created = Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env("CODEOFF_SCHEDULER_OPERATOR_ID", "ops-a")
+    .env("CODEOFF_SCHEDULER_OPERATOR_REALM", "test-realm")
+    .env_remove("SLACK_BOT_TOKEN")
+    .env_remove("SLACK_APP_TOKEN")
+    .env_remove("SLACK_SIGNING_SECRET")
+    .args([
+      "--state-dir",
+      state_dir.to_str().expect("state path"),
+      "scheduler",
+      "create",
+      "--file",
+      "-",
+      "--format",
+      "json",
+    ])
+    .write_stdin(input)
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+  let created_text = String::from_utf8(created).expect("stdout");
+  assert!(!created_text.contains(prompt));
+  let created: serde_json::Value = serde_json::from_str(&created_text).expect("created JSON");
+  assert_eq!(created["schema_version"], 1);
+  assert_eq!(created["ok"], true);
+  assert_eq!(created["data"]["targets"]["items"][0]["kind"], "none");
+  let job_id = created["data"]["job_id"].as_str().expect("job id");
+
+  let get = Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env("CODEOFF_SCHEDULER_OPERATOR_ID", "ops-a")
+    .env("CODEOFF_SCHEDULER_OPERATOR_REALM", "test-realm")
+    .env_remove("SLACK_BOT_TOKEN")
+    .env_remove("SLACK_APP_TOKEN")
+    .env_remove("SLACK_SIGNING_SECRET")
+    .args([
+      "--state-dir",
+      state_dir.to_str().expect("state path"),
+      "scheduler",
+      "get",
+      job_id,
+    ])
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+  let get_text = String::from_utf8(get).expect("get stdout");
+  assert!(!get_text.contains(prompt));
+  let get: serde_json::Value = serde_json::from_str(&get_text).expect("get JSON");
+  assert_eq!(get["data"]["job_id"], job_id);
+  assert!(get["data"]["definition"].get("instruction").is_none());
+  assert!(state_dir.join("codeoff.db").is_file());
+}
+
+#[test]
+fn test_scheduler_missing_identity_and_invalid_input_fail_closed_without_secret_echo() {
+  let dir = tempdir().expect("create tempdir");
+  let state_dir = dir.path().join("state");
+  let missing = Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env_remove("CODEOFF_SCHEDULER_OPERATOR_ID")
+    .env_remove("CODEOFF_SCHEDULER_OPERATOR_REALM")
+    .args([
+      "--state-dir",
+      state_dir.to_str().expect("state path"),
+      "scheduler",
+      "list",
+    ])
+    .assert()
+    .failure()
+    .get_output()
+    .stderr
+    .clone();
+  let missing: serde_json::Value =
+    serde_json::from_slice(&missing).expect("versioned identity error");
+  assert_eq!(missing["error"]["code"], "unauthorized");
+  assert!(!state_dir.exists());
+
+  let secret = "Authorization: Bearer invalid-secret";
+  let invalid = Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env("CODEOFF_SCHEDULER_OPERATOR_ID", "ops-a")
+    .env("CODEOFF_SCHEDULER_OPERATOR_REALM", "test-realm")
+    .args([
+      "--state-dir",
+      state_dir.to_str().expect("state path"),
+      "scheduler",
+      "create",
+      "--file",
+      "-",
+      "--format",
+      "json",
+    ])
+    .write_stdin(format!(
+      r#"{{"schema_version":1,"instruction":"{secret}","owner":"U1"}}"#
+    ))
+    .assert()
+    .failure()
+    .get_output()
+    .stderr
+    .clone();
+  let invalid_text = String::from_utf8(invalid).expect("stderr");
+  assert!(!invalid_text.contains(secret));
+  let invalid: serde_json::Value = serde_json::from_str(&invalid_text).expect("versioned error");
+  assert_eq!(invalid["error"]["code"], "validation_failed");
 }
 
 #[test]
@@ -164,6 +515,10 @@ fn test_serve_non_check_reports_wired_loops_without_skeleton_status() {
 enabled = true
 transport = "tcp"
 bind = "127.0.0.1:0"
+
+[scheduler]
+enabled = true
+run_claims_enabled = false
 "#,
   )
   .expect("write config");
@@ -317,6 +672,148 @@ url = "sqlite://${CODEOFF_STATE_DIR:-./.codeoff}/codeoff.db"
   assert!(stdout.contains("mcp=disabled"));
   assert!(stdout.contains("mcp_transport=stdio"));
   assert!(!stdout.contains("sqlite://"));
+}
+
+#[test]
+fn test_config_check_scheduled_runner_role_rejects_mixed_role_tables() {
+  let dir = tempdir().expect("create tempdir");
+  let config_path = dir.path().join("codeoff.toml");
+  fs::write(
+    &config_path,
+    scheduled_runner_config_with_tables(&[
+      scheduled_runner_gateway_table(),
+      scheduled_runner_control_table(),
+    ]),
+  )
+  .expect("write config");
+
+  Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .args([
+      "--config",
+      config_path.to_str().expect("utf-8 path"),
+      "config",
+      "check",
+      "--scheduled-runner-role",
+      "gateway",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("scheduled_codex.remote_runner"));
+}
+
+#[test]
+fn test_config_check_scheduled_runner_role_rejects_dedicated_worker_secret_environment() {
+  let dir = tempdir().expect("create tempdir");
+  let config_path = dir.path().join("codeoff.toml");
+  fs::write(
+    &config_path,
+    scheduled_runner_config_with_tables(&[scheduled_runner_control_table()]),
+  )
+  .expect("write config");
+
+  Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env_clear()
+    .env("OPENAI_API_KEY", "do-not-print")
+    .args([
+      "--config",
+      config_path.to_str().expect("utf-8 path"),
+      "config",
+      "check",
+      "--scheduled-runner-role",
+      "control",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains(
+      "scheduled runner control forbids ambient secret environment OPENAI_API_KEY",
+    ))
+    .stderr(predicates::str::contains("do-not-print").not());
+}
+
+fn scheduled_runner_config_with_tables(tables: &[&str]) -> String {
+  format!(
+    r#"
+[agent.scheduled_codex]
+execution_backend = "remote-runner"
+codex_program = "/opt/codeoff/bin/codex"
+codex_program_sha256 = "{codex_program_sha256}"
+codex_home = "/var/lib/codeoff/scheduled-codex"
+cwd = "/work/codeoff-scheduled"
+github_mcp_url = "http://127.0.0.1:8090/mcp"
+github_mcp_artifact_path = "/opt/codeoff/bin/github-mcp-server"
+github_mcp_artifact_sha256 = "{github_mcp_artifact_sha256}"
+github_mcp_endpoint_identity = "github-mcp-scheduled-v1"
+github_mcp_access_auth_mode = "supervisor-dynamic-tools-v1"
+github_mcp_access_token_revision = "mcp-channel-v1"
+credential_reference = "kubernetes:codeoff/github-mcp"
+permission_policy_revision = "scheduled-read-only-v1"
+config_revision = "scheduled-codex-v1"
+config_sha256 = "{config_sha256}"
+gateway_image_digest = "sha256:{gateway_image_sha256}"
+runner_image_digest = "sha256:{runner_image_sha256}"
+runner_workload_identity = "spiffe://codeoff/runner/production"
+runner_client_cert_public_key_fingerprint = "{runner_client_cert_public_key_fingerprint}"
+credential_revision = "github-readonly-2026-07"
+isolation_attestation_path = "/var/run/codeoff/isolation-attestation.json"
+isolation_trust_bundle_path = "/opt/codeoff/attestation/isolation-trust-bundle.json"
+trusted_owner_uid = 0
+trusted_owner_gid = 0
+runtime_uid = 65534
+runtime_gid = 65534
+
+{tables}
+"#,
+    codex_program_sha256 = "a".repeat(64),
+    github_mcp_artifact_sha256 = "b".repeat(64),
+    config_sha256 = "c".repeat(64),
+    gateway_image_sha256 = "e".repeat(64),
+    runner_image_sha256 = "f".repeat(64),
+    runner_client_cert_public_key_fingerprint = "1".repeat(64),
+    tables = tables.join("\n"),
+  )
+}
+
+fn scheduled_runner_gateway_table() -> &'static str {
+  r#"
+[agent.scheduled_codex.remote_runner.gateway]
+bind = "0.0.0.0:7443"
+server_certificate_path = "/run/codeoff/tls/server.crt"
+server_private_key_path = "/run/codeoff/tls/server.key"
+client_ca_bundle_path = "/run/codeoff/tls/client-ca.crt"
+execution_grant_private_key_path = "/run/codeoff/grant/gateway.pk8"
+execution_grant_key_id = "gateway-grant-key-1"
+execution_grant_key_revision = "gateway-grant-2026-07"
+execution_grant_signer_identity = "spiffe://codeoff/gateway/production"
+executor_evidence_public_key_path = "/run/codeoff/evidence/executor.pub"
+executor_evidence_key_id = "executor-key-1"
+executor_evidence_key_revision = "executor-evidence-2026-07"
+executor_evidence_signer_identity = "spiffe://codeoff/executor/production"
+handshake_timeout_ms = 5000
+frame_timeout_ms = 30000
+readiness_ttl_ms = 30000
+max_connections = 2
+"#
+}
+
+fn scheduled_runner_control_table() -> &'static str {
+  r#"
+[agent.scheduled_codex.remote_runner.control]
+gateway_address = "codeoff-gateway.codeoff.svc:7443"
+gateway_server_name = "codeoff-gateway.codeoff.svc"
+client_certificate_path = "/run/codeoff/tls/client.crt"
+client_private_key_path = "/run/codeoff/tls/client.key"
+server_ca_bundle_path = "/run/codeoff/tls/server-ca.crt"
+local_socket_path = "/run/codeoff/runner/executor.sock"
+control_uid = 10001
+control_gid = 10001
+expected_executor_uid = 0
+expected_executor_gid = 0
+connect_timeout_ms = 5000
+frame_timeout_ms = 30000
+readiness_ttl_ms = 30000
+"#
 }
 
 #[test]

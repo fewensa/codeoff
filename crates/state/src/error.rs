@@ -38,6 +38,12 @@ pub enum StateError {
   #[error("failed to connect state database")]
   Connect,
 
+  #[error("failed to read state database for readiness: {source}")]
+  Readiness {
+    #[source]
+    source: sqlx::Error,
+  },
+
   #[error("failed to run state database migrations: {source}")]
   Migrate {
     #[source]
@@ -122,12 +128,60 @@ pub enum StateError {
     #[source]
     source: sqlx::Error,
   },
+
+  #[error("invalid scheduler state: {reason}")]
+  InvalidSchedulerState { reason: String },
+
+  #[error("scheduler generation conflict")]
+  SchedulerGenerationConflict,
+
+  #[error("scheduled run lease was lost")]
+  ScheduledRunLostLease,
+
+  #[error("scheduled run attempt or fence counter is exhausted")]
+  ScheduledRunCounterExhausted,
+
+  #[error("scheduled executor admission is no longer current")]
+  ScheduledExecutorAdmissionUnavailable,
+
+  #[error("scheduled active job limit exceeded for {scope}")]
+  ScheduledActiveJobLimitExceeded { scope: &'static str },
+
+  #[error("scheduled run completion conflicts with durable authority")]
+  ScheduledRunCompletionConflict,
+
+  #[error("scheduled delivery lease was lost")]
+  ScheduledDeliveryLostLease,
+
+  #[error("scheduled delivery attempt or fence counter is exhausted")]
+  ScheduledDeliveryCounterExhausted,
+
+  #[error("scheduled delivery baseline generation changed")]
+  ScheduledDeliveryBaselineConflict,
+
+  #[error("scheduled delivery payload conflicts with immutable authority")]
+  ScheduledDeliveryPayloadConflict,
+
+  #[error("scheduled delivery history is not eligible for retention")]
+  ScheduledDeliveryRetentionConflict,
+
+  #[error("scheduled run history is not eligible for retention")]
+  ScheduledRunRetentionConflict,
+
+  #[error("scheduled once occurrence is expired and cannot be resumed")]
+  ScheduledOnceExpired,
+
+  #[error("failed to manage scheduler state: {source}")]
+  Scheduler {
+    #[source]
+    source: sqlx::Error,
+  },
 }
 
 impl StateError {
   #[must_use]
   pub fn is_transient_storage_contention(&self) -> bool {
-    let Self::SlackDelivery { source } = self else {
+    let (Self::SlackDelivery { source } | Self::Scheduler { source }) = self else {
       return false;
     };
     let sqlx::Error::Database(error) = source else {

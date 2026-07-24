@@ -1,4 +1,4 @@
-use codeoff_agent_contract::{AgentBackend, AgentTask, AgentTaskResult};
+use codeoff_agent_contract::{AgentBackend, AgentTask, AgentTaskResult, SessionMode};
 use codeoff_channel_contract::{
   ChannelContextPage, ChannelContextRequest, ChannelEvent, ChannelEventKind, ChannelReplyTarget,
 };
@@ -34,6 +34,17 @@ impl FakeBackend {
       result,
       tasks: Mutex::new(Vec::new()),
     }
+  }
+}
+
+fn channel_context(task: &AgentTask) -> &codeoff_agent_contract::ChannelTaskContext {
+  task.channel.as_ref().expect("channel task context")
+}
+
+fn resume_thread_id(task: &AgentTask) -> Option<&str> {
+  match &task.session {
+    SessionMode::Fresh => None,
+    SessionMode::Resume { thread_id } => Some(thread_id),
   }
 }
 
@@ -604,9 +615,8 @@ async fn dispatch_bootstraps_recent_direct_message_context() {
 
   let context = {
     let tasks = backend.tasks.lock().expect("tasks");
-    tasks[0]
-      .context
-      .channel_context
+    channel_context(&tasks[0])
+      .recent_context
       .clone()
       .expect("bootstrapped context")
   };
@@ -681,9 +691,8 @@ async fn dispatch_records_context_fetch_failure_and_injects_warning() {
   );
 
   let tasks = backend.tasks.lock().expect("tasks");
-  let context = tasks[0]
-    .context
-    .channel_context
+  let context = channel_context(&tasks[0])
+    .recent_context
     .as_deref()
     .expect("context warning");
   assert!(context.contains("\"warnings\""));
@@ -772,8 +781,8 @@ async fn gateway_smoke_dispatches_fake_codex_tool_reply_and_resumes_slack_thread
   let (first_conversation_key, first_resume_thread_id) = {
     let first_tasks = first_backend.tasks.lock().expect("first tasks");
     (
-      first_tasks[0].context.conversation_key.clone(),
-      first_tasks[0].context.resume_thread_id.clone(),
+      channel_context(&first_tasks[0]).conversation_key.clone(),
+      resume_thread_id(&first_tasks[0]).map(ToOwned::to_owned),
     )
   };
   assert_eq!(first_conversation_key, "slack:workspace-1:thread:C1:99.0");
@@ -823,11 +832,11 @@ async fn gateway_smoke_dispatches_fake_codex_tool_reply_and_resumes_slack_thread
   );
   let second_tasks = second_backend.tasks.lock().expect("second tasks");
   assert_eq!(
-    second_tasks[0].context.conversation_key,
+    channel_context(&second_tasks[0]).conversation_key,
     "slack:workspace-1:thread:C1:99.0"
   );
   assert_eq!(
-    second_tasks[0].context.resume_thread_id.as_deref(),
+    resume_thread_id(&second_tasks[0]),
     Some("codex-thread-smoke")
   );
 }
@@ -997,12 +1006,12 @@ async fn dispatch_uses_slack_thread_as_codex_conversation_key() {
   let tasks = backend.tasks.lock().expect("tasks");
   assert_eq!(tasks[0].task_id, "slack:workspace-1:dedupe-1");
   assert_eq!(
-    tasks[0].context.conversation_key,
+    channel_context(&tasks[0]).conversation_key,
     "slack:workspace-1:thread:C1:99.0"
   );
-  assert_eq!(tasks[0].context.resume_thread_id, None);
+  assert_eq!(resume_thread_id(&tasks[0]), None);
   assert_eq!(
-    tasks[0].context.message_text.as_deref(),
+    channel_context(&tasks[0]).message_text.as_deref(),
     Some("please restart the failed worker")
   );
 }
@@ -1021,9 +1030,8 @@ async fn dispatch_includes_compact_slack_communication_context() {
     .expect("dispatch");
 
   let tasks = backend.tasks.lock().expect("tasks");
-  let context_text = tasks[0]
-    .context
-    .channel_context
+  let context_text = channel_context(&tasks[0])
+    .recent_context
     .as_deref()
     .expect("compact communication context");
   let context: Value = serde_json::from_str(context_text).expect("context json");
@@ -1078,10 +1086,7 @@ async fn dispatch_uses_existing_codex_thread_for_repeated_conversation() {
     .expect("dispatch");
 
   let tasks = backend.tasks.lock().expect("tasks");
-  assert_eq!(
-    tasks[0].context.resume_thread_id.as_deref(),
-    Some("codex-thread-existing")
-  );
+  assert_eq!(resume_thread_id(&tasks[0]), Some("codex-thread-existing"));
 }
 
 #[tokio::test]
@@ -1107,8 +1112,7 @@ async fn dispatch_includes_conversation_summary_for_repeated_conversation() {
     .expect("second dispatch");
 
   let tasks = second_backend.tasks.lock().expect("tasks");
-  let summary = tasks[0]
-    .context
+  let summary = channel_context(&tasks[0])
     .conversation_summary
     .as_deref()
     .expect("conversation summary");
@@ -1210,7 +1214,7 @@ async fn dispatch_replaces_stale_codex_thread_mapping_after_backend_recovery() {
 
   let resume_thread_id = {
     let tasks = backend.tasks.lock().expect("tasks");
-    tasks[0].context.resume_thread_id.clone()
+    resume_thread_id(&tasks[0]).map(ToOwned::to_owned)
   };
   assert_eq!(resume_thread_id.as_deref(), Some("codex-thread-archived"));
   assert_eq!(
@@ -1238,10 +1242,10 @@ async fn dispatch_uses_slack_dm_as_codex_conversation_key() {
   let tasks = backend.tasks.lock().expect("tasks");
   assert_eq!(tasks[0].task_id, "slack:workspace-1:dm-dedupe-1");
   assert_eq!(
-    tasks[0].context.conversation_key,
+    channel_context(&tasks[0]).conversation_key,
     "slack:workspace-1:dm:D1:U1"
   );
-  assert_eq!(tasks[0].context.resume_thread_id, None);
+  assert_eq!(resume_thread_id(&tasks[0]), None);
 }
 
 #[tokio::test]
@@ -1259,8 +1263,8 @@ async fn dispatch_uses_slack_channel_fallback_as_codex_conversation_key() {
 
   let tasks = backend.tasks.lock().expect("tasks");
   assert_eq!(
-    tasks[0].context.conversation_key,
+    channel_context(&tasks[0]).conversation_key,
     "slack:workspace-1:channel:C1"
   );
-  assert_eq!(tasks[0].context.resume_thread_id, None);
+  assert_eq!(resume_thread_id(&tasks[0]), None);
 }

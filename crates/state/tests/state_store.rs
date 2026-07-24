@@ -841,6 +841,9 @@ values
         context_attempt_days: 14,
         conversation_summary_days: 90,
         artifact_days: 7,
+        scheduled_run_days: 30,
+        scheduled_delivery_days: 30,
+        scheduled_retention_batch_limit: 100,
       },
     )
     .await

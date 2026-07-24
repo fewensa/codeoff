@@ -11,7 +11,15 @@ path = "src/lib.rs"
 [dependencies]
 codeoff-agent-contract = { path = "../contract" }
 codeoff-config = { path = "../../config" }
+codeoff-core = { path = "../../core" }
+nix.workspace = true
+ring.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+codeoff-state = { path = "../../state", features = ["test-support"] }
 
 [lints]
 workspace = true

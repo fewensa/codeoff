@@ -3,9 +3,13 @@
 mod config;
 mod error;
 
+pub use codeoff_core::{CredentialRevision, RunnerWorkloadIdentity};
 pub use config::{
-  AgentConfig, CodeoffConfig, ConfigLoadOptions, DataRetentionConfig, DatabaseConfig, ServerConfig,
-  SlackConfig, SlackDirectMessageFeedbackMode, SlackResponseFeedbackConfig,
-  SlackResponseFeedbackMode, SlackUserTokenConfig, StateConfig,
+  AgentConfig, CodeoffConfig, ConfigLoadOptions, DataRetentionConfig, DatabaseConfig,
+  ScheduledCodexConfig, ScheduledExecutionBackend, ScheduledRemoteRunnerConfig,
+  ScheduledRunnerControlConfig, ScheduledRunnerExecutorConfig, ScheduledRunnerGatewayConfig,
+  ScheduledRunnerRole, SchedulerRuntimeConfig, ServerConfig, SlackConfig,
+  SlackDirectMessageFeedbackMode, SlackResponseFeedbackConfig, SlackResponseFeedbackMode,
+  SlackUserTokenConfig, StateConfig,
 };
 pub use error::ConfigError;

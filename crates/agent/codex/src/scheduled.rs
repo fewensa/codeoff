@@ -49,6 +49,8 @@ use nix::sys::stat::{Mode, SFlag, fchmod, fstat, mkdirat};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 #[cfg(all(unix, test))]
 use nix::unistd::chown;
+#[cfg(test)]
+use nix::unistd::geteuid;
 #[cfg(unix)]
 use nix::unistd::{Gid, Uid, fchown};
 #[cfg(unix)]
@@ -73,6 +75,8 @@ pub const GITHUB_MCP_ARTIFACT_SHA256_X86_64: &str =
   "955fff9cf50ae99ee021871a4782c36360252d82fd03c8307fd7394c44ba3886";
 pub const GITHUB_MCP_ARTIFACT_SHA256_ARM64: &str =
   "5d47f9e36850769db8a46c97a7ad1e7a1bd51502c57765a81e697f5740455227";
+#[cfg(unix)]
+const SETPRIV_PROGRAM: &str = "/usr/bin/setpriv";
 
 /// Enables process-wide descendant adoption for the dedicated root executor before it starts its
 /// async runtime. The executor role is sequential and must own no children at this boundary.
@@ -1781,6 +1785,7 @@ struct VerifiedCommand {
   _program: fs::File,
   _codex_home: fs::File,
   _cwd: fs::File,
+  _privilege_helper: Option<fs::File>,
 }
 
 #[cfg(unix)]
@@ -1810,10 +1815,37 @@ fn verified_command(
     fcntl(&codex_home, FcntlArg::F_SETFD(FdFlag::empty()))
       .map_err(|error| format!("inherit verified CODEX_HOME descriptor: {error}"))?;
   }
-  let mut command = Command::new(format!("/proc/self/fd/{}", program.as_raw_fd()));
-  if let Some((uid, gid)) = child_identity {
-    command.uid(uid).gid(gid);
-  }
+  let program_path = format!("/proc/self/fd/{}", program.as_raw_fd());
+  let privilege_helper = child_identity
+    .map(|_| {
+      fs::File::open(SETPRIV_PROGRAM)
+        .map_err(|error| format!("open scheduled privilege helper: {error}"))
+        .and_then(|helper| {
+          fcntl(&helper, FcntlArg::F_SETFD(FdFlag::empty()))
+            .map_err(|error| format!("inherit scheduled privilege helper descriptor: {error}"))?;
+          Ok(helper)
+        })
+    })
+    .transpose()?;
+  let mut command = if let Some((uid, gid)) = child_identity {
+    let helper = privilege_helper
+      .as_ref()
+      .expect("child identity opens privilege helper");
+    let mut command = Command::new(format!("/proc/self/fd/{}", helper.as_raw_fd()));
+    command.args([
+      "--clear-groups",
+      "--reuid",
+      &uid.to_string(),
+      "--regid",
+      &gid.to_string(),
+      "--no-new-privs",
+      "--",
+      &program_path,
+    ]);
+    command
+  } else {
+    Command::new(&program_path)
+  };
   command
     .args(&arguments[1..])
     .env_clear()
@@ -1830,6 +1862,7 @@ fn verified_command(
     _program: program,
     _codex_home: codex_home,
     _cwd: cwd,
+    _privilege_helper: privilege_helper,
   })
 }
 
@@ -5841,6 +5874,53 @@ mod tests {
       .expect("execute verified descriptor");
     assert!(output.status.success());
     assert_eq!(output.stdout, b"trusted-inode\n");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn verified_child_identity_has_no_privilege_tail() {
+    if geteuid().as_raw() != 0 {
+      return;
+    }
+    let temp = TempDir::new().expect("tempdir");
+    let codex_home = temp.path().join("codex-home");
+    let cwd = temp.path().join("cwd");
+    fs::create_dir(&codex_home).expect("CODEX_HOME");
+    fs::create_dir(codex_home.join("state")).expect("state root");
+    fs::write(codex_home.join("config.toml"), "").expect("config");
+    fs::create_dir(&cwd).expect("cwd");
+    let artifacts = Arc::new(test_artifacts(Path::new("/bin/sh"), &codex_home, &cwd));
+
+    let output = verified_command(
+      &artifacts,
+      &["sh", "-c", "cat /proc/self/status"],
+      false,
+      Some((65_534, 65_534)),
+    )
+    .expect("verified child command")
+    .command
+    .output()
+    .expect("execute child probe");
+    assert!(
+      output.status.success(),
+      "child status probe failed: stderr={}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    let status = String::from_utf8(output.stdout).expect("status is utf8");
+    let field = |name: &str| {
+      status
+        .lines()
+        .find_map(|line| line.strip_prefix(name))
+        .expect("status field")
+        .trim()
+    };
+    let uid = field("Uid:");
+    let gid = field("Gid:");
+    assert_eq!(uid.split_whitespace().nth(1), Some("65534"));
+    assert_eq!(gid.split_whitespace().nth(1), Some("65534"));
+    assert_eq!(field("Groups:"), "");
+    assert_eq!(field("CapEff:"), "0000000000000000");
+    assert_eq!(field("NoNewPrivs:"), "1");
   }
 
   #[cfg(unix)]

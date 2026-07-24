@@ -677,12 +677,22 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
             }
           }
           Ok(None) => {
-            cancellation.store(true, Ordering::Release);
-            return Err(io::Error::other("scheduled runner control disconnected during execution").into());
+            return await_execution_cleanup_after_control_loss(
+              &cancellation,
+              &mut execution,
+              Duration::from_millis(config.scheduler.run_cancellation_grace_ms),
+              "scheduled runner control disconnected during execution",
+            )
+            .await;
           }
           Ok(Some(_)) | Err(_) => {
-            cancellation.store(true, Ordering::Release);
-            return Err(io::Error::other("scheduled runner control transport failed").into());
+            return await_execution_cleanup_after_control_loss(
+              &cancellation,
+              &mut execution,
+              Duration::from_millis(config.scheduler.run_cancellation_grace_ms),
+              "scheduled runner control transport failed",
+            )
+            .await;
           }
         }
       }
@@ -705,6 +715,27 @@ async fn run_executor_session(config: CodeoffConfig) -> Result<(), Box<dyn Error
     ))
     .await?;
   Ok(())
+}
+
+async fn await_execution_cleanup_after_control_loss(
+  cancellation: &AtomicBool,
+  execution: &mut tokio::task::JoinHandle<ScheduledExecutionResult>,
+  cleanup_grace: Duration,
+  reason: &'static str,
+) -> Result<(), Box<dyn Error>> {
+  cancellation.store(true, Ordering::Release);
+  match tokio::time::timeout(cleanup_grace, execution).await {
+    Ok(Ok(ScheduledExecutionResult::CleanupUnproven(_))) => {
+      Err(io::Error::other("scheduled runner cleanup was not proven after control loss").into())
+    }
+    Ok(Ok(_)) => Err(io::Error::other(reason).into()),
+    Ok(Err(_)) => {
+      Err(io::Error::other("scheduled runner execution task failed after control loss").into())
+    }
+    Err(_) => {
+      Err(io::Error::other("scheduled runner cleanup did not converge after control loss").into())
+    }
+  }
 }
 
 fn validate_admission(
@@ -1288,6 +1319,73 @@ mod tests {
     assert_eq!(error.code, "runner-cleanup-unproven");
     assert_eq!(error.message, "scheduled runner cleanup was not proven");
     assert!(error.retryable);
+  }
+
+  #[tokio::test]
+  async fn post_start_control_loss_waits_for_execution_cleanup_before_failing_closed() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let task_cancellation = Arc::clone(&cancellation);
+    let task_cleaned = Arc::clone(&cleaned);
+    let mut execution = tokio::task::spawn_blocking(move || {
+      while !task_cancellation.load(Ordering::Acquire) {
+        std::thread::yield_now();
+      }
+      task_cleaned.store(true, Ordering::Release);
+      ScheduledExecutionResult::CleanupUnproven(ScheduledFailure {
+        kind: ScheduledFailureKind::Transport,
+        message: "cleanup completed after control loss".to_owned(),
+      })
+    });
+
+    let error = await_execution_cleanup_after_control_loss(
+      cancellation.as_ref(),
+      &mut execution,
+      Duration::from_secs(1),
+      "scheduled runner control disconnected during execution",
+    )
+    .await
+    .expect_err("control loss must fail closed without signing cleanup");
+
+    assert!(cancellation.load(Ordering::Acquire));
+    assert!(cleaned.load(Ordering::Acquire));
+    assert_eq!(
+      error.to_string(),
+      "scheduled runner cleanup was not proven after control loss"
+    );
+  }
+
+  #[tokio::test]
+  async fn post_start_control_loss_times_out_when_execution_cleanup_does_not_converge() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let task_release = Arc::clone(&release);
+    let mut execution = tokio::task::spawn_blocking(move || {
+      while !task_release.load(Ordering::Acquire) {
+        std::thread::yield_now();
+      }
+      ScheduledExecutionResult::Interrupted {
+        thread_id: None,
+        turn_id: None,
+      }
+    });
+
+    let error = await_execution_cleanup_after_control_loss(
+      cancellation.as_ref(),
+      &mut execution,
+      Duration::from_millis(1),
+      "scheduled runner control transport failed",
+    )
+    .await
+    .expect_err("non-converged cleanup must fail closed");
+
+    assert!(cancellation.load(Ordering::Acquire));
+    assert_eq!(
+      error.to_string(),
+      "scheduled runner cleanup did not converge after control loss"
+    );
+    release.store(true, Ordering::Release);
+    execution.await.expect("release execution task");
   }
 
   #[test]

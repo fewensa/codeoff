@@ -67,6 +67,7 @@ RUN apt-get update \
     tar \
     tmux \
     unzip \
+    util-linux \
     vim \
     wget \
     xz-utils \
@@ -74,6 +75,7 @@ RUN apt-get update \
   && mkdir -p /var/lib/codex \
   && test "${CODEX_VERSION}" = "0.144.6" \
   && npm install -g "@openai/codex@${CODEX_VERSION}" \
+  && test -x /usr/bin/setpriv \
   && test "$(codex --version)" = "codex-cli ${CODEX_VERSION}" \
   && test "$(sha256sum /usr/local/lib/node_modules/@openai/codex/bin/codex.js | cut -d' ' -f1)" = "${CODEX_PROGRAM_SHA256}" \
   && codex_schema_dir="$(mktemp -d /tmp/codex-schema.XXXXXX)" \

@@ -30,8 +30,8 @@ use codeoff_channel_slack::{
   run_socket_worker,
 };
 use codeoff_config::{
-  CodeoffConfig, ConfigLoadOptions, ScheduledExecutionBackend, SchedulerRuntimeConfig, SlackConfig,
-  SlackDirectMessageFeedbackMode, SlackResponseFeedbackMode,
+  CodeoffConfig, ConfigLoadOptions, ScheduledExecutionBackend, ScheduledRunnerRole,
+  SchedulerRuntimeConfig, SlackConfig, SlackDirectMessageFeedbackMode, SlackResponseFeedbackMode,
 };
 use codeoff_mcp::McpTcpServer;
 use codeoff_runtime::{
@@ -63,7 +63,9 @@ use tokio::sync::OnceCell;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use crate::command::{Cli, Command, ConfigCommand, SchedulerCommand, WorkerCommand};
+use crate::command::{
+  Cli, Command, ConfigCheckScheduledRunnerRole, ConfigCommand, SchedulerCommand, WorkerCommand,
+};
 use crate::observability::{
   OperationalHttpServer, PrometheusSchedulerTelemetry, SNAPSHOT_INTERVAL, init_scheduler_tracing,
   refresh_scheduler_snapshot,
@@ -3081,7 +3083,9 @@ fn run_config(
   state_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
   match command {
-    ConfigCommand::Check => {
+    ConfigCommand::Check {
+      scheduled_runner_role,
+    } => {
       let mut options = ConfigLoadOptions::new();
 
       if let Some(config_path) = config_path {
@@ -3094,6 +3098,9 @@ fn run_config(
 
       let config = CodeoffConfig::load(options)?;
       config.validate()?;
+      if let Some(role) = scheduled_runner_role {
+        validate_config_check_scheduled_runner_role(&config, role)?;
+      }
       println!(
         "config ok: state_dir={}, database=configured, mcp={}, mcp_transport={}",
         config.state_dir().display(),
@@ -3107,6 +3114,32 @@ fn run_config(
       Ok(())
     }
   }
+}
+
+fn validate_config_check_scheduled_runner_role(
+  config: &CodeoffConfig,
+  role: ConfigCheckScheduledRunnerRole,
+) -> Result<(), Box<dyn Error>> {
+  let scheduled_runner_role = match role {
+    ConfigCheckScheduledRunnerRole::Gateway => ScheduledRunnerRole::Gateway,
+    ConfigCheckScheduledRunnerRole::Control => ScheduledRunnerRole::Control,
+    ConfigCheckScheduledRunnerRole::Executor => ScheduledRunnerRole::Executor,
+  };
+  config
+    .agent
+    .scheduled_codex
+    .validate_remote_runner_role(scheduled_runner_role)?;
+  match role {
+    ConfigCheckScheduledRunnerRole::Gateway => {
+      crate::scheduled_runner::validate_gateway_environment(|name| {
+        std::env::var_os(name).is_some()
+      })?;
+    }
+    ConfigCheckScheduledRunnerRole::Control | ConfigCheckScheduledRunnerRole::Executor => {
+      crate::scheduled_runner::validate_dedicated_worker_surface(config, scheduled_runner_role)?;
+    }
+  }
+  Ok(())
 }
 
 fn run_migrate(

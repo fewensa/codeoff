@@ -313,9 +313,20 @@ pub enum WorkerCommand {
   ScheduledRunnerExecutor,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+pub enum ConfigCheckScheduledRunnerRole {
+  Gateway,
+  Control,
+  Executor,
+}
+
 #[derive(Debug, Copy, Clone, Subcommand)]
 pub enum ConfigCommand {
-  Check,
+  Check {
+    /// Validates the strict configuration surface for one remote scheduled-runner role.
+    #[arg(long, value_enum)]
+    scheduled_runner_role: Option<ConfigCheckScheduledRunnerRole>,
+  },
 }
 
 #[cfg(test)]

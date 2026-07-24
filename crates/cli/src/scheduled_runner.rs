@@ -1054,7 +1054,9 @@ const DEDICATED_RUNNER_SECRET_ENVIRONMENT: [&str; 4] = [
   "GITHUB_PAT",
 ];
 
-fn validate_gateway_environment(present: impl Fn(&str) -> bool) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_gateway_environment(
+  present: impl Fn(&str) -> bool,
+) -> Result<(), Box<dyn Error>> {
   if let Some(name) = DEDICATED_RUNNER_SECRET_ENVIRONMENT
     .iter()
     .copied()
@@ -1071,7 +1073,7 @@ fn validate_gateway_environment(present: impl Fn(&str) -> bool) -> Result<(), Bo
   Ok(())
 }
 
-fn validate_dedicated_worker_surface(
+pub(crate) fn validate_dedicated_worker_surface(
   config: &CodeoffConfig,
   role: ScheduledRunnerRole,
 ) -> Result<(), Box<dyn Error>> {

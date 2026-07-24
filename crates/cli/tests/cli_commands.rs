@@ -6,6 +6,7 @@ use codeoff_channel_contract::{ChannelEvent, ChannelEventKind, ChannelReplyTarge
 use codeoff_cli::Cli;
 use codeoff_config::{CodeoffConfig, ConfigLoadOptions};
 use codeoff_state::{SlackSourceEvent, StateStore};
+use predicates::prelude::PredicateBooleanExt;
 use tempfile::tempdir;
 
 #[test]
@@ -671,6 +672,148 @@ url = "sqlite://${CODEOFF_STATE_DIR:-./.codeoff}/codeoff.db"
   assert!(stdout.contains("mcp=disabled"));
   assert!(stdout.contains("mcp_transport=stdio"));
   assert!(!stdout.contains("sqlite://"));
+}
+
+#[test]
+fn test_config_check_scheduled_runner_role_rejects_mixed_role_tables() {
+  let dir = tempdir().expect("create tempdir");
+  let config_path = dir.path().join("codeoff.toml");
+  fs::write(
+    &config_path,
+    scheduled_runner_config_with_tables(&[
+      scheduled_runner_gateway_table(),
+      scheduled_runner_control_table(),
+    ]),
+  )
+  .expect("write config");
+
+  Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .args([
+      "--config",
+      config_path.to_str().expect("utf-8 path"),
+      "config",
+      "check",
+      "--scheduled-runner-role",
+      "gateway",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("scheduled_codex.remote_runner"));
+}
+
+#[test]
+fn test_config_check_scheduled_runner_role_rejects_dedicated_worker_secret_environment() {
+  let dir = tempdir().expect("create tempdir");
+  let config_path = dir.path().join("codeoff.toml");
+  fs::write(
+    &config_path,
+    scheduled_runner_config_with_tables(&[scheduled_runner_control_table()]),
+  )
+  .expect("write config");
+
+  Command::cargo_bin("codeoff")
+    .expect("codeoff binary")
+    .env_clear()
+    .env("OPENAI_API_KEY", "do-not-print")
+    .args([
+      "--config",
+      config_path.to_str().expect("utf-8 path"),
+      "config",
+      "check",
+      "--scheduled-runner-role",
+      "control",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains(
+      "scheduled runner control forbids ambient secret environment OPENAI_API_KEY",
+    ))
+    .stderr(predicates::str::contains("do-not-print").not());
+}
+
+fn scheduled_runner_config_with_tables(tables: &[&str]) -> String {
+  format!(
+    r#"
+[agent.scheduled_codex]
+execution_backend = "remote-runner"
+codex_program = "/opt/codeoff/bin/codex"
+codex_program_sha256 = "{codex_program_sha256}"
+codex_home = "/var/lib/codeoff/scheduled-codex"
+cwd = "/work/codeoff-scheduled"
+github_mcp_url = "http://127.0.0.1:8090/mcp"
+github_mcp_artifact_path = "/opt/codeoff/bin/github-mcp-server"
+github_mcp_artifact_sha256 = "{github_mcp_artifact_sha256}"
+github_mcp_endpoint_identity = "github-mcp-scheduled-v1"
+github_mcp_access_auth_mode = "supervisor-dynamic-tools-v1"
+github_mcp_access_token_revision = "mcp-channel-v1"
+credential_reference = "kubernetes:codeoff/github-mcp"
+permission_policy_revision = "scheduled-read-only-v1"
+config_revision = "scheduled-codex-v1"
+config_sha256 = "{config_sha256}"
+gateway_image_digest = "sha256:{gateway_image_sha256}"
+runner_image_digest = "sha256:{runner_image_sha256}"
+runner_workload_identity = "spiffe://codeoff/runner/production"
+runner_client_cert_public_key_fingerprint = "{runner_client_cert_public_key_fingerprint}"
+credential_revision = "github-readonly-2026-07"
+isolation_attestation_path = "/var/run/codeoff/isolation-attestation.json"
+isolation_trust_bundle_path = "/opt/codeoff/attestation/isolation-trust-bundle.json"
+trusted_owner_uid = 0
+trusted_owner_gid = 0
+runtime_uid = 65534
+runtime_gid = 65534
+
+{tables}
+"#,
+    codex_program_sha256 = "a".repeat(64),
+    github_mcp_artifact_sha256 = "b".repeat(64),
+    config_sha256 = "c".repeat(64),
+    gateway_image_sha256 = "e".repeat(64),
+    runner_image_sha256 = "f".repeat(64),
+    runner_client_cert_public_key_fingerprint = "1".repeat(64),
+    tables = tables.join("\n"),
+  )
+}
+
+fn scheduled_runner_gateway_table() -> &'static str {
+  r#"
+[agent.scheduled_codex.remote_runner.gateway]
+bind = "0.0.0.0:7443"
+server_certificate_path = "/run/codeoff/tls/server.crt"
+server_private_key_path = "/run/codeoff/tls/server.key"
+client_ca_bundle_path = "/run/codeoff/tls/client-ca.crt"
+execution_grant_private_key_path = "/run/codeoff/grant/gateway.pk8"
+execution_grant_key_id = "gateway-grant-key-1"
+execution_grant_key_revision = "gateway-grant-2026-07"
+execution_grant_signer_identity = "spiffe://codeoff/gateway/production"
+executor_evidence_public_key_path = "/run/codeoff/evidence/executor.pub"
+executor_evidence_key_id = "executor-key-1"
+executor_evidence_key_revision = "executor-evidence-2026-07"
+executor_evidence_signer_identity = "spiffe://codeoff/executor/production"
+handshake_timeout_ms = 5000
+frame_timeout_ms = 30000
+readiness_ttl_ms = 30000
+max_connections = 2
+"#
+}
+
+fn scheduled_runner_control_table() -> &'static str {
+  r#"
+[agent.scheduled_codex.remote_runner.control]
+gateway_address = "codeoff-gateway.codeoff.svc:7443"
+gateway_server_name = "codeoff-gateway.codeoff.svc"
+client_certificate_path = "/run/codeoff/tls/client.crt"
+client_private_key_path = "/run/codeoff/tls/client.key"
+server_ca_bundle_path = "/run/codeoff/tls/server-ca.crt"
+local_socket_path = "/run/codeoff/runner/executor.sock"
+control_uid = 10001
+control_gid = 10001
+expected_executor_uid = 0
+expected_executor_gid = 0
+connect_timeout_ms = 5000
+frame_timeout_ms = 30000
+readiness_ttl_ms = 30000
+"#
 }
 
 #[test]

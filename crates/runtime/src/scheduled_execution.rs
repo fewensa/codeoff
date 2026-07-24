@@ -348,12 +348,13 @@ async fn run_scheduled_worker_tick(
   if !orchestrator.run_claims_enabled {
     return Ok(TickOutcome::Unavailable);
   }
-  if orchestrator
-    .backend
-    .refresh_materialization_admission()
-    .await
-    == RefreshedExecutorAdmission::Unavailable
-  {
+  if matches!(
+    orchestrator
+      .backend
+      .refresh_materialization_admission()
+      .await,
+    RefreshedExecutorAdmission::Unavailable
+  ) {
     return Ok(TickOutcome::Unavailable);
   }
   let due_jobs = tokio::select! {
@@ -375,7 +376,7 @@ async fn run_scheduled_worker_tick(
       .backend
       .refresh_materialization_admission()
       .await;
-    if admission == RefreshedExecutorAdmission::Unavailable {
+    if matches!(admission, RefreshedExecutorAdmission::Unavailable) {
       return Ok(TickOutcome::Unavailable);
     }
     let clock = Arc::clone(&orchestrator.clock);
@@ -385,7 +386,8 @@ async fn run_scheduled_worker_tick(
         result = state.materialize_due_schedule(&job_id, job.generation, now) => result,
         () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
       },
-      RefreshedExecutorAdmission::Authority(authority) => {
+      RefreshedExecutorAdmission::Authority(authority)
+      | RefreshedExecutorAdmission::ReservedAuthority { authority, .. } => {
         let state = state.clone();
         let job_id = job_id.clone();
         let authority = authority.clone();
@@ -594,6 +596,30 @@ pub struct PrepareInput {
   pub capability_digest: String,
   pub targets_json: String,
   pub cancellation: Arc<AtomicBool>,
+  pub backend_reservation: Option<BackendReservation>,
+}
+
+#[derive(Clone)]
+pub struct BackendReservation(Arc<dyn Any + Send + Sync>);
+
+impl std::fmt::Debug for BackendReservation {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str("BackendReservation([redacted])")
+  }
+}
+
+impl BackendReservation {
+  #[must_use]
+  pub fn new<T: Send + Sync + 'static>(value: T) -> Self {
+    Self(Arc::new(value))
+  }
+
+  pub fn downcast_ref<T: Send + Sync + 'static>(&self) -> Result<&T, PrepareFailure> {
+    self
+      .0
+      .downcast_ref::<T>()
+      .ok_or_else(|| PrepareFailure::artifact("scheduled_backend_reservation_type_mismatch"))
+  }
 }
 
 pub struct BackendPrepared {
@@ -644,6 +670,10 @@ impl BackendPrepared {
 }
 
 pub trait PreparedExecution: Send {
+  fn validate_pre_start(&self) -> Result<(), PrepareFailure> {
+    Ok(())
+  }
+
   fn execute(self: Box<Self>, cancellation: Arc<AtomicBool>) -> ExecutionResult;
 }
 
@@ -696,11 +726,15 @@ pub trait ScheduledExecutionBackend: Send + Sync {
   ) -> Result<BackendPrepared, PrepareFailure>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum RefreshedExecutorAdmission {
   Unavailable,
   Ready,
   Authority(ScheduledExecutorAdmission),
+  ReservedAuthority {
+    authority: ScheduledExecutorAdmission,
+    reservation: BackendReservation,
+  },
 }
 
 struct UnavailableScheduledExecutionBackend;
@@ -791,6 +825,10 @@ impl PreparedRun {
 
   fn matches(&self, authority: &ScheduledPrepareAuthority) -> bool {
     self.authority == *authority
+  }
+
+  fn validate_pre_start(&self) -> Result<(), PrepareFailure> {
+    self.execution.validate_pre_start()
   }
 
   fn execute(self, cancellation: Arc<AtomicBool>) -> ExecutionResult {
@@ -975,13 +1013,19 @@ impl ScheduledRunOrchestrator {
       return Ok(TickOutcome::Unavailable);
     }
     let admission = self.backend.refresh_admission().await;
-    if admission == RefreshedExecutorAdmission::Unavailable {
+    if matches!(admission, RefreshedExecutorAdmission::Unavailable) {
       return Ok(TickOutcome::Unavailable);
     }
     if *shutdown.borrow() {
       return Ok(TickOutcome::Cancelled);
     }
     let now = self.clock.now();
+    let backend_reservation = match &admission {
+      RefreshedExecutorAdmission::ReservedAuthority { reservation, .. } => {
+        Some(reservation.clone())
+      }
+      _ => None,
+    };
     let claim_result = match &admission {
       RefreshedExecutorAdmission::Unavailable => Ok(None),
       RefreshedExecutorAdmission::Ready => {
@@ -997,7 +1041,8 @@ impl ScheduledRunOrchestrator {
           () = cancellation_requested(shutdown.clone()) => return Ok(TickOutcome::Cancelled),
         }
       }
-      RefreshedExecutorAdmission::Authority(authority) => {
+      RefreshedExecutorAdmission::Authority(authority)
+      | RefreshedExecutorAdmission::ReservedAuthority { authority, .. } => {
         let state = self.state.clone();
         let lease_owner = self.lease_owner.clone();
         let authority = authority.clone();
@@ -1044,6 +1089,7 @@ impl ScheduledRunOrchestrator {
     let Some(claim) = claim else {
       return Ok(TickOutcome::Idle);
     };
+    drop(admission);
     let snapshot_policy = ExecutionPolicy::from_policy(&claim.scheduler_policy);
     #[cfg(test)]
     {
@@ -1126,6 +1172,7 @@ impl ScheduledRunOrchestrator {
       capability_digest: claim.capability_digest.clone(),
       targets_json: claim.targets_json.clone(),
       cancellation: Arc::clone(&cancellation),
+      backend_reservation,
     };
     let backend = Arc::clone(&self.backend);
     if self.clock.now() >= absolute_deadline {
@@ -1262,6 +1309,12 @@ impl ScheduledRunOrchestrator {
       let outcome = self
         .record_preflight_failure(&claim, PrepareFailure::fatal("run_deadline_exceeded"))
         .await;
+      stop_heartbeat(&mut heartbeat).await;
+      return outcome;
+    }
+
+    if let Err(failure) = prepared.validate_pre_start() {
+      let outcome = self.record_preflight_failure(&claim, failure).await;
       stop_heartbeat(&mut heartbeat).await;
       return outcome;
     }
@@ -2055,6 +2108,99 @@ mod tests {
     execution_exited: Option<Arc<Notify>>,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
+  }
+
+  #[derive(Clone)]
+  struct TestReservation {
+    _inner: Arc<TestReservationInner>,
+  }
+
+  struct TestReservationInner {
+    releases: Arc<AtomicUsize>,
+  }
+
+  impl Drop for TestReservationInner {
+    fn drop(&mut self) {
+      self.releases.fetch_add(1, Ordering::AcqRel);
+    }
+  }
+
+  struct CasConflictBackend {
+    admission: ScheduledExecutorAdmission,
+    clock: Arc<TestClock>,
+    releases: Arc<AtomicUsize>,
+    starts: Arc<AtomicUsize>,
+  }
+
+  struct CasConflictPrepared {
+    reservation: TestReservation,
+    clock: Arc<TestClock>,
+    starts: Arc<AtomicUsize>,
+  }
+
+  #[async_trait]
+  impl ScheduledExecutionBackend for CasConflictBackend {
+    fn readiness(&self) -> ExecutorReadiness {
+      ExecutorReadiness::Ready
+    }
+
+    async fn refresh_admission(&self) -> RefreshedExecutorAdmission {
+      RefreshedExecutorAdmission::ReservedAuthority {
+        authority: self.admission.clone(),
+        reservation: BackendReservation::new(TestReservation {
+          _inner: Arc::new(TestReservationInner {
+            releases: Arc::clone(&self.releases),
+          }),
+        }),
+      }
+    }
+
+    async fn authorize(
+      &self,
+      input: &PrepareInput,
+    ) -> Result<BackendAuthorization, PrepareFailure> {
+      let reservation = input
+        .backend_reservation
+        .as_ref()
+        .ok_or_else(|| PrepareFailure::fatal("test reservation missing"))?
+        .downcast_ref::<TestReservation>()?
+        .clone();
+      Ok(BackendAuthorization::new(reservation))
+    }
+
+    fn prepare(
+      &self,
+      input: PrepareInput,
+      authorization: BackendAuthorization,
+    ) -> Result<BackendPrepared, PrepareFailure> {
+      let reservation: TestReservation = authorization.downcast()?;
+      let profile = input.authority.attestation_json(true);
+      Ok(BackendPrepared::new(
+        input.authority,
+        profile.clone(),
+        sha256_hex(profile.as_bytes()),
+        Box::new(CasConflictPrepared {
+          reservation,
+          clock: Arc::clone(&self.clock),
+          starts: Arc::clone(&self.starts),
+        }),
+      ))
+    }
+  }
+
+  impl PreparedExecution for CasConflictPrepared {
+    fn validate_pre_start(&self) -> Result<(), PrepareFailure> {
+      let _ = &self.reservation;
+      self.clock.0.store(1_000, Ordering::Release);
+      Ok(())
+    }
+
+    fn execute(self: Box<Self>, _cancellation: Arc<AtomicBool>) -> ExecutionResult {
+      self.starts.fetch_add(1, Ordering::AcqRel);
+      ExecutionResult::Completed {
+        summary: "must not start after CAS conflict".to_owned(),
+      }
+    }
   }
 
   struct PrepareTestGate {
@@ -3177,6 +3323,35 @@ mod tests {
         .is_none(),
       "the stale executor must not return the logical run to pending"
     );
+  }
+
+  #[tokio::test]
+  async fn test_cas_conflict_releases_reserved_backend_without_start_or_budget_leak() {
+    let (_temp, state) = fixture(&[("reservation-cas", 110)]).await;
+    let authority = test_executor_authority(1, 'a');
+    state
+      .register_scheduled_executor_epoch(&authority, 110)
+      .await
+      .expect("register authority");
+    let clock = Arc::new(TestClock(AtomicI64::new(111), 1));
+    let releases = Arc::new(AtomicUsize::new(0));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(CasConflictBackend {
+      admission: test_executor_admission(&authority, 150),
+      clock: Arc::clone(&clock),
+      releases: Arc::clone(&releases),
+      starts: Arc::clone(&starts),
+    });
+    let budget = GlobalTurnBudget::new(1);
+    let mut runtime = orchestrator(state, backend, clock, 1);
+    runtime.budget = budget.clone();
+    assert_eq!(
+      runtime.run_once().await.expect("tick"),
+      TickOutcome::LostLease
+    );
+    assert_eq!(starts.load(Ordering::Acquire), 0);
+    assert_eq!(releases.load(Ordering::Acquire), 1);
+    assert_eq!(budget.available_permits(), 1);
   }
 
   #[test]

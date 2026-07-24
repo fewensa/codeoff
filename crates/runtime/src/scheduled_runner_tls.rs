@@ -12,7 +12,9 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use codeoff_core::RunnerWorkloadIdentity;
@@ -414,6 +416,101 @@ where
       .map_err(|_| ScheduledRunnerTlsError::FrameTimeout)??;
     Ok(())
   }
+
+  pub(crate) async fn write_frame_observed<A, P, B>(
+    &mut self,
+    frame: &RemoteFrame,
+    on_first_poll: A,
+    on_first_pending: P,
+    on_first_byte: B,
+  ) -> Result<(), ScheduledRunnerTlsError>
+  where
+    A: FnOnce() -> io::Result<()>,
+    P: FnOnce() -> io::Result<()>,
+    B: FnOnce() -> io::Result<()>,
+  {
+    let encoded = frame.encode()?;
+    let length =
+      u32::try_from(encoded.len()).map_err(|_| ScheduledRunnerTlsError::FrameTooLarge)?;
+    let mut on_first_poll = Some(on_first_poll);
+    let mut on_first_pending = Some(on_first_pending);
+    let mut on_first_byte = Some(on_first_byte);
+    let write = async {
+      write_all_observed(
+        &mut self.stream,
+        &length.to_be_bytes(),
+        &mut on_first_poll,
+        &mut on_first_pending,
+        &mut on_first_byte,
+      )
+      .await?;
+      write_all_observed(
+        &mut self.stream,
+        &encoded,
+        &mut on_first_poll,
+        &mut on_first_pending,
+        &mut on_first_byte,
+      )
+      .await?;
+      self.stream.flush().await
+    };
+    tokio::time::timeout(self.write_timeout, write)
+      .await
+      .map_err(|_| ScheduledRunnerTlsError::FrameTimeout)??;
+    Ok(())
+  }
+}
+
+async fn write_all_observed<S, A, P, B>(
+  stream: &mut S,
+  mut buffer: &[u8],
+  on_first_poll: &mut Option<A>,
+  on_first_pending: &mut Option<P>,
+  on_first_byte: &mut Option<B>,
+) -> io::Result<()>
+where
+  S: AsyncWrite + Unpin,
+  A: FnOnce() -> io::Result<()>,
+  P: FnOnce() -> io::Result<()>,
+  B: FnOnce() -> io::Result<()>,
+{
+  while !buffer.is_empty() {
+    let written = std::future::poll_fn(|context| {
+      if let Some(observer) = on_first_poll.take()
+        && let Err(error) = observer()
+      {
+        return Poll::Ready(Err(error));
+      }
+      match Pin::new(&mut *stream).poll_write(context, buffer) {
+        Poll::Pending => {
+          if let Some(observer) = on_first_pending.take()
+            && let Err(error) = observer()
+          {
+            return Poll::Ready(Err(error));
+          }
+          Poll::Pending
+        }
+        Poll::Ready(Ok(written)) if written > 0 => {
+          if let Some(observer) = on_first_byte.take()
+            && let Err(error) = observer()
+          {
+            return Poll::Ready(Err(error));
+          }
+          Poll::Ready(Ok(written))
+        }
+        result @ Poll::Ready(_) => result,
+      }
+    })
+    .await?;
+    if written == 0 {
+      return Err(io::Error::new(
+        io::ErrorKind::WriteZero,
+        "failed to write scheduled runner frame",
+      ));
+    }
+    buffer = &buffer[written..];
+  }
+  Ok(())
 }
 
 fn load_roots(

@@ -5,7 +5,7 @@
 //! `ScheduledExecutionBackend` seam.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,8 +20,9 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::scheduled_execution::{
-  BackendAuthorization, BackendPrepared, ExecutionResult, ExecutorReadiness, PrepareFailure,
-  PrepareInput, PreparedExecution, RefreshedExecutorAdmission, ScheduledExecutionBackend,
+  BackendAuthorization, BackendPrepared, BackendReservation, ExecutionResult, ExecutorReadiness,
+  PrepareFailure, PrepareInput, PreparedExecution, RefreshedExecutorAdmission,
+  ScheduledExecutionBackend,
 };
 use crate::scheduled_remote_protocol::{
   AdmissionFrame, CancelFrame, ErrorFrame, MAX_ADMISSION_TTL_MILLIS, PrepareFrame, PreparedFrame,
@@ -37,8 +38,10 @@ use crate::scheduled_runner_evidence::{
 };
 use crate::scheduled_runner_grant::{RemoteExecutionGrantClaims, RemoteExecutionGrantSigner};
 use crate::scheduled_runner_tls::{
-  ScheduledRunnerAuthorizedPeer, ScheduledRunnerServerConnection, session_challenge, session_nonce,
+  ScheduledRunnerAuthorizedPeer, ScheduledRunnerFramed, ScheduledRunnerServerConnection,
+  ScheduledRunnerTlsError, session_challenge, session_nonce,
 };
+use tokio::io::{AsyncRead, AsyncWrite};
 
 const MAX_BROKER_CONNECTIONS: usize = 16;
 const BROKER_COMMAND_CAPACITY: usize = 2;
@@ -155,6 +158,7 @@ struct BrokerInner {
   grant_signer: Arc<RemoteExecutionGrantSigner>,
   connections: Arc<Semaphore>,
   current: Mutex<Option<Arc<RegisteredRunnerSession>>>,
+  next_generation: AtomicU64,
 }
 
 impl ScheduledRunnerBroker {
@@ -169,6 +173,7 @@ impl ScheduledRunnerBroker {
         config,
         grant_signer,
         current: Mutex::new(None),
+        next_generation: AtomicU64::new(1),
       }),
     })
   }
@@ -211,7 +216,15 @@ impl ScheduledRunnerBroker {
       &expected_challenge,
     )?;
     let (commands, receiver) = mpsc::channel(BROKER_COMMAND_CAPACITY);
+    let generation = self
+      .inner
+      .next_generation
+      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        value.checked_add(1)
+      })
+      .map_err(|_| ScheduledRunnerBrokerError::SessionUnavailable)?;
     let session = Arc::new(RegisteredRunnerSession {
+      generation,
       session_nonce: expected_session_nonce,
       ready_frame,
       ready,
@@ -329,7 +342,7 @@ impl ScheduledRunnerBroker {
     let mut current = self.inner.current.lock().expect("runner session registry");
     if current
       .as_ref()
-      .is_some_and(|registered| registered.is_connected())
+      .is_some_and(|registered| registered.is_connected() || registered.has_pinned_reservation())
     {
       return Err(ScheduledRunnerBrokerError::DuplicateSession);
     }
@@ -339,11 +352,149 @@ impl ScheduledRunnerBroker {
 
   fn unregister(&self, session: &Arc<RegisteredRunnerSession>) {
     session.connected.store(false, Ordering::Release);
-    session.release_slot();
     let mut current = self.inner.current.lock().expect("runner session registry");
     if current
       .as_ref()
       .is_some_and(|registered| Arc::ptr_eq(registered, session))
+    {
+      if session.has_pinned_reservation() {
+        return;
+      }
+      session.release_slot();
+      *current = None;
+    }
+  }
+
+  fn validate_and_pin_reservation(
+    &self,
+    lease: &ReservationLeaseInner,
+    now: u64,
+  ) -> Result<(), ScheduledRunnerBrokerError> {
+    let current = self.inner.current.lock().expect("runner session registry");
+    if !current.as_ref().is_some_and(|registered| {
+      Arc::ptr_eq(registered, &lease.session) && registered.is_connected()
+    }) {
+      return Err(ScheduledRunnerBrokerError::SessionUnavailable);
+    }
+    let mut slot = lease.session.slot.lock().expect("runner execution slot");
+    let reservation = slot
+      .as_mut()
+      .ok_or(ScheduledRunnerBrokerError::SessionUnavailable)?;
+    if reservation.nonce != lease.admission_nonce
+      || reservation.generation != lease.session.generation
+      || reservation.session_nonce != lease.session.session_nonce
+      || reservation.challenge != lease.session.ready.challenge
+      || reservation.expires_at_unix_millis <= now
+      || !reservation.grant_issued
+      || reservation.grant_id.is_none()
+      || reservation.phase != ReservationPhase::PreStart
+    {
+      return Err(ScheduledRunnerBrokerError::SessionUnavailable);
+    }
+    reservation.phase = ReservationPhase::PinnedForCas;
+    Ok(())
+  }
+
+  fn begin_start_attempt(
+    &self,
+    lease: &ReservationLeaseInner,
+  ) -> Result<(), ScheduledRunnerBrokerError> {
+    let current = self.inner.current.lock().expect("runner session registry");
+    if !current.as_ref().is_some_and(|registered| {
+      Arc::ptr_eq(registered, &lease.session) && registered.is_connected()
+    }) {
+      return Err(ScheduledRunnerBrokerError::SessionUnavailable);
+    }
+    let mut slot = lease.session.slot.lock().expect("runner execution slot");
+    let reservation = slot
+      .as_mut()
+      .ok_or(ScheduledRunnerBrokerError::SessionUnavailable)?;
+    if reservation.nonce != lease.admission_nonce
+      || reservation.generation != lease.session.generation
+      || reservation.session_nonce != lease.session.session_nonce
+      || reservation.challenge != lease.session.ready.challenge
+      || !reservation.grant_issued
+      || reservation.grant_id.is_none()
+      || reservation.phase != ReservationPhase::PinnedForCas
+    {
+      return Err(ScheduledRunnerBrokerError::SessionUnavailable);
+    }
+    reservation.phase = ReservationPhase::AttemptingStart;
+    Ok(())
+  }
+
+  fn confirm_start_byte(
+    &self,
+    lease: &ReservationLeaseInner,
+  ) -> Result<(), ScheduledRunnerBrokerError> {
+    let current = self.inner.current.lock().expect("runner session registry");
+    if !current
+      .as_ref()
+      .is_some_and(|registered| Arc::ptr_eq(registered, &lease.session))
+    {
+      return Err(ScheduledRunnerBrokerError::SessionUnavailable);
+    }
+    let mut slot = lease.session.slot.lock().expect("runner execution slot");
+    let reservation = slot
+      .as_mut()
+      .ok_or(ScheduledRunnerBrokerError::SessionUnavailable)?;
+    if reservation.nonce != lease.admission_nonce
+      || reservation.generation != lease.session.generation
+      || reservation.session_nonce != lease.session.session_nonce
+      || reservation.challenge != lease.session.ready.challenge
+      || !reservation.grant_issued
+      || reservation.grant_id.is_none()
+      || !matches!(
+        reservation.phase,
+        ReservationPhase::AttemptingStart | ReservationPhase::OutcomeUnknown
+      )
+    {
+      return Err(ScheduledRunnerBrokerError::SessionUnavailable);
+    }
+    reservation.phase = ReservationPhase::Started;
+    Ok(())
+  }
+
+  fn mark_start_uncertain(
+    &self,
+    lease: &ReservationLeaseInner,
+  ) -> Result<(), ScheduledRunnerBrokerError> {
+    let current = self.inner.current.lock().expect("runner session registry");
+    if !current
+      .as_ref()
+      .is_some_and(|registered| Arc::ptr_eq(registered, &lease.session))
+    {
+      return Err(ScheduledRunnerBrokerError::SessionUnavailable);
+    }
+    let mut slot = lease.session.slot.lock().expect("runner execution slot");
+    let reservation = slot
+      .as_mut()
+      .ok_or(ScheduledRunnerBrokerError::SessionUnavailable)?;
+    if reservation.nonce != lease.admission_nonce
+      || reservation.phase != ReservationPhase::AttemptingStart
+    {
+      return Err(ScheduledRunnerBrokerError::SessionUnavailable);
+    }
+    reservation.phase = ReservationPhase::OutcomeUnknown;
+    Ok(())
+  }
+
+  fn release_reservation(
+    &self,
+    lease: &ReservationLeaseInner,
+    allow_attempting: bool,
+    allow_started: bool,
+  ) {
+    let mut current = self.inner.current.lock().expect("runner session registry");
+    let released =
+      lease
+        .session
+        .release_reservation(&lease.admission_nonce, allow_attempting, allow_started);
+    if !lease.session.is_connected()
+      && released
+      && current
+        .as_ref()
+        .is_some_and(|registered| Arc::ptr_eq(registered, &lease.session))
     {
       *current = None;
     }
@@ -363,8 +514,14 @@ impl ScheduledRunnerBroker {
   fn state_admission(
     &self,
     reserve_slot: bool,
-  ) -> Result<(ScheduledExecutorAdmission, Arc<RegisteredRunnerSession>), ScheduledRunnerBrokerError>
-  {
+  ) -> Result<
+    (
+      ScheduledExecutorAdmission,
+      Arc<RegisteredRunnerSession>,
+      Option<ReservationLease>,
+    ),
+    ScheduledRunnerBrokerError,
+  > {
     let now_millis = unix_millis()?;
     let now_seconds =
       i64::try_from(now_millis / 1_000).map_err(|_| ScheduledRunnerBrokerError::SessionExpired)?;
@@ -389,7 +546,7 @@ impl ScheduledRunnerBroker {
     if operation_deadline <= now_seconds || !session.slot_available(now_millis) {
       return Err(ScheduledRunnerBrokerError::SessionUnavailable);
     }
-    if reserve_slot {
+    let reservation = if reserve_slot {
       let ttl_millis = u64::try_from(self.inner.config.admission_ttl.as_millis())
         .map_err(|_| ScheduledRunnerBrokerError::SessionExpired)?;
       let expires_at = now_millis
@@ -401,8 +558,15 @@ impl ScheduledRunnerBroker {
             .unwrap_or(0)
             .saturating_mul(1_000),
         );
-      session.reserve(now_millis, expires_at)?;
-    }
+      let reservation = session.reserve(now_millis, expires_at)?;
+      Some(ReservationLease::new(
+        self.clone(),
+        Arc::clone(&session),
+        reservation.nonce,
+      ))
+    } else {
+      None
+    };
     Ok((
       ScheduledExecutorAdmission {
         schema_version: self.inner.config.schema_version,
@@ -414,6 +578,7 @@ impl ScheduledRunnerBroker {
         operation_deadline,
       },
       session,
+      reservation,
     ))
   }
 }
@@ -554,12 +719,87 @@ impl Drop for SessionRegistration {
 
 #[derive(Debug, Clone)]
 struct ProtocolAdmission {
+  generation: u64,
+  session_nonce: String,
+  challenge: String,
   nonce: String,
   expires_at_unix_millis: u64,
   grant_issued: bool,
+  grant_id: Option<String>,
+  phase: ReservationPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationPhase {
+  PreStart,
+  PinnedForCas,
+  AttemptingStart,
+  OutcomeUnknown,
+  Started,
+}
+
+#[derive(Clone)]
+struct ReservationLease(Arc<ReservationLeaseInner>);
+
+struct ReservationLeaseInner {
+  broker: ScheduledRunnerBroker,
+  session: Arc<RegisteredRunnerSession>,
+  admission_nonce: String,
+}
+
+impl ReservationLease {
+  fn new(
+    broker: ScheduledRunnerBroker,
+    session: Arc<RegisteredRunnerSession>,
+    admission_nonce: String,
+  ) -> Self {
+    Self(Arc::new(ReservationLeaseInner {
+      broker,
+      session,
+      admission_nonce,
+    }))
+  }
+
+  fn validate_and_pin(&self) -> Result<(), ScheduledRunnerBrokerError> {
+    self
+      .0
+      .broker
+      .validate_and_pin_reservation(&self.0, unix_millis()?)
+  }
+
+  fn begin_start_attempt(&self) -> Result<(), ScheduledRunnerBrokerError> {
+    self.0.broker.begin_start_attempt(&self.0)
+  }
+
+  fn confirm_start_byte(&self) -> Result<(), ScheduledRunnerBrokerError> {
+    self.0.broker.confirm_start_byte(&self.0)
+  }
+
+  fn mark_start_uncertain(&self) -> Result<(), ScheduledRunnerBrokerError> {
+    self.0.broker.mark_start_uncertain(&self.0)
+  }
+
+  fn release_after_no_start(&self) {
+    self.0.broker.release_reservation(&self.0, false, false);
+  }
+
+  fn release_after_zero_byte_start_failure(&self) {
+    self.0.broker.release_reservation(&self.0, true, false);
+  }
+
+  fn release_after_signed_result(&self) {
+    self.0.broker.release_reservation(&self.0, true, true);
+  }
+}
+
+impl Drop for ReservationLeaseInner {
+  fn drop(&mut self) {
+    self.broker.release_reservation(self, false, false);
+  }
 }
 
 struct RegisteredRunnerSession {
+  generation: u64,
   session_nonce: String,
   ready_frame: RemoteFrame,
   ready: ReadyFrame,
@@ -577,39 +817,54 @@ impl RegisteredRunnerSession {
 
   fn slot_available(&self, now: u64) -> bool {
     let mut slot = self.slot.lock().expect("runner execution slot");
-    if slot
-      .as_ref()
-      .is_some_and(|reservation| reservation.expires_at_unix_millis <= now)
-    {
+    if slot.as_ref().is_some_and(|reservation| {
+      reservation.phase == ReservationPhase::PreStart && reservation.expires_at_unix_millis <= now
+    }) {
       *slot = None;
     }
     slot.is_none()
   }
 
-  fn reserve(&self, now: u64, expires_at: u64) -> Result<(), ScheduledRunnerBrokerError> {
+  fn reserve(
+    &self,
+    now: u64,
+    expires_at: u64,
+  ) -> Result<ProtocolAdmission, ScheduledRunnerBrokerError> {
     if !self.is_connected() || expires_at <= now {
       return Err(ScheduledRunnerBrokerError::SessionUnavailable);
     }
     let mut slot = self.slot.lock().expect("runner execution slot");
-    if slot
-      .as_ref()
-      .is_some_and(|reservation| reservation.expires_at_unix_millis > now)
-    {
+    if slot.as_ref().is_some_and(|reservation| {
+      reservation.phase != ReservationPhase::PreStart || reservation.expires_at_unix_millis > now
+    }) {
       return Err(ScheduledRunnerBrokerError::SessionBusy);
     }
-    *slot = Some(ProtocolAdmission {
+    let reservation = ProtocolAdmission {
+      generation: self.generation,
+      session_nonce: self.session_nonce.clone(),
+      challenge: self.ready.challenge.clone(),
       nonce: random_sha256()?,
       expires_at_unix_millis: expires_at,
       grant_issued: false,
-    });
-    Ok(())
+      grant_id: None,
+      phase: ReservationPhase::PreStart,
+    };
+    *slot = Some(reservation.clone());
+    Ok(reservation)
   }
 
-  fn reserve_grant(&self, now: u64) -> Result<ProtocolAdmission, ScheduledRunnerBrokerError> {
+  fn reserve_grant(
+    &self,
+    now: u64,
+    admission_nonce: &str,
+  ) -> Result<ProtocolAdmission, ScheduledRunnerBrokerError> {
     let mut slot = self.slot.lock().expect("runner execution slot");
     let Some(reservation) = slot.as_mut() else {
       return Err(ScheduledRunnerBrokerError::SessionUnavailable);
     };
+    if reservation.nonce != admission_nonce || reservation.phase != ReservationPhase::PreStart {
+      return Err(ScheduledRunnerBrokerError::SessionUnavailable);
+    }
     if reservation.expires_at_unix_millis <= now || !self.is_connected() {
       *slot = None;
       return Err(ScheduledRunnerBrokerError::SessionExpired);
@@ -618,7 +873,40 @@ impl RegisteredRunnerSession {
       return Err(ScheduledRunnerBrokerError::SessionBusy);
     }
     reservation.grant_issued = true;
+    reservation.grant_id = Some(random_sha256()?);
     Ok(reservation.clone())
+  }
+
+  fn has_pinned_reservation(&self) -> bool {
+    self
+      .slot
+      .lock()
+      .expect("runner execution slot")
+      .as_ref()
+      .is_some_and(|reservation| reservation.phase != ReservationPhase::PreStart)
+  }
+
+  fn release_reservation(
+    &self,
+    admission_nonce: &str,
+    allow_attempting: bool,
+    allow_started: bool,
+  ) -> bool {
+    let mut slot = self.slot.lock().expect("runner execution slot");
+    if slot.as_ref().is_some_and(|reservation| {
+      reservation.nonce == admission_nonce
+        && (allow_started
+          || (allow_attempting && reservation.phase == ReservationPhase::AttemptingStart)
+          || matches!(
+            reservation.phase,
+            ReservationPhase::PreStart | ReservationPhase::PinnedForCas
+          ))
+    }) {
+      *slot = None;
+      true
+    } else {
+      false
+    }
   }
 
   fn release_slot(&self) {
@@ -629,9 +917,10 @@ impl RegisteredRunnerSession {
     &self,
     input: &PrepareInput,
     isolation_permit_envelope_json: String,
+    reservation_lease: &ReservationLease,
   ) -> Result<VerifiedPrepared, ScheduledRunnerBrokerError> {
     let now = unix_millis()?;
-    let reservation = self.reserve_grant(now)?;
+    let reservation = self.reserve_grant(now, &reservation_lease.0.admission_nonce)?;
     let binding = remote_binding(input, &self.ready)?;
     let task_json = remote_task_json(input, &binding)?;
     let admission = RemoteFrame {
@@ -656,7 +945,10 @@ impl RegisteredRunnerSession {
       targets_json: input.targets_json.clone(),
     };
     let grant_claims = RemoteExecutionGrantClaims::for_prepare(
-      random_sha256()?,
+      reservation
+        .grant_id
+        .clone()
+        .ok_or(ScheduledRunnerBrokerError::ProtocolRejected)?,
       1,
       self.evidence_config.execution_grant_signer_identity.clone(),
       self.evidence_config.execution_grant_key_revision.clone(),
@@ -703,6 +995,7 @@ impl RegisteredRunnerSession {
     preparation_nonce: String,
     executor_observed_profile_digest: String,
     cancellation: Arc<AtomicBool>,
+    reservation: ReservationLease,
   ) -> Result<RemoteExecutionTerminal, ScheduledRunnerBrokerError> {
     if !self.is_connected() {
       return Ok(RemoteExecutionTerminal::FailedBeforeStart);
@@ -722,6 +1015,7 @@ impl RegisteredRunnerSession {
         }),
         executor_observed_profile_digest,
         cancellation,
+        reservation,
         response,
       })
       .await
@@ -744,6 +1038,7 @@ enum BrokerCommand {
     frame: Box<RemoteFrame>,
     executor_observed_profile_digest: String,
     cancellation: Arc<AtomicBool>,
+    reservation: ReservationLease,
     response: oneshot::Sender<Result<RemoteExecutionTerminal, ScheduledRunnerBrokerError>>,
   },
 }
@@ -785,8 +1080,8 @@ async fn run_registered_connection(
               return Err(ScheduledRunnerBrokerError::RunnerRejected);
             }
           }
-          BrokerCommand::Start { frame, executor_observed_profile_digest, cancellation, response } => {
-            let result = drive_start(&mut connection, *frame, cancellation, &mut state, &session.evidence_config, &session.ready, &executor_observed_profile_digest).await;
+          BrokerCommand::Start { frame, executor_observed_profile_digest, cancellation, reservation, response } => {
+            let result = drive_start(&mut connection, *frame, cancellation, &mut state, &session.evidence_config, &session.ready, &executor_observed_profile_digest, &reservation).await;
             let failed = result.is_err();
             let _ = response.send(result);
             return if failed {
@@ -938,6 +1233,10 @@ async fn drive_prepare(
   }
 }
 
+#[allow(
+  clippy::too_many_arguments,
+  reason = "the driver receives the complete one-shot START protocol authority"
+)]
 async fn drive_start(
   connection: &mut ScheduledRunnerServerConnection,
   frame: RemoteFrame,
@@ -946,6 +1245,7 @@ async fn drive_start(
   evidence_config: &ScheduledRunnerBrokerConfig,
   ready: &ReadyFrame,
   executor_observed_profile_digest: &str,
+  reservation: &ReservationLease,
 ) -> Result<RemoteExecutionTerminal, ScheduledRunnerBrokerError> {
   let session = state
     .as_mut()
@@ -957,11 +1257,12 @@ async fn drive_start(
   session
     .accept(RemoteSessionRole::Gateway, frame.clone(), unix_millis()?)
     .map_err(|_| ScheduledRunnerBrokerError::ProtocolRejected)?;
-  connection
-    .framed
-    .write_frame(&frame)
+  if write_start_frame(&mut connection.framed, &frame, reservation)
     .await
-    .map_err(|_| ScheduledRunnerBrokerError::Transport)?;
+    .is_err()
+  {
+    return Err(ScheduledRunnerBrokerError::Transport);
+  }
   loop {
     tokio::select! {
       biased;
@@ -1011,6 +1312,43 @@ async fn drive_start(
       }
     }
   }
+}
+
+async fn write_start_frame<S>(
+  framed: &mut ScheduledRunnerFramed<S>,
+  frame: &RemoteFrame,
+  reservation: &ReservationLease,
+) -> Result<(), ScheduledRunnerTlsError>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  let attempted = reservation.clone();
+  let uncertain = reservation.clone();
+  let started = reservation.clone();
+  let result = framed
+    .write_frame_observed(
+      frame,
+      move || {
+        attempted
+          .begin_start_attempt()
+          .map_err(|_| std::io::Error::other("scheduled START reservation changed"))
+      },
+      move || {
+        uncertain
+          .mark_start_uncertain()
+          .map_err(|_| std::io::Error::other("scheduled START write became unbound"))
+      },
+      move || {
+        started
+          .confirm_start_byte()
+          .map_err(|_| std::io::Error::other("scheduled START reservation changed after write"))
+      },
+    )
+    .await;
+  if result.is_err() {
+    reservation.release_after_zero_byte_start_failure();
+  }
+  result
 }
 
 fn disconnect_terminal(outcome: RemoteDisconnectOutcome) -> RemoteExecutionTerminal {
@@ -1069,6 +1407,7 @@ impl RemoteScheduledExecutionBackend {
 struct RemoteAuthorization {
   session: Arc<RegisteredRunnerSession>,
   prepared: VerifiedPrepared,
+  reservation: ReservationLease,
 }
 
 struct VerifiedPrepared {
@@ -1096,39 +1435,44 @@ impl ScheduledExecutionBackend for RemoteScheduledExecutionBackend {
   }
 
   async fn refresh_materialization_admission(&self) -> RefreshedExecutorAdmission {
-    self
-      .broker
-      .state_admission(false)
-      .map_or(RefreshedExecutorAdmission::Unavailable, |(admission, _)| {
-        RefreshedExecutorAdmission::Authority(admission)
-      })
+    self.broker.state_admission(false).map_or(
+      RefreshedExecutorAdmission::Unavailable,
+      |(admission, _, _)| RefreshedExecutorAdmission::Authority(admission),
+    )
   }
 
   async fn refresh_admission(&self) -> RefreshedExecutorAdmission {
-    self
-      .broker
-      .state_admission(true)
-      .map_or(RefreshedExecutorAdmission::Unavailable, |(admission, _)| {
-        RefreshedExecutorAdmission::Authority(admission)
-      })
+    self.broker.state_admission(true).map_or(
+      RefreshedExecutorAdmission::Unavailable,
+      |(authority, _, reservation)| RefreshedExecutorAdmission::ReservedAuthority {
+        authority,
+        reservation: BackendReservation::new(
+          reservation.expect("claim admission creates reservation"),
+        ),
+      },
+    )
   }
 
   async fn authorize(&self, input: &PrepareInput) -> Result<BackendAuthorization, PrepareFailure> {
-    let session = self
-      .broker
-      .session()
-      .ok_or_else(|| PrepareFailure::fatal("scheduled_remote_session_unavailable"))?;
+    let reservation = input
+      .backend_reservation
+      .as_ref()
+      .ok_or_else(|| PrepareFailure::fatal("scheduled_remote_reservation_missing"))?
+      .downcast_ref::<ReservationLease>()?
+      .clone();
+    let session = Arc::clone(&reservation.0.session);
     let isolation_permit_envelope_json = self
       .permit_issuer
       .issue(input, &session.session_nonce)
       .await?;
     let prepared = session
-      .prepare(input, isolation_permit_envelope_json)
+      .prepare(input, isolation_permit_envelope_json, &reservation)
       .await
       .map_err(remote_prepare_failure)?;
     Ok(BackendAuthorization::new(RemoteAuthorization {
       session,
       prepared,
+      reservation,
     }))
   }
 
@@ -1137,7 +1481,11 @@ impl ScheduledExecutionBackend for RemoteScheduledExecutionBackend {
     input: PrepareInput,
     authorization: BackendAuthorization,
   ) -> Result<BackendPrepared, PrepareFailure> {
-    let RemoteAuthorization { session, prepared } = authorization.downcast()?;
+    let RemoteAuthorization {
+      session,
+      prepared,
+      reservation,
+    } = authorization.downcast()?;
     let prepared_frame = prepared.frame;
     Ok(BackendPrepared::new_remote(
       input.authority,
@@ -1151,6 +1499,7 @@ impl ScheduledExecutionBackend for RemoteScheduledExecutionBackend {
         binding: prepared_frame.binding,
         preparation_nonce: prepared_frame.preparation_nonce,
         executor_observed_profile_digest: prepared.executor_observed_profile_digest,
+        reservation,
       }),
     ))
   }
@@ -1162,26 +1511,39 @@ struct RemotePreparedExecution {
   binding: RunBinding,
   preparation_nonce: String,
   executor_observed_profile_digest: String,
+  reservation: ReservationLease,
 }
 
 impl PreparedExecution for RemotePreparedExecution {
+  fn validate_pre_start(&self) -> Result<(), PrepareFailure> {
+    self
+      .reservation
+      .validate_and_pin()
+      .map_err(|_| PrepareFailure::fatal("scheduled_remote_reservation_changed_before_commit"))
+  }
+
   fn execute(self: Box<Self>, cancellation: Arc<AtomicBool>) -> ExecutionResult {
     let this = *self;
-    let result = if this.session.is_connected() {
-      this.runtime.block_on(this.session.start(
-        this.binding,
-        this.preparation_nonce,
-        this.executor_observed_profile_digest,
-        cancellation,
-      ))
-    } else {
-      Ok(RemoteExecutionTerminal::FailedBeforeStart)
-    };
-    this.session.release_slot();
+    if !this.session.is_connected() {
+      this.reservation.release_after_no_start();
+      return ExecutionResult::TransportLost {
+        message: "scheduled remote runner disconnected after execution commit".to_owned(),
+      };
+    }
+    let result = this.runtime.block_on(this.session.start(
+      this.binding,
+      this.preparation_nonce,
+      this.executor_observed_profile_digest,
+      cancellation,
+      this.reservation.clone(),
+    ));
     match result {
-      Ok(RemoteExecutionTerminal::Result(result)) => remote_execution_result(result),
-      Ok(RemoteExecutionTerminal::FailedBeforeStart) => ExecutionResult::Interrupted {
-        transport_converged: true,
+      Ok(RemoteExecutionTerminal::Result(result)) => {
+        this.reservation.release_after_signed_result();
+        remote_execution_result(result)
+      }
+      Ok(RemoteExecutionTerminal::FailedBeforeStart) => ExecutionResult::TransportLost {
+        message: "scheduled remote runner disconnected at start boundary".to_owned(),
       },
       Ok(RemoteExecutionTerminal::OutcomeUnknown) | Err(_) => ExecutionResult::TransportLost {
         message: "scheduled remote runner outcome is unknown".to_owned(),
@@ -1357,8 +1719,10 @@ mod tests {
   use std::os::unix::fs::PermissionsExt;
   use std::os::unix::process::CommandExt;
   use std::path::PathBuf;
+  use std::pin::Pin;
   use std::process::{Command, Stdio};
-  use std::sync::OnceLock;
+  use std::sync::{Barrier, OnceLock};
+  use std::task::{Context, Poll};
 
   use crate::scheduled_remote_protocol::ReadinessRequestFrame;
   use crate::scheduled_runner_control::{
@@ -1379,6 +1743,7 @@ mod tests {
   use codeoff_agent_contract::{AgentTask, InvocationPrincipal};
   use codeoff_state::RunLeaseBinding;
   use nix::unistd::{Gid, Uid, chown, getegid, geteuid};
+  use tokio::io::ReadBuf;
   use tokio::net::TcpListener;
 
   const PRODUCTION_RELAY_HELPER_ENV: &str = "CODEOFF_PRODUCTION_RELAY_HELPER";
@@ -1391,6 +1756,96 @@ mod tests {
   const TEST_SERVER_NAME: &str = "gateway.codeoff.test";
   const TEST_CONTROL_UID: u32 = 65_533;
   const TEST_CONTROL_GID: u32 = 65_533;
+
+  struct PartialStartWriter {
+    bytes_before_failure: usize,
+    written: usize,
+  }
+
+  struct PendingStartWriter {
+    polled: bool,
+  }
+
+  impl AsyncRead for PartialStartWriter {
+    fn poll_read(
+      self: Pin<&mut Self>,
+      _context: &mut Context<'_>,
+      _buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+  }
+
+  impl AsyncWrite for PartialStartWriter {
+    fn poll_write(
+      mut self: Pin<&mut Self>,
+      _context: &mut Context<'_>,
+      buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+      if self.written >= self.bytes_before_failure {
+        return Poll::Ready(Err(std::io::Error::new(
+          std::io::ErrorKind::BrokenPipe,
+          "partial START fixture",
+        )));
+      }
+      let count = buffer
+        .len()
+        .min(self.bytes_before_failure.saturating_sub(self.written));
+      self.written += count;
+      Poll::Ready(Ok(count))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+      self: Pin<&mut Self>,
+      _context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+  }
+
+  impl AsyncRead for PendingStartWriter {
+    fn poll_read(
+      self: Pin<&mut Self>,
+      _context: &mut Context<'_>,
+      _buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+  }
+
+  impl AsyncWrite for PendingStartWriter {
+    fn poll_write(
+      mut self: Pin<&mut Self>,
+      context: &mut Context<'_>,
+      _buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+      if self.polled {
+        Poll::Ready(Err(std::io::Error::new(
+          std::io::ErrorKind::BrokenPipe,
+          "pending START fixture",
+        )))
+      } else {
+        self.polled = true;
+        context.waker().wake_by_ref();
+        Poll::Pending
+      }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+      self: Pin<&mut Self>,
+      _context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+  }
 
   fn evidence_keys() -> &'static (Vec<u8>, Vec<u8>) {
     static KEYS: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
@@ -1692,6 +2147,7 @@ mod tests {
   }
 
   fn registered_session(session_nonce: &str) -> Arc<RegisteredRunnerSession> {
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
     let config = config();
     let frame = ready_frame(
       session_nonce,
@@ -1705,6 +2161,7 @@ mod tests {
     };
     let (commands, _receiver) = mpsc::channel(BROKER_COMMAND_CAPACITY);
     Arc::new(RegisteredRunnerSession {
+      generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
       session_nonce: session_nonce.to_owned(),
       ready_frame: frame,
       ready,
@@ -1714,6 +2171,27 @@ mod tests {
       connected: AtomicBool::new(true),
       slot: Mutex::new(None),
     })
+  }
+
+  fn start_frame(session: &RegisteredRunnerSession) -> RemoteFrame {
+    RemoteFrame {
+      version: REMOTE_PROTOCOL_VERSION,
+      session_nonce: session.session_nonce.clone(),
+      sequence: 3,
+      message: RemoteMessage::Start(StartFrame {
+        binding: RunBinding {
+          run_id: "run-1".to_owned(),
+          job_id: "job-1".to_owned(),
+          attempt: 1,
+          fence_token: 1,
+          authority_digest: "a".repeat(64),
+          profile_digest: "b".repeat(64),
+          deployment_epoch: 1,
+          credential_revision: "credential-v1".to_owned(),
+        },
+        preparation_nonce: "c".repeat(64),
+      }),
+    }
   }
 
   #[test]
@@ -2382,21 +2860,24 @@ mod tests {
       Err(ScheduledRunnerBrokerError::DuplicateSession)
     ));
 
-    let (materialization, materialization_session) = broker
+    let (materialization, materialization_session, materialization_reservation) = broker
       .state_admission(false)
       .expect("materialization admission");
     assert_eq!(materialization.deployment_epoch, 9);
     assert!(materialization_session.slot.lock().expect("slot").is_none());
+    assert!(materialization_reservation.is_none());
 
-    let (_, claim_session) = broker.state_admission(true).expect("claim admission");
+    let (_, claim_session, claim_reservation) =
+      broker.state_admission(true).expect("claim admission");
+    let claim_reservation = claim_reservation.expect("claim reservation");
     assert!(claim_session.slot.lock().expect("slot").is_some());
     let now = unix_millis().expect("time");
     let issued = claim_session
-      .reserve_grant(now)
+      .reserve_grant(now, &claim_reservation.0.admission_nonce)
       .expect("first grant issuance reservation");
     assert!(issued.grant_issued);
     assert!(matches!(
-      claim_session.reserve_grant(now),
+      claim_session.reserve_grant(now, &claim_reservation.0.admission_nonce),
       Err(ScheduledRunnerBrokerError::SessionBusy)
     ));
     assert!(matches!(
@@ -2408,6 +2889,264 @@ mod tests {
 
     first.connected.store(false, Ordering::Release);
     broker.register(&second).expect("replacement registration");
+  }
+
+  #[test]
+  fn reservation_guard_releases_pre_start_and_pins_disconnect_generation() {
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
+    let session = registered_session(&"3".repeat(64));
+    broker.register(&session).expect("register session");
+    let (_, _, reservation) = broker.state_admission(true).expect("reserve session");
+    let reservation = reservation.expect("reservation guard");
+    assert!(session.slot.lock().expect("slot").is_some());
+    drop(reservation);
+    assert!(session.slot.lock().expect("slot").is_none());
+
+    let (_, _, reservation) = broker.state_admission(true).expect("reserve session again");
+    let reservation = reservation.expect("reservation guard");
+    session
+      .reserve_grant(unix_millis().expect("time"), &reservation.0.admission_nonce)
+      .expect("issue grant");
+    reservation.validate_and_pin().expect("pin before CAS");
+    broker.unregister(&session);
+    assert!(!session.is_connected());
+    assert!(session.slot.lock().expect("pinned slot").is_some());
+    let replacement = registered_session(&"4".repeat(64));
+    assert!(matches!(
+      broker.register(&replacement),
+      Err(ScheduledRunnerBrokerError::DuplicateSession)
+    ));
+    reservation.release_after_no_start();
+    assert!(session.slot.lock().expect("released slot").is_none());
+    broker
+      .register(&replacement)
+      .expect("replacement after pre-start release");
+  }
+
+  #[test]
+  fn pinned_reservation_is_not_expired_or_replaced_by_readiness() {
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
+    let session = registered_session(&"8".repeat(64));
+    broker.register(&session).expect("register session");
+    let (_, _, reservation) = broker.state_admission(true).expect("reserve session");
+    let reservation = reservation.expect("reservation guard");
+    session
+      .reserve_grant(unix_millis().expect("time"), &reservation.0.admission_nonce)
+      .expect("issue grant");
+    reservation.validate_and_pin().expect("pin before CAS");
+    {
+      let mut slot = session.slot.lock().expect("slot");
+      slot.as_mut().expect("reservation").expires_at_unix_millis = 0;
+    }
+    assert!(!session.slot_available(u64::MAX));
+    let slot = session.slot.lock().expect("slot");
+    let pinned = slot.as_ref().expect("pinned reservation");
+    assert_eq!(pinned.nonce, reservation.0.admission_nonce);
+    assert_eq!(pinned.phase, ReservationPhase::PinnedForCas);
+    drop(slot);
+    drop(reservation);
+    assert!(session.slot.lock().expect("released slot").is_none());
+  }
+
+  #[test]
+  fn stale_guard_release_cannot_clear_a_new_pinned_reservation() {
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
+    let session = registered_session(&"9".repeat(64));
+    broker.register(&session).expect("register session");
+    let (_, _, old) = broker.state_admission(true).expect("old reservation");
+    let old = old.expect("old reservation guard");
+    let delayed_old_drop = old.clone();
+    old.release_after_no_start();
+    drop(old);
+
+    let release_old = Arc::new(Barrier::new(2));
+    let release_old_thread = Arc::clone(&release_old);
+    let stale_release = std::thread::spawn(move || {
+      release_old_thread.wait();
+      drop(delayed_old_drop);
+    });
+
+    let (_, _, current) = broker.state_admission(true).expect("new reservation");
+    let current = current.expect("new reservation guard");
+    session
+      .reserve_grant(unix_millis().expect("time"), &current.0.admission_nonce)
+      .expect("new grant");
+    current.validate_and_pin().expect("pin new reservation");
+    release_old.wait();
+    stale_release.join().expect("stale release thread");
+
+    let slot = session.slot.lock().expect("slot");
+    let pinned = slot.as_ref().expect("new reservation survives");
+    assert_eq!(pinned.nonce, current.0.admission_nonce);
+    assert_eq!(pinned.phase, ReservationPhase::PinnedForCas);
+  }
+
+  #[tokio::test]
+  async fn zero_byte_start_failure_releases_exact_reservation() {
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
+    let session = registered_session(&"a".repeat(64));
+    broker.register(&session).expect("register session");
+    let (_, _, reservation) = broker.state_admission(true).expect("reserve session");
+    let reservation = reservation.expect("reservation guard");
+    session
+      .reserve_grant(unix_millis().expect("time"), &reservation.0.admission_nonce)
+      .expect("issue grant");
+    reservation.validate_and_pin().expect("pin before CAS");
+    let mut framed = ScheduledRunnerFramed::new(
+      PartialStartWriter {
+        bytes_before_failure: 0,
+        written: 0,
+      },
+      Duration::from_secs(1),
+      Duration::from_secs(1),
+    );
+    assert!(
+      write_start_frame(&mut framed, &start_frame(&session), &reservation)
+        .await
+        .is_err()
+    );
+    assert_eq!(framed.into_inner().written, 0);
+    assert!(session.slot.lock().expect("released slot").is_none());
+  }
+
+  #[tokio::test]
+  async fn unregister_before_start_writer_writes_zero_and_allows_replacement() {
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
+    let session = registered_session(&"b".repeat(64));
+    broker.register(&session).expect("register session");
+    let (_, _, reservation) = broker.state_admission(true).expect("reserve session");
+    let reservation = reservation.expect("reservation guard");
+    session
+      .reserve_grant(unix_millis().expect("time"), &reservation.0.admission_nonce)
+      .expect("issue grant");
+    reservation.validate_and_pin().expect("pin before CAS");
+    broker.unregister(&session);
+    let mut framed = ScheduledRunnerFramed::new(
+      PartialStartWriter {
+        bytes_before_failure: usize::MAX,
+        written: 0,
+      },
+      Duration::from_secs(1),
+      Duration::from_secs(1),
+    );
+    assert!(
+      write_start_frame(&mut framed, &start_frame(&session), &reservation)
+        .await
+        .is_err()
+    );
+    assert_eq!(framed.into_inner().written, 0);
+    assert!(session.slot.lock().expect("released slot").is_none());
+    broker
+      .register(&registered_session(&"c".repeat(64)))
+      .expect("replacement after zero-byte disconnect");
+  }
+
+  #[tokio::test]
+  async fn pending_start_write_failure_remains_outcome_unknown_and_pinned() {
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
+    let session = registered_session(&"d".repeat(64));
+    broker.register(&session).expect("register session");
+    let (_, _, reservation) = broker.state_admission(true).expect("reserve session");
+    let reservation = reservation.expect("reservation guard");
+    session
+      .reserve_grant(unix_millis().expect("time"), &reservation.0.admission_nonce)
+      .expect("issue grant");
+    reservation.validate_and_pin().expect("pin before CAS");
+    let mut framed = ScheduledRunnerFramed::new(
+      PendingStartWriter { polled: false },
+      Duration::from_secs(1),
+      Duration::from_secs(1),
+    );
+    assert!(
+      write_start_frame(&mut framed, &start_frame(&session), &reservation)
+        .await
+        .is_err()
+    );
+    assert_eq!(
+      session
+        .slot
+        .lock()
+        .expect("slot")
+        .as_ref()
+        .expect("unknown reservation")
+        .phase,
+      ReservationPhase::OutcomeUnknown
+    );
+    let guardian = reservation.clone();
+    drop(reservation);
+    assert!(session.slot.lock().expect("unknown slot").is_some());
+    guardian.release_after_signed_result();
+  }
+
+  #[test]
+  fn start_write_attempt_keeps_reservation_until_signed_cleanup() {
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
+    let session = registered_session(&"5".repeat(64));
+    broker.register(&session).expect("register session");
+    let (_, _, reservation) = broker.state_admission(true).expect("reserve session");
+    let reservation = reservation.expect("reservation guard");
+    session
+      .reserve_grant(unix_millis().expect("time"), &reservation.0.admission_nonce)
+      .expect("issue grant");
+    reservation.validate_and_pin().expect("pin before CAS");
+    reservation
+      .begin_start_attempt()
+      .expect("validate exact reservation at START boundary");
+    reservation
+      .confirm_start_byte()
+      .expect("point of no return before START write attempt");
+    broker.unregister(&session);
+    let guardian = reservation.clone();
+    drop(reservation);
+    assert!(session.slot.lock().expect("started slot").is_some());
+    assert!(matches!(
+      broker.register(&registered_session(&"6".repeat(64))),
+      Err(ScheduledRunnerBrokerError::DuplicateSession)
+    ));
+    guardian.release_after_signed_result();
+    assert!(session.slot.lock().expect("signed cleanup slot").is_none());
+  }
+
+  #[tokio::test]
+  async fn partial_start_frame_write_keeps_started_reservation_pinned() {
+    let broker = ScheduledRunnerBroker::new(config(), grant_signer()).expect("broker");
+    let session = registered_session(&"7".repeat(64));
+    broker.register(&session).expect("register session");
+    let (_, _, reservation) = broker.state_admission(true).expect("reserve session");
+    let reservation = reservation.expect("reservation guard");
+    session
+      .reserve_grant(unix_millis().expect("time"), &reservation.0.admission_nonce)
+      .expect("issue grant");
+    reservation.validate_and_pin().expect("pin before CAS");
+    let frame = start_frame(&session);
+    let mut framed = ScheduledRunnerFramed::new(
+      PartialStartWriter {
+        bytes_before_failure: 6,
+        written: 0,
+      },
+      Duration::from_secs(1),
+      Duration::from_secs(1),
+    );
+    assert!(matches!(
+      write_start_frame(&mut framed, &frame, &reservation).await,
+      Err(ScheduledRunnerTlsError::Io(_))
+    ));
+    assert_eq!(framed.into_inner().written, 6);
+    assert_eq!(
+      session
+        .slot
+        .lock()
+        .expect("slot")
+        .as_ref()
+        .expect("started reservation")
+        .phase,
+      ReservationPhase::Started
+    );
+    broker.unregister(&session);
+    let guardian = reservation.clone();
+    drop(reservation);
+    assert!(session.slot.lock().expect("partial START slot").is_some());
+    guardian.release_after_signed_result();
   }
 
   #[test]
@@ -2617,9 +3356,10 @@ mod tests {
     })
     .await
     .expect("broker registration");
-    broker
+    let (_, _, claim_reservation) = broker
       .state_admission(true)
       .expect("reserve broker session");
+    let claim_reservation = claim_reservation.expect("claim reservation lease");
     let authority = ScheduledPrepareAuthority::for_remote_session_test("run-1", "job-1", 1, 7);
     let input = PrepareInput {
       task: AgentTask {
@@ -2644,6 +3384,7 @@ mod tests {
       capability_digest: "3".repeat(64),
       targets_json: "[]".to_owned(),
       cancellation: Arc::new(AtomicBool::new(false)),
+      backend_reservation: None,
     };
 
     let executor_config = broker_config.clone();
@@ -2779,15 +3520,23 @@ mod tests {
     });
 
     let verified = session
-      .prepare(&input, "{\"schema_version\":1}".to_owned())
+      .prepare(
+        &input,
+        "{\"schema_version\":1}".to_owned(),
+        &claim_reservation,
+      )
       .await
       .expect("stateful authenticated prepare");
+    claim_reservation
+      .validate_and_pin()
+      .expect("pin before direct START test");
     let terminal = session
       .start(
         verified.frame.binding,
         verified.frame.preparation_nonce,
         verified.executor_observed_profile_digest,
         Arc::new(AtomicBool::new(false)),
+        claim_reservation.clone(),
       )
       .await
       .expect("stateful authenticated result");
@@ -2891,14 +3640,14 @@ mod tests {
       RemoteScheduledExecutionBackend::new(broker, Handle::current(), Arc::new(TestPermitIssuer));
     assert!(backend.is_configured());
     assert_eq!(backend.readiness(), ExecutorReadiness::Unavailable);
-    assert_eq!(
+    assert!(matches!(
       backend.refresh_materialization_admission().await,
       RefreshedExecutorAdmission::Unavailable
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
       backend.refresh_admission().await,
       RefreshedExecutorAdmission::Unavailable
-    );
+    ));
   }
 
   #[test]

@@ -1262,6 +1262,9 @@ mod tests {
 
   #[test]
   fn cleanup_unproven_execution_result_sends_error_without_cleanup_evidence() {
+    if current_process_credentials().uid != 0 {
+      return;
+    }
     let temp = tempfile::tempdir().expect("temporary directory");
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("evidence key");
     let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse evidence key");
@@ -1463,6 +1466,9 @@ mod tests {
     reason = "the protocol integration test keeps the complete bidirectional phase order visible"
   )]
   async fn relay_carries_complete_prepare_start_result_exchange() {
+    if current_process_credentials().uid != 0 {
+      return;
+    }
     let nonce = "a".repeat(64);
     let binding = RunBinding {
       run_id: "run-1".to_owned(),

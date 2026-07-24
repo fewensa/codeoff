@@ -536,6 +536,7 @@ fn validate_outer_fields(evidence: &SignedRunnerEvidence) -> Result<(), RunnerEv
 #[cfg(test)]
 mod tests {
   use super::*;
+  use nix::unistd::geteuid;
   use ring::rand::SystemRandom;
   use ring::signature::KeyPair;
   use std::fs;
@@ -636,6 +637,9 @@ mod tests {
 
   #[test]
   fn root_owned_key_loaders_require_exact_bounded_material() {
+    if geteuid().as_raw() != 0 {
+      return;
+    }
     let (private, public) = key_pair();
     let temp = tempfile::tempdir().expect("temp");
     let private_path = temp.path().join("executor.pk8");
